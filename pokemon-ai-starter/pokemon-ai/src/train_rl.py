@@ -187,6 +187,8 @@ def main():
 
         # Scan disk for ALL existing snapshots
         import glob as _glob, re as _re
+        # Snapshots before iter 260 are from the pre-type-effectiveness era
+        # (eval 25-44%, suboptimal play). Including them corrupts the value function.
         MIN_SNAPSHOT_ITER = 260
         all_disk_snapshots = sorted(set(_glob.glob("data/models/rl_v9/selfplay_v9_*/snapshot_*.pt")))
         def _snap_iter(path):

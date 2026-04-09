@@ -66,7 +66,9 @@ async def collect_v9(
     if not snapshot_pool:
         raise ValueError("snapshot_pool must contain at least one checkpoint")
 
-    # Select opponents: use ALL if pool is small, sample up to 15 if large
+    # Select opponents: use ALL if pool is small, sample up to 15 if large.
+    # 15 balances diversity (more opponents = broader training signal) against
+    # GPU memory (each opponent loads a separate model copy for inference).
     max_opponents = 15
     if len(snapshot_pool) <= max_opponents:
         selected = list(snapshot_pool)

@@ -492,7 +492,7 @@ class PSPPOCollector:
                 msg = self.traj_queue.get_nowait()
                 if msg[0] == _MSG_TRAJ:
                     trajs.append(msg[2])
-            except:
+            except Exception:
                 break
 
         elapsed = time.time() - t0
