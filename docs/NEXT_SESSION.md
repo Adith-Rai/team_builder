@@ -815,14 +815,38 @@ temporal model for OU, uniform-ish pool strategy, gamma=0.9999, clip=0.2.
 capacity reallocation → multi-gen/BC scaling. The original "30M BC scaling first" plan is
 deprioritized since the gap it was designed to close is much smaller than believed.
 
+**Infrastructure fixes (also Session 35):**
+- Atomic checkpoint writes (ppo.py) — prevents corruption on crash
+- Traceback in PPO exception handler — full stack trace for debugging
+- Grad accumulation bug fixed — accum_count reset on exception, grad clip at step not backward
+- Temporal history pre-slice — prevents OOM on 300+ turn battles
+- BC training AMP support — `--fp16` flag for ~2x speedup on CUDA
+- Vectorized collate function — numpy stack per-episode instead of per-turn Python loop
+- DataLoader optimization — persistent_workers, prefetch_factor, drop_last
+- Removed 18 unnecessary .copy() per sample in memmap reads
+
+**Deferred infrastructure items (do when relevant):**
+
+| Item | When to do | Effort |
+|------|-----------|--------|
+| DDP/FSDP multi-GPU wrapper | Before cloud training | 1-2 days |
+| Hydra/OmegaConf config management | Before running many experiments | Half day |
+| Structured logging (Python logging module) | Before long runs | Half day |
+| Test suite (pytest, smoke tests) | Ongoing, before major changes | Ongoing |
+| Remote checkpoint storage (S3/GCS) | Before cloud deployment | Half day |
+| Health monitoring / heartbeat | Before cloud deployment | 2 hours |
+| Signal handler for graceful Ctrl+C shutdown | Before next long run | 1 hour |
+
 ---
 
-## Current state snapshot (as of Session 35, 2026-04-09)
+## Current state snapshot (as of Session 35 end, 2026-04-09)
 
 ### Training state
-- **Training is STOPPED.** Architecture at ceiling. Don't resume without a reason.
+- **Training is STOPPED.** Ready for Exp 1 (lambda+entropy fix).
 - **Latest snapshot:** `data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1032)
 - **Use `train_rl.py`** (not the deleted `rl_train_v9.py`). Resume command in MEMORY.md.
+- **New flags available:** `--lam 0.95` (was 0.75), `--ent-coef 0.02` (was 0.04)
+- **BC training:** `--fp16` now available for ~2x speedup
 
 ### Key checkpoints
 - `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` — **BC base, Elo 806.**
@@ -833,4 +857,4 @@ deprioritized since the gap it was designed to close is much smaller than believ
 - Existing memmaps (human_v8, memmap_v8) are stale (move=107, switch=28). Regenerate before BC scaling.
 
 ### Git
-8 commits. `git log --oneline` for history. All changes tracked.
+9 commits. `git log --oneline` for history. All changes tracked.
