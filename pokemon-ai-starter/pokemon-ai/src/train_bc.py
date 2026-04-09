@@ -48,6 +48,7 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
                     epoch: int, tb: Optional[SummaryWriter], global_step: int,
                     grad_clip: float = 1.0, label_smoothing: float = 0.0,
                     scheduler=None, save_fn=None, save_every: int = 1000,
+                    scaler: Optional[torch.amp.GradScaler] = None,
                     ) -> tuple:
     """Train one epoch using batched spatial + sequential temporal.
     Returns (avg_loss, avg_acc, avg_v_loss, global_step)."""
@@ -58,6 +59,7 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
     n_batches = 0
     n_turns = 0
     t0 = time.time()
+    use_amp = scaler is not None
 
     for batch_idx, collated in enumerate(loader):
         B = collated["seq_lens"].shape[0]
@@ -66,40 +68,50 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
         actions = collated["action"].to(device)  # (B, T)
         results = collated["result"].to(device)  # (B, T)
 
-        # Batched forward: spatial all-at-once, temporal per-turn
-        out = model.forward_sequence(collated, device)
-        logits = out["action_logits"]  # (B, T, 9)
-        v_logits_all = out["v_logits"]  # (B, T, 51)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            # Batched forward: spatial all-at-once, temporal per-turn
+            out = model.forward_sequence(collated, device)
+            logits = out["action_logits"]  # (B, T, 9)
+            v_logits_all = out["v_logits"]  # (B, T, 51)
 
-        # Flatten valid turns for loss computation
-        valid = (mask > 0.5) & (actions >= 0)  # (B, T)
-        if not valid.any():
-            continue
+            # Flatten valid turns for loss computation
+            valid = (mask > 0.5) & (actions >= 0)  # (B, T)
+            if not valid.any():
+                continue
 
-        flat_logits = logits[valid]  # (N_valid, 9)
-        flat_actions = actions[valid]  # (N_valid,)
-        flat_legal = collated["legal_mask_raw"].to(device)[valid]  # (N_valid, 9)
+            flat_logits = logits[valid].float()  # (N_valid, 9) — float32 for loss
+            flat_actions = actions[valid]  # (N_valid,)
+            flat_legal = collated["legal_mask_raw"].to(device)[valid]  # (N_valid, 9)
 
-        pi_loss = masked_policy_ce(flat_logits, flat_actions, flat_legal,
-                                   label_smoothing=label_smoothing)
-        acc = compute_accuracy(flat_logits, flat_actions, flat_legal)
+            pi_loss = masked_policy_ce(flat_logits, flat_actions, flat_legal,
+                                       label_smoothing=label_smoothing)
+            acc = compute_accuracy(flat_logits, flat_actions, flat_legal)
 
-        # Value loss on turns with known results
-        flat_results = results[valid]  # (N_valid,)
-        v_valid = flat_results >= 0
-        v_loss = torch.tensor(0.0, device=device)
-        if v_valid.any():
-            vl = v_logits_all[valid][v_valid]
-            vt = flat_results[v_valid]
-            twohot = model.twohot_target(vt)
-            v_loss = F.cross_entropy(vl, twohot) * 0.5
+            # Value loss on turns with known results
+            flat_results = results[valid]  # (N_valid,)
+            v_valid = flat_results >= 0
+            v_loss = torch.tensor(0.0, device=device)
+            if v_valid.any():
+                vl = v_logits_all[valid][v_valid].float()  # float32 for CE loss
+                vt = flat_results[v_valid]
+                twohot = model.twohot_target(vt)
+                v_loss = F.cross_entropy(vl, twohot) * 0.5
 
-        total_batch_loss = pi_loss + v_loss
+            total_batch_loss = pi_loss + v_loss
+
         optimizer.zero_grad()
-        total_batch_loss.backward()
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(total_batch_loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_batch_loss.backward()
+            if grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
 
         n_valid = int(valid.sum().item())
         total_loss += pi_loss.item()
@@ -284,6 +296,8 @@ def main():
                         help="Games per bot for epoch-end eval (0 to disable)")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Save mid-epoch checkpoint every N batches (increase for 30M+ scaling)")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Enable mixed precision training (AMP) for ~2x speedup on CUDA")
     parser.add_argument("--server", type=str, default="ws://127.0.0.1:9000/showdown/websocket",
                         help="Battle server URL for bot eval")
     add_model_args(parser)
@@ -298,12 +312,18 @@ def main():
     val_ds = MemmapDataset(args.memmap_dir, split="val", val_ratio=args.val_ratio)
     print(f"Train: {len(train_ds)} episodes, Val: {len(val_ds)} episodes")
 
+    use_cuda = device.type == "cuda"
+    nw = args.workers
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_seq, num_workers=args.workers,
-                              pin_memory=(device.type == "cuda"))
+                              collate_fn=collate_seq, num_workers=nw,
+                              pin_memory=use_cuda, drop_last=True,
+                              persistent_workers=(nw > 0),
+                              prefetch_factor=(2 if nw > 0 else None))
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_seq, num_workers=args.workers,
-                            pin_memory=(device.type == "cuda"))
+                            collate_fn=collate_seq, num_workers=nw,
+                            pin_memory=use_cuda,
+                            persistent_workers=(nw > 0),
+                            prefetch_factor=(2 if nw > 0 else None))
 
     # Model
     cfg = config_from_args(args)
@@ -369,6 +389,11 @@ def main():
     with open(str(out_dir / "config.json"), "w") as f:
         json.dump({"model_config": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
+    # Mixed precision (AMP)
+    scaler = torch.cuda.amp.GradScaler() if args.fp16 and device.type == "cuda" else None
+    if scaler:
+        print(f"Mixed precision: ENABLED (fp16)")
+
     print(f"\nTraining {args.epochs} epochs, output: {out_dir}\n")
 
     # Compute global epoch offset so filenames don't collide on resume
@@ -398,6 +423,7 @@ def main():
             model, train_loader, optimizer, device, epoch, tb, global_step,
             grad_clip=args.grad_clip, label_smoothing=args.label_smoothing,
             scheduler=scheduler, save_fn=_save_checkpoint, save_every=args.save_every,
+            scaler=scaler,
         )
         elapsed = time.time() - t0
 

@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import gc
+import os
 import random
+import traceback
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -223,11 +225,11 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 if accum_count == 0:
                     optimizer.zero_grad()
                 loss.backward()
-                if max_grad_norm > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 accum_count += 1
 
                 if accum_count >= grad_accum:
+                    if max_grad_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
                     accum_count = 0
 
@@ -241,7 +243,11 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
             except Exception as e:
                 print(f"  [ERROR] PPO episode failed (T={T}): {e}", flush=True)
+                traceback.print_exc()
                 n_failed += 1
+                # Reset gradient state to prevent stale/partial gradients
+                optimizer.zero_grad()
+                accum_count = 0
                 continue
 
             # Free GPU memory periodically
@@ -251,6 +257,8 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
         # Flush remaining accumulated gradients
         if accum_count > 0:
+            if max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             accum_count = 0
 
@@ -323,4 +331,7 @@ def save_checkpoint(path, model, cfg, optimizer, iteration, metrics=None):
         "metrics": metrics or {},
         "v8_version": "8.0",
     }
-    torch.save(ckpt, path)
+    # Atomic write: save to temp file then rename to prevent corruption on crash
+    tmp_path = str(path) + ".tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, path)

@@ -19,7 +19,7 @@ Verified from `metamon/rl/configs/models/{small,medium,large}_agent.gin` and `vg
 | Per-step encoder d_model | **384** | **256** | 100 | 100 | 160 | unknown (likely 256-384) |
 | Per-step layers | 4 | 3 | 3 | 3 | 5 | 4 |
 | Per-step heads | 4 | 4 | 5 | 5 | 8 | **8** |
-| Per-step ff_dim | 768 (2× d_model) | 256 (1× d_model!) | unknown | unknown | unknown | 2× d_model |
+| Per-step ff_dim | **1536 (4× d_model)** | 256 (1× d_model!) | unknown | unknown | unknown | 2× d_model |
 | Tokens per timestep | 16 | 13 (1 CLS + 12 mons) | ~10 (4 scratch + 6 num) | ~10 | ~10 | 15 (2 decision + 1 field + 12 mons) |
 | **Temporal/sequence model** | **2L 4H 384d** | **NONE (frame stack optional)** | **3L 8H 512d** | **6L 8H 768d** | **9L 20H 1280d** | **NONE (stateless)** |
 | Temporal context | 200 turns | n frames (opt) | 200 | 200 | 128 | n/a |
@@ -87,15 +87,40 @@ So **uniform-over-all-history beats both Nash-weighted and latest-only** in the 
 | Reference | States | Result |
 |---|---|---|
 | ps-ppo | ~250M | >1900 Elo (Random Battles) |
-| **VGC-Bench BCFP** | **5,013,504** | **1768 Elo (VGC Doubles)** |
+| **VGC-Bench BCFP** | **5,013,504** | **1768 Elo (VGC Doubles, internal scale)** |
 | **Ours** | **~5-6M total** | **Elo 1032** (Session 33 extended ladder, SH=1000 anchor) |
 | Metamon (online phase) | hundreds of M+ | Top 10% (OU) |
 
-We're at almost exactly VGC-Bench's compute scale. They achieved 1768 Elo on a harder action space (doubles). **Our Session 33 measurement: latest snapshot at Elo 1032** (anchored to SH=1000 in our 38-player bot-anchored ladder; cross-format anchor scales aren't directly comparable, but the magnitude is striking).
+We're at almost exactly VGC-Bench's compute scale.
 
-**Session 33 Elo result conclusion:** the architecture is at its ceiling. ~700 Elo of headroom available somewhere we haven't unlocked. **1200+ iters of training between snapshot_0589 (Elo 1015) and snapshot_1784 (Elo 1032) produced ~17 Elo of net change**, all within bootstrap CI overlap. **More compute is NOT the lever at this scale** — we have empirical proof. The lever is upstream of PPO (bigger BC base, per Metamon's "size matters for BC > RL" thesis) or architectural (capacity reallocation, head count, ensemble critic). See §0.7 for the prioritized list.
+**⚠ SESSION 35 CRITICAL CORRECTION: The "700 Elo gap" is an artifact of incompatible scales.**
 
-The "we don't know our Elo" framing that drove Session 33's planning is now resolved. The result was: closer to the bot anchors than VGC-Bench's reference, with marginal advantage over the strongest heuristics. ~25-30 Elo above Tactical (top bot), tied within noise with snapshot_0589 from 1200 iters earlier. Plateau is real. Architecture-level levers needed.
+The VGC-Bench and our Elo ladders use completely different anchoring:
+
+| Player | VGC-Bench Scale | Our Scale |
+|---|---|---|
+| Random | 1127 | 444 |
+| SH | 1621 | 1000 |
+| Best agent | 1768 (BCFP) | 1032 (snapshot_1784) |
+| **Agent above SH** | **+147** | **+32** |
+
+**Apples-to-apples: BCFP is +147 above SH; we are +32 above SH. The real gap is ~115 Elo,
+not 700.** Still meaningful (~66% expected win rate for BCFP over us), but fundamentally
+different from the "massive architectural chasm" framing that drove Sessions 33-34 planning.
+
+Additionally, OU singles is harder than VGC doubles for AI: 30-60 turns vs 8-12, more hidden
+info, hazard/status accumulation, longer credit assignment horizon. A stateless model suffices
+for VGC; OU requires temporal modeling. Format-adjusted, the gap may be even smaller.
+
+**Revised conclusion (Session 35):** The plateau is real but the gap is closable with targeted
+fixes (hyperparameters, augmentation) rather than requiring fundamental architectural overhaul.
+**1200+ iters of training between snapshot_0589 (Elo 1015) and snapshot_1784 (Elo 1032)
+produced ~17 Elo of net change** — more training time at the current setup is still uneconomic.
+But the lever is likely **hyperparameter fixes (lambda, entropy)** + **data augmentation**
+before expensive architectural changes or BC scaling.
+
+**The original "700 Elo gap → need bigger BC base" logic chain is broken.** At ~115 Elo gap,
+cheaper experiments should be tried first. See §0.8 revised order of operations.
 
 ### 0.6 Eval methodology in published work
 
@@ -116,62 +141,64 @@ Things research **supports** (don't change):
 4. **Entity tokenization is justified.** All references use it.
 5. **BC pretrain → PPO fine-tune is justified.** Metamon, VGC-Bench, ps-ppo all do this.
 
-Things research **questions about our setup**:
-1. **Capacity allocation is inverted vs Metamon.** We have heavy per-step + light temporal. Metamon has light per-step + heavy temporal. Our temporal: 2L/4H/384d. Even Metamon Small's temporal: 3L/8H/512d.
-2. **Per-step ff_dim is doubled (768 = 2× d_model)** but VGC-Bench uses ff_dim = d_model (no expansion). ff doubling is a 4× param multiplier on each layer. May be wasted on per-step.
+Things research **questions about our setup** (Session 33 findings + Session 35 audit):
+1. **Capacity allocation is inverted vs Metamon.** We have heavy per-step + light temporal. Metamon has light per-step + heavy temporal. Our temporal: 2L/4H/384d. Even Metamon Small's temporal: 3L/8H/512d. **Note (S35):** Entity tokenization (the actual breakthrough) is preserved at any spatial dim — shrinking spatial doesn't remove entity attention. Safer test: spatial 256d/3L + temporal 512d/3L.
+2. ~~**Per-step ff_dim is doubled (768 = 2× d_model)**~~ **CORRECTED (S35):** actual code uses `ff_mult=4`, so ff_dim = 1536 = 4× d_model. This is the standard transformer ratio (Vaswani 2017). VGC-Bench's 1× is the outlier. **No change needed.**
 3. **Single critic** vs Metamon's 4-critic ensemble with popart. Variance reduction benefit unmeasured.
 4. **Attention head count: 4 vs ps-ppo's 8.** Free A/B test (param-neutral if d_head halves).
-5. **Pool filter `sp≥260`** vs BCFP's no-filter. May be discarding useful signal.
+5. **Pool filter `sp≥260`** vs BCFP's no-filter. Consider recency-weighted sampling (70% recent / 30% old) per OpenAI Five's 80/20 split.
+6. **⚠ GAE lambda = 0.75 is a major outlier (S35 finding).** Every published system uses 0.95 (VGC-Bench, ps-ppo, OpenAI Five, ProcGen). At 0.75, advantage estimates are heavily myopic — the model can't properly credit early-game moves for terminal reward in 30-60 turn battles. **Highest-priority fix.**
+7. **Entropy coef = 0.04 is 4× standard (S35 finding).** VGC-Bench uses 0.001, ps-ppo 0.01, OpenAI Five 0.01. **However**, our history shows entropy collapsed to 0.51 at ent=0.02 during early training (Session 28-29, iters 159-199). Reduce cautiously to 0.02 first, not 0.01.
 
-Things research **can't tell us**:
-1. **Whether our actual Elo is competitive with VGC-Bench's 1768.** Must be measured.
-2. **Whether style-spread bot eval is a fair primary metric.** Defensible argument either way; published references all add Elo as primary.
-3. **Whether the 5-6M states is a hard ceiling at our architecture, or whether more compute breaks 60%.** Cloud burst is the test, but only after Elo is measured.
+Things research **can't tell us** (updated S35):
+1. ~~Whether our actual Elo is competitive with VGC-Bench's 1768.~~ **RESOLVED (S35):** Elo scales are incompatible. Apples-to-apples gap is ~115 Elo (§0.5), not 700.
+2. **Whether lambda=0.95 will close the remaining gap.** Must test empirically.
+3. **Whether slot permutation augmentation helps at our scale.** Theoretically sound, untested.
 
-### 0.8 Order of operations (revised after Session 33 Elo result)
+### 0.8 Order of operations (revised Session 35 — hyperparameter-first)
 
-The original gating tree (Elo > 1700 → cloud, Elo < 1600 → local fix) is **superseded** by
-the actual measurement: latest snapshot at Elo 1032, ~700 Elo below VGC-Bench's reference.
-Neither original branch was right — both assumed we'd be much closer to VGC-Bench's range.
-The actual situation requires architectural intervention before any cloud scaling makes sense.
+**⚠ SESSION 35 REVISION:** The Session 33 plan was built on a false "700 Elo gap." The real
+gap is ~115 Elo (§0.5). This changes the optimal experiment order: **cheap hyperparameter
+fixes first, expensive architectural changes only if cheap fixes don't close the gap.**
 
 **New plan (canonical: `docs/NEXT_SESSION.md`):**
 
 ```
 [Step a]  ✅ DONE — Elo measured at 1032 (extended ladder, 38 players, 703 matches)
+[Step b]  ✅ DONE — Code refactor (Session 34)
    │
    ▼
-[Step b]  Code refactor — decompose rl_train_v9.py, smoke test, dead code prune
-   │       (1-2 days, prerequisite for clean A/B tests later)
+[Exp 1]  Hyperparameter fix: --lam 0.95 --ent-coef 0.02    [CLI flags only, ~15 hrs]
+   │      Run 200 iters from snapshot_1784, measure Elo vs baseline
+   │      Decision: if +50 Elo → hyperparams were the bottleneck, continue
+   │      if <+30 Elo → proceed to Exp 2
    │
    ▼
-[Step c1] Multi-gen vocab + feature prep (1-2 weeks)
-[Step c2] Multi-gen replay scrape — gens 6/7/8 OU (1-2 weeks, automated)
-   │       User direction: do multi-gen BEFORE scaled BC, so the scaled BC is
-   │       multi-gen-capable from day 1 (avoid retraining for multi-gen later)
+[Exp 2]  Slot permutation augmentation                       [~2 hrs impl + 200 iters]
+   │      Randomly shuffle team/move slot order in build_turn_batch()
    │
    ▼
-[Step c3] 30M BC scaling test on multi-gen data (3-7 days)
-   │       30M is the realistic local ceiling on 6GB GPU.
-   │       Decision threshold: 30M BC ≥ Elo 900 (vs current BC_base 806) confirms scaling lever
+[Exp 3]  Recency-weighted pool (70% last 200, 30% older)    [Small code change + 200 iters]
    │
    ▼
-[Step c4] PPO from new BC base + Elo measurement
-   │       Decision threshold: new PPO base beats snapshot_1784 (Elo 1032) by >50 Elo
-   │
-   ├─ if YES → BC scaling is the lever, continue scaling (50M+ on cloud, c5)
-   └─ if NO → BC scaling isn't the lever; architectural pivot needed (capacity reallocation,
-              ensemble critic, etc.)
+[Exp 4]  Elo ladder measurement after Exp 1-3
+   │      Decision: if total gain ≥+80 Elo → gap closed, proceed to multi-gen (Step c)
+   │      if total gain <+50 Elo → capacity reallocation needed (Exp 5)
    │
    ▼
-[Step c5] Cloud-scale BC at 50M+ (only if c3/c4 succeed)
-[Step c6] Multi-gen training data extension — gens 6/7/8 in the training set
-[Step d]  Cloud burst on the validated architecture, with success criterion +50 Elo / 20M states
+[Exp 5]  Capacity reallocation: spatial 256d/3L → temporal 512d/3L  [Requires BC retrain]
+   │      Only if Exp 1-3 insufficient
+   │
+   ▼
+[Step c]  Multi-gen prep + BC scaling (original c1-c6, now AFTER hyperparameter experiments)
+   │       Still the long-term plan, but no longer the FIRST experiment
+   │
+   ▼
+[Step d]  Cloud burst (after all local levers exhausted)
 ```
 
-The original c1/c2 (head count A/B, filter loosening) experiments are **deprecated** as
-standalone fixes — see NEXT_SESSION.md for the reasoning. They each give ~30-80 Elo at best,
-but the gap to the architectural reference is ~700 Elo. Smaller experiments are not the lever.
+The original "30M BC scaling first" plan is **deprioritized** — it was premised on a 700 Elo
+gap that doesn't exist. At ~115 Elo, hyperparameter fixes + augmentation may suffice.
 
 ---
 

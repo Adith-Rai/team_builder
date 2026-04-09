@@ -79,16 +79,16 @@ The extended ladder (38 players, 703 matches, anchored SH=1000):
 5. **We're at "barely above bot tier."** Latest snapshot (Elo 1032) is 32 Elo above Tactical
    (top bot, Elo 1000). ~55% expected win rate vs the top bot. Marginal edge, not dominant.
 
-6. **Cross-reference: VGC-Bench BCFP claimed 1768 Elo at our compute scale.** Different
-   anchors, can't directly compare, but the magnitude (~700 Elo gap) suggests substantial
-   architectural headroom we lack. The gap is too large to close with more training time.
+6. **⚠ Cross-reference CORRECTED (Session 35):** VGC-Bench BCFP is +147 above SH on their
+   scale; we're +32 above SH on ours. **The real gap is ~115 Elo, NOT 700.** The raw numbers
+   (1768 vs 1032) are on incompatible scales (VGC-Bench: Random=1127, SH=1621; ours:
+   Random=444, SH=1000). Additionally, OU singles is harder than VGC doubles (longer games,
+   more hidden info). The gap is closable with targeted fixes.
 
-**Implication: more training time at this rate is uneconomic.** At ~0.018 Elo/iter, gaining
-+50 Elo costs ~2800 iters (~9 days at 270s/iter). Gaining +700 Elo to close the gap to
-VGC-Bench's reference is fantasy at this rate (~50 weeks). The lever must be **pre-PPO**
-(bigger BC base — Metamon's "size matters for BC > RL" thesis) or **architectural** (capacity
-reallocation, head count, ensemble critic). Cloud burst on the current architecture might give
-+50-150 Elo over a few days; it will not close the 700 Elo gap.
+**Implication (revised Session 35):** more training time at the current rate (~0.018 Elo/iter)
+is still uneconomic. But the lever is **hyperparameter fixes first** (lambda=0.95 is the
+#1 anomaly — see RESEARCH.md §0.7), then augmentation, THEN architectural changes or BC
+scaling. The original "700 Elo gap → need fundamental overhaul" framing was wrong.
 
 **Lesson from the S32 regression:** plan experiments as separate clean runs. Disruptive
 mid-run tweaks (lr-restart, optimizer hyperparam changes, pool composition shifts) cost
@@ -500,14 +500,74 @@ can be implemented as small clean diffs to focused modules instead of 200-line e
 a 1900-line monolith. `--format` flags are wired, FormatConfig is the single source of
 truth for magic numbers, and build_turn_batch/action_to_order are shared (not duplicated).
 
+### ⚠ Step (c-pre) — Session 35 Hyperparameter Experiments (NEW, BEFORE multi-gen)
+
+**Status: NOT STARTED.** Added by Session 35 deep audit. The corrected Elo gap (~115, not
+700 — see "Session 35 Elo scale correction" above) means cheap hyperparameter fixes should
+be tested BEFORE expensive multi-gen/BC-scaling work. If these close most of the gap,
+the multi-gen plan proceeds on a stronger foundation.
+
+**PPO hyperparameter comparison (Session 35 audit finding):**
+
+| Parameter | **Ours** | **VGC-Bench** | **ps-ppo** | **OpenAI Five** |
+|-----------|----------|---------------|------------|-----------------|
+| gamma | 0.9999 | 1.0 | 0.99 | 0.9998 |
+| **lambda** | **0.75** | **0.95** | **0.95** | **0.95** |
+| clip | 0.2 | 0.2 | 0.2 | 0.2 |
+| **ent_coef** | **0.04** | **0.001** | **0.01** | **0.01** |
+| PPO epochs | 5 | 10 | 3-4 | 4 |
+| lr | 1e-4 | 1e-5 | 2.5e-4 | ~1e-4 |
+
+**Lambda = 0.75 is the single most anomalous parameter.** Every published system uses 0.95.
+At 0.75, GAE advantage estimates are heavily myopic in a 30-60 turn game with terminal reward.
+
+**Entropy history caveat:** at ent=0.02 during early training (iters 159-199), entropy
+collapsed to 0.51. Win rates didn't change (plateau was architectural, not entropy). But
+reduce cautiously: try 0.02 first, not 0.01.
+
+#### Exp 1 — Lambda + entropy fix (CLI flags only)
+
+```bash
+python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
+  --resume <LATEST_SNAPSHOT> --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 10 --n-iters 200 --warmup-iters 0 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04
+```
+
+**Decision:** Run Elo ladder after 200 iters. If +50 Elo over snapshot_1784 → hyperparams
+were the bottleneck. If <+30 Elo → proceed to Exp 2.
+
+#### Exp 2 — Slot permutation augmentation
+
+Randomly shuffle the 6 ally entity tokens and 6 opponent entity tokens in `build_turn_batch()`.
+Similarly shuffle 4 move tokens within each Pokemon. Preserves active-slot marking. This is
+free regularization — the model should be permutation-invariant over team slot order.
+
+Implementation: ~2 hours in `features.py:build_turn_batch()`. Run 200 iters, measure.
+
+#### Exp 3 — Recency-weighted pool sampling
+
+Change opponent sampling from uniform to: 70% from last 200 checkpoints, 30% from older.
+Implementation: small change in `rl_player.py:SelfPlayOpponent`. Run 200 iters, measure.
+
+#### Exp 4 — Combined Elo measurement
+
+Run Elo ladder after Exp 1-3. Decision:
+- If total gain ≥+80 Elo → gap substantially closed. Proceed to Step (c) multi-gen on the
+  improved training recipe.
+- If total gain <+50 Elo → capacity reallocation needed (Exp 5: spatial 256d/3L → temporal
+  512d/3L, requires BC retrain).
+
+---
+
 ### Step (c) — Multi-gen vocab prep, BEFORE BC scaling
 
-**Status: NOT STARTED.** This step replaces the original "head-count A/B + filter loosening"
-plan. The Session 33 Elo result killed those experiments as standalone fixes — they would
-each be expected to give ~30-80 Elo improvement, but the gap to architectural reference
-points is ~700 Elo. Smaller experiments are not the lever. The lever is **a stronger
-foundation (bigger BC base)** combined with **multi-gen capability** so we don't have to
-retrain BC for every gen.
+**Status: NOT STARTED.** ~~This step replaces the original "head-count A/B + filter loosening"
+plan.~~ **Session 35 update:** This step is now AFTER the hyperparameter experiments above.
+The original "700 Elo gap" justification for prioritizing BC scaling was based on incompatible
+Elo scales. The real gap (~115 Elo) may be partially closed by Exp 1-3. Multi-gen remains
+the long-term goal regardless.
 
 **User direction (confirmed Session 33):** do multi-gen prep BEFORE the BC scaling test,
 not after. Reasoning: multi-gen is the long-term project goal regardless. Doing it before
@@ -668,9 +728,12 @@ These are the questions still genuinely open after Session 33's Elo measurement.
 - **Don't grind on reward shaping.** Sessions 31-33 tried dense, sparse, terminal, immune
   penalty, KO bonus, HP delta. None broke the plateau. Reward isn't the lever.
 - **Don't try the "head count A/B" or "filter loosening" experiments as standalone fixes.**
-  They were in the original step (c) plan but the Session 33 Elo result killed them as
-  meaningful levers — they each give ~30-80 Elo improvement at best, but the gap to
-  reference points is ~700 Elo. Smaller experiments are not the lever. Bigger BC base is.
+  They were in the original step (c) plan but remain low-priority.
+- **⚠ Don't assume the "700 Elo gap" is real (Session 35 correction).** The VGC-Bench and our
+  Elo scales are incompatible. Apples-to-apples gap is ~115 Elo (BCFP +147 above SH vs our
+  +32 above SH). Plans premised on "700 Elo gap" were overreacting. See RESEARCH.md §0.5.
+- **Don't skip the lambda fix.** GAE lambda=0.75 is uniquely anomalous — every published
+  system uses 0.95. This should be the FIRST experiment, not BC scaling.
 - **Don't run another Elo ladder until you have something to measure.** N=50 ladder takes
   ~93 min. Don't burn that to "see if anything changed" — only run it after a meaningful
   experiment (refactor doesn't count, BC scaling does, PPO from new BC does).
@@ -720,7 +783,41 @@ dimensions and zero-pads old memmaps. vocab.py already covers gens 1-9.
 **Dead code removed:** V8RLPlayer + old collect + old main from ppo.py (718 lines), old
 rl_train_v9.py monolith (1931 lines), v7 files moved to legacy/.
 
-## Current state snapshot (as of Session 34 end, 2026-04-09)
+## Session 35 deep methodology audit (2026-04-09)
+
+**What happened:** Full audit of ML methodology, PPO hyperparameters, architecture, self-play,
+reward design, and data efficiency — cross-referenced against published systems (Metamon,
+VGC-Bench, ps-ppo, OpenAI Five, AlphaStar) and our own training history.
+
+**Major findings (ranked by impact):**
+
+1. **GAE lambda=0.75 is a major outlier.** Every published system uses 0.95. Most anomalous
+   hyperparameter. Causes myopic credit assignment in 30-60 turn games. #1 priority fix.
+2. **The "700 Elo gap" vs VGC-Bench is an artifact of incompatible Elo scales.** Real gap:
+   ~115 Elo (BCFP +147 above SH, we +32 above SH). Changes optimal experiment order.
+3. **Entropy=0.04 is 4x standard** (0.01 typical). But our history shows collapse at 0.02
+   during early training. Reduce cautiously to 0.02 first.
+4. **ff_dim was documented as 2x but is actually 4x** (standard). Doc error, not code error. Fixed.
+5. **Slot permutation augmentation** is near-free regularization we're not using.
+6. **Capacity allocation (spatial-heavy, temporal-light) is inverted vs Metamon**, but the
+   breakthrough was entity tokenization (preserved at any spatial dim), not spatial size.
+   Reallocation is justified but expensive (requires retrain). Do after cheap fixes.
+7. **Offline RL was tried (IQL, 3 runs) and failed**, but with scalar value head (now fixed
+   to distributional). Metamon's Binary+MaxQ was NOT fully implemented. Worth revisiting
+   but lower priority than hyperparameter fixes.
+8. **Recency-weighted pool** (70/30) may outperform pure uniform per OpenAI Five's pattern.
+
+**What was validated (don't change):**
+BC→PPO pipeline, terminal-only reward, entity tokenization, distributional value head,
+temporal model for OU, uniform-ish pool strategy, gamma=0.9999, clip=0.2.
+
+**Revised experiment order:** See Step (c-pre) above. Hyperparameter fixes → augmentation →
+capacity reallocation → multi-gen/BC scaling. The original "30M BC scaling first" plan is
+deprioritized since the gap it was designed to close is much smaller than believed.
+
+---
+
+## Current state snapshot (as of Session 35, 2026-04-09)
 
 ### Training state
 - **Training is STOPPED.** Architecture at ceiling. Don't resume without a reason.

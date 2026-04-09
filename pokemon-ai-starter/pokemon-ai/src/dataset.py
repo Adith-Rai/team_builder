@@ -120,31 +120,34 @@ class MemmapDataset(Dataset):
 
         samples = []
         for i in range(start, end):
+            # No .copy() needed — memmap views are read-only and collate copies
+            # into pre-allocated tensors. .astype() in collate creates new arrays
+            # for int fields. _pad_array creates new arrays when padding is needed.
             s = {
                 # Pokemon (both sides)
-                "our_pokemon_ids": mm["our_pokemon_ids"][i].copy(),       # (6, 7) int32
-                "our_pokemon_banks": mm["our_pokemon_banks"][i].copy(),   # (6, 10) int32
-                "our_pokemon_cont": mm["our_pokemon_cont"][i].copy(),    # (6, D) float32
-                "our_pokemon_mcont": mm["our_pokemon_mcont"][i].copy(),  # (6, 4, 23) float32
-                "opp_pokemon_ids": mm["opp_pokemon_ids"][i].copy(),
-                "opp_pokemon_banks": mm["opp_pokemon_banks"][i].copy(),
-                "opp_pokemon_cont": mm["opp_pokemon_cont"][i].copy(),
-                "opp_pokemon_mcont": mm["opp_pokemon_mcont"][i].copy(),
+                "our_pokemon_ids": mm["our_pokemon_ids"][i],       # (6, 7) int32
+                "our_pokemon_banks": mm["our_pokemon_banks"][i],   # (6, 10) int32
+                "our_pokemon_cont": mm["our_pokemon_cont"][i],     # (6, D) float32
+                "our_pokemon_mcont": mm["our_pokemon_mcont"][i],   # (6, 4, 23) float32
+                "opp_pokemon_ids": mm["opp_pokemon_ids"][i],
+                "opp_pokemon_banks": mm["opp_pokemon_banks"][i],
+                "opp_pokemon_cont": mm["opp_pokemon_cont"][i],
+                "opp_pokemon_mcont": mm["opp_pokemon_mcont"][i],
                 # Field
-                "field_banks": mm["field_banks"][i].copy(),              # (4,) int32
-                "field_cont": mm["field_cont"][i].copy(),                # (D,) float32
+                "field_banks": mm["field_banks"][i],               # (4,) int32
+                "field_cont": mm["field_cont"][i],                 # (D,) float32
                 # Transition
-                "trans_ids": mm["trans_ids"][i].copy(),                   # (2,) int32
-                "trans_cont": mm["trans_cont"][i].copy(),                # (D,) float32
+                "trans_ids": mm["trans_ids"][i],                    # (2,) int32
+                "trans_cont": mm["trans_cont"][i],                 # (D,) float32
                 # Active moves
-                "move_ids": mm["move_ids"][i].copy(),                    # (4,) int32
-                "move_banks": mm["move_banks"][i].copy(),                # (4, 4) int32
-                "move_cont": self._pad_array(mm["move_cont"][i].copy(), self._pad_move),  # (4, mcd) float32
+                "move_ids": mm["move_ids"][i],                     # (4,) int32
+                "move_banks": mm["move_banks"][i],                 # (4, 4) int32
+                "move_cont": self._pad_array(mm["move_cont"][i], self._pad_move),  # (4, mcd) float32
                 # Switches
-                "switch_ids": mm["switch_ids"][i].copy(),                # (5,) int32
-                "switch_cont": self._pad_array(mm["switch_cont"][i].copy(), self._pad_switch),  # (5, scd) float32
+                "switch_ids": mm["switch_ids"][i],                 # (5,) int32
+                "switch_cont": self._pad_array(mm["switch_cont"][i], self._pad_switch),  # (5, scd) float32
                 # Action/legal
-                "legal": mm["legal"][i].copy(),                          # (9,) float32
+                "legal": mm["legal"][i],                           # (9,) float32
                 "action": int(mm["action"][i]),
                 "t": int(mm["turn"][i]),
                 "done": (i == end - 1),
@@ -208,36 +211,37 @@ def collate_seq(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     for b, ep in enumerate(episodes):
         L = len(ep)
         seq_lens[b] = L
-        for t, s in enumerate(ep):
-            our_poke_ids[b, t] = torch.from_numpy(s["our_pokemon_ids"].astype(np.int64))
-            our_poke_banks[b, t] = torch.from_numpy(s["our_pokemon_banks"].astype(np.int64))
-            our_poke_cont[b, t] = torch.from_numpy(s["our_pokemon_cont"])
-            our_poke_mcont[b, t] = torch.from_numpy(s["our_pokemon_mcont"])
+        mask_t[b, :L] = 1.0
 
-            opp_poke_ids[b, t] = torch.from_numpy(s["opp_pokemon_ids"].astype(np.int64))
-            opp_poke_banks[b, t] = torch.from_numpy(s["opp_pokemon_banks"].astype(np.int64))
-            opp_poke_cont[b, t] = torch.from_numpy(s["opp_pokemon_cont"])
-            opp_poke_mcont[b, t] = torch.from_numpy(s["opp_pokemon_mcont"])
+        # Stack all turns for this episode at once (numpy), then convert to tensor once
+        our_poke_ids[b, :L] = torch.from_numpy(np.stack([s["our_pokemon_ids"] for s in ep]).astype(np.int64))
+        our_poke_banks[b, :L] = torch.from_numpy(np.stack([s["our_pokemon_banks"] for s in ep]).astype(np.int64))
+        our_poke_cont[b, :L] = torch.from_numpy(np.stack([s["our_pokemon_cont"] for s in ep]))
+        our_poke_mcont[b, :L] = torch.from_numpy(np.stack([s["our_pokemon_mcont"] for s in ep]))
 
-            field_banks_t[b, t] = torch.from_numpy(s["field_banks"].astype(np.int64))
-            field_cont_t[b, t] = torch.from_numpy(s["field_cont"])
+        opp_poke_ids[b, :L] = torch.from_numpy(np.stack([s["opp_pokemon_ids"] for s in ep]).astype(np.int64))
+        opp_poke_banks[b, :L] = torch.from_numpy(np.stack([s["opp_pokemon_banks"] for s in ep]).astype(np.int64))
+        opp_poke_cont[b, :L] = torch.from_numpy(np.stack([s["opp_pokemon_cont"] for s in ep]))
+        opp_poke_mcont[b, :L] = torch.from_numpy(np.stack([s["opp_pokemon_mcont"] for s in ep]))
 
-            trans_ids_t[b, t] = torch.from_numpy(s["trans_ids"].astype(np.int64))
-            trans_cont_t[b, t] = torch.from_numpy(s["trans_cont"])
+        field_banks_t[b, :L] = torch.from_numpy(np.stack([s["field_banks"] for s in ep]).astype(np.int64))
+        field_cont_t[b, :L] = torch.from_numpy(np.stack([s["field_cont"] for s in ep]))
 
-            active_move_ids[b, t] = torch.from_numpy(s["move_ids"].astype(np.int64))
-            active_move_banks[b, t] = torch.from_numpy(s["move_banks"].astype(np.int64))
-            active_move_cont[b, t] = torch.from_numpy(s["move_cont"])
+        trans_ids_t[b, :L] = torch.from_numpy(np.stack([s["trans_ids"] for s in ep]).astype(np.int64))
+        trans_cont_t[b, :L] = torch.from_numpy(np.stack([s["trans_cont"] for s in ep]))
 
-            switch_ids_t[b, t] = torch.from_numpy(s["switch_ids"].astype(np.int64))
-            switch_cont_t[b, t] = torch.from_numpy(s["switch_cont"])
+        active_move_ids[b, :L] = torch.from_numpy(np.stack([s["move_ids"] for s in ep]).astype(np.int64))
+        active_move_banks[b, :L] = torch.from_numpy(np.stack([s["move_banks"] for s in ep]).astype(np.int64))
+        active_move_cont[b, :L] = torch.from_numpy(np.stack([s["move_cont"] for s in ep]))
 
-            legal_t[b, t] = torch.from_numpy(s["legal"])
-            action_t[b, t] = s["action"]
-            mask_t[b, t] = 1.0
+        switch_ids_t[b, :L] = torch.from_numpy(np.stack([s["switch_ids"] for s in ep]).astype(np.int64))
+        switch_cont_t[b, :L] = torch.from_numpy(np.stack([s["switch_cont"] for s in ep]))
 
-            if "result" in s:
-                result_t[b, t] = s["result"]
+        legal_t[b, :L] = torch.from_numpy(np.stack([s["legal"] for s in ep]))
+        actions_np = np.array([s["action"] for s in ep], dtype=np.int64)
+        action_t[b, :L] = torch.from_numpy(actions_np)
+        results_np = np.array([s.get("result", -1.0) for s in ep], dtype=np.float32)
+        result_t[b, :L] = torch.from_numpy(results_np)
 
     # The PokeTransformer processes turns sequentially, building up history.
     # For BC training, we process each turn with its accumulated history.

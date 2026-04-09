@@ -113,10 +113,11 @@ class BattleAgent(Player):
         if history is None:
             self._history[btag] = summary
         else:
+            # Pre-slice before cat to avoid temporary OOM on long battles
+            ctx = self.cfg.temporal_context
+            if history.shape[1] >= ctx:
+                history = history[:, -(ctx - 1):]
             self._history[btag] = torch.cat([history, summary], dim=1)
-            # Trim to temporal context limit
-            if self._history[btag].shape[1] > self.cfg.temporal_context:
-                self._history[btag] = self._history[btag][:, -self.cfg.temporal_context:]
 
         # Select action
         logits = out["action_logits"][0]  # (9,)

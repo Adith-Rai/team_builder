@@ -107,9 +107,10 @@ class V9RLPlayer(Player):
         if history is None:
             self._history[btag] = summary
         else:
+            # Pre-slice before cat to avoid temporary OOM on long battles
+            if history.shape[1] >= 200:
+                history = history[:, -199:]
             self._history[btag] = torch.cat([history, summary], dim=1)
-            if self._history[btag].shape[1] > 200:
-                self._history[btag] = self._history[btag][:, -200:]
 
         # Sample action with temperature
         logits = result["action_logits"]  # (9,)
