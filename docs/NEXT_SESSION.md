@@ -642,6 +642,9 @@ tail -5 exp1_lambda095.log                     # current activity
 **Decision:** Run Elo ladder after 200 iters. If +50 Elo over snapshot_1784 → hyperparams
 were the bottleneck. If <+30 Elo → proceed to Exp 2.
 
+**Elo ladder also benefits from `--concurrency 50`** (same batcher efficiency gain).
+Previous 93-min run at concurrency=10 should drop to ~25-30 min at 50.
+
 #### Exp 2 — Slot permutation augmentation
 
 Randomly shuffle the 6 ally entity tokens and 6 opponent entity tokens in `build_turn_batch()`.
