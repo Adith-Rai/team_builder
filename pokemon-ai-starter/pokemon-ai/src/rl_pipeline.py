@@ -278,78 +278,9 @@ class MPRLPlayer(Player):
         return self._trajectories[btag]
 
     def _build_turn_batch_cpu(self, feat: dict) -> dict:
-        """Convert feature output to model batch dict on CPU."""
-        def _pi(p):
-            i = p["ids"]
-            return [i["species"], i["item"], i["ability"]]
-        def _pb(p):
-            b = p["banks"]
-            return [b["hp_pct"], b["level"], b["weight"], b["height"],
-                    b["stat_hp"], b["stat_atk"], b["stat_def"],
-                    b["stat_spa"], b["stat_spd"], b["stat_spe"]]
-        def _pmi(p):
-            i = p["ids"]
-            return [i["move0"], i["move1"], i["move2"], i["move3"]]
-        def _pmc(p):
-            from features import extract_move_cont
-            return extract_move_cont(p["continuous"])
-
-        our, opp = feat["our_pokemon"], feat["opp_pokemon"]
-        int_arrays = {
-            "our_pokemon_ids": np.array([[_pi(p) for p in our]], dtype=np.int64),
-            "our_pokemon_banks": np.array([[_pb(p) for p in our]], dtype=np.int64),
-            "our_pokemon_move_ids": np.array([[_pmi(p) for p in our]], dtype=np.int64),
-            "opp_pokemon_ids": np.array([[_pi(p) for p in opp]], dtype=np.int64),
-            "opp_pokemon_banks": np.array([[_pb(p) for p in opp]], dtype=np.int64),
-            "opp_pokemon_move_ids": np.array([[_pmi(p) for p in opp]], dtype=np.int64),
-        }
-        float_arrays = {
-            "our_pokemon_cont": np.array([[p["continuous"] for p in our]], dtype=np.float32),
-            "our_pokemon_move_cont": np.array([[_pmc(p) for p in our]], dtype=np.float32),
-            "opp_pokemon_cont": np.array([[p["continuous"] for p in opp]], dtype=np.float32),
-            "opp_pokemon_move_cont": np.array([[_pmc(p) for p in opp]], dtype=np.float32),
-            "field_cont": np.array([feat["field"]["continuous"]], dtype=np.float32),
-            "transition_cont": np.array([feat["transition"]["continuous"]], dtype=np.float32),
-            "legal_mask": feat["legal_mask"].reshape(1, 9).astype(np.float32),
-        }
-
-        mids, mbp, mac, mpp, mpr, mco = [], [], [], [], [], []
-        for m in feat["active_moves"]:
-            if m is None:
-                mids.append(0); mbp.append(0); mac.append(0); mpp.append(0); mpr.append(6)
-                mco.append([0.0]*MOVE_SLOT_CONT_DIM)
-            else:
-                mids.append(m["move_id"]); mbp.append(m["bp_int"]); mac.append(m["acc_int"])
-                mpp.append(m["pp_int"]); mpr.append(m["priority_int"]); mco.append(m["continuous"])
-        int_arrays["active_move_ids"] = np.array([mids], dtype=np.int64)
-        float_arrays["active_move_cont"] = np.array([mco], dtype=np.float32)
-
-        sids, sco = [], []
-        for s in feat["switch_slots"]:
-            if s is None:
-                sids.append(0); sco.append([0.0]*SWITCH_SLOT_CONT_DIM)
-            else:
-                sids.append(s["species_id"]); sco.append(s["continuous"])
-        int_arrays["switch_ids"] = np.array([sids], dtype=np.int64)
-        float_arrays["switch_cont"] = np.array([sco], dtype=np.float32)
-
-        batch = {}
-        for k, arr in int_arrays.items():
-            batch[k] = torch.from_numpy(arr)  # CPU tensor
-        for k, arr in float_arrays.items():
-            batch[k] = torch.from_numpy(arr)  # CPU tensor
-
-        fb = feat["field"]["banks"]
-        batch["field_banks"] = {k: torch.tensor([fb[k]], dtype=torch.long) for k in fb}
-        ti = feat["transition"]["ids"]
-        batch["transition_ids"] = {k: torch.tensor([ti[k]], dtype=torch.long) for k in ti}
-        batch["active_move_banks"] = {
-            "bp": torch.tensor([mbp], dtype=torch.long),
-            "acc": torch.tensor([mac], dtype=torch.long),
-            "pp": torch.tensor([mpp], dtype=torch.long),
-            "prio": torch.tensor([mpr], dtype=torch.long),
-        }
-        return batch
+        """Convert make_features() output to PokeTransformer batch dict on CPU."""
+        from features import build_turn_batch
+        return build_turn_batch(feat, device=None)  # None = CPU tensors
 
     async def choose_move(self, battle):
         btag = battle.battle_tag
@@ -412,20 +343,9 @@ class MPRLPlayer(Player):
         return self._action_to_order(battle, action_idx)
 
     def _action_to_order(self, battle, idx):
-        if idx < 4:
-            moves = list(battle.available_moves or [])
-            if idx < len(moves):
-                return self.create_order(moves[idx])
-        else:
-            sw = list(battle.available_switches or [])
-            si = idx - 4
-            if si < len(sw):
-                return self.create_order(sw[si])
-        if battle.available_moves:
-            return self.create_order(battle.available_moves[0])
-        if battle.available_switches:
-            return self.create_order(battle.available_switches[0])
-        return self.choose_random_move(battle)
+        from features import action_to_order
+        order = action_to_order(self, battle, idx)
+        return order if order is not None else self.choose_random_move(battle)
 
     def _battle_finished_callback(self, battle):
         btag = battle.battle_tag

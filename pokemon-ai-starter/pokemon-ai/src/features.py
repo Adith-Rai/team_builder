@@ -1453,3 +1453,139 @@ DIMS = {
     "n_volatile": N_VOLATILE,               # 38
     "n_paradox": N_PARADOX,                  # 7
 }
+
+
+# =============================
+# Shared batch-building utilities
+# =============================
+# Used by battle_agent.py, rl_player.py, rl_pipeline.py to convert
+# make_features() output into the dict PokeTransformer.forward() expects.
+# Centralizing here eliminates 300+ lines of duplication.
+
+
+def _poke_ids(p: dict) -> list:
+    """Extract [species, item, ability] from a pokemon feature dict."""
+    ids = p["ids"]
+    return [ids["species"], ids["item"], ids["ability"]]
+
+
+def _poke_banks(p: dict) -> list:
+    """Extract 10 bank values from a pokemon feature dict."""
+    b = p["banks"]
+    return [b["hp_pct"], b["level"], b["weight"], b["height"],
+            b["stat_hp"], b["stat_atk"], b["stat_def"],
+            b["stat_spa"], b["stat_spd"], b["stat_spe"]]
+
+
+def _poke_move_ids(p: dict) -> list:
+    """Extract [move0, move1, move2, move3] IDs from a pokemon feature dict."""
+    ids = p["ids"]
+    return [ids["move0"], ids["move1"], ids["move2"], ids["move3"]]
+
+
+def build_turn_batch(feat: dict, device=None) -> dict:
+    """Convert make_features() output to PokeTransformer batch dict.
+
+    Args:
+        feat: dict from make_features(battle)
+        device: torch device (None = CPU tensors, 'cuda' = GPU tensors)
+
+    Returns:
+        dict with all keys expected by PokeTransformer.forward()
+    """
+    import torch
+
+    def _t(data, dtype=torch.long):
+        t = torch.tensor(data, dtype=dtype)
+        return t.to(device, non_blocking=True) if device else t
+
+    def _tf(data):
+        return _t(data, dtype=torch.float32)
+
+    our, opp = feat["our_pokemon"], feat["opp_pokemon"]
+
+    batch = {
+        # Pokemon IDs, banks, continuous, move IDs, move continuous
+        "our_pokemon_ids": _t([[_poke_ids(p) for p in our]]),
+        "our_pokemon_banks": _t([[_poke_banks(p) for p in our]]),
+        "our_pokemon_cont": _tf([[p["continuous"] for p in our]]),
+        "our_pokemon_move_ids": _t([[_poke_move_ids(p) for p in our]]),
+        "our_pokemon_move_cont": _tf([[extract_move_cont(p["continuous"]) for p in our]]),
+        "opp_pokemon_ids": _t([[_poke_ids(p) for p in opp]]),
+        "opp_pokemon_banks": _t([[_poke_banks(p) for p in opp]]),
+        "opp_pokemon_cont": _tf([[p["continuous"] for p in opp]]),
+        "opp_pokemon_move_ids": _t([[_poke_move_ids(p) for p in opp]]),
+        "opp_pokemon_move_cont": _tf([[extract_move_cont(p["continuous"]) for p in opp]]),
+        # Field
+        "field_cont": _tf([feat["field"]["continuous"]]),
+        # Transition
+        "transition_cont": _tf([feat["transition"]["continuous"]]),
+        # Legal mask
+        "legal_mask": _tf(feat["legal_mask"].reshape(1, -1).tolist()),
+    }
+
+    # Field banks (dict of tensors)
+    fb = feat["field"]["banks"]
+    batch["field_banks"] = {k: _t([fb[k]]) for k in fb}
+
+    # Transition IDs (dict of tensors)
+    ti = feat["transition"]["ids"]
+    batch["transition_ids"] = {k: _t([ti[k]]) for k in ti}
+
+    # Active moves
+    mids, mbp, mac, mpp, mpr, mco = [], [], [], [], [], []
+    for m in feat["active_moves"]:
+        if m is None:
+            mids.append(0); mbp.append(0); mac.append(0)
+            mpp.append(0); mpr.append(6)
+            mco.append([0.0] * MOVE_SLOT_CONT_DIM)
+        else:
+            mids.append(m["move_id"]); mbp.append(m["bp_int"])
+            mac.append(m["acc_int"]); mpp.append(m["pp_int"])
+            mpr.append(m["priority_int"]); mco.append(m["continuous"])
+    batch["active_move_ids"] = _t([mids])
+    batch["active_move_cont"] = _tf([mco])
+    batch["active_move_banks"] = {
+        "bp": _t([mbp]), "acc": _t([mac]),
+        "pp": _t([mpp]), "prio": _t([mpr]),
+    }
+
+    # Switch slots
+    sids, sco = [], []
+    for s in feat["switch_slots"]:
+        if s is None:
+            sids.append(0); sco.append([0.0] * SWITCH_SLOT_CONT_DIM)
+        else:
+            sids.append(s["species_id"]); sco.append(s["continuous"])
+    batch["switch_ids"] = _t([sids])
+    batch["switch_cont"] = _tf([sco])
+
+    return batch
+
+
+def action_to_order(player, battle, action_idx: int):
+    """Convert action index (0-8) to a poke-env BattleOrder.
+
+    Args:
+        player: poke-env Player instance (has create_order method)
+        battle: poke-env Battle instance (has available_moves/switches)
+        action_idx: 0-3 = move, 4-8 = switch
+
+    Falls back to first legal move/switch if index is out of range.
+    Returns None only if no legal actions exist.
+    """
+    if action_idx < 4:
+        moves = list(battle.available_moves or [])
+        if action_idx < len(moves):
+            return player.create_order(moves[action_idx])
+    else:
+        switches = list(battle.available_switches or [])
+        si = action_idx - 4
+        if si < len(switches):
+            return player.create_order(switches[si])
+    # Fallback
+    if battle.available_moves:
+        return player.create_order(battle.available_moves[0])
+    if battle.available_switches:
+        return player.create_order(battle.available_switches[0])
+    return None
