@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# PyTorch checkpoints & models (large binary files)
+*.pt
+*.pth
+*.onnx
+
+# Data directories (too large for git)
+pokemon-ai-starter/pokemon-ai/src/data/
+raw_data/
+datasets/
+
+# Memmap files
+*.npy
+*.npz
+
+# Backups (frozen code snapshots — use git history instead)
+backups/
+pokemon-ai-starter/pokemon-ai/src/backups/
+
+# Logs & TensorBoard
+*.log
+tb/
+runs/
+events.out.tfevents.*
+
+# Large binary / data files
+*.json.gz
+*.tar.gz
+*.zip
+learnset.json
+stats.csv
+
+# Tools (portable Node binary, ~31MB)
+tools/
+
+# Bans / stoplists (data, not code)
+bans/
+stoplist/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node (battle server)
+node_modules/
+
+# Env / secrets
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+docker-compose.override.yml
+
+# Package lock (generated)
+package-lock.json
+
+# Claude Code settings (personal)
+.claude/
+
+# Showdown reference data (large)
+pokemon-ai-starter/pokemon-showdown/
+pokemon-ai-starter/showdown-reference/
+
+# Generated output (replays, eval reports)
+**/replays*/
+**/eval_reports/
+**/replay_*/
+
+# Pokemon AI data directory (separate from src/data/ above)
+pokemon-ai-starter/pokemon-ai/data/

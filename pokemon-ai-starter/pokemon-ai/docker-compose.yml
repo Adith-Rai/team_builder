@@ -1,0 +1,46 @@
+services:
+  showdown:
+    build:
+      context: .
+      dockerfile: docker/showdown.Dockerfile
+    container_name: showdown
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 60s
+      retries: 20
+
+  trainer:
+    command: ["bash","-lc","sleep infinity"]
+    build:
+      context: .
+      dockerfile: docker/trainer.Dockerfile
+    container_name: trainer
+    depends_on:
+      showdown:
+        condition: service_healthy
+    environment:
+      LOG_DIR: /app/data/logs
+      MODEL_DIR: /app/data/models
+      REPLAY_DIR: /app/data/replays
+      #DATASETS_DIR: /app/datasets 
+    volumes:
+      - ./src:/app/src:rw
+      - ./data:/app/data:rw
+      #- ./datasets:/app/datasets:rw
+    gpus: all
+    shm_size: "4g"
+
+  tensorboard:
+    image: python:3.11-slim
+    working_dir: /app
+    command: bash -lc "pip install tensorboard && tensorboard --logdir /app/data/logs --host 0.0.0.0 --port 6006"
+    volumes:
+      - ./data:/app/data:ro
+    ports:
+      - "6006:6006"
+    depends_on: [trainer]
