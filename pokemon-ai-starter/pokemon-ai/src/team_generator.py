@@ -32,6 +32,10 @@ class PokemonData:
     spreads: List[Tuple[str, str, List[int], float]] = field(default_factory=list)  # (nature, evs_str, evs_list, weight)
 
 
+def _normalize_name(name: str) -> str:
+    return name.lower().replace(" ", "").replace("-", "")
+
+
 # ---------------------------------------------------------------------------
 # OU ban lists per generation (Ubers / AG — cannot be used in OU)
 # ---------------------------------------------------------------------------
@@ -94,10 +98,6 @@ def get_ban_list(gen: int = 9) -> set:
 # Default for backward compat
 UBERS_AG = _UBERS_BY_GEN[9]
 UBERS_AG_LOWER = get_ban_list(9)
-
-
-def _normalize_name(name: str) -> str:
-    return name.lower().replace(" ", "").replace("-", "")
 
 
 def _base_species(name: str) -> str:
