@@ -585,13 +585,58 @@ a battle server not running (ECONNREFUSED) or a stale checkpoint path.
 
 #### Exp 1 — Lambda + entropy fix (CLI flags only)
 
+**Status: RUNNING (Session 35, started 2026-04-09 ~08:10)**
+Log file: `pokemon-ai-starter/pokemon-ai/src/exp1_lambda095.log`
+Run dir: `data/models/rl_v9/selfplay_v9_20260409_075821/`
+
+**Starting battle servers** (must be in separate persistent terminals or detached):
+```bash
+# Option A: Detached processes (from any terminal, survives terminal close)
+cd C:\Users\raiad\OneDrive\Desktop\team_builder\pokemon-ai-starter\pokemon-ai\src
+cmd.exe /c "start /B C:\Users\raiad\OneDrive\Desktop\team_builder\tools\node-v20.18.1-win-x64\node.exe battle_server.js --port 9000"
+cmd.exe /c "start /B C:\Users\raiad\OneDrive\Desktop\team_builder\tools\node-v20.18.1-win-x64\node.exe battle_server.js --port 9001"
+cmd.exe /c "start /B C:\Users\raiad\OneDrive\Desktop\team_builder\tools\node-v20.18.1-win-x64\node.exe battle_server.js --port 9002"
+
+# Verify:
+curl -s -o /dev/null -w "9000:%{http_code} " http://127.0.0.1:9000 && \
+curl -s -o /dev/null -w "9001:%{http_code} " http://127.0.0.1:9001 && \
+curl -s -o /dev/null -w "9002:%{http_code}\n" http://127.0.0.1:9002
+# Should show: 9000:200 9001:200 9002:200
+```
+
+**Training command:**
 ```bash
 python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
   --resume data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt \
   --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
-  --games-per-iter 200 --max-concurrent 10 --n-iters 200 --warmup-iters 0 \
+  --games-per-iter 200 --max-concurrent 50 --n-iters 200 --warmup-iters 0 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
-  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  2>&1 | tee exp1_lambda095.log
+```
+
+**Session 35 findings on concurrency and speed:**
+- `--max-concurrent 50` is ~3-4x faster than the old default of 10. With 50 concurrent
+  battles, inference batcher processes 5-7 requests per GPU forward call (vs 1 at conc=10).
+  GPU time goes from 11ms to 20ms per batch but does 5-7x more work per call.
+- 3 servers + 50 concurrent: ~4 min/iter. At 200 iters ≈ **~13 hours total.**
+- Previous training used `--max-concurrent 10` → ~4.5 min/iter with 3 servers.
+- **Use `--max-concurrent 50` going forward** unless OOM occurs.
+
+**FP16/FP32 note:** Spatial encoder runs in FP16 (via autocast). Temporal transformer runs
+in **FP32** explicitly (`all_summaries.float()` in inference_batcher.py:169). This is
+intentional — FP16 accumulation errors compound across 200 turns of causal attention.
+Summaries stored in history are always FP32.
+
+**Early results (first 2 iters):**
+- Iter 1785: W/L 105/95 (52.5%), entropy=0.845, pi=-0.040, kl=0.041
+- Iter 1786: W/L 105/95 (52.5%), entropy=0.876, pi=-0.111, kl=0.041
+- Entropy healthy (0.84-0.88), no collapse. KL within target.
+
+**Monitoring:**
+```bash
+grep "Iter " exp1_lambda095.log | tail -5     # completed iters
+tail -5 exp1_lambda095.log                     # current activity
 ```
 
 **Decision:** Run Elo ladder after 200 iters. If +50 Elo over snapshot_1784 → hyperparams
