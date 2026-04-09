@@ -58,6 +58,22 @@ class MemmapDataset(Dataset):
         mcd = self.meta["move_cont_dim"]
         scd = self.meta["switch_cont_dim"]
 
+        # Track dimension gaps for zero-padding in collate
+        from features import POKEMON_CONT_DIM, FIELD_CONT_DIM, TRANSITION_CONT_DIM, MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM
+        self._pad_move = max(0, MOVE_SLOT_CONT_DIM - mcd)
+        self._pad_switch = max(0, SWITCH_SLOT_CONT_DIM - scd)
+        if self._pad_move > 0 or self._pad_switch > 0:
+            import logging
+            logging.getLogger("pokemon_ai").warning(
+                f"Memmap dimension mismatch (will zero-pad): "
+                f"move_cont {mcd}→{MOVE_SLOT_CONT_DIM} (+{self._pad_move}), "
+                f"switch_cont {scd}→{SWITCH_SLOT_CONT_DIM} (+{self._pad_switch}). "
+                f"Consider regenerating memmaps with current features.py."
+            )
+        assert pcd == POKEMON_CONT_DIM, f"pokemon_cont_dim mismatch: memmap has {pcd}, features.py expects {POKEMON_CONT_DIM}"
+        assert fcd == FIELD_CONT_DIM, f"field_cont_dim mismatch: memmap has {fcd}, features.py expects {FIELD_CONT_DIM}"
+        assert tcd == TRANSITION_CONT_DIM, f"trans_cont_dim mismatch: memmap has {tcd}, features.py expects {TRANSITION_CONT_DIM}"
+
         def _mm(name, shape, dtype):
             return np.memmap(str(d / name), dtype=dtype, mode="r", shape=shape)
 
@@ -81,6 +97,15 @@ class MemmapDataset(Dataset):
         mm["result"] = _mm("result.npy", (N,), np.float32)
         mm["turn"] = _mm("turn.npy", (N,), np.int32)
         self._memmaps = mm
+
+    @staticmethod
+    def _pad_array(arr: np.ndarray, pad: int) -> np.ndarray:
+        """Zero-pad the last dimension of an array if pad > 0."""
+        if pad <= 0:
+            return arr
+        pad_shape = list(arr.shape)
+        pad_shape[-1] = pad
+        return np.concatenate([arr, np.zeros(pad_shape, dtype=arr.dtype)], axis=-1)
 
     def __len__(self):
         return len(self.ep_indices)
@@ -114,10 +139,10 @@ class MemmapDataset(Dataset):
                 # Active moves
                 "move_ids": mm["move_ids"][i].copy(),                    # (4,) int32
                 "move_banks": mm["move_banks"][i].copy(),                # (4, 4) int32
-                "move_cont": mm["move_cont"][i].copy(),                  # (4, D) float32
+                "move_cont": self._pad_array(mm["move_cont"][i].copy(), self._pad_move),  # (4, mcd) float32
                 # Switches
                 "switch_ids": mm["switch_ids"][i].copy(),                # (5,) int32
-                "switch_cont": mm["switch_cont"][i].copy(),              # (5, D) float32
+                "switch_cont": self._pad_array(mm["switch_cont"][i].copy(), self._pad_switch),  # (5, scd) float32
                 # Action/legal
                 "legal": mm["legal"][i].copy(),                          # (9,) float32
                 "action": int(mm["action"][i]),
