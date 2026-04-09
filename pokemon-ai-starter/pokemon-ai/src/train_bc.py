@@ -282,6 +282,8 @@ def main():
                              "Use when changing LR/weight_decay from a previous run.")
     parser.add_argument("--eval-games", type=int, default=200,
                         help="Games per bot for epoch-end eval (0 to disable)")
+    parser.add_argument("--save-every", type=int, default=1000,
+                        help="Save mid-epoch checkpoint every N batches (increase for 30M+ scaling)")
     parser.add_argument("--server", type=str, default="ws://127.0.0.1:9000/showdown/websocket",
                         help="Battle server URL for bot eval")
     add_model_args(parser)
@@ -395,7 +397,7 @@ def main():
         train_loss, train_acc, train_vloss, global_step = train_one_epoch(
             model, train_loader, optimizer, device, epoch, tb, global_step,
             grad_clip=args.grad_clip, label_smoothing=args.label_smoothing,
-            scheduler=scheduler, save_fn=_save_checkpoint, save_every=1000,
+            scheduler=scheduler, save_fn=_save_checkpoint, save_every=args.save_every,
         )
         elapsed = time.time() - t0
 

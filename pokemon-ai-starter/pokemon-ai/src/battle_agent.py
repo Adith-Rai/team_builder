@@ -64,6 +64,11 @@ class BattleAgent(Player):
                 if old_w.shape[1] < expected_in:
                     pad = expected_in - old_w.shape[1]
                     state[key] = torch.cat([old_w, torch.zeros(old_w.shape[0], pad, device=old_w.device)], dim=1)
+                    import logging
+                    logging.getLogger("pokemon_ai").warning(
+                        f"Dim expansion: {key} padded {old_w.shape[1]} -> {expected_in} (+{pad} zero-init cols). "
+                        f"If this is unexpected, the checkpoint may not match the current feature set."
+                    )
 
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
@@ -97,9 +102,8 @@ class BattleAgent(Player):
             return [ids["move0"], ids["move1"], ids["move2"], ids["move3"]]
 
         def _poke_move_cont(p):
-            cont = p["continuous"]
-            base = len(cont) - 92
-            return [cont[base + i*23: base + (i+1)*23] for i in range(4)]
+            from features import extract_move_cont
+            return extract_move_cont(p["continuous"])
 
         # Build (1, 6, ...) tensors for pokemon
         our_ids = torch.tensor([[_poke_ids(p) for p in feat["our_pokemon"]]], dtype=torch.long, device=dev)

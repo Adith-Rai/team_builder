@@ -66,9 +66,8 @@ class V9RLPlayer(Player):
             i = p["ids"]
             return [i["move0"], i["move1"], i["move2"], i["move3"]]
         def _pmc(p):
-            c = p["continuous"]
-            b = len(c) - 92
-            return [c[b+i*23:b+(i+1)*23] for i in range(4)]
+            from features import extract_move_cont
+            return extract_move_cont(p["continuous"])
 
         our, opp = feat["our_pokemon"], feat["opp_pokemon"]
         int_arrays = {

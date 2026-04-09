@@ -33,29 +33,67 @@ class PokemonData:
 
 
 # ---------------------------------------------------------------------------
-# OU ban list (Ubers / AG — cannot be used in OU)
-# Updated for Gen 9 as of early 2026
+# OU ban lists per generation (Ubers / AG — cannot be used in OU)
 # ---------------------------------------------------------------------------
 
-UBERS_AG = {
-    # Ubers
-    "Arceus", "Calyrex-Ice", "Calyrex-Shadow", "Dialga", "Dialga-Origin",
-    "Eternatus", "Giratina", "Giratina-Origin", "Groudon", "Ho-Oh",
-    "Koraidon", "Kyogre", "Kyurem-White", "Lugia", "Lunala",
-    "Mewtwo", "Miraidon", "Necrozma-Dawn-Wings", "Necrozma-Dusk-Mane",
-    "Palkia", "Palkia-Origin", "Rayquaza", "Reshiram", "Solgaleo",
-    "Terapagos", "Zacian", "Zacian-Crowned", "Zekrom",
-    # AG only
-    "Mega Rayquaza",
-    # Common OU bans (clauses) — includes mons banned after 2024-04 stats snapshot
-    "Flutter Mane", "Palafin", "Palafin-Hero", "Annihilape",
-    "Espathra", "Iron Bundle", "Chi-Yu", "Roaring Moon",
-    # Banned from OU after April 2024
-    "Gouging Fire", "Volcarona",
+_UBERS_BY_GEN = {
+    9: {
+        # Ubers
+        "Arceus", "Calyrex-Ice", "Calyrex-Shadow", "Dialga", "Dialga-Origin",
+        "Eternatus", "Giratina", "Giratina-Origin", "Groudon", "Ho-Oh",
+        "Koraidon", "Kyogre", "Kyurem-White", "Lugia", "Lunala",
+        "Mewtwo", "Miraidon", "Necrozma-Dawn-Wings", "Necrozma-Dusk-Mane",
+        "Palkia", "Palkia-Origin", "Rayquaza", "Reshiram", "Solgaleo",
+        "Terapagos", "Zacian", "Zacian-Crowned", "Zekrom",
+        # AG only
+        "Mega Rayquaza",
+        # Common OU bans (clauses)
+        "Flutter Mane", "Palafin", "Palafin-Hero", "Annihilape",
+        "Espathra", "Iron Bundle", "Chi-Yu", "Roaring Moon",
+        "Gouging Fire", "Volcarona",
+    },
+    8: {
+        # Gen 8 OU bans (Sword/Shield era)
+        "Arceus", "Calyrex-Ice", "Calyrex-Shadow", "Dialga", "Eternatus",
+        "Giratina", "Giratina-Origin", "Groudon", "Ho-Oh", "Kyogre",
+        "Kyurem-White", "Lugia", "Lunala", "Mewtwo", "Necrozma-Dawn-Wings",
+        "Necrozma-Dusk-Mane", "Palkia", "Rayquaza", "Reshiram", "Solgaleo",
+        "Zacian", "Zacian-Crowned", "Zekrom",
+        # Gen 8 OU specific bans
+        "Cinderace", "Darmanitan-Galar", "Dracovish", "Genesect",
+        "Landorus", "Magearna", "Spectrier", "Urshifu",
+    },
+    7: {
+        # Gen 7 OU bans (Sun/Moon era)
+        "Arceus", "Blaziken", "Darkrai", "Deoxys", "Deoxys-Attack",
+        "Dialga", "Giratina", "Giratina-Origin", "Groudon", "Ho-Oh",
+        "Kyogre", "Lugia", "Lunala", "Marshadow", "Mewtwo",
+        "Necrozma-Dawn-Wings", "Necrozma-Dusk-Mane", "Palkia",
+        "Pheromosa", "Rayquaza", "Reshiram", "Solgaleo", "Xerneas",
+        "Yveltal", "Zekrom", "Zygarde",
+        "Mega Gengar", "Mega Lucario", "Mega Salamence", "Mega Kangaskhan",
+    },
+    6: {
+        # Gen 6 OU bans (X/Y era)
+        "Arceus", "Blaziken", "Darkrai", "Deoxys", "Deoxys-Attack",
+        "Dialga", "Genesect", "Giratina", "Giratina-Origin", "Groudon",
+        "Ho-Oh", "Kyogre", "Lugia", "Mewtwo", "Palkia", "Rayquaza",
+        "Reshiram", "Xerneas", "Yveltal", "Zekrom",
+        "Mega Gengar", "Mega Lucario", "Mega Salamence", "Mega Kangaskhan",
+        "Mega Mawile",
+    },
 }
 
-# Normalize for comparison
-UBERS_AG_LOWER = {n.lower().replace(" ", "").replace("-", "") for n in UBERS_AG}
+
+def get_ban_list(gen: int = 9) -> set:
+    """Return the normalized OU ban list for a given generation."""
+    raw = _UBERS_BY_GEN.get(gen, _UBERS_BY_GEN[9])  # fallback to gen9
+    return {_normalize_name(n) for n in raw}
+
+
+# Default for backward compat
+UBERS_AG = _UBERS_BY_GEN[9]
+UBERS_AG_LOWER = get_ban_list(9)
 
 
 def _normalize_name(name: str) -> str:
@@ -79,15 +117,17 @@ def _base_species(name: str) -> str:
     return _normalize_name(parts[0])
 
 
-def _is_banned(name: str) -> bool:
-    return _normalize_name(name) in UBERS_AG_LOWER
+def _is_banned(name: str, ban_list: set = None) -> bool:
+    if ban_list is None:
+        ban_list = UBERS_AG_LOWER
+    return _normalize_name(name) in ban_list
 
 
 # ---------------------------------------------------------------------------
 # Parser for Smogon usage stat files
 # ---------------------------------------------------------------------------
 
-def parse_usage_file(path: str) -> List[PokemonData]:
+def parse_usage_file(path: str, ban_list: set = None) -> List[PokemonData]:
     """Parse a Smogon moveset statistics file into PokemonData objects."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -182,7 +222,7 @@ def parse_usage_file(path: str) -> List[PokemonData]:
                     elif content.startswith("Other"):
                         continue
 
-        if name and not _is_banned(name):
+        if name and not _is_banned(name, ban_list):
             pd = PokemonData(
                 name=name,
                 raw_count=raw_count,
@@ -198,9 +238,24 @@ def parse_usage_file(path: str) -> List[PokemonData]:
     return pokemon_list
 
 
+def _default_tiers(gen: int = 9) -> list:
+    """Default tier list for a given generation."""
+    prefix = f"gen{gen}"
+    return [
+        (f"{prefix}ou", "1695"),
+        (f"{prefix}uu", "1500"),
+        (f"{prefix}ru", "1500"),
+        (f"{prefix}nu", "1500"),
+        (f"{prefix}pu", "1500"),
+        (f"{prefix}zu", "1500"),
+    ]
+
+
 def load_pokemon_pool(
     stats_dir: str,
     tiers: Optional[List[str]] = None,
+    ban_list: set = None,
+    gen: int = 9,
 ) -> Dict[str, PokemonData]:
     """Load and merge Pokemon data across tiers.
 
@@ -208,14 +263,7 @@ def load_pokemon_pool(
     the highest raw_count (most data = most reliable distributions).
     """
     if tiers is None:
-        tiers = [
-            ("gen9ou", "1695"),
-            ("gen9uu", "1500"),
-            ("gen9ru", "1500"),
-            ("gen9nu", "1500"),
-            ("gen9pu", "1500"),
-            ("gen9zu", "1500"),
-        ]
+        tiers = _default_tiers(gen)
 
     pool: Dict[str, PokemonData] = {}
 
@@ -225,7 +273,7 @@ def load_pokemon_pool(
             print(f"  [WARN] Missing usage file: {path}")
             continue
 
-        mons = parse_usage_file(path)
+        mons = parse_usage_file(path, ban_list=ban_list)
         for mon in mons:
             key = _normalize_name(mon.name)
             if key not in pool or mon.raw_count > pool[key].raw_count:
@@ -417,9 +465,11 @@ class ProceduralTeambuilder(_Teambuilder):
                     (uniform weights, ignoring usage). Default 0.05 (5%).
     """
 
-    def __init__(self, stats_dir: str, random_pct: float = 0.05):
+    def __init__(self, stats_dir: str, random_pct: float = 0.05, gen: int = 9):
         super().__init__()
-        self.pool = load_pokemon_pool(stats_dir)
+        self.gen = gen
+        self.ban_list = get_ban_list(gen)
+        self.pool = load_pokemon_pool(stats_dir, ban_list=self.ban_list)
         self.random_pct = random_pct
         # Precompute uniform weights for random teams
         self._uniform_weights = {
@@ -436,9 +486,9 @@ class ProceduralTeambuilder(_Teambuilder):
         return self.join_team(mons)
 
 
-def procedural_teambuilder(stats_dir: str, random_pct: float = 0.05) -> ProceduralTeambuilder:
+def procedural_teambuilder(stats_dir: str, random_pct: float = 0.05, gen: int = 9) -> ProceduralTeambuilder:
     """Convenience constructor."""
-    return ProceduralTeambuilder(stats_dir, random_pct=random_pct)
+    return ProceduralTeambuilder(stats_dir, random_pct=random_pct, gen=gen)
 
 
 # ---------------------------------------------------------------------------

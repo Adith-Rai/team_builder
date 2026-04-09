@@ -412,11 +412,9 @@ class RecorderMixin:
                     b["stat_spa"], b["stat_spd"], b["stat_spe"]]
 
         def _poke_move_cont(poke_dict):
-            """Extract 4x23 compact move encoding from pokemon continuous features.
-            Move compact is the last 92 dims of pokemon_cont (4*23)."""
-            cont = poke_dict["continuous"]
-            base = len(cont) - 92  # 285 - 92 = 193
-            return [cont[base + i*23 : base + (i+1)*23] for i in range(4)]
+            """Extract 4x23 compact move encoding from pokemon continuous features."""
+            from features import extract_move_cont
+            return extract_move_cont(poke_dict["continuous"])
 
         def _move_slot(m):
             if m is None:

@@ -164,9 +164,8 @@ def _feat_to_flat_record(feat: dict, episode_id: str, t: int,
                 b["stat_spa"], b["stat_spd"], b["stat_spe"]]
 
     def _poke_move_cont(p):
-        cont = p["continuous"]
-        base = len(cont) - 92
-        return [cont[base + i*23: base + (i+1)*23] for i in range(4)]
+        from features import extract_move_cont
+        return extract_move_cont(p["continuous"])
 
     def _move_slot(m):
         if m is None:

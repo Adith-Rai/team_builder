@@ -408,6 +408,25 @@ def _pokemon_cont_dim() -> int:
 
 POKEMON_CONT_DIM = _pokemon_cont_dim()  # 285
 
+# Compact move encoding: last 4*23=92 dims of pokemon_cont are per-move features.
+# Use these helpers instead of hardcoding offsets.
+MOVE_CONT_PER_SLOT = 23
+N_MOVE_SLOTS = MAX_MOVES  # 4
+
+
+def extract_move_cont(pokemon_cont):
+    """Extract 4×23 compact move features from end of pokemon continuous vector.
+
+    Args:
+        pokemon_cont: list or array of length POKEMON_CONT_DIM (285)
+    Returns:
+        list of 4 sublists, each length MOVE_CONT_PER_SLOT (23)
+    """
+    n = N_MOVE_SLOTS * MOVE_CONT_PER_SLOT  # 92
+    base = len(pokemon_cont) - n
+    return [pokemon_cont[base + i * MOVE_CONT_PER_SLOT: base + (i + 1) * MOVE_CONT_PER_SLOT]
+            for i in range(N_MOVE_SLOTS)]
+
 
 def _encode_move_compact(move) -> List[float]:
     """23-dim compact move encoding: type_onehot(19) + bp(1) + category(2) + priority(1)."""
