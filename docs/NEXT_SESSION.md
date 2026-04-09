@@ -525,11 +525,70 @@ At 0.75, GAE advantage estimates are heavily myopic in a 30-60 turn game with te
 collapsed to 0.51. Win rates didn't change (plateau was architectural, not entropy). But
 reduce cautiously: try 0.02 first, not 0.01.
 
+#### Pre-flight verification checklist (Session 35 code changes)
+
+Session 35 made infrastructure fixes that need quick verification before Exp 1.
+Run these ONCE before starting any training. Should take ~5 minutes total.
+
+```bash
+cd pokemon-ai-starter/pokemon-ai/src
+
+# 1. Verify all files import cleanly (no broken deps)
+python -c "from ppo import compute_gae, save_checkpoint; print('ppo OK')"
+python -c "from dataset import MemmapDataset, collate_seq; print('dataset OK')"
+python -c "import train_bc; print('train_bc OK')"
+python -c "import train_rl; print('train_rl OK')"
+
+# 2. Start 1 battle server
+tools/../node.exe battle_server.js --port 9000 &
+
+# 3. Run 2 iters of training with NEW hyperparams — verify output matches expected format
+python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
+  --resume data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt \
+  --device cuda --servers 9000 --fp16 \
+  --games-per-iter 20 --max-concurrent 5 --n-iters 2 --warmup-iters 0 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --out-dir data/models/rl_v9/verify_s35 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04
+
+# VERIFY in output:
+# - [FLOW] lines appear (collection + PPO update working)
+# - Iter line shows non-zero pi/v/ent values (NOT "pi=0.0000 v=0.0000 ent=0.0000")
+# - "lam=0.95" appears in config printout (not 0.75)
+# - "ent=0.02" appears in config printout (not 0.04)
+# - Snapshot saved without errors
+# - No NaN warnings, no traceback output
+# - Entropy value reported (should be 0.5-1.0 range, watch for collapse toward 0)
+
+# 4. Verify checkpoint round-trip (atomic write)
+python -c "
+import torch, os
+p = 'data/models/rl_v9/verify_s35'
+snaps = [f for f in os.listdir(p) if f.startswith('snapshot_')]
+if snaps:
+    ckpt = torch.load(os.path.join(p, snaps[0]), map_location='cpu', weights_only=False)
+    print(f'Checkpoint OK: iter={ckpt[\"iteration\"]}, keys={list(ckpt.keys())}')
+    assert not os.path.exists(os.path.join(p, snaps[0] + '.tmp')), 'Temp file leaked!'
+    print('Atomic write OK')
+else:
+    print('WARNING: no snapshot saved — check n-iters and output')
+"
+
+# 5. Clean up verification run
+# rm -rf data/models/rl_v9/verify_s35  # optional, small
+```
+
+**If anything fails:** do NOT proceed to Exp 1. Debug first. The most likely failure is
+a battle server not running (ECONNREFUSED) or a stale checkpoint path.
+
+**If all passes:** proceed to Exp 1 below.
+
 #### Exp 1 — Lambda + entropy fix (CLI flags only)
 
 ```bash
 python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
-  --resume <LATEST_SNAPSHOT> --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
+  --resume data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt \
+  --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
   --games-per-iter 200 --max-concurrent 10 --n-iters 200 --warmup-iters 0 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04
@@ -544,12 +603,64 @@ Randomly shuffle the 6 ally entity tokens and 6 opponent entity tokens in `build
 Similarly shuffle 4 move tokens within each Pokemon. Preserves active-slot marking. This is
 free regularization — the model should be permutation-invariant over team slot order.
 
-Implementation: ~2 hours in `features.py:build_turn_batch()`. Run 200 iters, measure.
+**Implementation sketch** (in `features.py:build_turn_batch()`):
+```python
+# After building the 6-pokemon feature arrays, before packing into tensors:
+import random
+if training:  # only during training, not inference
+    # Shuffle ally team order (slots 1-5, keep slot 0 = active)
+    ally_perm = [0] + random.sample(range(1, 6), 5)
+    our_pokemon_ids = our_pokemon_ids[ally_perm]
+    our_pokemon_cont = our_pokemon_cont[ally_perm]
+    # ... same for banks, mcont
+
+    # Shuffle opponent team order (same pattern)
+    opp_perm = [0] + random.sample(range(1, 6), 5)
+    # ... same for opp arrays
+
+    # Shuffle move order within each pokemon (4 moves)
+    for i in range(6):
+        move_perm = random.sample(range(4), 4)
+        move_ids[i] = move_ids[i][move_perm]
+        move_cont[i] = move_cont[i][move_perm]
+```
+
+**Key constraint:** active Pokemon MUST stay at index 0 (the model uses position 0 for
+the active mon). Bench Pokemon (indices 1-5) can be freely permuted. Move order within
+each Pokemon can be freely permuted.
+
+**Where to add the `training` flag:** `build_turn_batch()` is called from both RL
+(rl_player.py — training) and eval (battle_agent.py — inference). Add a `training=False`
+parameter, pass `training=True` from rl_player.py only.
+
+**Also apply in BC training:** the collate path in dataset.py should also shuffle. Add
+permutation in `collate_seq()` or in `MemmapDataset.__getitem__()` with a `training` flag.
+
+Implementation: ~2 hours. Run 200 iters on top of Exp 1, measure.
 
 #### Exp 3 — Recency-weighted pool sampling
 
 Change opponent sampling from uniform to: 70% from last 200 checkpoints, 30% from older.
-Implementation: small change in `rl_player.py:SelfPlayOpponent`. Run 200 iters, measure.
+
+**Implementation** (in `rl_collection.py` or wherever opponents are sampled):
+```python
+# Instead of: selected = random.sample(snapshot_pool, max_opponents)
+# Do:
+recent_cutoff = max(0, len(snapshot_pool) - 200)
+recent = snapshot_pool[recent_cutoff:]
+older = snapshot_pool[:recent_cutoff]
+n_recent = int(max_opponents * 0.7)
+n_older = max_opponents - n_recent
+selected = random.sample(recent, min(n_recent, len(recent)))
+if older and n_older > 0:
+    selected += random.sample(older, min(n_older, len(older)))
+```
+
+**Rationale:** OpenAI Five uses 80/20 recent/older split. VGC-Bench uses pure uniform
+(which works at their scale). Our pool is ~610 deep — pure uniform wastes ~70% of training
+signal on weak old policies. Recency weighting focuses learning on current-strength opponents.
+
+Implementation: ~30 min. Run 200 iters on top of Exp 1+2, measure.
 
 #### Exp 4 — Combined Elo measurement
 
