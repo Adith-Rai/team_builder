@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Concrete TODO Order
 
-**Last updated: 2026-04-09 (Session 33 end — Elo ladder + extension complete)**
+**Last updated: 2026-04-09 (Session 34 end — major refactor complete)**
 
 This file is the canonical "if you're starting a new session, do these things in this order"
 reference. **It is intentionally self-contained** — a future session reading only this file
@@ -11,22 +11,20 @@ If you read nothing else, **read this top-to-bottom, then `docs/RESEARCH.md` §0
 
 ---
 
-## Where things stand right now (Session 33 end)
+## Where things stand right now (Session 34 end)
 
-- **Training is STOPPED** at `selfplay_v9_20260408_042048/snapshot_1784.pt` (the latest checkpoint).
-  Was killed cleanly to free the GPU for the Elo ladder run. Resume command in `MEMORY.md` if
-  you want to continue training, but **don't, until step (b)/(c) is done** — Session 33 proved
-  more iters at this scale produce essentially zero Elo improvement.
-- **First-ever Elo measurement is DONE.** Two ladder runs:
-  - **Initial** (31 players, 465 matches): `data/eval/elo_session33_FINAL.json`
-  - **Extended** (38 players, 703 matches, the canonical one): `data/eval/elo_session33_EXTENDED_FINAL.json`
-- **Resilience patches are in place** in `rl_train_v8.py` (`n_succeeded`/`n_failed`) and
-  `rl_train_v9.py` (FATAL guard at zero-PPO, snapshot save gate). Verified working.
-- **`eval_elo_ladder.py` v2** has the permanent fix: PlayerPool with LRU cache, checkpoint
-  state_dict caching (CPU), incremental JSONL save, resume support. Wall time for the 38-player
-  ladder is ~93 min on 4 shards. ~10x faster than v1's death-spiral pattern.
-- **Pre-cloud backup** at `pokemon-ai-starter/pokemon-ai/src/backups/v9_pre_cloud/` — patched
-  and working source for fallback if anything breaks.
+- **Training is STOPPED** at `selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1032).
+- **Elo measurement DONE.** Canonical: `data/eval/elo_session33_EXTENDED_FINAL.json`
+  (38 players, 703 matches). BC_base 806 → snapshot_1784 1032 = +226 Elo.
+- **Session 34 MAJOR REFACTOR COMPLETE.** All v8/v9 suffixes removed, monolith decomposed,
+  code deduplicated, dead code removed, multi-gen plumbing added, git initialized.
+  See "Session 34 refactor" section below for full details.
+- **Resilience patches in place** in `ppo.py` (`n_succeeded`/`n_failed`) and `train_rl.py`
+  (FATAL guard at zero-PPO, snapshot save gate).
+- **`eval_elo_ladder.py`** has --format flag, PlayerPool with LRU cache, JSONL save/resume.
+- **Git repo initialized** at project root. 8 commits. Use `git log --oneline` for history.
+- **Stale memmaps**: existing memmaps have move_cont_dim=107, switch_cont_dim=28 (pre-type-eff).
+  Current code expects 109/30. dataset.py auto-pads, but regenerate before BC scaling.
 
 ## The Session 33 Elo result — read this carefully
 
@@ -325,11 +323,11 @@ differ. What IS meaningful: the SHAPE of the curve (is our latest dramatically b
 our earliest? are we stronger than the smart bots? by how much?) and the rough order of
 magnitude relative to the anchor spread.
 
-### Step (b) — Code refactor + smoke test
+### Step (b) — Code refactor + smoke test ✅ **DONE (Session 34)**
 
-**Status: NOT STARTED.** Multi-day work. Can run in parallel to step (a) or after.
-The patches Session 33 added (n_succeeded detection, FATAL guard) work fine in the
-current monolithic file — refactor is for maintainability, not correctness.
+Completed in Session 34. See "Session 34 refactor summary" section above for full details.
+All files renamed, monolith decomposed, code deduplicated, dead code removed, multi-gen
+plumbing added, FormatConfig created, --format flags wired, git initialized. Smoke tested.
 
 **Goal:** Make the codebase A/B-test-friendly and crash-safe so steps (c1)–(c5) can be
 implemented as small clean diffs rather than 200-line edits to a 1900-line file.
@@ -495,12 +493,12 @@ runs.
 **Success criterion (whole step b):** old training command still produces equivalent output
 (same FLOW timing, same iter results) and the smoke test passes.
 
-### Step (b) DEFERRED status
+### Step (b) completion notes
 
-**Has not been started as of Session 33.** Estimated 1-2 days of focused work. Should be
-done before step (c) experiments start, because step (c) needs the modular file structure
-to add experiment-specific flags cleanly. If you're impatient and want to run step (c)
-first, you can — but expect ugly diffs to `rl_train_v9.py`.
+**Completed Session 34.** The modular file structure is now in place. Step (c) experiments
+can be implemented as small clean diffs to focused modules instead of 200-line edits to
+a 1900-line monolith. `--format` flags are wired, FormatConfig is the single source of
+truth for magic numbers, and build_turn_batch/action_to_order are shared (not duplicated).
 
 ### Step (c) — Multi-gen vocab prep, BEFORE BC scaling
 
@@ -694,89 +692,48 @@ These are the questions still genuinely open after Session 33's Elo measurement.
 
 ---
 
-## Current state snapshot (as of Session 33 end, 2026-04-09)
+## Session 34 refactor summary
 
-For a future session that needs to start cold without hunting:
+**All file renames (old → new):**
+- `features_v8.py` → `features.py` | `policy_heads_v8.py` → `model.py`
+- `bc_policy_player_v8.py` → `battle_agent.py` | `rl_train_v8.py` → `ppo.py`
+- `bc_train_v8.py` → `train_bc.py` | `dataset_v8.py` → `dataset.py`
+- `replay_to_memmap_v8.py` → `replay_to_memmap.py` | `convert_jsonl_to_memmap_v8.py` → `convert_jsonl_to_memmap.py`
+
+**Internal symbol renames:** make_features (was make_v8_features), BattleAgent (was BCPolicyPlayerV8),
+Trajectory (was V8Trajectory), ppo_update (was ppo_update_v8), load/save_checkpoint (was *_v8_*)
+
+**Monolith decomposition (rl_train_v9.py → 5 files):**
+- `train_rl.py` (~540 lines) — main loop with 8 extracted helpers
+- `inference_batcher.py` (~200 lines) — async batched GPU inference
+- `rl_player.py` (~180 lines) — V9RLPlayer + SelfPlayOpponent
+- `rl_collection.py` (~250 lines) — collect_v9 + BackgroundCollector
+- `rl_pipeline.py` (~350 lines) — multiprocess infrastructure
+
+**New shared code:** `format_config.py` (FormatConfig dataclass), `features.build_turn_batch()`,
+`features.action_to_order()` — eliminated 300+ lines of duplication across 3 files.
+
+**Multi-gen plumbing:** `--format` flag on train_rl.py, train_bc.py, eval_elo_ladder.py.
+team_generator.py has per-gen ban lists (gens 6-9) and gen parameter. dataset.py validates
+dimensions and zero-pads old memmaps. vocab.py already covers gens 1-9.
+
+**Dead code removed:** V8RLPlayer + old collect + old main from ppo.py (718 lines), old
+rl_train_v9.py monolith (1931 lines), v7 files moved to legacy/.
+
+## Current state snapshot (as of Session 34 end, 2026-04-09)
 
 ### Training state
-- **Training is STOPPED.** Was killed cleanly Session 33 to free the GPU for the Elo ladder.
-- **Latest snapshot:** `pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt`
-- **Reward style at stop:** terminal (`--reward-style terminal`)
-- **Pool size at stop:** 617 (filtered sp ≥ 260)
-- **Why we stopped:** Session 33 Elo measurement showed the architecture is at its ceiling.
-  Additional training iters would just produce more plateau-band noise. Resume only if you
-  have a specific reason (e.g., to validate something during the refactor work).
+- **Training is STOPPED.** Architecture at ceiling. Don't resume without a reason.
+- **Latest snapshot:** `data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1032)
+- **Use `train_rl.py`** (not the deleted `rl_train_v9.py`). Resume command in MEMORY.md.
 
-### To resume training (only if needed)
-```bash
-cd pokemon-ai-starter/pokemon-ai/src
-# Find latest snapshot:
-ls -t data/models/rl_v9/selfplay_v9_2026040*/snapshot_*.pt | head -1
-# Then use the resume command in MEMORY.md, pointing --resume at that snapshot.
-```
+### Key checkpoints
+- `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` — **BC base, Elo 806.**
+- `selfplay_v9_20260408_042048/snapshot_1784.pt` — **latest, Elo 1032.**
 
-### Battle servers
-4 servers were left running on ports 9000/9001/9002/9003 at end of Session 33 (port 9003
-added for parallelization of the Elo ladder). Restart with the commands in MEMORY.md if
-they've stopped.
+### Key data
+- `data/eval/elo_session33_EXTENDED_FINAL.json` — canonical Elo baseline (38 players, 703 matches)
+- Existing memmaps (human_v8, memmap_v8) are stale (move=107, switch=28). Regenerate before BC scaling.
 
-### Key checkpoints (canonical references — Elo numbers are from extended ladder)
-- `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` — **BC base**, init-from for all v9 runs.
-  **Elo: 806.** The starting point everything is built on.
-- `selfplay_v9_20260401_141524/snapshot_0699.pt` — old "all-time peak" by smart_avg (57%).
-  **Actual Elo: 998.** Middle of the pack. Smart_avg lied. **NOT** the target to reproduce.
-- `selfplay_v9_20260407_124041/snapshot_1724.pt` — pre-CUDA-crash clean state. **Elo: 1027**.
-- `selfplay_v9_20260408_042048/snapshot_1784.pt` — **latest, current top of ladder. Elo: 1032.**
-  The strongest checkpoint we have.
-
-### Key code files (and their state at Session 33 end)
-- `eval_elo_ladder.py` — **Session 33 build, with permanent fix.** PlayerPool + checkpoint
-  cache + JSONL save/resume. ~93 min for full 38-player ladder on 4 shards. Verified working.
-- `recover_elo_from_log.py` — log-parsing recovery tool, used during the v1 death-spiral.
-  Still useful as a recovery tool if the main script's incremental save somehow fails.
-- `bc_policy_player_v8.py` — modified Session 33 to accept `_cached_ckpt` parameter (bypasses
-  disk read). Backwards-compatible — existing callers don't change.
-- `rl_train_v9.py` — **1900+ lines, monolith.** Has the Session 33 resilience patches but
-  is the refactor target for step (b).
-- `rl_train_v8.py` — has `ppo_update_v8` with `n_succeeded`/`n_failed` return additions.
-- `policy_heads_v8.py` — 13.38M params, target for c3 (BC scaling — needs to grow to ~30M).
-- `features_v8.py` — 16 entity tokens, type effectiveness features. Will need vocab expansion
-  for c1 (multi-gen prep).
-- `vocab.py` — embedding tables for species/move/ability/item. Will need expansion for multi-gen.
-- `team_generator.py` — currently gen9-only. Will need per-gen support.
-- `mp_collect_v2.py`, `mp_collect_v3.py` — multiprocess collection, cloud-ready, NOT in main path.
-- `backups/v9_pre_cloud/` — Session 33 patched source fallback.
-- `backups/README.md` — which backup is which.
-
-### Key data files
-- `pokemon-ai-starter/pokemon-ai/src/data/eval/elo_session33_EXTENDED_FINAL.json` — **canonical
-  Session 33 Elo result.** 38 players, 703 matches, BayesElo + bootstrap CIs. The baseline
-  every future experiment will be compared against.
-- `pokemon-ai-starter/pokemon-ai/src/data/eval/elo_session33_FINAL.json` — first ladder run
-  (31 players, 465 matches). Kept for history; superseded by EXTENDED.
-- `pokemon-ai-starter/pokemon-ai/src/data/eval/elo_session33_shard{0,1,2,3}.{json,jsonl}` —
-  per-shard incremental saves. The JSONLs are resume sources for any future ladder extension.
-- `data/datasets/human_v3_memmap/` — 200K gen9ou 1500+ replays, 10.1M records. Source for
-  the existing 13.4M BC. Needs gen6/7/8 extension for c2.
-
-### If you need to resume right now (5-line cheat sheet)
-```bash
-# 1. Resume training from latest snapshot (only if you have a reason):
-cd pokemon-ai-starter/pokemon-ai/src
-ls -t data/models/rl_v9/selfplay_v9_2026040*/snapshot_*.pt | head -1
-# Use that path with the resume command in MEMORY.md.
-
-# 2. Re-run Elo ladder against the canonical baseline (kill training first, both want GPU):
-python -u eval_elo_ladder.py --combine \
-  data/eval/elo_session33_shard0.json \
-  data/eval/elo_session33_shard1.json \
-  data/eval/elo_session33_shard2.json \
-  data/eval/elo_session33_shard3.json \
-  --out-json /tmp/elo_recheck.json
-# (Pure combine — no new matches needed unless you have new snapshots to add.)
-
-# 3. To add NEW snapshots to the existing ladder (e.g., post-experiment):
-# - Merge all 4 existing shard JSONLs into a single master (see Session 33 STATUS notes)
-# - Copy master to each shard's JSONL slot
-# - Re-launch with --snapshots that include the new ones (resume will skip old pairs)
-```
+### Git
+8 commits. `git log --oneline` for history. All changes tracked.
