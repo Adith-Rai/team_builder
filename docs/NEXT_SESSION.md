@@ -628,22 +628,68 @@ in **FP32** explicitly (`all_summaries.float()` in inference_batcher.py:169). Th
 intentional — FP16 accumulation errors compound across 200 turns of causal attention.
 Summaries stored in history are always FP32.
 
-**Early results (first 2 iters):**
-- Iter 1785: W/L 105/95 (52.5%), entropy=0.845, pi=-0.040, kl=0.041
-- Iter 1786: W/L 105/95 (52.5%), entropy=0.876, pi=-0.111, kl=0.041
-- Entropy healthy (0.84-0.88), no collapse. KL within target.
+**Exp 1 results (215 iters: 1785-1999, measured by Elo ladder):**
+
+Elo result file: `data/eval/elo_session35_exp1.json` (33 players, 528 matchups, 100 games each)
+
+| Era | Mean Elo | Snapshots | vs Previous |
+|-----|----------|-----------|-------------|
+| E4 Stability | 1015 | 2 | — |
+| E7 S32 disruption | 1001 | 5 | -14 |
+| E8 S33 stable | 1003 | 2 | +2 |
+| **E9 Exp1 lam=0.95** | **1019** | **8** | **+16** |
+
+Key: **sp1784 (baseline) = Elo 1003, sp1984 (Exp1 best) = Elo 1028, delta = +25 Elo.**
+Below +50 threshold but **E9 is the highest era mean ever** (1019). 5 of top 8 players
+are Exp 1 snapshots. Improvement rate ~0.12 Elo/iter (8x faster than old 0.014 Elo/iter).
+
+**The trajectory was still climbing when we stopped.** First-half Exp1 mean 1015 → second-half
+1023 = +8 within the run. Self-play win rate still >53% (model still improving vs pool).
+**Training resumed for 500 more iters (2000-2499) to see if trajectory continues.**
+
+**Smart_avg was flat at ~52% across E4-E9** while Elo showed real structure. Smart_avg
+is indicative (trends per-bot are real signal) but saturates — can't resolve 990 vs 1030.
+Elo is the primary metric. Smart_avg is a secondary check.
+
+**CURRENT STATUS: TRAINING RUNNING (iter 2000-2499, same hyperparams)**
+Log: `exp1_lambda095.log` (appending). Run dir: `selfplay_v9_20260410_*/`
+Resume command (if interrupted):
+```bash
+python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
+  --resume <LATEST_SNAPSHOT> --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 50 --n-iters 500 --warmup-iters 0 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  2>&1 | tee -a exp1_lambda095.log
+```
 
 **Monitoring:**
 ```bash
 grep "Iter " exp1_lambda095.log | tail -5     # completed iters
+grep "EVAL:" exp1_lambda095.log | tail -5     # bot eval results
 tail -5 exp1_lambda095.log                     # current activity
 ```
 
-**Decision:** Run Elo ladder after 200 iters. If +50 Elo over snapshot_1784 → hyperparams
-were the bottleneck. If <+30 Elo → proceed to Exp 2.
+**Incremental Elo measurement (new --add-to mode, ~30 min per snapshot):**
+```bash
+python eval_elo_ladder.py \
+  --add-to data/eval/elo_session35_exp1.json \
+  --snapshots data/models/rl_v9/.../snapshot_XXXX.pt \
+  --names spXXXX \
+  --n-games 100 --concurrency 100 --device cuda \
+  --server ws://127.0.0.1:9000/showdown/websocket \
+  --out-json data/eval/elo_session35_updated.json
+```
+Runs only new-player matchups (32 × 100 games), refits BT on all matches. Much faster
+than full round-robin (~30 min vs ~8 hrs).
 
-**Elo ladder also benefits from `--concurrency 50`** (same batcher efficiency gain).
-Previous 93-min run at concurrency=10 should drop to ~25-30 min at 50.
+**Decision (after 500 more iters):** Run Elo via --add-to for a few snapshots (e.g.
+sp2199, sp2499). If total delta ≥+50 Elo over sp1784 → lambda was the lever, continue.
+If still <+50 → proceed to Exp 2 (slot permutation).
+
+**Elo ladder also benefits from `--concurrency 100`** for the eval ladder. Use 100 for
+eval (not training — training uses 50). Single-server only (multi-shard doesn't help
+due to GPU contention on 6GB).
 
 #### Exp 2 — Slot permutation augmentation
 
@@ -891,26 +937,32 @@ These are the questions still genuinely open after Session 33's Elo measurement.
 - **⚠ Don't assume the "700 Elo gap" is real (Session 35 correction).** The VGC-Bench and our
   Elo scales are incompatible. Apples-to-apples gap is ~115 Elo (BCFP +147 above SH vs our
   +32 above SH). Plans premised on "700 Elo gap" were overreacting. See RESEARCH.md §0.5.
-- **Don't skip the lambda fix.** GAE lambda=0.75 is uniquely anomalous — every published
-  system uses 0.95. This should be the FIRST experiment, not BC scaling.
-- **Don't run another Elo ladder until you have something to measure.** N=50 ladder takes
-  ~93 min. Don't burn that to "see if anything changed" — only run it after a meaningful
-  experiment (refactor doesn't count, BC scaling does, PPO from new BC does).
+- **Don't skip the lambda fix.** GAE lambda=0.75 was uniquely anomalous — every published
+  system uses 0.95. **DONE (Session 35 Exp 1): +25 Elo so far, still climbing.**
+- **Don't compare raw Elo numbers across different ladder runs.** Pool composition changes
+  shift absolute ratings. sp1784 was Elo 1032 in Session 33 ladder (38 players) but 1003 in
+  Session 35 ladder (33 players, different composition). **Relative ordering within a ladder
+  is what matters.** Use `--add-to` for consistent incremental measurement.
+- **Smart_avg is indicative but not primary.** Per-bot trends ARE real signal (if Tactical
+  goes from 48% to 57%, that's real improvement). But smart_avg saturates — it was flat at
+  ~52% across E4-E9 while Elo showed E4(1015)→E9(1019) improvement. Use Elo for decisions.
 
 ## Reference files
 
-- `docs/RESEARCH.md` §0 — canonical architecture comparison (Session 33 research findings)
-- `docs/STATUS.md` Session 33 sections (POST-SCRIPT, RESEARCH ROUND, ELO LADDER RESULT, ELO
-  LADDER EXTENDED) — full session narrative top-to-bottom
+- `docs/RESEARCH.md` §0 — canonical architecture comparison (updated Session 35)
+- `docs/STATUS.md` — full session history
 - `docs/CLOUD_DEPLOY.md` — revised cloud plan with decision tree gated on Elo
-- `MEMORY.md` — quick-reference summary, exactly 200 lines, fully loaded each session
-- `memory/feedback_capacity_allocation.md` — Session 33 finding on capacity inversion vs Metamon
-- `memory/project_multigen_plan.md` — multi-gen pipeline TODO (referenced by step c1/c2)
-- `memory/project_not_needed.md` — features the model learns; don't hand-engineer
-- `pokemon-ai-starter/pokemon-ai/src/backups/v9_pre_cloud/` — Session 33 patched source fallback
-- `pokemon-ai-starter/pokemon-ai/src/backups/README.md` — which backup is which
-- `pokemon-ai-starter/pokemon-ai/src/data/eval/elo_session33_EXTENDED_FINAL.json` — canonical
-  Session 33 Elo result (the baseline future experiments are compared against)
+- `memory/MEMORY.md` — quick-reference summary, loaded each session
+- `memory/feedback_session35_audit.md` — S35 audit: lambda, entropy, Elo scale, ff_dim
+- `memory/project_infra_audit.md` — S35 code audit: deferred fixes, cloud readiness
+- `memory/feedback_capacity_allocation.md` — capacity inversion vs Metamon
+- `memory/project_multigen_plan.md` — multi-gen pipeline TODO
+- `data/eval/elo_session35_exp1.json` — **canonical Elo (Session 35, 33 players, 528 matchups)**
+- `data/eval/elo_session33_EXTENDED_FINAL.json` — Session 33 Elo (historical reference)
+- `data/eval/eval_history.csv` — all bot eval results from TensorBoard
+- `data/eval/eras.json` — era definitions (E0-E9) for trajectory analysis
+- `extract_eval_csv.py` — extract eval data from TB to CSV + plots
+- `plot_session35.py` — 3-panel Elo + eval trajectory plot
 
 ---
 
@@ -998,22 +1050,31 @@ deprioritized since the gap it was designed to close is much smaller than believ
 
 ---
 
-## Current state snapshot (as of Session 35 end, 2026-04-09)
+## Current state snapshot (as of Session 35, 2026-04-10)
 
 ### Training state
-- **Training is STOPPED.** Ready for Exp 1 (lambda+entropy fix).
-- **Latest snapshot:** `data/models/rl_v9/selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1032)
-- **Use `train_rl.py`** (not the deleted `rl_train_v9.py`). Resume command in MEMORY.md.
-- **New flags available:** `--lam 0.95` (was 0.75), `--ent-coef 0.02` (was 0.04)
-- **BC training:** `--fp16` now available for ~2x speedup
+- **TRAINING RUNNING.** Exp 1 continuation, iters 2000-2499. `--lam 0.95 --ent-coef 0.02`.
+- Log: `exp1_lambda095.log`. Run dir: `selfplay_v9_20260410_*/`
+- **Exp 1 result so far:** +25 Elo (sp1784=1003 → sp1984=1028). Still climbing. 500 more iters.
+- Resume command in MEMORY.md if interrupted.
 
 ### Key checkpoints
-- `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` — **BC base, Elo 806.**
-- `selfplay_v9_20260408_042048/snapshot_1784.pt` — **latest, Elo 1032.**
+- `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` — **BC base, Elo 818.**
+- `selfplay_v9_20260408_042048/snapshot_1784.pt` — **pre-Exp1 baseline, Elo 1003.**
+- `selfplay_v9_20260409_080620/snapshot_1984.pt` — **Exp1 best so far, Elo 1028.**
+- `selfplay_v9_20260410_001804/snapshot_1999.pt` — **Exp1 last measured, Elo 1021.**
 
 ### Key data
-- `data/eval/elo_session33_EXTENDED_FINAL.json` — canonical Elo baseline (38 players, 703 matches)
+- `data/eval/elo_session35_exp1.json` — **canonical Elo (33 players, 528 matchups, 100 games)**
+- `data/eval/eval_history.csv` — bot eval history from all TensorBoard logs
+- `data/eval/eras.json` — era definitions E0-E9
 - Existing memmaps (human_v8, memmap_v8) are stale (move=107, switch=28). Regenerate before BC scaling.
 
 ### Git
-9 commits. `git log --oneline` for history. All changes tracked.
+`git log --oneline` for history. All Session 35 changes tracked.
+
+### Tools added this session
+- `extract_eval_csv.py` — TensorBoard eval → CSV + trend plots
+- `plot_session35.py` — 3-panel combined Elo + eval trajectory
+- `run_elo_shards.sh` — parallel Elo shard launcher
+- `eval_elo_ladder.py --add-to` — incremental Elo measurement (~30 min per new snapshot)
