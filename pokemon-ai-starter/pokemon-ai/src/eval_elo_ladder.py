@@ -704,6 +704,241 @@ def combine_shards(shard_paths: List[str], anchor_bot: str, anchor_elo: float,
         print(f"Saved combined results to {out_json}")
 
 
+def _add_to_existing(args):
+    """Add new player(s) to an existing Elo ladder JSON.
+
+    Loads all previous matches from the existing JSON, adds the new snapshot(s)
+    specified by --snapshots/--names, runs ONLY the matchups involving new players
+    vs all existing players, then refits BT on the combined match set.
+
+    Usage:
+        python eval_elo_ladder.py --add-to data/eval/elo_session35_exp1.json \
+            --snapshots path/to/new_snapshot.pt --names sp2099 \
+            --n-games 100 --concurrency 100 --device cuda \
+            --server ws://127.0.0.1:9000/showdown/websocket \
+            --out-json data/eval/elo_updated.json
+    """
+    import time
+    from datetime import datetime as _dt
+    from itertools import combinations
+
+    # Load existing ladder
+    with open(args.add_to) as f:
+        existing = json.load(f)
+
+    existing_players = existing["players"]
+    existing_matches = existing["matches"]
+    existing_names = {p["name"] for p in existing_players}
+
+    print(f"Loaded existing ladder: {len(existing_players)} players, "
+          f"{len(existing_matches)} matches from {args.add_to}", flush=True)
+
+    # Build new player specs from --snapshots / --names
+    if not args.snapshots:
+        print("ERROR: --add-to requires --snapshots (the new player(s) to add)", file=sys.stderr)
+        sys.exit(1)
+
+    new_names = args.names if args.names else [Path(p).stem for p in args.snapshots]
+    assert len(new_names) == len(args.snapshots), "--names must match --snapshots count"
+
+    new_players = []
+    for path, name in zip(args.snapshots, new_names):
+        if name in existing_names:
+            print(f"  SKIP: {name} already in ladder", flush=True)
+            continue
+        new_players.append(PlayerSpec(name=name, kind="snapshot", ckpt=path))
+        print(f"  NEW: {name} ({path})", flush=True)
+
+    if not new_players:
+        print("No new players to add. Exiting.", flush=True)
+        return
+
+    # Build combined player list
+    all_player_specs = []
+    for p in existing_players:
+        if p["kind"] == "snapshot":
+            all_player_specs.append(PlayerSpec(name=p["name"], kind="snapshot", ckpt=p["ckpt"]))
+        else:
+            all_player_specs.append(PlayerSpec(name=p["name"], kind="bot", ckpt=None))
+    all_player_specs.extend(new_players)
+
+    name_to_idx = {sp.name: i for i, sp in enumerate(all_player_specs)}
+
+    # Only run matchups involving new players vs all existing players
+    new_pairs = []
+    for new_p in new_players:
+        ni = name_to_idx[new_p.name]
+        for existing_p in all_player_specs:
+            if existing_p.name == new_p.name:
+                continue
+            ei = name_to_idx[existing_p.name]
+            i, j = min(ni, ei), max(ni, ei)
+            new_pairs.append((i, j))
+
+    # Also add pairs between new players if multiple
+    if len(new_players) > 1:
+        for a, b in combinations([name_to_idx[p.name] for p in new_players], 2):
+            new_pairs.append((min(a, b), max(a, b)))
+
+    print(f"\nNew matchups to run: {len(new_pairs)} "
+          f"({len(new_players)} new player(s) vs {len(all_player_specs) - len(new_players)} existing)",
+          flush=True)
+
+    # Set up player pool and run matches
+    server_cfg = resolve_server(args.server)
+    pool = PlayerPool(
+        max_snapshots=args.max_snapshots_in_pool,
+        server_cfg=server_cfg,
+        device=args.device,
+        concurrency=args.concurrency,
+        battle_format=args.format,
+    )
+
+    # Start with existing matches
+    matches = list(existing_matches)
+    wins = {}
+    game_counts = {}
+    for m in existing_matches:
+        wins[(m['p1'], m['p2'])] = m['p1_wins']
+        wins[(m['p2'], m['p1'])] = m['p2_wins']
+        game_counts[(m['p1'], m['p2'])] = m['total']
+        game_counts[(m['p2'], m['p1'])] = m['total']
+
+    # JSONL for incremental saves
+    jsonl_path = jsonl_path_for(args.out_json) if args.out_json else None
+    already_done = set()
+    if jsonl_path and jsonl_path.exists():
+        prev, already_done = load_existing_matches(jsonl_path)
+        if prev:
+            print(f"  RESUME: {len(prev)} matches from {jsonl_path}", flush=True)
+            for m in prev:
+                key = tuple(sorted([m['p1'], m['p2']]))
+                if key not in {tuple(sorted([em['p1'], em['p2']])) for em in existing_matches}:
+                    matches.append(m)
+                    wins[(m['p1'], m['p2'])] = m['p1_wins']
+                    wins[(m['p2'], m['p1'])] = m['p2_wins']
+                    game_counts[(m['p1'], m['p2'])] = m['total']
+                    game_counts[(m['p2'], m['p1'])] = m['total']
+
+    def _log(msg):
+        print(f"[{_dt.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    t_start = time.time()
+    pairs_to_run = [(i, j) for (i, j) in new_pairs
+                    if tuple(sorted([all_player_specs[i].name, all_player_specs[j].name]))
+                    not in already_done]
+    _log(f"=== Running {len(pairs_to_run)} new matchups ({len(new_pairs) - len(pairs_to_run)} already done) ===")
+
+    completed = 0
+    try:
+        for pi, (i, j) in enumerate(pairs_to_run):
+            a, b = all_player_specs[i], all_player_specs[j]
+            elapsed = time.time() - t_start
+            eta = ((elapsed / max(completed, 1)) * (len(pairs_to_run) - pi)) if completed > 0 else 0
+            _log(f"[{pi+1}/{len(pairs_to_run)}] {a.name} vs {b.name}  "
+                 f"(elapsed {elapsed/60:.1f}m, ETA {eta/60:.1f}m)")
+            try:
+                p_a = pool.get(a)
+                p_b = pool.get(b)
+                pool.reset_for_matchup(p_a, p_b)
+
+                t_match = time.time()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_battle_pair(
+                        p_a, p_b, args.n_games,
+                        timeout=max(600, args.n_games * 12)
+                    ))
+                finally:
+                    loop.close()
+                match_elapsed = time.time() - t_match
+
+                w1, w2 = p_a.n_won_battles, p_b.n_won_battles
+                ties = p_a.n_tied_battles
+                total = w1 + w2 + ties
+                r = {
+                    "p1": a.name, "p2": b.name,
+                    "p1_kind": a.kind, "p2_kind": b.kind,
+                    "p1_wins": w1, "p2_wins": w2, "ties": ties, "total": total,
+                    "p1_wr": w1 / max(1, total),
+                    "elapsed": round(match_elapsed, 1),
+                }
+            except Exception as e:
+                _log(f"  [ERROR] match failed: {e}")
+                continue
+
+            matches.append(r)
+            wins[(a.name, b.name)] = r["p1_wins"]
+            wins[(b.name, a.name)] = r["p2_wins"]
+            game_counts[(a.name, b.name)] = r["total"]
+            game_counts[(b.name, a.name)] = r["total"]
+            completed += 1
+            _log(f"  -> {r['p1_wins']}-{r['p2_wins']} (ties:{r['ties']}) "
+                 f"| {r['p1_wr']:.0%} | {r['elapsed']:.0f}s")
+            append_match_to_jsonl(jsonl_path, r)
+    finally:
+        _log(f"=== Done: {completed} new matchups in {(time.time()-t_start)/60:.1f}m ===")
+        pool.cleanup()
+
+    # Refit BT on ALL matches (existing + new)
+    all_names = [sp.name for sp in all_player_specs]
+    print(f"\nFitting Bradley-Terry on {len(matches)} total matches "
+          f"({len(existing_matches)} existing + {completed} new)...", flush=True)
+    pi_hat = fit_bradley_terry(all_names, wins, game_counts)
+    elos_result = pi_to_elo(pi_hat, anchor_name=args.anchor_bot, anchor_elo=args.anchor_elo)
+
+    print(f"Bootstrapping CIs ({args.n_bootstrap} iters)...", flush=True)
+    cis_result = bootstrap_elo_cis(matches, all_names, n_bootstrap=args.n_bootstrap,
+                                   anchor_name=args.anchor_bot, anchor_elo=args.anchor_elo)
+
+    # Print results
+    print(f"\n{'='*72}")
+    print(f"  ELO LADDER  (updated with {len(new_players)} new player(s), "
+          f"anchored to {args.anchor_bot}={args.anchor_elo:.0f})")
+    print(f"{'='*72}\n")
+
+    rows = sorted(elos_result.items(), key=lambda x: -x[1])
+    print(f"{'Rank':>5}  {'Player':<28}  {'Elo':>6}  {'95% CI':>14}  {'Type':<5}  {'New'}")
+    print("-" * 80)
+    new_name_set = {p.name for p in new_players}
+    for rank, (name, elo) in enumerate(rows, 1):
+        ci = cis_result.get(name, (elo, elo, elo))
+        spec = next(sp for sp in all_player_specs if sp.name == name)
+        kind = "snap" if spec.kind == "snapshot" else "bot"
+        marker = " <-- NEW" if name in new_name_set else ""
+        print(f"  #{rank:>2}  {name:<28}  {elo:>6.0f}  [{ci[1]:>4.0f}, {ci[2]:>4.0f}]  {kind}  {marker}")
+    print()
+
+    # Save
+    if args.out_json:
+        out = {
+            "config": {
+                "added_to": args.add_to,
+                "n_games": args.n_games,
+                "anchor_bot": args.anchor_bot,
+                "anchor_elo": args.anchor_elo,
+                "n_bootstrap": args.n_bootstrap,
+                "n_matchups": len(matches),
+                "n_players": len(all_player_specs),
+                "new_players": [p.name for p in new_players],
+            },
+            "players": [
+                {"name": sp.name, "kind": sp.kind,
+                 "ckpt": sp.ckpt if sp.kind == "snapshot" else None}
+                for sp in all_player_specs
+            ],
+            "elos": {n: round(e, 1) for n, e in elos_result.items()},
+            "cis": {n: {"median": round(c[0], 1), "lo95": round(c[1], 1), "hi95": round(c[2], 1)}
+                    for n, c in cis_result.items()},
+            "matches": matches,
+        }
+        Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.out_json, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Saved updated results to {args.out_json}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Snapshot Elo ladder + bot anchors")
     p.add_argument("--snapshots", nargs="+", default=None,
@@ -755,12 +990,22 @@ def main():
                    help="Combine multiple shard JSONs into a final Elo ladder. "
                         "Pass shard JSON paths as arguments. Skips tournament; "
                         "just refits BT on the merged win matrix.")
+    p.add_argument("--add-to", default=None,
+                   help="Add new player(s) to an existing Elo JSON. Loads all previous "
+                        "matches, adds --snapshots as new players, runs ONLY matchups "
+                        "involving the new player(s) vs all existing players, refits BT. "
+                        "Much faster than a full round-robin for incremental measurement.")
     args = p.parse_args()
 
     # ---- Combine mode: merge shard JSONs and exit ----
     if args.combine:
         combine_shards(args.combine, args.anchor_bot, args.anchor_elo,
                        args.n_bootstrap, args.out_json)
+        return
+
+    # ---- Add-to mode: add new player(s) to existing ladder ----
+    if args.add_to:
+        _add_to_existing(args)
         return
 
     # ---- Build player list ----
