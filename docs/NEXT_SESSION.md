@@ -651,16 +651,22 @@ are Exp 1 snapshots. Improvement rate ~0.12 Elo/iter (8x faster than old 0.014 E
 is indicative (trends per-bot are real signal) but saturates — can't resolve 990 vs 1030.
 Elo is the primary metric. Smart_avg is a secondary check.
 
-**CURRENT STATUS: TRAINING RUNNING (iter 2000-2499, same hyperparams)**
-Log: `exp1_lambda095.log` (appending). Run dir: `selfplay_v9_20260410_*/`
+**Exp 1 (ent=0.02) result:** Peak at iter 2019 (savg=60%, all-time high). Then entropy
+drifted from 0.84 to 0.52 and evals declined: 60→57→56→53→58→55→53→52. Entropy=0.02
+was too aggressive — productive sharpening initially, then over-sharpening.
+
+**CURRENT STATUS: Exp 1b RUNNING (from iter 2019 peak, ent=0.03, lam=0.95)**
+Log: `exp1b_ent03.log`. Branched from peak snapshot_2019 (savg=60%).
+Tests whether ent=0.03 holds the gains while preventing entropy collapse.
+
 Resume command (if interrupted):
 ```bash
 python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
   --resume <LATEST_SNAPSHOT> --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
   --games-per-iter 200 --max-concurrent 50 --n-iters 500 --warmup-iters 0 \
-  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.03 --grad-accum 1 \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
-  2>&1 | tee -a exp1_lambda095.log
+  2>&1 | tee -a exp1b_ent03.log
 ```
 
 **Monitoring:**

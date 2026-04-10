@@ -69,9 +69,17 @@
       "id": "E9",
       "name": "S35 Exp 1 (lam=0.95, ent=0.02)",
       "iter_lo": 1785,
-      "iter_hi": 99999,
+      "iter_hi": 2020,
       "color": "#b3ffb3",
-      "description": "Session 35 Exp 1: lambda fixed from 0.75 to 0.95, entropy reduced from 0.04 to 0.02, max-concurrent bumped to 50. Self-play win rate jumped from ~49-50% to ~55%. Smart_avg flat at ~52% but smart_avg was also flat across E4-E8 while Elo climbed. Elo measurement pending."
+      "description": "Session 35 Exp 1: lambda=0.95, ent=0.02. Elo +25 over baseline (sp1984=1028 vs sp1784=1003). Eval floor rose 49->53%, ceiling 56->60%. But entropy drifted from 0.84 to 0.52 and evals declined from peak 60% back to 52% by iter ~2150. Entropy too low. Peak at iter 2019 (savg=60%)."
+    },
+    {
+      "id": "E10",
+      "name": "S35 Exp 1b (lam=0.95, ent=0.03)",
+      "iter_lo": 2020,
+      "iter_hi": 99999,
+      "color": "#99ff99",
+      "description": "Session 35 Exp 1b: restarted from E9 peak (snapshot_2019, savg=60%) with ent bumped to 0.03 to arrest entropy decline. Lambda=0.95 retained. Testing whether 0.03 holds the gains while preventing over-sharpening."
     }
   ]
 }
