@@ -347,6 +347,10 @@ def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
         writer.add_scalar("eval/Tactical", tac, it)
         writer.add_scalar("eval/Strategic", stra, it)
 
+        # Persist to registry (fire-and-forget)
+        from registry import log_eval
+        log_eval(it, str(run_dir), sh, smd, tac, stra, smart_avg)
+
         if smart_avg > best_eval_wr:
             best_eval_wr = smart_avg
     except Exception as e:
@@ -416,6 +420,10 @@ def main():
     print(f"FP16: {'ON' if args.fp16 else 'OFF'}, Compile: {'ON' if compiled else 'OFF'}, "
           f"Pipeline: {'ON' if args.pipeline else 'OFF'}, Device: {device}")
     print(f"Snapshot pool: {len(snapshot_pool)} checkpoints\n", flush=True)
+
+    # Register this run (fire-and-forget)
+    from registry import log_run
+    log_run(str(run_dir), config, start_iter, start_iter + args.n_iters - 1)
 
     # Training state
     best_eval_wr = 0.0

@@ -938,6 +938,24 @@ def _add_to_existing(args):
             json.dump(out, f, indent=2)
         print(f"Saved updated results to {args.out_json}")
 
+    # Persist Elo results to registry (fire-and-forget)
+    try:
+        from registry import log_elo
+        import re as _re
+        bot_set = {sp.name for sp in all_player_specs if sp.kind == "bot"}
+        ladder_name = Path(args.out_json).stem if args.out_json else "add_to"
+        for name, elo_val in elos_result.items():
+            if name in bot_set:
+                continue
+            ci = cis_result.get(name, (elo_val, elo_val, elo_val))
+            m = _re.search(r'(\d{3,4})', name)
+            it = int(m.group(1)) if m else (0 if name == "BC_base" else -1)
+            ckpt = next((sp.ckpt for sp in all_player_specs if sp.name == name), None)
+            log_elo(it, name, elo_val, ci[1], ci[2], ladder_name,
+                    n_games=args.n_games, ckpt=ckpt)
+    except Exception as e:
+        print(f"  [WARN] Registry Elo logging failed: {e}", flush=True)
+
 
 def main():
     p = argparse.ArgumentParser(description="Snapshot Elo ladder + bot anchors")
@@ -1291,6 +1309,25 @@ def main():
         with open(args.out_json, "w") as f:
             json.dump(out, f, indent=2)
         print(f"Saved results to {args.out_json}")
+
+    # Persist Elo results to registry (fire-and-forget)
+    if not is_shard:
+        try:
+            from registry import log_elo
+            import re as _re
+            bot_names_set = {sp.name for sp in players if sp.kind == "bot"}
+            ladder_name = Path(args.out_json).stem if args.out_json else "unnamed"
+            for name, elo_val in elos.items():
+                if name in bot_names_set:
+                    continue
+                ci = cis.get(name, (elo_val, elo_val, elo_val))
+                m = _re.search(r'(\d{3,4})', name)
+                it = int(m.group(1)) if m else (0 if name == "BC_base" else -1)
+                ckpt = next((sp.ckpt for sp in players if sp.name == name), None)
+                log_elo(it, name, elo_val, ci[1], ci[2], ladder_name,
+                        n_games=args.n_games, ckpt=ckpt)
+        except Exception as e:
+            print(f"  [WARN] Registry Elo logging failed: {e}", flush=True)
 
 
 if __name__ == "__main__":
