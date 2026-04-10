@@ -1078,3 +1078,28 @@ deprioritized since the gap it was designed to close is much smaller than believ
 - `plot_session35.py` — 3-panel combined Elo + eval trajectory
 - `run_elo_shards.sh` — parallel Elo shard launcher
 - `eval_elo_ladder.py --add-to` — incremental Elo measurement (~30 min per new snapshot)
+- `registry.py` — fire-and-forget append helpers for persistent data registry
+- `build_registry.py` — rebuild registry from scratch (safety net)
+
+### Persistent data registry
+
+All training runs, bot evals, and Elo measurements are **automatically** saved to
+`data/eval/registry/` in JSONL format. No manual action needed during training.
+
+| File | Updated by | Contents |
+|------|-----------|----------|
+| `runs.jsonl` | train_rl.py (auto at start) | Run configs: lam, ent, lr, iter range, etc. |
+| `evals.jsonl` | train_rl.py (auto every 20 iters) | SH%, SD%, Tac%, Str%, smart_avg% per eval |
+| `elos.jsonl` | eval_elo_ladder.py (auto after BT fit) | Elo, CI, ladder source per snapshot |
+| `eras.json` | Manual edit | Era definitions (id, iter range, color, description) |
+
+If the registry gets out of sync: `python build_registry.py` rebuilds from scratch.
+Scans all run dirs, TensorBoard logs, and Elo JSONs — nothing lost if source data exists.
+
+### Session handover checklist (for future sessions)
+
+1. Read `docs/NEXT_SESSION.md` top-to-bottom (this file)
+2. Check training status: `grep "Iter " exp1_lambda095.log | tail -5`
+3. Check registry: `python build_registry.py --print-summary`
+4. Check `data/eval/eras.json` — add new era if training regime changed
+5. Check `memory/MEMORY.md` for current state summary
