@@ -1,0 +1,77 @@
+{
+  "_comment": "Canonical training eras for the Elo trajectory analysis. Edit this file to update era boundaries or add new eras as the project progresses. Used by analyze_elo_trajectory.py.",
+  "eras": [
+    {
+      "id": "E0",
+      "name": "BC base (init)",
+      "iter_lo": 0,
+      "iter_hi": 1,
+      "color": "#cccccc",
+      "description": "BC starting point. Init-from for all v9 PPO runs."
+    },
+    {
+      "id": "E1",
+      "name": "Pre-fix early PPO collapse",
+      "iter_lo": 1,
+      "iter_hi": 280,
+      "color": "#ffcccc",
+      "description": "Early PPO before type effectiveness features. Model actively degraded vs BC due to wrong optimization signal."
+    },
+    {
+      "id": "E2-3",
+      "name": "Type+Switch eff breakthrough",
+      "iter_lo": 280,
+      "iter_hi": 340,
+      "color": "#ccffcc",
+      "description": "Session 30 breakthrough: type effectiveness features added (+~190 Elo gain), switch effectiveness + floor fix added shortly after."
+    },
+    {
+      "id": "E4",
+      "name": "Stability patches era",
+      "iter_lo": 340,
+      "iter_hi": 700,
+      "color": "#ccddff",
+      "description": "Post-breakthrough steady climb. NaN abort, -100 masking, ent_coef tuning, KL gate. Many minor fixes, generally stable."
+    },
+    {
+      "id": "E5",
+      "name": "KL gate / old smart_avg peak",
+      "iter_lo": 700,
+      "iter_hi": 724,
+      "color": "#e6ccff",
+      "description": "Iter 699 was the old 'all-time peak' by smart_avg (57%). Elo measurement showed it was actually mid-pack at ~998."
+    },
+    {
+      "id": "E6",
+      "name": "S31 root-cause fixes",
+      "iter_lo": 724,
+      "iter_hi": 940,
+      "color": "#ccddff",
+      "description": "Session 31: FP16 NaN fix, snapshot pool pruning, lr-restart investigation. Stable era with slight improvement."
+    },
+    {
+      "id": "E7",
+      "name": "S32 speed work + tweaks",
+      "iter_lo": 940,
+      "iter_hi": 1500,
+      "color": "#ffd9b3",
+      "description": "Session 32: batched temporal, pipeline, snapshot pool overhauls, lr-restart events, adaptive entropy experiments, reward shaping changes. MULTIPLE DISRUPTIVE TWEAKS — caused -13 Elo regression vs E6."
+    },
+    {
+      "id": "E8",
+      "name": "S33 terminal reward (stable)",
+      "iter_lo": 1500,
+      "iter_hi": 1785,
+      "color": "#ccddff",
+      "description": "Session 33: terminal reward locked in, no more reward experiments, stable training. Recovered from S32 regression and slightly exceeded E6 best. Snapshot 1784 was Elo 1032 (all-time high at the time)."
+    },
+    {
+      "id": "E9",
+      "name": "S35 Exp 1 (lam=0.95, ent=0.02)",
+      "iter_lo": 1785,
+      "iter_hi": 99999,
+      "color": "#b3ffb3",
+      "description": "Session 35 Exp 1: lambda fixed from 0.75 to 0.95, entropy reduced from 0.04 to 0.02, max-concurrent bumped to 50. Self-play win rate jumped from ~49-50% to ~55%. Smart_avg flat at ~52% but smart_avg was also flat across E4-E8 while Elo climbed. Elo measurement pending."
+    }
+  ]
+}
