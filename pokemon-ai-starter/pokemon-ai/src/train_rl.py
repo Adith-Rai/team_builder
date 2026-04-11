@@ -467,11 +467,6 @@ def main():
         pending_collection = None
         wr = wins / max(1, wins + losses + ties)
 
-        # ---- Start background collection for next iter ----
-        mp_bg_collector = _start_background_collection(
-            args, model, device, server_pool, snapshot_pool,
-            collect_args, bg_collector, mp_bg_collector, in_warmup, _flow)
-
         # ---- PPO Update ----
         _flow("building PPO episodes")
         episodes = build_ppo_episodes(trajs, gamma=args.gamma, lam=args.lam)
@@ -524,9 +519,19 @@ def main():
                 ent_coef = max(ent_coef * 0.95, 0.01)
                 print(f"  [ENT] High ({loss_info['ent']:.3f}), ent_coef → {ent_coef:.4f}")
 
-        # ---- Snapshot + Eval ----
+        # ---- Snapshot (before background collection so new snapshot is in pool) ----
         _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
                              wr, best_eval_wr, snapshot_pool, run_dir)
+
+        # ---- Start background collection for next iter ----
+        # Moved here from before PPO update so that the latest snapshot is in the
+        # pool when background collection begins. Previously, background collection
+        # started before snapshot save, so the model never fought its most recent self.
+        mp_bg_collector = _start_background_collection(
+            args, model, device, server_pool, snapshot_pool,
+            collect_args, bg_collector, mp_bg_collector, in_warmup, _flow)
+
+        # ---- Eval (runs while background collection is in progress) ----
         best_eval_wr = _maybe_eval(it, args, model, cfg, optimizer, device, writer,
                                     run_dir, best_eval_wr, battle_format)
 
