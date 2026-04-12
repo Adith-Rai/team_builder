@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Concrete TODO Order
 
-**Last updated: 2026-04-09 (Session 34 end — major refactor complete)**
+**Last updated: 2026-04-12 (Session 36 — post-crash catch-up, Exp 1c analytics)**
 
 This file is the canonical "if you're starting a new session, do these things in this order"
 reference. **It is intentionally self-contained** — a future session reading only this file
@@ -11,20 +11,44 @@ If you read nothing else, **read this top-to-bottom, then `docs/RESEARCH.md` §0
 
 ---
 
-## Where things stand right now (Session 34 end)
+## Where things stand right now (Session 36 — 2026-04-12)
 
-- **Training is STOPPED** at `selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1032).
-- **Elo measurement DONE.** Canonical: `data/eval/elo_session33_EXTENDED_FINAL.json`
-  (38 players, 703 matches). BC_base 806 → snapshot_1784 1032 = +226 Elo.
-- **Session 34 MAJOR REFACTOR COMPLETE.** All v8/v9 suffixes removed, monolith decomposed,
-  code deduplicated, dead code removed, multi-gen plumbing added, git initialized.
-  See "Session 34 refactor" section below for full details.
-- **Resilience patches in place** in `ppo.py` (`n_succeeded`/`n_failed`) and `train_rl.py`
-  (FATAL guard at zero-PPO, snapshot save gate).
-- **`eval_elo_ladder.py`** has --format flag, PlayerPool with LRU cache, JSONL save/resume.
-- **Git repo initialized** at project root. 8 commits. Use `git log --oneline` for history.
-- **Stale memmaps**: existing memmaps have move_cont_dim=107, switch_cont_dim=28 (pre-type-eff).
-  Current code expects 109/30. dataset.py auto-pads, but regenerate before BC scaling.
+- **Training INTERRUPTED** by Windows BSOD at 2026-04-12 17:04. Crash was kernel WMI bug
+  (bugcheck 0x00000164), NOT GPU/VRAM. Machine has recurring BSODs (Apr 4, 8, 12).
+  NVIDIA nvlddmkm errors logged repeatedly. **Action: update GPU drivers, uninstall MSI
+  bloatware (Dragon Center/NBFoundation).**
+- **Exp 1c (lam=0.95, ent=0.02)** was the active run. 425 iters completed (2120-2544).
+  Last good checkpoint: `selfplay_v9_20260411_115905/snapshot_2539.pt`.
+  Corrupted: `snapshot_2544.pt.tmp` (needs deletion). Atomic writes protected the data.
+- **Three hyperparameter experiments completed** (see "Exp 1/1b/1c results" below):
+  - Exp 1: lam=0.95, ent=0.02, iters 1789-2019. +25 Elo. Peak at iter 2019 then entropy decline.
+  - Exp 1b: lam=0.95, ent=0.03, iters 2020-2230. Entropy stabilized but overshot (~1.06).
+  - Exp 1c: lam=0.95, ent=0.02, iters 2120-2544. Best consistency. Plateau at savg ~54.6.
+- **Analytics script:** `src/analyze_experiments.py` — full comparison of all experiments
+  with per-bot stats, rolling averages, consistency analysis, correlations.
+- **Hyperparameter experiments are DONE.** Mean savg raised from 52.4 (Exp 1) to 54.6
+  (Exp 1b/1c). Entropy stable at ~0.85. No further gains from ent tuning. Next: Exp 2
+  (slot permutation) or Exp 3 (recency-weighted pool).
+- **Elo measurement DONE (Session 35).** Canonical: `data/eval/elo_session35_exp1.json`
+  (33 players, 528 matchups, 100 games). sp1784=1003 → sp1984=1028 = +25 Elo.
+- **Session 34 refactor DONE.** All v8/v9 suffixes removed, monolith decomposed, git initialized.
+- **Stale memmaps**: move_cont_dim=107, switch_cont_dim=28 (expects 109/30). Auto-padded.
+
+### Run history (Sessions 35-36)
+
+| Run | Registry | Experiment | ent | Iters | Log | Notes |
+|-----|----------|-----------|-----|-------|-----|-------|
+| 35-36 | Exp 1 | lam=0.95 | 0.02 | 1789-2019 | exp1_lambda095.log | +25 Elo, peak savg 60% at 2019, then entropy decline |
+| 37-38 | Exp 1b | lam=0.95 | 0.03 | 2020-2230 | exp1b_ent03.log | Entropy recovered but overshot to 1.06, SP win% declining |
+| 39 | **Exp 1c** | lam=0.95 | **0.02** | 2120-2544 | **exp1c_ent02_from2119.log** | Best run. Stable entropy. Crashed at iter 2544 |
+
+### Key checkpoints
+
+- BC_base: `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` (Elo 806)
+- Pre-Exp1 baseline: `selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1003)
+- Exp1 best: `selfplay_v9_20260409_080620/snapshot_1984.pt` (Elo 1028)
+- Exp1b branch: `selfplay_v9_20260410_201319/snapshot_2119.pt` (branched to Exp 1c)
+- **Exp1c latest (resume from here):** `selfplay_v9_20260411_115905/snapshot_2539.pt`
 
 ## The Session 33 Elo result — read this carefully
 
@@ -655,28 +679,70 @@ Elo is the primary metric. Smart_avg is a secondary check.
 drifted from 0.84 to 0.52 and evals declined: 60→57→56→53→58→55→53→52. Entropy=0.02
 was too aggressive — productive sharpening initially, then over-sharpening.
 
-**CURRENT STATUS: Exp 1b RUNNING (from iter 2019 peak, ent=0.03, lam=0.95)**
-Log: `exp1b_ent03.log`. Branched from peak snapshot_2019 (savg=60%).
-Tests whether ent=0.03 holds the gains while preventing entropy collapse.
+**Exp 1b (ent=0.03) result:** Branched from iter 2019 peak. Ran 210 iters (2020-2230).
+Entropy recovered and stabilized (0.77→1.06) but OVERSHOT — became too exploratory.
+SP win% was actually declining (-3.6/100it). Mean savg=54.6 (good) but std=1.4.
+Decision: ent=0.03 too high, switch back to ent=0.02 from a point with healthy entropy.
 
-Resume command (if interrupted):
+**Exp 1c (ent=0.02, from iter 2119) — BEST RUN. Completed 425 iters (2120-2544).**
+Resumed from Exp 1b's snapshot_2119 (where entropy was healthy at ~0.93) with ent=0.02.
+Log: `exp1c_ent02_from2119.log`. Crashed at iter 2544 (Windows BSOD, not training bug).
+
+**Exp 1c analytics (from `analyze_experiments.py`):**
+
+Cross-experiment comparison (smart_avg):
+```
+                           Experiment    N   Mean   Std    Min    Max   <52%   >=56%
+  Pre-Exp (lam=0.75, ent=0.04)          9   52.9   1.6   50.2   55.0   33%     0%
+  Exp 1 (lam=0.95, ent=0.02)           11   52.4   1.9   48.8   56.4   45%     9%
+  Exp 1b (lam=0.95, ent=0.03)          10   54.6   1.4   52.5   57.2    0%    20%
+  Exp 1c (lam=0.95, ent=0.02)          21   54.6   2.0   50.8   58.4   10%    29%
+```
+
+Per-bot means across experiments:
+```
+       Bot       Pre-Exp    Exp 1     Exp 1b    Exp 1c
+       SH        55.8±3.0   52.9±4.0  56.8±3.4  56.1±3.3
+       SmartDmg  53.5±3.1   52.9±2.9  54.6±3.7  55.3±3.3   ← most improved
+       Tactical  50.5±2.0   52.0±3.9  53.6±3.0  54.1±3.9   ← was weakest, now solid
+       Strategic 52.0±3.8   51.6±4.1  53.4±3.3  53.0±3.6   ← stubborn, still weakest
+```
+
+Key findings:
+- **+2.2 savg** over Pre-Exp/Exp 1 — real, sustained across 21 eval points
+- **0% evals below 50%** (vs 9% Exp 1), only 10% below 52% (vs 45% Exp 1)
+- **SH: 13 consecutive evals at 55+** (iters 2199-2439) — longest hot streak ever
+- **Tactical: transformed** from 50.5 mean/44% dips to 54.1 mean/5% dips
+- **Strategic: still weakest** (24% below 50, 4 consecutive dips at 2159-2219), but
+  improved in second half (mean 51.5→54.3)
+- **Entropy stable at ~0.85** (no drift, no collapse). Solved the Exp 1 entropy problem.
+- **Flat trend** (-0.23/100it). Plateau reached — not declining, not climbing.
+- **Bot correlations (Exp 1c):** SH-SmartDmg mildly correlated (r=0.35), Tactical
+  negatively correlated with SH (r=-0.19), Strategic uncorrelated with everything.
+- **Last 50-100 iters were the strongest self-play window:** SP win% 55.0-55.4,
+  52-54% of iters at >=55%. Eval dips at 2519/2539 were noise, not decline.
+
+**CONCLUSION: Hyperparameter experiments (Exp 1/1b/1c) DONE.** Lambda fix from 0.75→0.95
+was the main lever (+25 Elo confirmed). Entropy tuning (0.02→0.03→0.02) found the sweet
+spot: start with healthy entropy from Exp 1b, then maintain with ent=0.02. No further
+gains available from ent tuning. **Proceed to Exp 2 (slot permutation) or Exp 3
+(recency-weighted pool).**
+
+Resume command (if continuing Exp 1c):
 ```bash
+# DELETE snapshot_2544.pt.tmp first!
+rm data/models/rl_v9/selfplay_v9_20260411_115905/snapshot_2544.pt.tmp
+
 python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
-  --resume <LATEST_SNAPSHOT> --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
+  --resume data/models/rl_v9/selfplay_v9_20260411_115905/snapshot_2539.pt \
+  --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
   --games-per-iter 200 --max-concurrent 50 --n-iters 500 --warmup-iters 0 \
-  --reward-style terminal --lam 0.95 --ent-coef 0.03 --grad-accum 1 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
-  2>&1 | tee -a exp1b_ent03.log
+  2>&1 | tee -a exp1c_ent02_from2119.log
 ```
 
-**Monitoring:**
-```bash
-grep "Iter " exp1_lambda095.log | tail -5     # completed iters
-grep "EVAL:" exp1_lambda095.log | tail -5     # bot eval results
-tail -5 exp1_lambda095.log                     # current activity
-```
-
-**Incremental Elo measurement (new --add-to mode, ~30 min per snapshot):**
+**Incremental Elo measurement (--add-to mode, ~30 min per snapshot):**
 ```bash
 python eval_elo_ladder.py \
   --add-to data/eval/elo_session35_exp1.json \
@@ -686,35 +752,67 @@ python eval_elo_ladder.py \
   --server ws://127.0.0.1:9000/showdown/websocket \
   --out-json data/eval/elo_session35_updated.json
 ```
-Runs only new-player matchups (32 × 100 games), refits BT on all matches. Much faster
-than full round-robin (~30 min vs ~8 hrs).
 
-**Decision (after 500 more iters):** Run Elo via --add-to for a few snapshots (e.g.
-sp2199, sp2499). If total delta ≥+50 Elo over sp1784 → lambda was the lever, continue.
-If still <+50 → proceed to Exp 2 (slot permutation).
+**Decision: proceed to Exp 2 + Exp 3 (REVISED).** Hyperparameter experiments raised
+the plateau but didn't break through. Session 36 research (web + literature review)
+found that (a) our Exp 3 plan of 70/30 recency weighting is suboptimal — PFSP is
+strictly better and proven in AlphaStar, and (b) slot permutation is strongly supported
+by equivariance theory (E2GN2, NeurIPS 2024: 10x sample efficiency from equivariance).
 
-**Elo ladder also benefits from `--concurrency 100`** for the eval ladder. Use 100 for
-eval (not training — training uses 50). Single-server only (multi-shard doesn't help
-due to GPU contention on 6GB).
+**Starting checkpoint: `snapshot_2539.pt`** (latest good). Rationale:
+- Last 50 iters had strongest SP win% (55.4, 54% of iters at >=55%, only 8% below 50%)
+- Entropy healthy at 0.86 — no need to branch from an earlier "healthier" point
+- Eval dips at 2519/2539 were noise (training signal was strong underneath)
+- Largest pool (847 checkpoints) — more opponents for PFSP to weight
+- snapshot_2379 (peak rm3=56.8) is 160 iters behind with a smaller pool — not worth reverting
+- We're changing the training dynamics (PFSP + augmentation) so eval at the old regime
+  is less relevant than having the strongest underlying policy + biggest pool
 
 #### Exp 2 — Slot permutation augmentation
 
-Randomly shuffle the 6 ally entity tokens and 6 opponent entity tokens in `build_turn_batch()`.
-Similarly shuffle 4 move tokens within each Pokemon. Preserves active-slot marking. This is
-free regularization — the model should be permutation-invariant over team slot order.
+**What it is:** During training only, randomly shuffle the order of bench Pokemon (slots
+1-5) and moves within each Pokemon (4 moves per mon). Active mon stays at slot 0.
+This is data augmentation — the model sees more orderings of the same game state.
 
-**Implementation sketch** (in `features.py:build_turn_batch()`):
+**Why it helps (concrete):** Our bench Pokemon are sorted by species name in
+`features.py:_get_sorted_bench()`. This means Garchomp is ALWAYS at a specific position
+relative to other team members. The model can memorize "the Pokemon at position 3 is
+usually Garchomp, so attend to position 3 for ground coverage" instead of learning the
+general rule "attend to whichever entity provides ground coverage." Shuffling forces
+content-based attention instead of position-based memorization.
+
+Self-attention in our spatial transformer IS mathematically permutation-equivariant over
+input tokens — but the fixed input ordering breaks this in practice because the model
+can learn position-dependent biases through training. Augmentation restores the symmetry.
+
+**Evidence:**
+- E2GN2 (NeurIPS 2024): 10x sample efficiency from equivariance in multi-agent settings.
+  Architectural equivariance > augmentation, but augmentation is cheap and our entity
+  tokenization already handles most of the symmetry.
+- No Pokemon-specific paper tests slot permutation. This is our own experiment.
+- CONJECTURE: Expected +5-15 Elo. Could be more if position memorization is a bigger
+  bottleneck than we think. Could be near-zero if entity tokenization already forces
+  content-based attention. We'll know in 200 iters.
+
+**Downsides:**
+- Slight training noise increase (same state seen in different orderings = noisier gradients)
+- If the model has learned useful positional heuristics (e.g., "slot 1 is the fastest
+  bench mon" via species sort), shuffling destroys those. But these are spurious
+  correlations — they don't generalize to new teams. Net positive.
+- Zero compute overhead (permutation is O(6) per sample).
+
+**Implementation** (in `features.py:build_turn_batch()`):
 ```python
 # After building the 6-pokemon feature arrays, before packing into tensors:
 import random
 if training:  # only during training, not inference
-    # Shuffle ally team order (slots 1-5, keep slot 0 = active)
+    # Shuffle ally bench order (slots 1-5, keep slot 0 = active)
     ally_perm = [0] + random.sample(range(1, 6), 5)
     our_pokemon_ids = our_pokemon_ids[ally_perm]
     our_pokemon_cont = our_pokemon_cont[ally_perm]
     # ... same for banks, mcont
 
-    # Shuffle opponent team order (same pattern)
+    # Shuffle opponent bench order (same pattern)
     opp_perm = [0] + random.sample(range(1, 6), 5)
     # ... same for opp arrays
 
@@ -725,9 +823,12 @@ if training:  # only during training, not inference
         move_cont[i] = move_cont[i][move_perm]
 ```
 
-**Key constraint:** active Pokemon MUST stay at index 0 (the model uses position 0 for
-the active mon). Bench Pokemon (indices 1-5) can be freely permuted. Move order within
-each Pokemon can be freely permuted.
+**Key constraints:**
+- Active Pokemon MUST stay at index 0 (model uses position 0 for active mon)
+- Bench Pokemon (indices 1-5) can be freely permuted
+- Move order within each Pokemon can be freely permuted
+- Switch action targets (switch_slots) must be permuted with the SAME permutation as
+  bench Pokemon, so "switch to slot 2" still maps to the correct Pokemon after shuffling
 
 **Where to add the `training` flag:** `build_turn_batch()` is called from both RL
 (rl_player.py — training) and eval (battle_agent.py — inference). Add a `training=False`
@@ -736,16 +837,180 @@ parameter, pass `training=True` from rl_player.py only.
 **Also apply in BC training:** the collate path in dataset.py should also shuffle. Add
 permutation in `collate_seq()` or in `MemmapDataset.__getitem__()` with a `training` flag.
 
-Implementation: ~2 hours. Run 200 iters on top of Exp 1, measure.
+Implementation: ~2 hours. Run jointly with Exp 3.
 
-#### Exp 3 — Recency-weighted pool sampling
+#### Exp 3 (REVISED) — PFSP opponent sampling (replaces recency-weighted pool)
 
-Change opponent sampling from uniform to: 70% from last 200 checkpoints, 30% from older.
+**What it is:** Replace uniform random opponent sampling with Prioritized Fictitious
+Self-Play (PFSP). Instead of `random.sample(pool, 15)`, weight each pool checkpoint by
+how hard it is for the current model to beat, then sample proportionally.
 
-**Implementation** (in `rl_collection.py` or wherever opponents are sampled):
+**Why it helps (concrete):** Our pool has 847 checkpoints. With uniform sampling, 15
+opponents per iter means each iter samples ~1.8% of the pool. Most of those 847 are
+from early training (iters 0-1000) when the model was weak. The current model beats
+those easily — training against them produces near-zero learning signal (the model
+already knows how to beat them). PFSP focuses training compute on the opponents that
+are actually challenging.
+
+Current sampling code (`rl_collection.py:76`):
 ```python
-# Instead of: selected = random.sample(snapshot_pool, max_opponents)
-# Do:
+selected = random.sample(snapshot_pool, max_opponents)  # pure uniform
+```
+
+This is the single most wasteful thing in our training pipeline. Every serious self-play
+system since AlphaStar (2019) uses prioritized sampling.
+
+**Evidence:**
+- AlphaStar (Nature 2019): PFSP is the core of their league training. Priority function
+  `f(x) = (1-x)^p` weights harder opponents higher. Used in all three agent types
+  (main, main exploiter, league exploiter).
+- VGC-Bench (AAMAS 2026): Uses Double Oracle (a PSRO variant with Nash-weighted
+  opponent selection). Outperforms uniform fictitious play.
+- Self-play survey (Aug 2024): Explicitly identifies opponent sampling as a key lever.
+  PFSP strictly dominates both uniform and recency-weighted approaches.
+- The original Exp 3 plan (70% recent, 30% old) was a crude approximation of what PFSP
+  does properly. Recency is a weak proxy for difficulty — some old checkpoints may
+  still be hard (different style), some recent ones may be easy (similar style).
+
+**Downsides:**
+- Need to track win rates vs pool checkpoints. This adds bookkeeping but the data is
+  already partially available (each iter logs per-opponent results like `sp1784=7/14`).
+- Cold start: new checkpoints have no win-rate estimate. Solution: initialize at 50%
+  (assume even match) and update after first encounter.
+- Staleness: win rates shift as the model improves. Solution: use exponential moving
+  average or only count recent encounters (last 5-10 meetings).
+- Risk of exploitation narrowing: if the model only trains vs hard opponents, it might
+  forget how to beat easy ones. Mitigation: keep a small fraction (10-20%) of random
+  uniform samples alongside PFSP-weighted samples.
+
+**Implementation** (in `rl_collection.py`):
+```python
+# Replace uniform sampling with PFSP
+# win_rates: dict mapping checkpoint_path -> EMA win rate (maintained across iters)
+# Default 0.5 for unseen checkpoints
+
+def pfsp_sample(snapshot_pool, win_rates, n_opponents, uniform_frac=0.15):
+    \"\"\"Sample opponents using PFSP weighting + uniform safety margin.\"\"\"
+    n_uniform = max(1, int(n_opponents * uniform_frac))
+    n_pfsp = n_opponents - n_uniform
+
+    # PFSP weights: harder opponents get higher weight
+    # f(x) = (1 - win_rate)^2  (AlphaStar uses p=2 for main agent)
+    weights = []
+    for sp in snapshot_pool:
+        wr = win_rates.get(sp, 0.5)
+        weights.append((1.0 - wr) ** 2)
+    total = sum(weights)
+    probs = [w / total for w in weights]
+
+    # Weighted sample without replacement
+    pfsp_selected = np.random.choice(
+        len(snapshot_pool), size=min(n_pfsp, len(snapshot_pool)),
+        replace=False, p=probs
+    )
+    selected = [snapshot_pool[i] for i in pfsp_selected]
+
+    # Add uniform random for diversity / anti-forgetting
+    remaining = [sp for sp in snapshot_pool if sp not in selected]
+    if remaining and n_uniform > 0:
+        selected += random.sample(remaining, min(n_uniform, len(remaining)))
+
+    return selected
+
+# After each iter, update win_rates from per-opponent results:
+# ema_rate = 0.3 (weight recent encounters more)
+# win_rates[opp] = (1 - ema_rate) * win_rates[opp] + ema_rate * (wins / games)
+```
+
+**Always include latest snapshot** in the sample (existing behavior, keep it).
+
+Implementation: ~3 hours (sampling + win-rate tracking + EMA updates). Run jointly
+with Exp 2 for 200 iters, then measure.
+
+#### Why implement Exp 2 + Exp 3 together
+
+These changes are orthogonal:
+- Exp 2 changes HOW the model sees each game state (augmented input)
+- Exp 3 changes WHICH opponents it trains against (harder ones)
+
+Running them together is fine because:
+1. Neither requires the other as a baseline
+2. Both are cheap to implement (<1 day total)
+3. Combined measurement (200 iters + Elo) tells us if cheap fixes work
+4. If combined gain is large, we can ablate later to understand which contributed
+5. If combined gain is small, we know to move to Exp 5 (capacity reallocation)
+
+The 70/30 recency approach from the old Exp 3 is superseded. Do NOT implement it.
+
+#### Exp 4 — Elo measurement after Exp 2+3
+
+Run incremental Elo via `--add-to` for snapshot_2539 (pre-experiment baseline) and
+2-3 post-experiment snapshots. ~30 min each via `eval_elo_ladder.py --add-to`.
+
+**Decision criteria:**
+- If total gain >=+30 Elo → cheap fixes working, run 200 more iters
+- If total gain >=+50 Elo → gap substantially closed, proceed to multi-gen (Step c)
+- If total gain <+30 Elo → move to Exp 5 (capacity reallocation)
+
+#### Exp 5 — Capacity reallocation (if Exp 2+3 insufficient)
+
+Redistribute model capacity: spatial 256d/3L → temporal 512d/3L. Requires BC retrain.
+
+**Why this is the right architectural change (concrete):**
+- Metamon allocates 5-8x more capacity to temporal than spatial across ALL model sizes
+  (15M: 100d→512d, 50M: 100d→768d, 200M: 160d→1280d). This isn't arbitrary.
+- OU singles games are 30-60 turns with heavy hidden information. Long-range temporal
+  dependencies (what happened 20 turns ago) dominate per-turn spatial pattern matching.
+- Our 1:1 ratio (384d spatial / 384d temporal) means the temporal model is underweight.
+- Entity tokenization (the breakthrough) lives in the spatial encoder. Shrinking spatial
+  from 384d→256d preserves entity attention — verified in code, the spatial transformer
+  processes entity tokens the same regardless of d_model.
+- Net param count stays ~13M (spatial shrinks, temporal grows).
+
+**Downsides:** Requires BC retrain from scratch (~days), then PPO from new BC base.
+
+### Session 36 research findings (for future reference)
+
+**New landscape information (April 2026 web research):**
+1. **PokeAgent Challenge (NeurIPS 2025)** is now a live benchmark at pokeagentchallenge.com.
+   100+ teams, 650+ community. We could submit for ground-truth Elo against Metamon, Foul
+   Play, and others. Not in previous docs.
+2. **Metamon Kakuna** (57M, Gen9OU) exists but has no published public Elo. Internal only.
+3. **Foul Play** (pure MCTS, no neural net) co-won PokeAgent Track 1 alongside PA-Agent (RL).
+   Validates MIT thesis: "RL alone plateaus but RL+search breaks through."
+4. **No pure RL agent has demonstrated >1800 Gen9 OU on public ladder.** PokeChamp (LLM
+   minimax) gets 1300-1500 but times out 1/3 of games. ps-ppo >1900 is Random Battles only.
+5. **Top human Gen9 OU: 2030-2115 Elo** (Showdown Glicko-1 + GXE).
+6. **EPO (2025)** confirms constant entropy > entropy decay in multi-turn RL. Validates our
+   finding that stable ent=0.02 works.
+7. **"Self-Play Only Evolves When..." (March 2026)** argues sustained improvement requires
+   new learnable signal. PFSP provides this by always presenting challenging opponents.
+
+**Longer-term options (not immediate priority):**
+- **Search (MCTS) at inference time:** Highest-ceiling option per MIT thesis + Foul Play
+  results. Would require opponent modeling + forward sim via battle server. ~1-2 weeks impl.
+  CONJECTURE: could be +200-500 Elo based on MIT result (Rank 8, 1693 Elo with PPO+MCTS
+  in Gen4). Risk: inference latency, imperfect info handling.
+- **PokeAgent Challenge submission:** Ground-truth benchmarking. Low cost (API wrapper).
+- **Scale to 50M+ params:** Metamon uses 57M for Gen9OU. Our 13.38M may be undersized.
+  But requires more BC data + cloud compute. This is the Step c/d path.
+
+**What the docs previously got wrong:**
+- Exp 3 (70/30 recency) was a weak proxy for PFSP. Literature is clear: win-rate
+  weighting > recency weighting. Superseded.
+- The "115 Elo gap" framing (vs VGC-Bench) is an estimate across incompatible scales
+  and formats. The real benchmark should be public ladder or PokeAgent, not cross-scale
+  inference. Treat 115 as directional, not precise.
+- Search was mentioned (MIT thesis) but not prioritized. With Foul Play (pure MCTS)
+  winning PokeAgent, search deserves higher priority than previously documented.
+
+### Old Exp 3 plan (SUPERSEDED — do NOT implement)
+
+~~Change opponent sampling from uniform to: 70% from last 200 checkpoints, 30% from older.~~
+
+```python
+# OLD PLAN — SUPERSEDED BY PFSP (see revised Exp 3 above)
+# Do NOT implement this. PFSP is strictly better.
 recent_cutoff = max(0, len(snapshot_pool) - 200)
 recent = snapshot_pool[recent_cutoff:]
 older = snapshot_pool[:recent_cutoff]
@@ -761,14 +1026,7 @@ if older and n_older > 0:
 signal on weak old policies. Recency weighting focuses learning on current-strength opponents.
 
 Implementation: ~30 min. Run 200 iters on top of Exp 1+2, measure.
-
-#### Exp 4 — Combined Elo measurement
-
-Run Elo ladder after Exp 1-3. Decision:
-- If total gain ≥+80 Elo → gap substantially closed. Proceed to Step (c) multi-gen on the
-  improved training recipe.
-- If total gain <+50 Elo → capacity reallocation needed (Exp 5: spatial 256d/3L → temporal
-  512d/3L, requires BC retrain).
+*(This plan was replaced by PFSP — see revised Exp 3 above.)*
 
 ---
 
