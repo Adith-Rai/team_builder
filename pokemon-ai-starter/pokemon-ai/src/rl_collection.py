@@ -16,6 +16,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from poke_env.ps_client.account_configuration import AccountConfiguration
@@ -44,6 +45,82 @@ def _make_server(ws_url: str) -> ServerConfiguration:
     return ServerConfiguration(ws, http)
 
 
+def pfsp_sample(
+    snapshot_pool: List[str],
+    win_rates: Dict[str, list],
+    n_opponents: int = 15,
+    uniform_frac: float = 0.15,
+    latest_snapshot: Optional[str] = None,
+) -> List[str]:
+    """Select opponents using Prioritized Fictitious Self-Play (PFSP).
+
+    Weights each checkpoint by (1 - win_rate)^2: harder opponents are sampled
+    more often. A fraction of slots are filled by uniform random sampling for
+    anti-forgetting (re-tests opponents with stale ratings).
+
+    Args:
+        snapshot_pool: all available checkpoints
+        win_rates: {checkpoint_path: [wins, games]} — missing = default 0.5
+        n_opponents: total opponents to select
+        uniform_frac: fraction of slots for uniform random (anti-forgetting)
+        latest_snapshot: always include this checkpoint if provided
+
+    Returns:
+        list of selected checkpoint paths (no duplicates)
+    """
+    pool_size = len(snapshot_pool)
+    if pool_size <= n_opponents:
+        return list(snapshot_pool)
+
+    # Compute PFSP weights: (1 - win_rate)^2
+    weights = np.empty(pool_size, dtype=np.float64)
+    for i, sp in enumerate(snapshot_pool):
+        wr_data = win_rates.get(sp)
+        if wr_data and wr_data[1] > 0:
+            wr = wr_data[0] / wr_data[1]
+        else:
+            wr = 0.5  # unknown opponent — assume even match
+        weights[i] = (1.0 - wr) ** 2
+
+    # Prevent all-zero weights (if model wins 100% vs everything)
+    if weights.sum() < 1e-12:
+        weights[:] = 1.0
+
+    probs = weights / weights.sum()
+
+    # Split between PFSP-weighted and uniform
+    n_uniform = max(1, int(n_opponents * uniform_frac))
+    n_pfsp = n_opponents - n_uniform
+
+    # Reserve a slot for latest if needed
+    has_latest = latest_snapshot is not None
+    if has_latest:
+        n_pfsp = max(0, n_pfsp - 1)
+
+    # PFSP weighted sample (without replacement)
+    pfsp_indices = np.random.choice(pool_size, size=min(n_pfsp, pool_size),
+                                    replace=False, p=probs)
+    selected_set = set(pfsp_indices)
+
+    # Uniform random sample from remaining pool
+    remaining = [i for i in range(pool_size) if i not in selected_set]
+    if remaining and n_uniform > 0:
+        uniform_indices = random.sample(remaining, min(n_uniform, len(remaining)))
+        selected_set.update(uniform_indices)
+
+    # Always include latest
+    if has_latest:
+        latest_idx = None
+        for i, sp in enumerate(snapshot_pool):
+            if sp == latest_snapshot:
+                latest_idx = i
+                break
+        if latest_idx is not None:
+            selected_set.add(latest_idx)
+
+    return [snapshot_pool[i] for i in selected_set]
+
+
 async def collect_v9(
     model: PokeTransformer, device: torch.device,
     server_pool: List[ServerConfiguration],
@@ -55,6 +132,7 @@ async def collect_v9(
     latest_snapshot: Optional[str] = None,
     teambuilder=None,
     battle_format: str = "gen9ou",
+    win_rates: Optional[Dict[str, list]] = None,
 ):
     """Pure self-play collection with batched inference.
     Plays against MULTIPLE opponents per iteration (uniform from pool, max 15).
@@ -66,15 +144,17 @@ async def collect_v9(
     if not snapshot_pool:
         raise ValueError("snapshot_pool must contain at least one checkpoint")
 
-    # Select opponents: use ALL if pool is small, sample up to 15 if large.
+    # Select opponents via PFSP (prioritized) or uniform fallback.
     # 15 balances diversity (more opponents = broader training signal) against
     # GPU memory (each opponent loads a separate model copy for inference).
     max_opponents = 15
     if len(snapshot_pool) <= max_opponents:
         selected = list(snapshot_pool)
+    elif win_rates is not None:
+        selected = pfsp_sample(snapshot_pool, win_rates, max_opponents,
+                               uniform_frac=0.15, latest_snapshot=latest_snapshot)
     else:
         selected = random.sample(snapshot_pool, max_opponents)
-        # Always include the latest snapshot
         if latest_snapshot and latest_snapshot not in selected:
             selected[-1] = latest_snapshot
 
@@ -86,6 +166,7 @@ async def collect_v9(
     all_trajs = []
     total_wins, total_losses, total_ties, total_steps = 0, 0, 0, 0
     opp_results = []
+    opp_records = {}  # {checkpoint_path: [wins, games]} for PFSP update
     t0 = time.time()
 
     # --- Parallel opponent collection ---
@@ -153,7 +234,7 @@ async def collect_v9(
         _cancel_listener(opponent)
         del player, opponent
 
-        return trajs, w, l, ties, f"{short}={w}/{w+l}"
+        return trajs, w, l, ties, f"{short}={w}/{w+l}", opp_ckpt
 
     # Build opponent tasks
     opp_tasks = []
@@ -186,12 +267,19 @@ async def collect_v9(
             if isinstance(result, Exception):
                 print(f"  [ERROR] Wave opponent failed: {result}", flush=True)
                 continue
-            trajs, w, l, ties, summary = result
+            trajs, w, l, ties, summary, ckpt_path = result
             all_trajs.extend(trajs)
             total_wins += w
             total_losses += l
             total_ties += ties
             opp_results.append(summary)
+            # Track per-opponent results for PFSP win rate updates
+            games = w + l
+            if games > 0:
+                rec = opp_records.get(ckpt_path, [0, 0])
+                rec[0] += w
+                rec[1] += games
+                opp_records[ckpt_path] = rec
 
         # Print batcher profiling for this wave
         prof = batcher.prof_summary()
@@ -204,7 +292,7 @@ async def collect_v9(
     opp_summary = " ".join(opp_results)
     gc.collect()
 
-    return all_trajs, total_wins, total_losses, total_ties, total_steps, opp_summary, elapsed
+    return all_trajs, total_wins, total_losses, total_ties, total_steps, opp_summary, elapsed, opp_records
 
 
 class BackgroundCollector:
@@ -221,8 +309,9 @@ class BackgroundCollector:
         self._error = None
         self.cpu_inference = cpu_inference
 
-    def start(self, model, device, server_pool, snapshot_pool, args_dict):
+    def start(self, model, device, server_pool, snapshot_pool, args_dict, win_rates=None):
         """Start background collection with a deepcopy of the model."""
+        self._win_rates = win_rates
         collect_model = deepcopy(model)
 
         # CPU inference: move model copy to CPU, zero GPU contention with PPO
@@ -243,12 +332,12 @@ class BackgroundCollector:
         self._thread = threading.Thread(
             target=self._run,
             args=(collect_model, collect_device, collect_fp16, collect_opp_device,
-                  server_pool, snapshot_pool, args_dict),
+                  server_pool, snapshot_pool, args_dict, self._win_rates),
             daemon=True,
         )
         self._thread.start()
 
-    def _run(self, collect_model, device, fp16, opp_device, server_pool, snapshot_pool, a):
+    def _run(self, collect_model, device, fp16, opp_device, server_pool, snapshot_pool, a, win_rates):
         try:
             loop = asyncio.new_event_loop()
             latest_sp = snapshot_pool[-1] if len(snapshot_pool) > 1 else None
@@ -264,6 +353,7 @@ class BackgroundCollector:
                     opponent_device=opp_device,
                     latest_snapshot=latest_sp,
                     teambuilder=a.get("teambuilder"),
+                    win_rates=win_rates,
                 )
             )
             loop.close()

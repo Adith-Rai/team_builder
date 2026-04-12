@@ -1483,12 +1483,56 @@ def _poke_move_ids(p: dict) -> list:
     return [ids["move0"], ids["move1"], ids["move2"], ids["move3"]]
 
 
-def build_turn_batch(feat: dict, device=None) -> dict:
+def _permute_team(team: list) -> list:
+    """Randomly permute bench slots (1-5) of a 6-pokemon team list.
+
+    Slot 0 (active) is never moved. Returns a new list (does not mutate input).
+    Also randomly permutes the 4 move features within each pokemon's continuous
+    vector (the last 92 dims = 4 moves × 23 features each).
+    """
+    import random
+
+    import copy
+
+    # Permute bench order (shallow copy team, deep copy each pokemon dict)
+    perm = [0] + random.sample(range(1, 6), 5)
+    team = [copy.deepcopy(team[i]) for i in perm]
+
+    # Permute move order within each pokemon's entity features
+    for p in team:
+        cont = p.get("continuous")
+        move_ids_key = "move_ids"
+        if cont is None:
+            continue
+        # Move features are the last N_MOVE_SLOTS * MOVE_CONT_PER_SLOT dims of continuous
+        n_move_dims = N_MOVE_SLOTS * MOVE_CONT_PER_SLOT  # 4 * 23 = 92
+        base = len(cont) - n_move_dims
+        if base < 0:
+            continue
+        move_perm = random.sample(range(N_MOVE_SLOTS), N_MOVE_SLOTS)
+        # Permute continuous move features
+        new_cont = list(cont[:base])
+        for mi in move_perm:
+            src = base + mi * MOVE_CONT_PER_SLOT
+            new_cont.extend(cont[src: src + MOVE_CONT_PER_SLOT])
+        p["continuous"] = new_cont
+        # Permute categorical move IDs (stored as ids["move0"]..ids["move3"])
+        ids = p.get("ids")
+        if ids and "move0" in ids:
+            old = [ids[f"move{i}"] for i in range(N_MOVE_SLOTS)]
+            for i, mi in enumerate(move_perm):
+                ids[f"move{i}"] = old[mi]
+
+    return team
+
+
+def build_turn_batch(feat: dict, device=None, training: bool = False) -> dict:
     """Convert make_features() output to PokeTransformer batch dict.
 
     Args:
         feat: dict from make_features(battle)
         device: torch device (None = CPU tensors, 'cuda' = GPU tensors)
+        training: if True, apply slot permutation augmentation (bench + moves)
 
     Returns:
         dict with all keys expected by PokeTransformer.forward()
@@ -1503,6 +1547,10 @@ def build_turn_batch(feat: dict, device=None) -> dict:
         return _t(data, dtype=torch.float32)
 
     our, opp = feat["our_pokemon"], feat["opp_pokemon"]
+
+    if training:
+        our = _permute_team(list(our))
+        opp = _permute_team(list(opp))
 
     batch = {
         # Pokemon IDs, banks, continuous, move IDs, move continuous

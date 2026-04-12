@@ -179,8 +179,8 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
 
 def _collect_data(args, model, device, server_pool, snapshot_pool,
                   rs_cfg, train_teambuilder, battle_format,
-                  loop, pending_collection, _flow):
-    """Run one collection step. Returns (trajs, wins, losses, ties, steps, opp_name, collect_time)."""
+                  loop, pending_collection, _flow, win_rates=None):
+    """Run one collection step. Returns (trajs, wins, losses, ties, steps, opp_name, collect_time, opp_records)."""
     if pending_collection is not None:
         _flow("using pre-collected data from background")
         result = pending_collection
@@ -191,7 +191,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         from mp_collect_v2 import mp_collect_v2
         model.eval()
         latest_sp = snapshot_pool[-1] if len(snapshot_pool) > 1 else None
-        return mp_collect_v2(
+        mp_result = mp_collect_v2(
             model, device, server_pool,
             n_games=args.games_per_iter,
             max_concurrent=args.max_concurrent,
@@ -204,6 +204,8 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             opponent_device=args.opponent_device,
             batch_timeout_ms=args.batch_timeout_ms,
         )
+        # mp_collect_v2 returns 7-tuple; add empty opp_records for compatibility
+        return mp_result + ({},)
 
     _flow("starting SYNC collection")
     model.eval()
@@ -221,6 +223,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             latest_snapshot=latest_sp,
             teambuilder=train_teambuilder,
             battle_format=battle_format,
+            win_rates=win_rates,
         )
     )
     _flow(f"sync collection done: {result[6]:.0f}s, {len(result[0])} trajs")
@@ -248,7 +251,8 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
         mp_bg_collector.start(model, device, server_pool, snapshot_pool, mp_collect_args)
     elif bg_collector and not in_warmup and not args.mp:
         _flow("starting BACKGROUND collection for next iter")
-        bg_collector.start(model, device, server_pool, snapshot_pool, collect_args)
+        bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
+                           win_rates=collect_args.get("win_rates"))
     return mp_bg_collector
 
 
@@ -404,6 +408,29 @@ def main():
     with open(run_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
+    # PFSP win rate tracking: {checkpoint_path: [wins, games]}
+    # Load from previous run if resuming, otherwise start fresh (all default 0.5)
+    win_rates_path = run_dir / "win_rates.json"
+    win_rates = {}
+    if args.resume:
+        # Try loading from the PREVIOUS run's directory
+        prev_run_dir = Path(args.resume).parent
+        prev_wr = prev_run_dir / "win_rates.json"
+        if prev_wr.exists():
+            try:
+                with open(prev_wr) as f:
+                    win_rates = json.load(f)
+                print(f"  [PFSP] Loaded {len(win_rates)} win rates from {prev_wr}")
+            except Exception as e:
+                print(f"  [PFSP] Failed to load win_rates: {e}, starting fresh")
+    if win_rates_path.exists():
+        try:
+            with open(win_rates_path) as f:
+                win_rates = json.load(f)
+            print(f"  [PFSP] Loaded {len(win_rates)} win rates from {win_rates_path}")
+        except Exception:
+            pass
+
     # Resume
     start_iter = 0
     if args.resume:
@@ -437,6 +464,7 @@ def main():
         "temp_range": (args.temp_min, args.temp_max),
         "opponent_device": args.opponent_device,
         "teambuilder": train_teambuilder,
+        "win_rates": win_rates,
     }
     pending_collection = None
     mp_bg_collector = None
@@ -460,10 +488,12 @@ def main():
             print(f"  Value warmup complete, unfreezing all parameters", flush=True)
 
         # ---- Collect ----
-        trajs, wins, losses, ties, steps, opp_name, collect_time = _collect_data(
+        collect_result = _collect_data(
             args, model, device, server_pool, snapshot_pool,
             rs_cfg, train_teambuilder, battle_format,
-            loop, pending_collection, _flow)
+            loop, pending_collection, _flow, win_rates=win_rates)
+        trajs, wins, losses, ties, steps, opp_name, collect_time = collect_result[:7]
+        opp_records = collect_result[7] if len(collect_result) > 7 else {}
         pending_collection = None
         wr = wins / max(1, wins + losses + ties)
 
@@ -509,6 +539,21 @@ def main():
         # ---- Log + TensorBoard ----
         wr = _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
                        loss_info, opp_name, snapshot_pool, in_warmup)
+
+        # ---- PFSP win rate update ----
+        if opp_records:
+            for ckpt, (w, g) in opp_records.items():
+                rec = win_rates.get(ckpt, [0, 0])
+                rec[0] += w
+                rec[1] += g
+                win_rates[ckpt] = rec
+            # Save periodically (every 5 iters to avoid IO bottleneck)
+            if (it + 1) % 5 == 0:
+                try:
+                    with open(win_rates_path, "w") as f:
+                        json.dump(win_rates, f)
+                except Exception:
+                    pass
 
         # ---- Adaptive entropy ----
         if args.adaptive_entropy and loss_info["ent"] > 0.01:

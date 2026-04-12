@@ -53,7 +53,7 @@ class V9RLPlayer(Player):
     def _build_turn_batch(self, feat: dict) -> dict:
         """Convert make_features() output to PokeTransformer batch dict on self.device."""
         from features import build_turn_batch
-        return build_turn_batch(feat, device=self.device)
+        return build_turn_batch(feat, device=self.device, training=True)
 
     def _to_cpu(self, batch: dict) -> dict:
         out = {}
