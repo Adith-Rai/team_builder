@@ -728,19 +728,19 @@ spot: start with healthy entropy from Exp 1b, then maintain with ent=0.02. No fu
 gains available from ent tuning. **Proceed to Exp 2 (slot permutation) or Exp 3
 (recency-weighted pool).**
 
-Resume command (if continuing Exp 1c):
+Resume command (Exp 2+3: slot permutation + PFSP active):
 ```bash
-# DELETE snapshot_2544.pt.tmp first!
-rm data/models/rl_v9/selfplay_v9_20260411_115905/snapshot_2544.pt.tmp
-
+# snapshot_2544.pt.tmp already deleted (Session 36)
 python -u train_rl.py --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
   --resume data/models/rl_v9/selfplay_v9_20260411_115905/snapshot_2539.pt \
   --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
-  --games-per-iter 200 --max-concurrent 50 --n-iters 500 --warmup-iters 0 \
+  --games-per-iter 200 --max-concurrent 75 --n-iters 500 --warmup-iters 0 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
-  2>&1 | tee -a exp1c_ent02_from2119.log
+  2>&1 | tee exp2_exp3_pfsp.log
 ```
+Slot permutation + PFSP are active automatically (built into features.py and
+rl_collection.py). PFSP warms up over ~50 iters. conc=75 (up from 50).
 
 **Incremental Elo measurement (--add-to mode, ~30 min per snapshot):**
 ```bash
