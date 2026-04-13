@@ -152,12 +152,16 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     start_iter = ckpt.get("iteration", 0) + 1
     pool = ckpt.get("metrics", {}).get("snapshot_pool", snapshot_pool)
 
+    # Normalize all pool paths to forward slashes (fixes Windows \/  duplicates)
+    pool = [p.replace("\\", "/") for p in pool]
+
     # Scan disk for ALL existing snapshots and add to pool
     import glob as _glob, re as _re
     # Snapshots before iter 260 are from the pre-type-effectiveness era
     # (eval 25-44%, suboptimal play). Including them corrupts the value function.
     MIN_SNAPSHOT_ITER = 260
     all_disk = sorted(set(_glob.glob("data/models/rl_v9/selfplay_v9_*/snapshot_*.pt")))
+    all_disk = [p.replace("\\", "/") for p in all_disk]
     def _snap_iter(path):
         m = _re.search(r'snapshot_(\d+)\.pt$', path)
         return int(m.group(1)) if m else 0
@@ -166,9 +170,21 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     new_snaps = [s for s in all_disk if s not in existing]
     if new_snaps:
         pool = new_snaps + pool
+
+    # Deduplicate (same file, different path variants)
+    seen = set()
+    deduped = []
+    for p in pool:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    n_dupes = len(pool) - len(deduped)
+    pool = deduped
+
     print(f"Resumed from {args.resume}, starting at iter {start_iter}, "
           f"pool: {len(pool)} checkpoints (+{len(new_snaps)} from disk scan, "
-          f"filtered sp<{MIN_SNAPSHOT_ITER})", flush=True)
+          f"filtered sp<{MIN_SNAPSHOT_ITER})"
+          f"{f', removed {n_dupes} path duplicates' if n_dupes else ''}", flush=True)
 
     return start_iter, pool
 
@@ -312,10 +328,10 @@ def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
     elif loss_info.get("n_succeeded", 1) == 0:
         print(f"  Snapshot SKIPPED: 0 PPO episodes succeeded (tainted iter)", flush=True)
     else:
-        sp_path = str(run_dir / f"snapshot_{it:04d}.pt")
+        sp_path = str(run_dir / f"snapshot_{it:04d}.pt").replace("\\", "/")
         save_checkpoint(sp_path, model, cfg, optimizer, it, metrics={
             "win_rate": wr, "best_eval_wr": best_eval_wr,
-            "snapshot_pool": snapshot_pool[-500:],
+            "snapshot_pool": snapshot_pool,
         })
         snapshot_pool.append(sp_path)
         print(f"  Snapshot saved: {sp_path} (pool={len(snapshot_pool)})", flush=True)
@@ -430,6 +446,19 @@ def main():
             print(f"  [PFSP] Loaded {len(win_rates)} win rates from {win_rates_path}")
         except Exception:
             pass
+    # Normalize win_rates keys and merge duplicates from path separator issues
+    if win_rates:
+        normalized = {}
+        for k, v in win_rates.items():
+            nk = k.replace("\\", "/")
+            if nk in normalized:
+                normalized[nk][0] += v[0]
+                normalized[nk][1] += v[1]
+            else:
+                normalized[nk] = list(v)
+        if len(normalized) < len(win_rates):
+            print(f"  [PFSP] Merged {len(win_rates) - len(normalized)} duplicate path entries")
+        win_rates = normalized
 
     # Resume
     start_iter = 0
@@ -526,7 +555,7 @@ def main():
             try:
                 emerg = str(run_dir / f"emergency_iter_{it:04d}.pt")
                 save_checkpoint(emerg, model, cfg, optimizer, it, metrics={
-                    "win_rate": wr, "snapshot_pool": snapshot_pool[-500:]})
+                    "win_rate": wr, "snapshot_pool": snapshot_pool})
                 print(f"  [FATAL] Saved: {emerg}", flush=True)
             except Exception as e:
                 print(f"  [FATAL] Save failed: {e}", flush=True)
@@ -543,10 +572,11 @@ def main():
         # ---- PFSP win rate update ----
         if opp_records:
             for ckpt, (w, g) in opp_records.items():
-                rec = win_rates.get(ckpt, [0, 0])
+                nk = ckpt.replace("\\", "/")
+                rec = win_rates.get(nk, [0, 0])
                 rec[0] += w
                 rec[1] += g
-                win_rates[ckpt] = rec
+                win_rates[nk] = rec
             # Save periodically (every 5 iters to avoid IO bottleneck)
             if (it + 1) % 5 == 0:
                 try:
@@ -588,7 +618,7 @@ def main():
     # Final save
     final_path = str(run_dir / "final.pt")
     save_checkpoint(final_path, model, cfg, optimizer, start_iter + args.n_iters - 1,
-                    metrics={"best_eval_wr": best_eval_wr, "snapshot_pool": snapshot_pool[-500:]})
+                    metrics={"best_eval_wr": best_eval_wr, "snapshot_pool": snapshot_pool})
     print(f"\nTraining complete. Final checkpoint: {final_path}", flush=True)
     writer.close()
     loop.close()
