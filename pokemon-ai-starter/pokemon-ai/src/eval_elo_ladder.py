@@ -759,7 +759,12 @@ def _add_to_existing(args):
         if p["kind"] == "snapshot":
             all_player_specs.append(PlayerSpec(name=p["name"], kind="snapshot", ckpt=p["ckpt"]))
         else:
-            all_player_specs.append(PlayerSpec(name=p["name"], kind="bot", ckpt=None))
+            # Look up bot class from registry — needed for instantiation
+            bot_cls = ALL_BOTS.get(p["name"])
+            if bot_cls is None:
+                print(f"  WARN: bot {p['name']} not in ALL_BOTS registry, skipping", flush=True)
+                continue
+            all_player_specs.append(PlayerSpec(name=p["name"], kind="bot", ckpt=None, bot_cls=bot_cls))
     all_player_specs.extend(new_players)
 
     name_to_idx = {sp.name: i for i, sp in enumerate(all_player_specs)}
@@ -780,9 +785,23 @@ def _add_to_existing(args):
         for a, b in combinations([name_to_idx[p.name] for p in new_players], 2):
             new_pairs.append((min(a, b), max(a, b)))
 
-    print(f"\nNew matchups to run: {len(new_pairs)} "
+    full_pair_count = len(new_pairs)
+    print(f"\nNew matchups to run: {full_pair_count} "
           f"({len(new_players)} new player(s) vs {len(all_player_specs) - len(new_players)} existing)",
           flush=True)
+
+    # Optional sharding for parallel runs across multiple servers
+    if args.shard:
+        try:
+            shard_idx, shard_total = (int(x) for x in args.shard.split("/"))
+            assert 0 <= shard_idx < shard_total
+        except Exception:
+            print(f"--shard must be 'i/N' with 0 <= i < N, got {args.shard!r}", file=sys.stderr)
+            sys.exit(1)
+        # Deterministic round-robin partition: pair k goes to shard (k % N)
+        new_pairs = [(i, j) for k, (i, j) in enumerate(new_pairs) if k % shard_total == shard_idx]
+        print(f"Shard {shard_idx}/{shard_total}: {len(new_pairs)} of {full_pair_count} matchups",
+              flush=True)
 
     # Set up player pool and run matches
     server_cfg = resolve_server(args.server)

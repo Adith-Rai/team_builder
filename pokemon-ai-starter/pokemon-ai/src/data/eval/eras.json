@@ -77,9 +77,25 @@
       "id": "E10",
       "name": "S35 Exp 1b (lam=0.95, ent=0.03)",
       "iter_lo": 2020,
-      "iter_hi": 99999,
+      "iter_hi": 2120,
       "color": "#99ff99",
-      "description": "Session 35 Exp 1b: restarted from E9 peak (snapshot_2019, savg=60%) with ent bumped to 0.03 to arrest entropy decline. Lambda=0.95 retained. Testing whether 0.03 holds the gains while preventing over-sharpening."
+      "description": "Session 35 Exp 1b: restarted from E9 peak (snapshot_2019) with ent=0.03. Entropy recovered (0.77->1.06) but overshot — too exploratory. SP win% declining. Ran 210 iters (2020-2230 in log, branched at 2119)."
+    },
+    {
+      "id": "E11",
+      "name": "S36 Exp 1c (lam=0.95, ent=0.02)",
+      "iter_lo": 2120,
+      "iter_hi": 2540,
+      "color": "#b3ffb3",
+      "description": "Session 36 Exp 1c: resumed from Exp 1b snapshot_2119 (healthy entropy ~0.93) with ent=0.02. Best run: savg=54.6, entropy stable ~0.85, 0% evals below 50%. 425 iters. Interrupted by Windows BSOD at iter 2544."
+    },
+    {
+      "id": "E12",
+      "name": "S36 Exp 2+3 (permutation + PFSP)",
+      "iter_lo": 2540,
+      "iter_hi": 99999,
+      "color": "#ffffb3",
+      "description": "Session 36 Exp 2+3: slot permutation augmentation + PFSP opponent sampling. Resumed from Exp 1c snapshot_2539. Path separator bug fixed at iter 2700. KL turbulence 2760-2800 (epoch-0 early stops), recovering by 2810. Eval ~52.8% (below Exp 1c 54.6 baseline, pending recovery)."
     }
   ]
 }
