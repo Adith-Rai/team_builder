@@ -62,7 +62,30 @@ def parse_args():
     p.add_argument("--ppo-epochs", type=int, default=5)
     p.add_argument("--ent-coef", type=float, default=0.02)
     p.add_argument("--adaptive-entropy", action="store_true",
-                   help="Auto-adjust ent_coef to keep entropy in [0.55, 0.80] range")
+                   help="Auto-adjust ent_coef to keep entropy in [low, high] range")
+    p.add_argument("--adaptive-entropy-low", type=float, default=0.65,
+                   help="Raise ent_coef when entropy falls below this (default: 0.65, was 0.55)")
+    p.add_argument("--adaptive-entropy-high", type=float, default=0.95,
+                   help="Lower ent_coef when entropy exceeds this (default: 0.95, was 0.80)")
+    p.add_argument("--adaptive-entropy-max", type=float, default=0.08,
+                   help="Cap for ent_coef under adaptive adjustment (default: 0.08)")
+    p.add_argument("--adaptive-entropy-min", type=float, default=0.01,
+                   help="Floor for ent_coef under adaptive adjustment (default: 0.01)")
+    p.add_argument("--adaptive-entropy-step", type=float, default=0.1,
+                   help="Per-iter multiplicative change to ent_coef (default: 0.1 = ±10%)")
+    # Early stopping (composite: savg + per-bot consensus)
+    p.add_argument("--early-stop", action="store_true",
+                   help="Enable composite early stopping based on eval regression")
+    p.add_argument("--early-stop-patience", type=int, default=3,
+                   help="Consecutive regressing evals required to stop (default: 3)")
+    p.add_argument("--early-stop-savg-threshold", type=float, default=2.0,
+                   help="Minimum savg regression (percent) from best rm3 to count (default: 2.0)")
+    p.add_argument("--early-stop-bot-threshold", type=float, default=3.0,
+                   help="Minimum per-bot regression (percent) from best rm3 to count (default: 3.0)")
+    p.add_argument("--early-stop-bot-count", type=int, default=3,
+                   help="How many of 4 bots must regress (default: 3)")
+    p.add_argument("--early-stop-min-evals", type=int, default=5,
+                   help="Minimum eval points before checking stop condition (default: 5)")
     p.add_argument("--vf-coef", type=float, default=1.0)
     p.add_argument("--target-kl", type=float, default=0.03)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -338,10 +361,17 @@ def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
 
 
 def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
-                best_eval_wr, battle_format):
-    """Run bot evaluation if interval reached. Returns updated best_eval_wr."""
+                best_eval_wr, battle_format, eval_history=None):
+    """Run bot evaluation if interval reached.
+
+    Returns (updated_best_eval_wr, eval_dict or None, should_stop bool).
+    should_stop is True when early stopping condition triggers.
+    """
     if (it + 1) % args.eval_interval != 0:
-        return best_eval_wr
+        return best_eval_wr, None, False
+
+    eval_dict = None
+    should_stop = False
     try:
         tmp = str(run_dir / f"iter_{it:04d}.pt")
         save_checkpoint(tmp, model, cfg, optimizer, it)
@@ -373,9 +403,75 @@ def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
 
         if smart_avg > best_eval_wr:
             best_eval_wr = smart_avg
+
+        eval_dict = {"iter": it, "savg": smart_avg, "SH": sh, "SmartDmg": smd,
+                     "Tactical": tac, "Strategic": stra}
+
+        # ---- Composite early stopping check ----
+        if args.early_stop and eval_history is not None:
+            eval_history.append(eval_dict)
+            should_stop = _check_early_stop(eval_history, args)
     except Exception as e:
         print(f"  [ERROR] Eval failed: {e}", flush=True)
-    return best_eval_wr
+    return best_eval_wr, eval_dict, should_stop
+
+
+def _check_early_stop(eval_history, args):
+    """Composite early stopping: requires BOTH savg AND multi-bot regression.
+
+    Best = max rolling-3 mean from history (smoothed baseline, noise-resistant).
+    Stop if the LAST `patience` RAW evals are ALL below best by threshold,
+    AND at least `bot_count` of 4 bots are regressing on each of those evals.
+
+    A single bad eval followed by recovery won't trigger (raw check resets).
+    Sustained degradation across multiple evals and multiple bots triggers.
+    """
+    if len(eval_history) < args.early_stop_min_evals:
+        return False  # not enough data
+
+    bots = ["SH", "SmartDmg", "Tactical", "Strategic"]
+
+    def rm3(history, key, i):
+        start = max(0, i - 2)
+        window = history[start:i + 1]
+        return sum(e[key] for e in window) / len(window)
+
+    n = len(eval_history)
+    rm3_savg = [rm3(eval_history, "savg", i) for i in range(n)]
+    rm3_bots = {b: [rm3(eval_history, b, i) for i in range(n)] for b in bots}
+
+    best_savg = max(rm3_savg)
+    best_bots = {b: max(rm3_bots[b]) for b in bots}
+
+    patience = args.early_stop_patience
+    if n < patience:
+        return False
+
+    savg_th = args.early_stop_savg_threshold
+    bot_th = args.early_stop_bot_threshold
+    bot_cnt = args.early_stop_bot_count
+
+    # Use RAW recent evals for stop trigger (rolling baseline for best).
+    # Trigger if EITHER:
+    #   (a) savg regressed by threshold AND `bot_cnt` of 4 bots regressing, OR
+    #   (b) savg regressed severely (>2x threshold) — handles specialization cases
+    #       where 2 bots tank while 2 improve (net bad but doesn't meet bot consensus).
+    for i in range(n - patience, n):
+        raw = eval_history[i]
+        raw_savg_bad = raw["savg"] < best_savg - savg_th
+        savg_very_bad = raw["savg"] < best_savg - (2 * savg_th)
+        bot_bad_count = sum(1 for b in bots if raw[b] < best_bots[b] - bot_th)
+        consensus_bad = raw_savg_bad and (bot_bad_count >= bot_cnt)
+        combined_bad = consensus_bad or savg_very_bad
+        if not combined_bad:
+            return False
+
+    # All `patience` recent raw evals show degradation on both signals
+    last_savg = eval_history[-1]["savg"]
+    print(f"  [EARLY STOP] {patience} consecutive raw evals show savg regression >{savg_th:.1f}% "
+          f"AND >={bot_cnt} bots regressing >{bot_th:.1f}%. "
+          f"Best rm3_savg={best_savg:.1f}, last raw savg={last_savg:.1f}", flush=True)
+    return True
 
 
 # =============================
@@ -497,6 +593,7 @@ def main():
     }
     pending_collection = None
     mp_bg_collector = None
+    eval_history = []  # list of eval dicts for early-stopping check
 
     # ---- Training loop ----
     for it in range(start_iter, start_iter + args.n_iters):
@@ -586,13 +683,22 @@ def main():
                     pass
 
         # ---- Adaptive entropy ----
+        # Raises ent_coef when entropy drops (prevents collapse).
+        # Lowers ent_coef when entropy is too exploratory.
         if args.adaptive_entropy and loss_info["ent"] > 0.01:
-            if loss_info["ent"] < 0.55:
-                ent_coef = min(ent_coef * 1.05, 0.06)
-                print(f"  [ENT] Low ({loss_info['ent']:.3f}), ent_coef → {ent_coef:.4f}")
-            elif loss_info["ent"] > 0.80:
-                ent_coef = max(ent_coef * 0.95, 0.01)
-                print(f"  [ENT] High ({loss_info['ent']:.3f}), ent_coef → {ent_coef:.4f}")
+            low = args.adaptive_entropy_low
+            high = args.adaptive_entropy_high
+            max_coef = args.adaptive_entropy_max
+            min_coef = args.adaptive_entropy_min
+            step = args.adaptive_entropy_step
+            if loss_info["ent"] < low:
+                ent_coef = min(ent_coef * (1.0 + step), max_coef)
+                print(f"  [ENT] Low ({loss_info['ent']:.3f} < {low:.2f}), ent_coef → {ent_coef:.4f}",
+                      flush=True)
+            elif loss_info["ent"] > high:
+                ent_coef = max(ent_coef * (1.0 - step), min_coef)
+                print(f"  [ENT] High ({loss_info['ent']:.3f} > {high:.2f}), ent_coef → {ent_coef:.4f}",
+                      flush=True)
 
         # ---- Snapshot (before background collection so new snapshot is in pool) ----
         _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
@@ -607,8 +713,14 @@ def main():
             collect_args, bg_collector, mp_bg_collector, in_warmup, _flow)
 
         # ---- Eval (runs while background collection is in progress) ----
-        best_eval_wr = _maybe_eval(it, args, model, cfg, optimizer, device, writer,
-                                    run_dir, best_eval_wr, battle_format)
+        best_eval_wr, _, should_stop = _maybe_eval(
+            it, args, model, cfg, optimizer, device, writer,
+            run_dir, best_eval_wr, battle_format,
+            eval_history=eval_history if args.early_stop else None)
+        if should_stop:
+            print(f"\n[EARLY STOP] Terminating at iter {it}. Best snapshots saved; "
+                  f"check evals registry and snapshot_*.pt files in {run_dir}.", flush=True)
+            break
 
         # Memory cleanup
         del trajs, episodes
