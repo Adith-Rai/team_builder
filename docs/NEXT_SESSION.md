@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Concrete TODO Order
 
-**Last updated: 2026-04-12 (Session 36 — post-crash catch-up, Exp 1c analytics)**
+**Last updated: 2026-04-15 (Session 36 — Exp 2+3+4 complete, safeguards added, ready for next phase)**
 
 This file is the canonical "if you're starting a new session, do these things in this order"
 reference. **It is intentionally self-contained** — a future session reading only this file
@@ -11,43 +11,50 @@ If you read nothing else, **read this top-to-bottom, then `docs/RESEARCH.md` §0
 
 ---
 
-## Where things stand right now (Session 36 — 2026-04-12)
+## Where things stand right now (Session 36 end — 2026-04-15)
 
-- **Training INTERRUPTED** by Windows BSOD at 2026-04-12 17:04. Crash was kernel WMI bug
-  (bugcheck 0x00000164), NOT GPU/VRAM. Machine has recurring BSODs (Apr 4, 8, 12).
-  NVIDIA nvlddmkm errors logged repeatedly. **Action: update GPU drivers, uninstall MSI
-  bloatware (Dragon Center/NBFoundation).**
-- **Exp 1c (lam=0.95, ent=0.02)** was the active run. 425 iters completed (2120-2544).
-  Last good checkpoint: `selfplay_v9_20260411_115905/snapshot_2539.pt`.
-  Corrupted: `snapshot_2544.pt.tmp` (needs deletion). Atomic writes protected the data.
-- **Three hyperparameter experiments completed** (see "Exp 1/1b/1c results" below):
-  - Exp 1: lam=0.95, ent=0.02, iters 1789-2019. +25 Elo. Peak at iter 2019 then entropy decline.
-  - Exp 1b: lam=0.95, ent=0.03, iters 2020-2230. Entropy stabilized but overshot (~1.06).
-  - Exp 1c: lam=0.95, ent=0.02, iters 2120-2544. Best consistency. Plateau at savg ~54.6.
-- **Analytics script:** `src/analyze_experiments.py` — full comparison of all experiments
-  with per-bot stats, rolling averages, consistency analysis, correlations.
-- **Hyperparameter experiments are DONE.** Mean savg raised from 52.4 (Exp 1) to 54.6
-  (Exp 1b/1c). Entropy stable at ~0.85. No further gains from ent tuning. Next: Exp 2
-  (slot permutation) or Exp 3 (recency-weighted pool).
-- **Elo measurement DONE (Session 35).** Canonical: `data/eval/elo_session35_exp1.json`
-  (33 players, 528 matchups, 100 games). sp1784=1003 → sp1984=1028 = +25 Elo.
-- **Session 34 refactor DONE.** All v8/v9 suffixes removed, monolith decomposed, git initialized.
+- **Current all-time best checkpoint:** `selfplay_v9_20260413_061236/snapshot_2979.pt` at
+  **Elo 1058** (confirmed by elo_session36_FINAL.json). +30 Elo over Session 35 top (sp1984=1028).
+  **Maybe higher:** sp2999 measurement in progress (~90 min) — had savg=61% peak, likely new best.
+- **Exp 4 (LR refinement)** revealed: lower LR can hit better peaks (sp2999 savg=61% all-time high)
+  but entropy collapse risk is real. Run crashed at iter 3055 via FATAL zero-PPO guard.
+  Entropy collapsed 0.84→0.58 over 70 iters despite PFSP + permutation. Safety mechanisms were OFF.
+- **Safeguards added (Session 36):**
+  - **Adaptive entropy**: raised default thresholds (low=0.65 was 0.55, step=10% was 5%, max=0.08 was 0.06).
+    All configurable via `--adaptive-entropy-{low,high,step,max,min}`. Would have caught Exp 4 collapse.
+  - **Composite early stopping** (`--early-stop`): tracks rolling-3 savg + per-bot. Stops when last
+    `patience` RAW evals show BOTH savg regression AND 3+ bots regressing, OR savg drops >2x threshold
+    (handles specialization). 9 unit tests pass including Exp 4 replay.
+- **Root cause of drift:** PFSP cumulative WR is stale — 12% of training compute was on opponents
+  the model had mastered (recent WR >10% higher than historical cum). Combined with weak ent_coef,
+  this caused specialization → entropy collapse.
+- **All experiments summary:**
+  - Exp 1 (lam 0.75→0.95): +25 Elo
+  - Exp 1b/1c (ent=0.03→0.02): +7 Elo, entropy stable
+  - Exp 2+3 (permutation + PFSP): peak sp2979 at 1058 (+30 over sp1984)
+  - Exp 4 (LR=3e-5, games=400): sp2999 possibly new peak, then collapsed
+- **Elo canonical:** `data/eval/elo_session36_FINAL.json` (52 players, 1326 matches).
+- **Machine stability:** BSODs pattern ended after March, no issues this session.
 - **Stale memmaps**: move_cont_dim=107, switch_cont_dim=28 (expects 109/30). Auto-padded.
 
 ### Run history (Sessions 35-36)
 
-| Run | Registry | Experiment | ent | Iters | Log | Notes |
-|-----|----------|-----------|-----|-------|-----|-------|
-| 35-36 | Exp 1 | lam=0.95 | 0.02 | 1789-2019 | exp1_lambda095.log | +25 Elo, peak savg 60% at 2019, then entropy decline |
-| 37-38 | Exp 1b | lam=0.95 | 0.03 | 2020-2230 | exp1b_ent03.log | Entropy recovered but overshot to 1.06, SP win% declining |
-| 39 | **Exp 1c** | lam=0.95 | **0.02** | 2120-2544 | **exp1c_ent02_from2119.log** | Best run. Stable entropy. Crashed at iter 2544 |
+| Exp | lam | ent | LR | Iters | Notes |
+|-----|-----|-----|------|-------|-------|
+| Exp 1 | 0.95 | 0.02 | 1e-4 | 1789-2019 | +25 Elo, peak savg 60% at 2019, entropy decline after |
+| Exp 1b | 0.95 | 0.03 | 1e-4 | 2020-2230 | Entropy overshot to 1.06, SP win% declining |
+| Exp 1c | 0.95 | 0.02 | 1e-4 | 2120-2544 | Stable entropy, savg ~54.6. BSOD at 2544 |
+| Exp 2+3 | 0.95 | 0.02 | 1e-4 | 2540-3199 | Slot permutation + PFSP. Peak sp2979=1058 Elo. Drifted to 1046 by end |
+| **Exp 4** | 0.95 | 0.02 | **3e-5** | 2980-3054 | LR refinement + 400 games. sp2999 savg=61% (all-time high). **Entropy collapse → FATAL at 3055** |
 
-### Key checkpoints
+### Key checkpoints (with measured Elo)
 
-- BC_base: `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` (Elo 806)
-- Pre-Exp1 baseline: `selfplay_v9_20260408_042048/snapshot_1784.pt` (Elo 1003)
-- Exp1 best: `selfplay_v9_20260409_080620/snapshot_1984.pt` (Elo 1028)
-- Exp1b branch: `selfplay_v9_20260410_201319/snapshot_2119.pt` (branched to Exp 1c)
+- BC_base: `data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt` (Elo 817)
+- Exp1 best: `selfplay_v9_20260409_080620/snapshot_1984.pt` (Elo 1031)
+- Exp 1c final: `selfplay_v9_20260411_115905/snapshot_2539.pt` (Elo 1030)
+- **Exp 2+3 peak (current best): `selfplay_v9_20260413_061236/snapshot_2979.pt` (Elo 1058)**
+- Exp 4 candidate peak: `selfplay_v9_20260415_083340/snapshot_2999.pt` (savg=61%, Elo measuring now)
+- Exp 4 pre-crash: `selfplay_v9_20260415_083340/snapshot_3054.pt` (ent=0.66, collapsing)
 - **Exp1c latest (resume from here):** `selfplay_v9_20260411_115905/snapshot_2539.pt`
 
 ## The Session 33 Elo result — read this carefully
