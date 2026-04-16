@@ -716,11 +716,11 @@ def main():
             step = args.adaptive_entropy_step
             if loss_info["ent"] < low:
                 ent_coef = min(ent_coef * (1.0 + step), max_coef)
-                print(f"  [ENT] Low ({loss_info['ent']:.3f} < {low:.2f}), ent_coef → {ent_coef:.4f}",
+                print(f"  [ENT] Low ({loss_info['ent']:.3f} < {low:.2f}), ent_coef -> {ent_coef:.4f}",
                       flush=True)
             elif loss_info["ent"] > high:
                 ent_coef = max(ent_coef * (1.0 - step), min_coef)
-                print(f"  [ENT] High ({loss_info['ent']:.3f} > {high:.2f}), ent_coef → {ent_coef:.4f}",
+                print(f"  [ENT] High ({loss_info['ent']:.3f} > {high:.2f}), ent_coef -> {ent_coef:.4f}",
                       flush=True)
 
         # ---- Snapshot (before background collection so new snapshot is in pool) ----
