@@ -86,6 +86,15 @@ def parse_args():
                    help="How many of 4 bots must regress (default: 3)")
     p.add_argument("--early-stop-min-evals", type=int, default=5,
                    help="Minimum eval points before checking stop condition (default: 5)")
+    # PFSP win-rate tracking mode
+    p.add_argument("--win-rate-mode", choices=["cumulative", "ema"], default="cumulative",
+                   help="How PFSP tracks opponent win rates. cumulative=all history (default), "
+                        "ema=exponential moving average (forgets old data, fixes staleness)")
+    p.add_argument("--win-rate-ema-alpha", type=float, default=0.3,
+                   help="EMA blend weight for new encounters (default: 0.3). Only used with --win-rate-mode=ema")
+    p.add_argument("--win-rate-ema-window", type=int, default=50,
+                   help="Cap on effective_games in EMA mode (default: 50). "
+                        "Prevents unbounded growth and ensures old data fades.")
     p.add_argument("--vf-coef", type=float, default=1.0)
     p.add_argument("--target-kl", type=float, default=0.03)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
@@ -671,9 +680,23 @@ def main():
             for ckpt, (w, g) in opp_records.items():
                 nk = ckpt.replace("\\", "/")
                 rec = win_rates.get(nk, [0, 0])
-                rec[0] += w
-                rec[1] += g
-                win_rates[nk] = rec
+                if args.win_rate_mode == "ema":
+                    # EMA mode: blend old rate with new batch rate.
+                    # Old rec is stored as [eff_wins, eff_games] representing
+                    # the smoothed rate. effective_games is capped to prevent
+                    # unbounded growth and ensure old data is forgotten.
+                    alpha = args.win_rate_ema_alpha
+                    old_rate = (rec[0] / rec[1]) if rec[1] > 0 else 0.5
+                    batch_rate = (w / g) if g > 0 else 0.5
+                    new_rate = (1.0 - alpha) * old_rate + alpha * batch_rate
+                    # Cap effective games at ema_window (default 50) so old data fades.
+                    eff_games = min(rec[1] + g, args.win_rate_ema_window)
+                    win_rates[nk] = [new_rate * eff_games, eff_games]
+                else:
+                    # Cumulative (default): just add wins and games
+                    rec[0] += w
+                    rec[1] += g
+                    win_rates[nk] = rec
             # Save periodically (every 5 iters to avoid IO bottleneck)
             if (it + 1) % 5 == 0:
                 try:
