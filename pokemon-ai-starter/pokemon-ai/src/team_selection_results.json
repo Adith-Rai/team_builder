@@ -1,0 +1,1126 @@
+{
+  "ranking": [
+    {
+      "rank": 1,
+      "team": "TEAM_AU",
+      "SH": 86.0,
+      "SmartDmg": 82.0,
+      "Tactical": 76.0,
+      "Strategic": 70.0,
+      "savg": 78.5
+    },
+    {
+      "rank": 2,
+      "team": "TEAM_T",
+      "SH": 88.0,
+      "SmartDmg": 76.0,
+      "Tactical": 74.0,
+      "Strategic": 72.0,
+      "savg": 77.5
+    },
+    {
+      "rank": 3,
+      "team": "TEAM_G",
+      "SH": 74.0,
+      "SmartDmg": 72.0,
+      "Tactical": 86.0,
+      "Strategic": 76.0,
+      "savg": 77.0
+    },
+    {
+      "rank": 4,
+      "team": "TEAM_B",
+      "SH": 74.0,
+      "SmartDmg": 84.0,
+      "Tactical": 68.0,
+      "Strategic": 74.0,
+      "savg": 75.0
+    },
+    {
+      "rank": 5,
+      "team": "TEAM_C",
+      "SH": 80.0,
+      "SmartDmg": 84.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 74.0,
+      "savg": 73.5
+    },
+    {
+      "rank": 6,
+      "team": "TEAM_O",
+      "SH": 78.0,
+      "SmartDmg": 80.0,
+      "Tactical": 74.0,
+      "Strategic": 62.0,
+      "savg": 73.5
+    },
+    {
+      "rank": 7,
+      "team": "TEAM_AZ",
+      "SH": 78.0,
+      "SmartDmg": 74.0,
+      "Tactical": 66.0,
+      "Strategic": 72.0,
+      "savg": 72.5
+    },
+    {
+      "rank": 8,
+      "team": "TEAM_BK",
+      "SH": 74.0,
+      "SmartDmg": 78.0,
+      "Tactical": 66.0,
+      "Strategic": 72.0,
+      "savg": 72.5
+    },
+    {
+      "rank": 9,
+      "team": "TEAM_BJ",
+      "SH": 72.0,
+      "SmartDmg": 72.0,
+      "Tactical": 70.0,
+      "Strategic": 72.0,
+      "savg": 71.5
+    },
+    {
+      "rank": 10,
+      "team": "TEAM_BE",
+      "SH": 72.0,
+      "SmartDmg": 62.0,
+      "Tactical": 74.0,
+      "Strategic": 76.0,
+      "savg": 71.0
+    },
+    {
+      "rank": 11,
+      "team": "TEAM_Y",
+      "SH": 70.0,
+      "SmartDmg": 78.0,
+      "Tactical": 70.0,
+      "Strategic": 64.0,
+      "savg": 70.5
+    },
+    {
+      "rank": 12,
+      "team": "TEAM_BA",
+      "SH": 82.0,
+      "SmartDmg": 66.0,
+      "Tactical": 72.0,
+      "Strategic": 62.0,
+      "savg": 70.5
+    },
+    {
+      "rank": 13,
+      "team": "TEAM_W",
+      "SH": 70.0,
+      "SmartDmg": 70.0,
+      "Tactical": 76.0,
+      "Strategic": 64.0,
+      "savg": 70.0
+    },
+    {
+      "rank": 14,
+      "team": "TEAM_BB",
+      "SH": 84.0,
+      "SmartDmg": 64.0,
+      "Tactical": 64.0,
+      "Strategic": 68.0,
+      "savg": 70.0
+    },
+    {
+      "rank": 15,
+      "team": "TEAM_AX",
+      "SH": 64.0,
+      "SmartDmg": 86.0,
+      "Tactical": 70.0,
+      "Strategic": 57.99999999999999,
+      "savg": 69.5
+    },
+    {
+      "rank": 16,
+      "team": "TEAM_A",
+      "SH": 72.0,
+      "SmartDmg": 64.0,
+      "Tactical": 72.0,
+      "Strategic": 68.0,
+      "savg": 69.0
+    },
+    {
+      "rank": 17,
+      "team": "TEAM_V",
+      "SH": 74.0,
+      "SmartDmg": 72.0,
+      "Tactical": 64.0,
+      "Strategic": 64.0,
+      "savg": 68.5
+    },
+    {
+      "rank": 18,
+      "team": "TEAM_AQ",
+      "SH": 86.0,
+      "SmartDmg": 68.0,
+      "Tactical": 74.0,
+      "Strategic": 46.0,
+      "savg": 68.5
+    },
+    {
+      "rank": 19,
+      "team": "TEAM_BQ",
+      "SH": 78.0,
+      "SmartDmg": 66.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 72.0,
+      "savg": 68.5
+    },
+    {
+      "rank": 20,
+      "team": "TEAM_H",
+      "SH": 72.0,
+      "SmartDmg": 70.0,
+      "Tactical": 62.0,
+      "Strategic": 68.0,
+      "savg": 68.0
+    },
+    {
+      "rank": 21,
+      "team": "TEAM_E",
+      "SH": 62.0,
+      "SmartDmg": 70.0,
+      "Tactical": 68.0,
+      "Strategic": 70.0,
+      "savg": 67.5
+    },
+    {
+      "rank": 22,
+      "team": "TEAM_BC",
+      "SH": 66.0,
+      "SmartDmg": 66.0,
+      "Tactical": 68.0,
+      "Strategic": 70.0,
+      "savg": 67.5
+    },
+    {
+      "rank": 23,
+      "team": "TEAM_BF",
+      "SH": 78.0,
+      "SmartDmg": 66.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 67.5
+    },
+    {
+      "rank": 24,
+      "team": "TEAM_I",
+      "SH": 64.0,
+      "SmartDmg": 72.0,
+      "Tactical": 60.0,
+      "Strategic": 68.0,
+      "savg": 66.0
+    },
+    {
+      "rank": 25,
+      "team": "TEAM_AF",
+      "SH": 68.0,
+      "SmartDmg": 70.0,
+      "Tactical": 52.0,
+      "Strategic": 74.0,
+      "savg": 66.0
+    },
+    {
+      "rank": 26,
+      "team": "TEAM_AK",
+      "SH": 68.0,
+      "SmartDmg": 74.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 64.0,
+      "savg": 66.0
+    },
+    {
+      "rank": 27,
+      "team": "TEAM_AM",
+      "SH": 78.0,
+      "SmartDmg": 60.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 66.0
+    },
+    {
+      "rank": 28,
+      "team": "TEAM_AY",
+      "SH": 70.0,
+      "SmartDmg": 78.0,
+      "Tactical": 62.0,
+      "Strategic": 54.0,
+      "savg": 66.0
+    },
+    {
+      "rank": 29,
+      "team": "TEAM_P",
+      "SH": 68.0,
+      "SmartDmg": 62.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 74.0,
+      "savg": 65.0
+    },
+    {
+      "rank": 30,
+      "team": "TEAM_N",
+      "SH": 66.0,
+      "SmartDmg": 66.0,
+      "Tactical": 64.0,
+      "Strategic": 62.0,
+      "savg": 64.5
+    },
+    {
+      "rank": 31,
+      "team": "TEAM_BG",
+      "SH": 64.0,
+      "SmartDmg": 82.0,
+      "Tactical": 48.0,
+      "Strategic": 57.99999999999999,
+      "savg": 63.0
+    },
+    {
+      "rank": 32,
+      "team": "TEAM_BN",
+      "SH": 62.0,
+      "SmartDmg": 64.0,
+      "Tactical": 60.0,
+      "Strategic": 66.0,
+      "savg": 63.0
+    },
+    {
+      "rank": 33,
+      "team": "TEAM_K",
+      "SH": 57.99999999999999,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 72.0,
+      "Strategic": 57.99999999999999,
+      "savg": 61.5
+    },
+    {
+      "rank": 34,
+      "team": "TEAM_J",
+      "SH": 66.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 62.0,
+      "Strategic": 57.99999999999999,
+      "savg": 61.0
+    },
+    {
+      "rank": 35,
+      "team": "TEAM_AC",
+      "SH": 60,
+      "SmartDmg": 66,
+      "Tactical": 56,
+      "Strategic": 62,
+      "savg": 61.0
+    },
+    {
+      "rank": 36,
+      "team": "TEAM_D",
+      "SH": 62.0,
+      "SmartDmg": 50.0,
+      "Tactical": 64.0,
+      "Strategic": 64.0,
+      "savg": 60.0
+    },
+    {
+      "rank": 37,
+      "team": "TEAM_M",
+      "SH": 60.0,
+      "SmartDmg": 54.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 60.0
+    },
+    {
+      "rank": 38,
+      "team": "TEAM_U",
+      "SH": 50.0,
+      "SmartDmg": 70.0,
+      "Tactical": 64.0,
+      "Strategic": 56.00000000000001,
+      "savg": 60.0
+    },
+    {
+      "rank": 39,
+      "team": "TEAM_AG",
+      "SH": 64.0,
+      "SmartDmg": 64.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 56.00000000000001,
+      "savg": 60.0
+    },
+    {
+      "rank": 40,
+      "team": "TEAM_AV",
+      "SH": 68.0,
+      "SmartDmg": 62.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 52.0,
+      "savg": 60.0
+    },
+    {
+      "rank": 41,
+      "team": "TEAM_AB",
+      "SH": 70,
+      "SmartDmg": 60,
+      "Tactical": 58,
+      "Strategic": 50,
+      "savg": 59.5
+    },
+    {
+      "rank": 42,
+      "team": "TEAM_AH",
+      "SH": 64.0,
+      "SmartDmg": 62.0,
+      "Tactical": 60.0,
+      "Strategic": 50.0,
+      "savg": 59.0
+    },
+    {
+      "rank": 43,
+      "team": "TEAM_AJ",
+      "SH": 74.0,
+      "SmartDmg": 52.0,
+      "Tactical": 54.0,
+      "Strategic": 56.00000000000001,
+      "savg": 59.0
+    },
+    {
+      "rank": 44,
+      "team": "TEAM_Z",
+      "SH": 58,
+      "SmartDmg": 54,
+      "Tactical": 54,
+      "Strategic": 66,
+      "savg": 58.0
+    },
+    {
+      "rank": 45,
+      "team": "TEAM_BM",
+      "SH": 54.0,
+      "SmartDmg": 54.0,
+      "Tactical": 60.0,
+      "Strategic": 64.0,
+      "savg": 58.0
+    },
+    {
+      "rank": 46,
+      "team": "TEAM_AE",
+      "SH": 64.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 46.0,
+      "Strategic": 57.99999999999999,
+      "savg": 56.5
+    },
+    {
+      "rank": 47,
+      "team": "TEAM_L",
+      "SH": 56.00000000000001,
+      "SmartDmg": 48.0,
+      "Tactical": 64.0,
+      "Strategic": 50.0,
+      "savg": 54.5
+    },
+    {
+      "rank": 48,
+      "team": "TEAM_AL",
+      "SH": 42.0,
+      "SmartDmg": 52.0,
+      "Tactical": 52.0,
+      "Strategic": 66.0,
+      "savg": 53.0
+    },
+    {
+      "rank": 49,
+      "team": "TEAM_F",
+      "SH": 40.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 66.0,
+      "Strategic": 42.0,
+      "savg": 51.5
+    },
+    {
+      "rank": 50,
+      "team": "TEAM_AD",
+      "SH": 68.0,
+      "SmartDmg": 34.0,
+      "Tactical": 54.0,
+      "Strategic": 48.0,
+      "savg": 51.0
+    },
+    {
+      "rank": 51,
+      "team": "TEAM_AO",
+      "SH": 46.0,
+      "SmartDmg": 44.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 52.0,
+      "savg": 49.5
+    },
+    {
+      "rank": 52,
+      "team": "TEAM_BP",
+      "SH": 54.0,
+      "SmartDmg": 60.0,
+      "Tactical": 38.0,
+      "Strategic": 42.0,
+      "savg": 48.5
+    },
+    {
+      "rank": 53,
+      "team": "TEAM_AW",
+      "SH": 48.0,
+      "SmartDmg": 48.0,
+      "Tactical": 54.0,
+      "Strategic": 42.0,
+      "savg": 48.0
+    },
+    {
+      "rank": 54,
+      "team": "TEAM_AI",
+      "SH": 40.0,
+      "SmartDmg": 50.0,
+      "Tactical": 50.0,
+      "Strategic": 44.0,
+      "savg": 46.0
+    },
+    {
+      "rank": 55,
+      "team": "TEAM_S",
+      "SH": 52.0,
+      "SmartDmg": 44.0,
+      "Tactical": 50.0,
+      "Strategic": 36.0,
+      "savg": 45.5
+    },
+    {
+      "rank": 56,
+      "team": "TEAM_BL",
+      "SH": 64.0,
+      "SmartDmg": 52.0,
+      "Tactical": 30.0,
+      "Strategic": 34.0,
+      "savg": 45.0
+    },
+    {
+      "rank": 57,
+      "team": "TEAM_BR",
+      "SH": 44.0,
+      "SmartDmg": 40.0,
+      "Tactical": 48.0,
+      "Strategic": 48.0,
+      "savg": 45.0
+    },
+    {
+      "rank": 58,
+      "team": "TEAM_BI",
+      "SH": 50.0,
+      "SmartDmg": 42.0,
+      "Tactical": 38.0,
+      "Strategic": 48.0,
+      "savg": 44.5
+    },
+    {
+      "rank": 59,
+      "team": "TEAM_AA",
+      "SH": 50,
+      "SmartDmg": 52,
+      "Tactical": 38,
+      "Strategic": 34,
+      "savg": 43.5
+    },
+    {
+      "rank": 60,
+      "team": "TEAM_BO",
+      "SH": 46.0,
+      "SmartDmg": 38.0,
+      "Tactical": 38.0,
+      "Strategic": 42.0,
+      "savg": 41.0
+    },
+    {
+      "rank": 61,
+      "team": "TEAM_BH",
+      "SH": 32.0,
+      "SmartDmg": 44.0,
+      "Tactical": 44.0,
+      "Strategic": 30.0,
+      "savg": 37.5
+    },
+    {
+      "rank": 62,
+      "team": "TEAM_X",
+      "SH": 32.0,
+      "SmartDmg": 42.0,
+      "Tactical": 36.0,
+      "Strategic": 36.0,
+      "savg": 36.5
+    },
+    {
+      "rank": 63,
+      "team": "TEAM_BD",
+      "SH": 36.0,
+      "SmartDmg": 16.0,
+      "Tactical": 42.0,
+      "Strategic": 50.0,
+      "savg": 36.0
+    },
+    {
+      "rank": 64,
+      "team": "TEAM_R",
+      "SH": 30.0,
+      "SmartDmg": 38.0,
+      "Tactical": 36.0,
+      "Strategic": 38.0,
+      "savg": 35.5
+    },
+    {
+      "rank": 65,
+      "team": "TEAM_Q",
+      "SH": 24.0,
+      "SmartDmg": 22.0,
+      "Tactical": 32.0,
+      "Strategic": 38.0,
+      "savg": 29.0
+    },
+    {
+      "rank": 66,
+      "team": "TEAM_AS",
+      "SH": 34.0,
+      "SmartDmg": 26.0,
+      "Tactical": 32.0,
+      "Strategic": 22.0,
+      "savg": 28.5
+    },
+    {
+      "rank": 67,
+      "team": "TEAM_AP",
+      "SH": 30.0,
+      "SmartDmg": 22.0,
+      "Tactical": 34.0,
+      "Strategic": 26.0,
+      "savg": 28.0
+    },
+    {
+      "rank": 68,
+      "team": "TEAM_AR",
+      "SH": 24.0,
+      "SmartDmg": 14.000000000000002,
+      "Tactical": 38.0,
+      "Strategic": 28.000000000000004,
+      "savg": 26.0
+    },
+    {
+      "rank": 69,
+      "team": "TEAM_AT",
+      "SH": 20.0,
+      "SmartDmg": 26.0,
+      "Tactical": 22.0,
+      "Strategic": 32.0,
+      "savg": 25.0
+    },
+    {
+      "rank": 70,
+      "team": "TEAM_AN",
+      "SH": 20.0,
+      "SmartDmg": 18.0,
+      "Tactical": 18.0,
+      "Strategic": 22.0,
+      "savg": 19.5
+    }
+  ],
+  "raw": {
+    "TEAM_A": {
+      "SH": 72.0,
+      "SmartDmg": 64.0,
+      "Tactical": 72.0,
+      "Strategic": 68.0,
+      "savg": 69.0
+    },
+    "TEAM_B": {
+      "SH": 74.0,
+      "SmartDmg": 84.0,
+      "Tactical": 68.0,
+      "Strategic": 74.0,
+      "savg": 75.0
+    },
+    "TEAM_C": {
+      "SH": 80.0,
+      "SmartDmg": 84.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 74.0,
+      "savg": 73.5
+    },
+    "TEAM_D": {
+      "SH": 62.0,
+      "SmartDmg": 50.0,
+      "Tactical": 64.0,
+      "Strategic": 64.0,
+      "savg": 60.0
+    },
+    "TEAM_E": {
+      "SH": 62.0,
+      "SmartDmg": 70.0,
+      "Tactical": 68.0,
+      "Strategic": 70.0,
+      "savg": 67.5
+    },
+    "TEAM_F": {
+      "SH": 40.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 66.0,
+      "Strategic": 42.0,
+      "savg": 51.5
+    },
+    "TEAM_G": {
+      "SH": 74.0,
+      "SmartDmg": 72.0,
+      "Tactical": 86.0,
+      "Strategic": 76.0,
+      "savg": 77.0
+    },
+    "TEAM_H": {
+      "SH": 72.0,
+      "SmartDmg": 70.0,
+      "Tactical": 62.0,
+      "Strategic": 68.0,
+      "savg": 68.0
+    },
+    "TEAM_I": {
+      "SH": 64.0,
+      "SmartDmg": 72.0,
+      "Tactical": 60.0,
+      "Strategic": 68.0,
+      "savg": 66.0
+    },
+    "TEAM_J": {
+      "SH": 66.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 62.0,
+      "Strategic": 57.99999999999999,
+      "savg": 61.0
+    },
+    "TEAM_K": {
+      "SH": 57.99999999999999,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 72.0,
+      "Strategic": 57.99999999999999,
+      "savg": 61.5
+    },
+    "TEAM_L": {
+      "SH": 56.00000000000001,
+      "SmartDmg": 48.0,
+      "Tactical": 64.0,
+      "Strategic": 50.0,
+      "savg": 54.5
+    },
+    "TEAM_M": {
+      "SH": 60.0,
+      "SmartDmg": 54.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 60.0
+    },
+    "TEAM_N": {
+      "SH": 66.0,
+      "SmartDmg": 66.0,
+      "Tactical": 64.0,
+      "Strategic": 62.0,
+      "savg": 64.5
+    },
+    "TEAM_O": {
+      "SH": 78.0,
+      "SmartDmg": 80.0,
+      "Tactical": 74.0,
+      "Strategic": 62.0,
+      "savg": 73.5
+    },
+    "TEAM_P": {
+      "SH": 68.0,
+      "SmartDmg": 62.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 74.0,
+      "savg": 65.0
+    },
+    "TEAM_Q": {
+      "SH": 24.0,
+      "SmartDmg": 22.0,
+      "Tactical": 32.0,
+      "Strategic": 38.0,
+      "savg": 29.0
+    },
+    "TEAM_R": {
+      "SH": 30.0,
+      "SmartDmg": 38.0,
+      "Tactical": 36.0,
+      "Strategic": 38.0,
+      "savg": 35.5
+    },
+    "TEAM_S": {
+      "SH": 52.0,
+      "SmartDmg": 44.0,
+      "Tactical": 50.0,
+      "Strategic": 36.0,
+      "savg": 45.5
+    },
+    "TEAM_T": {
+      "SH": 88.0,
+      "SmartDmg": 76.0,
+      "Tactical": 74.0,
+      "Strategic": 72.0,
+      "savg": 77.5
+    },
+    "TEAM_U": {
+      "SH": 50.0,
+      "SmartDmg": 70.0,
+      "Tactical": 64.0,
+      "Strategic": 56.00000000000001,
+      "savg": 60.0
+    },
+    "TEAM_V": {
+      "SH": 74.0,
+      "SmartDmg": 72.0,
+      "Tactical": 64.0,
+      "Strategic": 64.0,
+      "savg": 68.5
+    },
+    "TEAM_W": {
+      "SH": 70.0,
+      "SmartDmg": 70.0,
+      "Tactical": 76.0,
+      "Strategic": 64.0,
+      "savg": 70.0
+    },
+    "TEAM_X": {
+      "SH": 32.0,
+      "SmartDmg": 42.0,
+      "Tactical": 36.0,
+      "Strategic": 36.0,
+      "savg": 36.5
+    },
+    "TEAM_Y": {
+      "SH": 70.0,
+      "SmartDmg": 78.0,
+      "Tactical": 70.0,
+      "Strategic": 64.0,
+      "savg": 70.5
+    },
+    "TEAM_Z": {
+      "SH": 58,
+      "SmartDmg": 54,
+      "Tactical": 54,
+      "Strategic": 66,
+      "savg": 58.0
+    },
+    "TEAM_AA": {
+      "SH": 50,
+      "SmartDmg": 52,
+      "Tactical": 38,
+      "Strategic": 34,
+      "savg": 43.5
+    },
+    "TEAM_AB": {
+      "SH": 70,
+      "SmartDmg": 60,
+      "Tactical": 58,
+      "Strategic": 50,
+      "savg": 59.5
+    },
+    "TEAM_AC": {
+      "SH": 60,
+      "SmartDmg": 66,
+      "Tactical": 56,
+      "Strategic": 62,
+      "savg": 61.0
+    },
+    "TEAM_AD": {
+      "SH": 68.0,
+      "SmartDmg": 34.0,
+      "Tactical": 54.0,
+      "Strategic": 48.0,
+      "savg": 51.0
+    },
+    "TEAM_AE": {
+      "SH": 64.0,
+      "SmartDmg": 57.99999999999999,
+      "Tactical": 46.0,
+      "Strategic": 57.99999999999999,
+      "savg": 56.5
+    },
+    "TEAM_AF": {
+      "SH": 68.0,
+      "SmartDmg": 70.0,
+      "Tactical": 52.0,
+      "Strategic": 74.0,
+      "savg": 66.0
+    },
+    "TEAM_AG": {
+      "SH": 64.0,
+      "SmartDmg": 64.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 56.00000000000001,
+      "savg": 60.0
+    },
+    "TEAM_AH": {
+      "SH": 64.0,
+      "SmartDmg": 62.0,
+      "Tactical": 60.0,
+      "Strategic": 50.0,
+      "savg": 59.0
+    },
+    "TEAM_AI": {
+      "SH": 40.0,
+      "SmartDmg": 50.0,
+      "Tactical": 50.0,
+      "Strategic": 44.0,
+      "savg": 46.0
+    },
+    "TEAM_AJ": {
+      "SH": 74.0,
+      "SmartDmg": 52.0,
+      "Tactical": 54.0,
+      "Strategic": 56.00000000000001,
+      "savg": 59.0
+    },
+    "TEAM_AK": {
+      "SH": 68.0,
+      "SmartDmg": 74.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 64.0,
+      "savg": 66.0
+    },
+    "TEAM_AL": {
+      "SH": 42.0,
+      "SmartDmg": 52.0,
+      "Tactical": 52.0,
+      "Strategic": 66.0,
+      "savg": 53.0
+    },
+    "TEAM_AM": {
+      "SH": 78.0,
+      "SmartDmg": 60.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 66.0
+    },
+    "TEAM_AN": {
+      "SH": 20.0,
+      "SmartDmg": 18.0,
+      "Tactical": 18.0,
+      "Strategic": 22.0,
+      "savg": 19.5
+    },
+    "TEAM_AO": {
+      "SH": 46.0,
+      "SmartDmg": 44.0,
+      "Tactical": 56.00000000000001,
+      "Strategic": 52.0,
+      "savg": 49.5
+    },
+    "TEAM_AP": {
+      "SH": 30.0,
+      "SmartDmg": 22.0,
+      "Tactical": 34.0,
+      "Strategic": 26.0,
+      "savg": 28.0
+    },
+    "TEAM_AQ": {
+      "SH": 86.0,
+      "SmartDmg": 68.0,
+      "Tactical": 74.0,
+      "Strategic": 46.0,
+      "savg": 68.5
+    },
+    "TEAM_AR": {
+      "SH": 24.0,
+      "SmartDmg": 14.000000000000002,
+      "Tactical": 38.0,
+      "Strategic": 28.000000000000004,
+      "savg": 26.0
+    },
+    "TEAM_AS": {
+      "SH": 34.0,
+      "SmartDmg": 26.0,
+      "Tactical": 32.0,
+      "Strategic": 22.0,
+      "savg": 28.5
+    },
+    "TEAM_AT": {
+      "SH": 20.0,
+      "SmartDmg": 26.0,
+      "Tactical": 22.0,
+      "Strategic": 32.0,
+      "savg": 25.0
+    },
+    "TEAM_AU": {
+      "SH": 86.0,
+      "SmartDmg": 82.0,
+      "Tactical": 76.0,
+      "Strategic": 70.0,
+      "savg": 78.5
+    },
+    "TEAM_AV": {
+      "SH": 68.0,
+      "SmartDmg": 62.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 52.0,
+      "savg": 60.0
+    },
+    "TEAM_AW": {
+      "SH": 48.0,
+      "SmartDmg": 48.0,
+      "Tactical": 54.0,
+      "Strategic": 42.0,
+      "savg": 48.0
+    },
+    "TEAM_AX": {
+      "SH": 64.0,
+      "SmartDmg": 86.0,
+      "Tactical": 70.0,
+      "Strategic": 57.99999999999999,
+      "savg": 69.5
+    },
+    "TEAM_AY": {
+      "SH": 70.0,
+      "SmartDmg": 78.0,
+      "Tactical": 62.0,
+      "Strategic": 54.0,
+      "savg": 66.0
+    },
+    "TEAM_AZ": {
+      "SH": 78.0,
+      "SmartDmg": 74.0,
+      "Tactical": 66.0,
+      "Strategic": 72.0,
+      "savg": 72.5
+    },
+    "TEAM_BA": {
+      "SH": 82.0,
+      "SmartDmg": 66.0,
+      "Tactical": 72.0,
+      "Strategic": 62.0,
+      "savg": 70.5
+    },
+    "TEAM_BB": {
+      "SH": 84.0,
+      "SmartDmg": 64.0,
+      "Tactical": 64.0,
+      "Strategic": 68.0,
+      "savg": 70.0
+    },
+    "TEAM_BC": {
+      "SH": 66.0,
+      "SmartDmg": 66.0,
+      "Tactical": 68.0,
+      "Strategic": 70.0,
+      "savg": 67.5
+    },
+    "TEAM_BD": {
+      "SH": 36.0,
+      "SmartDmg": 16.0,
+      "Tactical": 42.0,
+      "Strategic": 50.0,
+      "savg": 36.0
+    },
+    "TEAM_BE": {
+      "SH": 72.0,
+      "SmartDmg": 62.0,
+      "Tactical": 74.0,
+      "Strategic": 76.0,
+      "savg": 71.0
+    },
+    "TEAM_BF": {
+      "SH": 78.0,
+      "SmartDmg": 66.0,
+      "Tactical": 66.0,
+      "Strategic": 60.0,
+      "savg": 67.5
+    },
+    "TEAM_BG": {
+      "SH": 64.0,
+      "SmartDmg": 82.0,
+      "Tactical": 48.0,
+      "Strategic": 57.99999999999999,
+      "savg": 63.0
+    },
+    "TEAM_BH": {
+      "SH": 32.0,
+      "SmartDmg": 44.0,
+      "Tactical": 44.0,
+      "Strategic": 30.0,
+      "savg": 37.5
+    },
+    "TEAM_BI": {
+      "SH": 50.0,
+      "SmartDmg": 42.0,
+      "Tactical": 38.0,
+      "Strategic": 48.0,
+      "savg": 44.5
+    },
+    "TEAM_BJ": {
+      "SH": 72.0,
+      "SmartDmg": 72.0,
+      "Tactical": 70.0,
+      "Strategic": 72.0,
+      "savg": 71.5
+    },
+    "TEAM_BK": {
+      "SH": 74.0,
+      "SmartDmg": 78.0,
+      "Tactical": 66.0,
+      "Strategic": 72.0,
+      "savg": 72.5
+    },
+    "TEAM_BL": {
+      "SH": 64.0,
+      "SmartDmg": 52.0,
+      "Tactical": 30.0,
+      "Strategic": 34.0,
+      "savg": 45.0
+    },
+    "TEAM_BM": {
+      "SH": 54.0,
+      "SmartDmg": 54.0,
+      "Tactical": 60.0,
+      "Strategic": 64.0,
+      "savg": 58.0
+    },
+    "TEAM_BN": {
+      "SH": 62.0,
+      "SmartDmg": 64.0,
+      "Tactical": 60.0,
+      "Strategic": 66.0,
+      "savg": 63.0
+    },
+    "TEAM_BO": {
+      "SH": 46.0,
+      "SmartDmg": 38.0,
+      "Tactical": 38.0,
+      "Strategic": 42.0,
+      "savg": 41.0
+    },
+    "TEAM_BP": {
+      "SH": 54.0,
+      "SmartDmg": 60.0,
+      "Tactical": 38.0,
+      "Strategic": 42.0,
+      "savg": 48.5
+    },
+    "TEAM_BQ": {
+      "SH": 78.0,
+      "SmartDmg": 66.0,
+      "Tactical": 57.99999999999999,
+      "Strategic": 72.0,
+      "savg": 68.5
+    },
+    "TEAM_BR": {
+      "SH": 44.0,
+      "SmartDmg": 40.0,
+      "Tactical": 48.0,
+      "Strategic": 48.0,
+      "savg": 45.0
+    }
+  }
+}

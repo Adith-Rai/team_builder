@@ -51,27 +51,20 @@ OPPONENTS = [
 ]
 
 
-async def eval_team_vs_bot(checkpoint, device, team_str, team_name,
+async def eval_team_vs_bot(cached_ckpt, checkpoint_path, device, team_str, team_name,
                             opp_cls, opp_name, n_games, concurrency, server):
-    """Play n_games with a specific team against a specific bot."""
+    """Play n_games with a specific team against a specific bot.
+    Uses cached_ckpt to avoid reloading model from disk each time."""
+    from teams_ou import random_pool_teambuilder
     tb = ConstantTeambuilder(team_str)
     p1 = BattleAgent(
-        checkpoint, device=device,
+        checkpoint_path, device=device, _cached_ckpt=cached_ckpt,
         account_configuration=AccountConfiguration.generate(f"T{team_name[:6]}", rand=True),
         battle_format="gen9ou",
         max_concurrent_battles=concurrency,
         server_configuration=server,
         team=tb,
     )
-    p2 = opp_cls(
-        account_configuration=AccountConfiguration.generate(f"B{opp_name[:4]}", rand=True),
-        battle_format="gen9ou",
-        max_concurrent_battles=concurrency,
-        server_configuration=server,
-        team=ConstantTeambuilder(team_str),  # bot also uses same team pool? No — bots use their own
-    )
-    # Actually bots should use the random pool for fair eval
-    from teams_ou import random_pool_teambuilder
     p2 = opp_cls(
         account_configuration=AccountConfiguration.generate(f"B{opp_name[:4]}", rand=True),
         battle_format="gen9ou",
@@ -107,14 +100,14 @@ async def eval_team_vs_bot(checkpoint, device, team_str, team_name,
     return wr, wins, total
 
 
-async def eval_one_team(checkpoint, device, team_str, team_name,
+async def eval_one_team(cached_ckpt, checkpoint_path, device, team_str, team_name,
                          n_games_per_bot, concurrency, servers):
     """Evaluate one team against all 4 bots, using round-robin across servers."""
     results = {}
     for i, (opp_cls, opp_name) in enumerate(OPPONENTS):
         server = servers[i % len(servers)]
         wr, wins, total = await eval_team_vs_bot(
-            checkpoint, device, team_str, team_name,
+            cached_ckpt, checkpoint_path, device, team_str, team_name,
             opp_cls, opp_name, n_games_per_bot, concurrency, server,
         )
         results[opp_name] = wr
@@ -139,37 +132,59 @@ def main():
     servers = [make_server(s.strip()) for s in args.servers.split(",")]
     team_names = list_teams()
 
-    print(f"Team Selection: {len(team_names)} teams x {len(OPPONENTS)} bots x {args.games_per_bot} games")
-    print(f"Total games: {len(team_names) * len(OPPONENTS) * args.games_per_bot}")
+    # Load checkpoint ONCE (avoids VRAM leak from repeated loads)
+    print(f"Loading checkpoint once: {args.checkpoint}", flush=True)
+    cached_ckpt = torch.load(args.checkpoint, map_location=torch.device(args.device),
+                              weights_only=False)
+    print(f"Checkpoint loaded. Model params: {sum(p.numel() for p in cached_ckpt.get('model_state_dict', {}).values() if hasattr(p, 'numel')):,}", flush=True)
+
+    # Resume: load existing results if any
+    all_results = {}
+    if os.path.exists(args.out_json):
+        try:
+            with open(args.out_json) as f:
+                saved = json.load(f)
+            if "raw" in saved:
+                all_results = saved["raw"]
+            else:
+                all_results = saved
+            print(f"Resumed: {len(all_results)} teams already done", flush=True)
+        except Exception:
+            pass
+
+    remaining = [(ti, tn) for ti, tn in enumerate(team_names) if tn not in all_results]
+    print(f"\nTeam Selection: {len(remaining)} remaining of {len(team_names)} teams "
+          f"x {len(OPPONENTS)} bots x {args.games_per_bot} games")
+    print(f"Total games remaining: {len(remaining) * len(OPPONENTS) * args.games_per_bot}")
     print(f"Servers: {len(servers)}, Concurrency: {args.concurrency}")
-    print(f"Checkpoint: {args.checkpoint}")
     print(f"Device: {args.device}")
     print()
 
-    all_results = {}
     t0 = time.time()
+    done_count = 0
 
-    for ti, tname in enumerate(team_names):
+    for ti, tname in remaining:
         team_str = TEAMS[ti]
         tt0 = time.time()
 
         results = asyncio.run(eval_one_team(
-            args.checkpoint, args.device, team_str, tname,
+            cached_ckpt, args.checkpoint, args.device, team_str, tname,
             args.games_per_bot, args.concurrency, servers,
         ))
         all_results[tname] = results
+        done_count += 1
         elapsed = time.time() - tt0
         total_elapsed = time.time() - t0
-        remaining = (total_elapsed / (ti + 1)) * (len(team_names) - ti - 1)
+        eta = (total_elapsed / done_count) * (len(remaining) - done_count)
 
         print(f"[{ti+1:2d}/{len(team_names)}] {tname:8s}: "
               f"SH={results['SH']:.0f}% SmD={results['SmartDmg']:.0f}% "
               f"Tac={results['Tactical']:.0f}% Str={results['Strategic']:.0f}% "
-              f"savg={results['savg']:.1f}%  ({elapsed:.0f}s, ETA {remaining/60:.0f}m)",
+              f"savg={results['savg']:.1f}%  ({elapsed:.0f}s, ETA {eta/60:.0f}m)",
               flush=True)
 
         # Save incrementally
-        if (ti + 1) % 5 == 0 or ti == len(team_names) - 1:
+        if done_count % 5 == 0 or done_count == len(remaining):
             with open(args.out_json, "w") as f:
                 json.dump(all_results, f, indent=2)
 
