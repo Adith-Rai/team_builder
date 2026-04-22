@@ -95,7 +95,7 @@
       "iter_lo": 2540,
       "iter_hi": 99999,
       "color": "#ffffb3",
-      "description": "Session 36 Exp 2+3: slot permutation augmentation + PFSP opponent sampling. Resumed from Exp 1c snapshot_2539. Path separator bug fixed at iter 2700. KL turbulence 2760-2800 (epoch-0 early stops), recovering by 2810. Eval ~52.8% (below Exp 1c 54.6 baseline, pending recovery)."
+      "description": "Session 36 Exp 2+3 + Exp 4 + Exp 5. Slot permutation + PFSP + LR refinement + safeguards. Peak sp2979=Elo 1058 (all-time best). Exp 4 collapsed (entropy) at 3055. Exp 5 confirmed ceiling with all safeguards (adaptive ent + early stop + EMA). 62 players measured, 1891 matches."
     }
   ]
 }

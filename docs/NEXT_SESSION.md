@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-15 (Session 36 end)**
+**Last updated: 2026-04-21 (Session 36 final — multi-gen is the next phase)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -15,17 +15,27 @@ Supporting documents:
 ## Current position
 
 **Best checkpoint: `selfplay_v9_20260413_061236/snapshot_2979.pt` at Elo 1058**
-(confirmed by `data/eval/elo_session37_sp2999.json`, 55 players, 1433 matches).
+(confirmed by `data/eval/elo_exp5_FINAL.json`, 62 players, 1891 matches).
 
 - +38 Elo above strongest heuristic bot (Tactical=1019)
 - +30 Elo above previous session-top (sp1984=1028)
 - +241 Elo above BC base (817)
 
-Near-tied: `snapshot_2999.pt` (Elo 1055, CI overlaps with sp2979). Use either as canonical.
+Near-tied: `snapshot_2999.pt` (Elo 1055, CI overlaps). Top 7 snapshots are all 1048-1058.
 
-**We've hit the architectural ceiling for this model size (13.38M).** The plateau is at
-~1050-1060 Elo. Hyperparameter tuning is exhausted. Further gains require architectural
-changes (capacity reallocation, BC scaling, multi-gen, or search).
+**The architectural ceiling is CONFIRMED at ~1058 Elo.** Exp 5 (200 iters with all
+safeguards: adaptive entropy + early stop + EMA PFSP + 400 games/iter) produced no
+checkpoint that exceeded sp2979. The plateau is real, measured across 62 players and
+1891 matchups. Further gains require architectural changes.
+
+**Team selection test in progress:** testing sp2979 with each of 70 handcrafted OU teams
+individually against bots (14,000 games). Early results show savg 51-77% depending
+on team — massive variance. Fixed-team play is MUCH stronger than random-from-pool.
+Results will be in `team_selection_results.json` when complete.
+
+**Next phase: MULTI-GEN + GEN-AGNOSTIC PREP.** User direction: do multi-gen before any
+model size changes (capacity reallocation, BC scaling) so all future work builds on a
+multi-gen-ready foundation. See "What to do next" section below.
 
 ---
 
@@ -69,7 +79,7 @@ SNAPS="path/to/snap1.pt path/to/snap2.pt ..."
 NAMES="sp1000 sp1010 ..."
 
 # Shard 0 (on server 9000):
-python -u eval_elo_ladder.py --add-to data/eval/elo_session37_sp2999.json \
+python -u eval_elo_ladder.py --add-to data/eval/elo_exp5_FINAL.json \
   --snapshots $SNAPS --names $NAMES \
   --n-games 100 --concurrency 70 --device cuda \
   --server ws://127.0.0.1:9000/showdown/websocket \
@@ -112,6 +122,7 @@ Get-Content "path\to\log.log" -Wait | Select-String "\] Iter|EVAL:|Snapshot|KL e
 | PFSP (vs uniform) | (1-wr)² weighted | +11 Elo, but 12% stale-rating waste | **Keep. Consider EMA to fix staleness.** |
 | LR refinement | 1e-4 → 3e-5 | Hit peak sp2999 (Elo 1055), then collapsed | **Lower LR is risky without safeguards.** |
 | Games/iter 400 | paired with low LR | More data per update | Secondary — paired with LR choice. |
+| **Exp 5 safeguards** | adaptive ent + early stop + EMA | 200 iters, savg=55.3% mean, no collapse | **Ceiling confirmed at ~1058. Safeguards work.** |
 
 ### What causes collapse (learned the hard way)
 
@@ -194,7 +205,7 @@ data/eval/registry/
 └── elos.jsonl         Per-snapshot Elo measurements (auto-logged by eval_elo_ladder.py)
 
 data/eval/
-├── elo_session37_sp2999.json    Canonical Elo ladder (55 players)
+├── elo_exp5_FINAL.json    Canonical Elo ladder (55 players)
 ├── eras.json                     Training era definitions for trajectory plots
 └── trajectory_session36.png      Latest trajectory plot
 ```
@@ -208,10 +219,39 @@ test_ema_pfsp.py       EMA win-rate tracking (8 tests)
 
 ---
 
-## What to do next — concrete options
+## What to do next — MULTI-GEN IS THE PRIORITY
 
-The hyperparameter refinement lever is exhausted. The real question is which
-architectural/scale experiment to run next.
+The hyperparameter refinement lever is exhausted (confirmed by Exp 5). Multi-gen
+prep comes FIRST before any model size changes, so all future work builds on a
+multi-gen-ready foundation.
+
+### IMMEDIATE NEXT: Multi-gen + gen-agnostic prep
+
+**Why first:** User direction (Session 33, reconfirmed Session 36): multi-gen before
+BC scaling or capacity reallocation. Reasoning: if we change model size or retrain BC
+BEFORE multi-gen, we'd redo all that work when we add multi-gen later. Do it once.
+
+**What needs to change (the architecture is ALREADY gen-agnostic):**
+- `vocab.py`: verify/expand species/move/ability/item tables for gens 6-9
+- `features.py`: add gen-specific volatile effects (Mega Evolution for gen6, Z-moves for gen7)
+- `team_generator.py`: per-gen team generation + ban lists (currently gen9 only)
+- `format_config.py`: add gen6/7/8 FormatConfig entries (n_actions, team_size, etc.)
+- `replay_to_memmap_v8.py`: gen filter for scraping gen6/7/8 OU replays
+- `battle_server.js`: verify it handles gen6/7/8 formats
+
+**What does NOT change:** model.py, ppo.py, train_rl.py, rl_collection.py, rl_player.py
+(all already parameterized via FormatConfig + --format flag).
+
+**Gen scope:** Start with gens 6-9 (fully compatible features). Gens 4-5 need minor
+adjustments. Skip gens 1-3 for now (missing abilities/items, different mechanics).
+
+**Estimated effort:** 1-2 sessions for vocab + features + team gen. Multi-gen replay
+scraping can run in background.
+
+**Validation:** Train a 1-iter BC sanity check with expanded vocab on existing gen9
+data → confirm no breakage. Then scrape gen6-8 replays and train multi-gen BC.
+
+### AFTER multi-gen: architectural experiments
 
 ### Option A — Capacity reallocation (Exp 5 from old plan)
 
@@ -333,7 +373,7 @@ Top human Gen9 OU peaks: 2030-2115 Elo.
 
 ## Reference data
 
-### Confirmed Elo (from `elo_session37_sp2999.json`)
+### Confirmed Elo (from `elo_exp5_FINAL.json`)
 
 Top 10 snapshots:
 ```
@@ -370,7 +410,7 @@ Collapse reference:
 - `selfplay_v9_20260415_083340/emergency_iter_3055.pt` — Exp 4 collapse (DO NOT USE)
 
 ### Data files / registry
-- `data/eval/elo_session37_sp2999.json` — canonical Elo ladder (55 players, ~1400 matches)
+- `data/eval/elo_exp5_FINAL.json` — canonical Elo ladder (55 players, ~1400 matches)
 - `data/eval/eras.json` — training era definitions (E0-E12)
 - `data/eval/registry/runs.jsonl` — all training run configs
 - `data/eval/registry/evals.jsonl` — per-iter bot evals (~200+ entries)
@@ -395,7 +435,7 @@ For starting a new session:
 1. **Read this file top-to-bottom.** It's self-contained.
 2. **Check git status** (`git log --oneline -10`) for any un-handed-over work.
 3. **Check for running processes** (`nvidia-smi | grep python`) — anything still training?
-4. **Check latest Elo:** `data/eval/elo_session37_sp2999.json` → confirm sp2979=1058 is still the best.
+4. **Check latest Elo:** `data/eval/elo_exp5_FINAL.json` → confirm sp2979=1058 is still the best.
 5. **If training didn't finish cleanly, check the emergency checkpoint** in the run dir.
 6. **Pick a next step** from "What to do next" above based on time budget.
 7. **If running any PPO training, enable safeguards**: `--adaptive-entropy --early-stop`.
