@@ -97,13 +97,25 @@ def main():
 
         print(f"Connected. Starting {args.n_games} ladder games...\n", flush=True)
 
+        prev_battles = set()
         # Play ladder games
         for i in range(args.n_games):
             try:
                 await player.ladder(1)
                 w, l, t = player.n_won_battles, player.n_lost_battles, player.n_tied_battles
-                print(f"  Game {i+1}/{args.n_games}: W={w} L={l} T={t} "
-                      f"(WR={w/max(1,w+l+t)*100:.0f}%)", flush=True)
+
+                # Find opponent name from latest battle
+                opp_name = "?"
+                result = "?"
+                for btag, battle in player.battles.items():
+                    if btag not in prev_battles:
+                        prev_battles.add(btag)
+                        opp_name = battle.opponent_username or "?"
+                        result = "W" if battle.won else "L" if battle.lost else "T"
+                        break
+
+                print(f"  Game {i+1}/{args.n_games}: {result} vs {opp_name:30s}  "
+                      f"W={w} L={l} T={t} (WR={w/max(1,w+l+t)*100:.0f}%)", flush=True)
             except Exception as e:
                 print(f"  Game {i+1}/{args.n_games}: ERROR - {e}", flush=True)
 
