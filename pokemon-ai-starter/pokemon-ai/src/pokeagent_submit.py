@@ -34,10 +34,10 @@ from battle_agent import BattleAgent
 from teams_ou import get_team, list_teams, TEAMS, random_pool_teambuilder
 
 
-# PokeAgent Challenge server
+# PokeAgent Challenge server (from official docs)
 POKEAGENT_SERVER = ServerConfiguration(
-    "wss://pokeagentshowdown.com/showdown/websocket",
-    "https://play.pokemonshowdown.com/action.php?",
+    "wss://battling.pokeagentchallenge.com/showdown/websocket",
+    "https://battling.pokeagentchallenge.com/action.php?",
 )
 
 

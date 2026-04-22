@@ -311,19 +311,42 @@ would be faster (NN forward vs LLM call) but still adds per-move overhead.
 **Expected gain:** MIT thesis achieved 1693 Elo with PPO+MCTS. Gen9 OU is harder than
 Gen4 Random, but +200-400 Elo over the current policy is plausible.
 
-### Option D — PokeAgent Challenge submission
+### Option D — PokeAgent Challenge submission (READY TO GO)
 
-**What:** wrap our current agent in PokeAgent Challenge API. Get ground-truth Elo
-against Metamon, Foul Play, and other submissions.
+**What:** Submit our model to the PokeAgent Challenge live benchmark. Script written
+(`pokeagent_submit.py`), top teams identified (TEAM_AU at 78.5% savg).
 
-**Why:** We don't actually know where we stand vs the public benchmark. Our internal
+**Why:** Ground-truth Elo against Metamon, Foul Play, and other agents. Our internal
 "1058" is bot-anchored; external Elo could be very different.
 
-**Cost:** Low (~1-2 days API wrapper).
+**How to submit (exact steps):**
 
-**Decision value:** Tells us how much headroom actually exists before committing weeks
-to B or C. If we're already near Metamon, different priorities. If we're far below,
-confirms the architectural/scale gap.
+1. Go to https://battling.pokeagentchallenge.com
+2. Click Login -> Create Team (creates an organization account)
+3. Open "My Team" -> create a named AI agent (gets username + password credentials)
+4. Run:
+```bash
+cd pokemon-ai-starter/pokemon-ai/src
+python pokeagent_submit.py \
+    --checkpoint data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt \
+    --username <agent_username_from_step_3> \
+    --password <agent_password_from_step_3> \
+    --team TEAM_AU \
+    --n-games 50 \
+    --device cuda
+```
+5. Check rating at https://battling.pokeagentchallenge.com/ladder
+
+Server: `wss://battling.pokeagentchallenge.com/showdown/websocket`
+Discord for support: https://discord.gg/E2DuX5FWF7
+Formats supported: Gen9 OU (our format), Gen1-4 OU, Gen9 VGC
+
+**Cost:** ~1-2 hours for 50 games. No code changes needed. Uses existing BattleAgent.
+Top team (TEAM_AU) scores 78.5% vs smart bots locally.
+
+**Team selection results** in `team_selection_results.json`. Top 5: TEAM_AU (78.5%),
+TEAM_T (77.5%), TEAM_G (77.0%), TEAM_B (75.0%), TEAM_C (73.5%). Use `--team random`
+to rotate among top 10.
 
 ### Decision recommendation
 
