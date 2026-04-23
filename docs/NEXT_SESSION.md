@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-22 (Session 37 — Metamon study + multi-gen prep + capacity reshape done)**
+**Last updated: 2026-04-23 (Session 38 — BC reshape launched, interrupted by BSOD cluster)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -10,6 +10,81 @@ Supporting documents:
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
 - `docs/CLOUD_DEPLOY.md` — cloud migration plan
+
+---
+
+## Session 38 status (READ THIS FIRST)
+
+**BC reshape run was launched and crashed mid-epoch-2 due to a Windows BSOD cluster, not a
+training bug.** Details below. User is rebooting after NVIDIA driver update; next session
+needs to pick up the BC retrain from the last saved checkpoint.
+
+### What was running
+`train_bc.py` with the Session 37 reshape config (d_spatial=256, d_temporal=512,
+3L/3L, K=4, dropout=0.05, fp16). Log: `pokemon-ai-starter/pokemon-ai/src/bc_reshape.log`.
+Output dir: `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v8_bc_20260423_031532/`.
+
+Model: **14,284,716 params** (matches Session 37 design target of ~14.28M).
+
+### What completed before crash
+- **Epoch 0**: train_loss=0.989 train_acc=0.634 val_acc=0.671 v_loss=0.420
+  bot eval: SH=21%, SmartDmg=22%, Tactical=18%, Strategic=18%, **smart_avg=20.0%** → saved `best.pt`
+- **Epoch 1**: train_loss=0.837 train_acc=0.673 val_acc=0.675 v_loss=0.423
+  bot eval: SH=18%, SmartDmg=24%, Tactical=20%, Strategic=18%, **smart_avg=19.6%** (no new best)
+- **Epoch 2**: stopped at step [40] (~41s in)
+
+Smart_avg 20% at epoch 1/10 is below BC_base's 22-26% but not predictive — too early to
+judge the reshape. Resume and let the full 10 epochs complete before making architecture
+decisions.
+
+### Checkpoints available for resume
+All in `data/models/bc/v8_bc_20260423_031532/`:
+- `best.pt` — epoch 0 weights only (20.0% smart_avg)
+- `epoch_000.pt` — full resumable state (model + optimizer + scheduler + epoch/step)
+- `epoch_001.pt` — full resumable state at end of epoch 1 ← **use this to resume**
+- `step_1356.pt` — mid-epoch-2 checkpoint (optional, more recent but epoch boundary cleaner)
+- `replays_epoch000/`, `replays_epoch001/` — eval replays from bot games
+
+### Crashes and fix (the real reason training stopped)
+**Three BSODs on 2026-04-23 (all bugcheck `0x0000019C` KERNEL_AUTO_BOOST_INVALID_LOCK_RELEASE, Arg1=0x50):**
+- 02:26 AM (killed BC training mid-epoch-2)
+- 08:36 AM (after user rebooted)
+- 11:12 AM (dump saved to `C:\Windows\MEMORY.DMP`)
+
+Same bugcheck + same Arg1 three times = specific driver synchronization bug. **Not** GPU,
+**not** fp16, **not** training code. This is the same cluster pattern flagged in
+"Known machine-level issues" below and in earlier Session 31/35 BSOD notes.
+
+**Remediation applied this session:**
+1. `model.py` got a small AMP dtype fix (scatter sources cast to dest dtype — commit `cf38cf2`).
+   Harmless/good regardless of the crashes; committed before investigation.
+2. **NVIDIA driver updated** from 551.23 (Jan 2024, 14 months old) → **Studio 595.79**
+   (Mar 10, 2026). Clean install via the installer's "Custom → Perform a clean installation".
+   Verify post-reboot with `nvidia-smi` — driver_version should read `595.79`.
+
+**Still NOT done (user deferred — flag in next session):**
+- MSI bloatware is still running and is the prime suspect per `NEXT_SESSION.md` machine-
+  level warning. Active services on this box right now:
+  `MSI Foundation Service`, `MSI NBFoundation Service`, `MSI_Central_Service`,
+  `MSI_Companion_Service`, `MSI_VoiceControl_Service`, `NahimicService`.
+  If crashes resume after the driver update, uninstall MSI Center / Dragon Center /
+  NBFoundation / Nahimic next.
+- VirtualBox `VBoxNetLwf` errors on every boot (uninstall VirtualBox if not needed).
+
+### Next concrete step (after driver update + reboot)
+1. `nvidia-smi` to confirm driver 595.79 and no lingering processes.
+2. Start battle servers (commands in "Quick-reference commands" below).
+3. Resume BC retrain — same command as "BC retrain with capacity reshape" section below
+   but add: `--resume data/models/bc/v8_bc_20260423_031532/epoch_001.pt`
+4. If another BSOD hits, stop, uninstall MSI bloatware (list above), reboot, retry.
+
+### Uncommitted files in the tree (as of reboot)
+- `watch.ps1` (project root) — PowerShell system monitor (GPU/VRAM/CPU/RAM/disk every 5s
+  to `system_watch.log`). Created this session to catch the next BSOD; not committed yet.
+  Safe to keep or commit as-is.
+
+### Commits this session
+- `cf38cf2` model.py: cast scatter sources to destination dtype in forward
 
 ---
 
@@ -60,7 +135,9 @@ Results will be in `team_selection_results.json` when complete.
 
 ## Quick-reference commands
 
-### BC retrain with capacity reshape (Session 37 — the NEXT step)
+### BC retrain with capacity reshape (Session 38 — RESUME after BSOD cluster)
+
+**Resume from epoch 1 (recommended — 8 epochs remaining):**
 ```bash
 cd pokemon-ai-starter/pokemon-ai/src
 python -u train_bc.py \
@@ -73,7 +150,17 @@ python -u train_bc.py \
   --lr 1e-4 --weight-decay 1e-4 --grad-clip 2.0 \
   --batch-size 16 --epochs 10 --sched cosine --warmup-steps 200 \
   --eval-games 200 \
-  2>&1 | tee bc_reshape.log
+  --resume data/models/bc/v8_bc_20260423_031532/epoch_001.pt \
+  2>&1 | tee -a bc_reshape.log
+```
+
+`--resume` loads model+optimizer+scheduler+epoch+step, so training picks up at epoch 2.
+Run output goes to the SAME directory (`v8_bc_20260423_031532`) — new epoch_NNN files
+append cleanly. Use `tee -a` to append to the existing log rather than overwrite.
+
+**Fresh run (if you want to start over — not recommended, throws away 2 epochs of work):**
+```bash
+# Same as above but omit --resume, and use `tee bc_reshape.log` (no -a).
 ```
 
 Expected: ~14.28M params. The reshape tests whether Metamon-style temporal:spatial
