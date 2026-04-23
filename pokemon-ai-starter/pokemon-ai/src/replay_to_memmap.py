@@ -254,6 +254,66 @@ def validate_episode(records: List[dict]) -> Tuple[bool, str]:
 # Memmap writer
 # =============================
 
+def _trim_files_to_n_rows(out_dir: Path, N: int, dims: Dict[str, int]) -> None:
+    """Truncate raw-memmap .npy files to exactly N rows.
+
+    These files were created by np.memmap(mode='w+') with no numpy header, so they
+    are flat row-major float32/int32 binaries. Truncating to N * per_row_bytes
+    yields a valid memmap of shape (N, ...). Skips files that already match.
+
+    Does NOT touch episode_index.npy (written by np.save, has a header) or
+    metadata.json.
+    """
+    pcd = dims["poke_cont_dim"]; fcd = dims["field_cont_dim"]
+    tcd = dims["trans_cont_dim"]; mcd = dims["move_cont_dim"]
+    scd = dims["switch_cont_dim"]
+    i4 = np.dtype(np.int32).itemsize
+    f4 = np.dtype(np.float32).itemsize
+
+    # (filename, bytes-per-row) for every raw-memmap file written by MemmapV8Writer.
+    # Keep in sync with __init__ shapes.
+    targets = [
+        ("our_pokemon_ids.npy",   6 * 7 * i4),
+        ("our_pokemon_banks.npy", 6 * 10 * i4),
+        ("our_pokemon_cont.npy",  6 * pcd * f4),
+        ("our_pokemon_mcont.npy", 6 * 4 * 23 * f4),
+        ("opp_pokemon_ids.npy",   6 * 7 * i4),
+        ("opp_pokemon_banks.npy", 6 * 10 * i4),
+        ("opp_pokemon_cont.npy",  6 * pcd * f4),
+        ("opp_pokemon_mcont.npy", 6 * 4 * 23 * f4),
+        ("field_banks.npy", 4 * i4),
+        ("field_cont.npy",  fcd * f4),
+        ("trans_ids.npy",   2 * i4),
+        ("trans_cont.npy",  tcd * f4),
+        ("move_ids.npy",    4 * i4),
+        ("move_banks.npy",  4 * 4 * i4),
+        ("move_cont.npy",   4 * mcd * f4),
+        ("switch_ids.npy",  5 * i4),
+        ("switch_cont.npy", 5 * scd * f4),
+        ("legal.npy",       9 * f4),
+        ("action.npy",      i4),
+        ("result.npy",      f4),
+        ("turn.npy",        i4),
+    ]
+    reclaimed = 0
+    for name, row_bytes in targets:
+        path = out_dir / name
+        if not path.exists():
+            continue
+        cur = path.stat().st_size
+        want = N * row_bytes
+        if cur == want:
+            continue
+        if cur < want:
+            # Unexpected — file is smaller than N rows. Skip to avoid corruption.
+            print(f"  [WARN] {name}: size {cur} < expected {want}, skipping")
+            continue
+        os.truncate(str(path), want)
+        reclaimed += cur - want
+    if reclaimed:
+        print(f"  Trimmed memmap files: reclaimed {reclaimed/1e9:.2f} GB")
+
+
 class MemmapV8Writer:
     """Writes v8 records directly to pre-allocated memmap arrays."""
 
@@ -367,11 +427,21 @@ class MemmapV8Writer:
         with open(str(self.out_dir / "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        # Flush all memmaps
-        for attr in dir(self):
-            obj = getattr(self, attr)
-            if isinstance(obj, np.memmap):
-                obj.flush()
+        # Flush all memmaps, then release handles so we can truncate.
+        mm_attrs = [a for a in dir(self) if isinstance(getattr(self, a), np.memmap)]
+        for attr in mm_attrs:
+            getattr(self, attr).flush()
+        for attr in mm_attrs:
+            mm = getattr(self, attr)
+            if hasattr(mm, "_mmap") and mm._mmap is not None:
+                mm._mmap.close()
+            setattr(self, attr, None)
+        import gc
+        gc.collect()
+
+        # Physically trim each memmap file to N rows (reclaims unused preallocation).
+        if N < self.max_rows:
+            _trim_files_to_n_rows(self.out_dir, N, self._dims)
 
         # Report size
         total_bytes = sum(
@@ -382,9 +452,6 @@ class MemmapV8Writer:
         print(f"\nMemmap finalized: {N:,} rows, {E:,} episodes, {total_bytes/1e9:.2f} GB")
         print(f"  Max allocated: {self.max_rows:,} rows")
         print(f"  Utilization: {N/self.max_rows*100:.1f}%")
-        if N < self.max_rows:
-            print(f"  Note: memmap files contain {self.max_rows - N:,} unused trailing rows")
-            print(f"  (episode_index only references the first {N:,} rows)")
 
 
 # =============================

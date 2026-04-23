@@ -34,7 +34,6 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
 from poke_env.data import to_id_str
 
-from features import make_obs_mask_and_slots
 from features import make_features
 
 
