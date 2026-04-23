@@ -164,7 +164,8 @@ class InferenceServerV2:
         self.result_queues = result_queues
         self.batch_timeout = batch_timeout_ms / 1000.0
         self.min_batch = min_batch
-        self.D = model.cfg.d_model
+        # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy checkpoints)
+        self.D = getattr(model, "d_temporal", model.cfg.d_model)
         self.max_temporal = model.temporal.temporal_context
 
         self.history: Dict[Tuple[int, str], torch.Tensor] = {}

@@ -42,6 +42,14 @@ class PokeTransformerConfig:
     ff_mult: int = 4          # feedforward expansion
     dropout: float = 0.1
 
+    # --- Capacity reallocation (Session 37, Metamon-inspired) ---
+    # When d_spatial / d_temporal are None, fall back to d_model (old behavior).
+    # When n_summary_tokens == 0, use legacy single attention-pooled summary.
+    # When >= 1, use K learnable scratch tokens (Metamon-style) + projection to d_temporal.
+    d_spatial: Optional[int] = None
+    d_temporal: Optional[int] = None
+    n_summary_tokens: int = 0
+
     # Temporal
     temporal_context: int = 200  # max turns of history
     temporal_mode: str = "summary"  # "summary" or "frames"
@@ -145,12 +153,12 @@ class MoveNet(nn.Module):
 # =============================
 
 class PokemonNet(nn.Module):
-    """Encodes one Pokemon into a d_model-dim token.
+    """Encodes one Pokemon into a d_spatial-dim token.
 
     Processes entity embeddings + NumericalBanks + continuous features + 4 MoveNet outputs.
     """
 
-    def __init__(self, cfg: PokeTransformerConfig, move_net: MoveNet):
+    def __init__(self, cfg: PokeTransformerConfig, move_net: MoveNet, d_out: int):
         super().__init__()
         self.move_net = move_net  # shared across all Pokemon
 
@@ -172,12 +180,12 @@ class PokemonNet(nn.Module):
         in_dim = entity_dim + bank_total + move_total + POKEMON_CONT_DIM
 
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, cfg.d_model),
+            nn.Linear(in_dim, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.LayerNorm(d_out),
+            nn.Linear(d_out, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
+            nn.LayerNorm(d_out),
         )
 
     def forward(self, ids: Dict[str, torch.Tensor], banks: Dict[str, torch.Tensor],
@@ -228,9 +236,9 @@ class PokemonNet(nn.Module):
 # =============================
 
 class FieldNet(nn.Module):
-    """Encodes field state into a d_model-dim token."""
+    """Encodes field state into a d_spatial-dim token."""
 
-    def __init__(self, cfg: PokeTransformerConfig):
+    def __init__(self, cfg: PokeTransformerConfig, d_out: int):
         super().__init__()
         self.turn_bank = NumericalBank(201, cfg.bank_dim)
         self.weather_dur_bank = NumericalBank(9, cfg.bank_dim_small)
@@ -241,12 +249,12 @@ class FieldNet(nn.Module):
         in_dim = bank_total + FIELD_CONT_DIM
 
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, cfg.d_model),
+            nn.Linear(in_dim, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.LayerNorm(d_out),
+            nn.Linear(d_out, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
+            nn.LayerNorm(d_out),
         )
 
     def forward(self, banks: Dict[str, torch.Tensor], cont: torch.Tensor) -> torch.Tensor:
@@ -263,9 +271,9 @@ class FieldNet(nn.Module):
 # =============================
 
 class TransitionNet(nn.Module):
-    """Encodes previous-turn events into a d_model-dim token."""
+    """Encodes previous-turn events into a d_spatial-dim token."""
 
-    def __init__(self, cfg: PokeTransformerConfig):
+    def __init__(self, cfg: PokeTransformerConfig, d_out: int):
         super().__init__()
         # Action IDs can be either move or species — use a combined embedding
         # (move and species IDs don't overlap much, and unknown=0 handles both)
@@ -273,12 +281,12 @@ class TransitionNet(nn.Module):
 
         in_dim = cfg.entity_embed_dim * 2 + TRANSITION_CONT_DIM
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, cfg.d_model),
+            nn.Linear(in_dim, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.LayerNorm(d_out),
+            nn.Linear(d_out, d_out),
             nn.GELU(),
-            nn.LayerNorm(cfg.d_model),
+            nn.LayerNorm(d_out),
         )
 
     def forward(self, ids: Dict[str, torch.Tensor], cont: torch.Tensor) -> torch.Tensor:
@@ -293,88 +301,106 @@ class TransitionNet(nn.Module):
 # =============================
 
 class SpatialTransformer(nn.Module):
-    """Processes 17 entity tokens with Poke-Mask attention.
+    """Processes entity tokens with Poke-Mask attention.
 
-    Poke-Mask: state tokens [2:] can't attend to decision tokens [0:2].
+    Token layout (legacy K=0):
+      [actor, critic, field, transition, 6 our mons, 6 opp mons] = 16 tokens
+      Summary: single attention-pooled vector.
+
+    Token layout (K>=1, Metamon-inspired):
+      [actor, critic, field, transition, 6 our mons, 6 opp mons, K scratch] = 16+K tokens
+      Summaries: K scratch token outputs (no pooling).
+
+    Poke-Mask: non-decision tokens ([2:]) can't attend to decision tokens [0:2].
     Actor [0] can't see critic [1] and vice versa.
     """
 
-    def __init__(self, cfg: PokeTransformerConfig):
+    def __init__(self, cfg: PokeTransformerConfig, d_spatial: int):
         super().__init__()
-        # 16 tokens: actor(1) + critic(1) + field(1) + transition(1) + our_poke(6) + opp_poke(6)
-        self.n_tokens = 16
-        self.d_model = cfg.d_model
+        self.d_spatial = d_spatial
         self.gradient_checkpoint = cfg.gradient_checkpoint
+        self.n_summary_tokens = cfg.n_summary_tokens
+        # 16 base tokens + K summary scratch tokens (0 in legacy mode)
+        self.n_base = 16
+        self.n_tokens = self.n_base + self.n_summary_tokens
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
+            d_model=d_spatial,
             nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_model * cfg.ff_mult,
+            dim_feedforward=d_spatial * cfg.ff_mult,
             dropout=cfg.dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,  # pre-layer norm (more stable)
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=cfg.n_spatial_layers,
         )
 
         # Learnable decision tokens
-        self.actor_token = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
-        self.critic_token = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
+        self.actor_token = nn.Parameter(torch.randn(d_spatial) * 0.02)
+        self.critic_token = nn.Parameter(torch.randn(d_spatial) * 0.02)
 
-        # Token type embedding (helps distinguish our vs opp vs field vs decision)
-        # Types: 0=actor, 1=critic, 2=field, 3=transition, 4=our_pokemon, 5=opp_pokemon
-        self.token_type_embed = nn.Embedding(6, cfg.d_model)
+        # Token type embedding. Legacy (K=0) has 6 types; new (K≥1) adds type 6=summary.
+        # Sizing conditionally preserves exact state-dict shape for loading legacy checkpoints.
+        n_types_embed = 6 if self.n_summary_tokens == 0 else 7
+        self.token_type_embed = nn.Embedding(n_types_embed, d_spatial)
 
-        # Attention pooling for turn summary
-        self.summary_query = nn.Parameter(torch.randn(cfg.d_model) * 0.02)
-        self.summary_attn = nn.MultiheadAttention(
-            cfg.d_model, num_heads=cfg.n_heads, dropout=cfg.dropout, batch_first=True,
-        )
-        self.summary_norm = nn.LayerNorm(cfg.d_model)
+        if self.n_summary_tokens == 0:
+            # Legacy path: attention pooling yields a single summary vector.
+            self.summary_query = nn.Parameter(torch.randn(d_spatial) * 0.02)
+            self.summary_attn = nn.MultiheadAttention(
+                d_spatial, num_heads=cfg.n_heads, dropout=cfg.dropout, batch_first=True,
+            )
+            self.summary_norm = nn.LayerNorm(d_spatial)
+        else:
+            # New path: K learnable scratch tokens participate in self-attention.
+            # Flatten output (B, K, d_spatial) → (B, K*d_spatial); projection to temporal happens outside.
+            self.summary_scratch = nn.Parameter(torch.randn(self.n_summary_tokens, d_spatial) * 0.02)
 
-        # Build Poke-Mask (registered as buffer so it moves with .to(device))
         self.register_buffer("poke_mask", self._build_poke_mask())
 
     def _build_poke_mask(self) -> torch.Tensor:
-        """Additive attention mask. -inf blocks attention."""
+        """Additive attention mask. -inf blocks attention.
+
+        All non-decision tokens (state + summary) are blocked from attending to
+        decision tokens [0:2]. This preserves the Poke-Mask guarantee that the
+        policy/value representation at the actor/critic tokens cannot be
+        indirectly contaminated via summary-token relays.
+        """
         mask = torch.zeros(self.n_tokens, self.n_tokens)
-        # State tokens [2:] can't attend to decision tokens [0:2]
-        mask[2:, 0:2] = float("-inf")
-        # Actor [0] can't see critic [1]
-        mask[0, 1] = float("-inf")
-        # Critic [1] can't see actor [0]
-        mask[1, 0] = float("-inf")
+        mask[2:, 0:2] = float("-inf")    # state + summary tokens can't see decision
+        mask[0, 1] = float("-inf")       # actor can't see critic
+        mask[1, 0] = float("-inf")       # critic can't see actor
         return mask
 
     def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        tokens: (B, 14, d_model) -- field + transition + 6 our + 6 opp = 14 entity tokens
-                (decision tokens are prepended internally to make 16 total)
+        tokens: (B, 14, d_spatial) -- field + transition + 6 our + 6 opp = 14 entity tokens
 
         Returns:
-            full_output: (B, 16, d_model) -- all 16 token outputs
-            summary: (B, d_model) -- attention-pooled turn summary
+            full_output: (B, n_tokens, d_spatial) -- all token outputs
+            summaries: legacy: (B, d_spatial) single pooled summary
+                       new:    (B, K, d_spatial) K scratch token outputs
         """
         B = tokens.shape[0]
         device = tokens.device
 
-        # Prepend learnable decision tokens
+        # Prepend decision tokens; append K summary scratch tokens if enabled
         actor = self.actor_token.unsqueeze(0).expand(B, -1).unsqueeze(1)   # (B, 1, D)
         critic = self.critic_token.unsqueeze(0).expand(B, -1).unsqueeze(1)  # (B, 1, D)
-        x = torch.cat([actor, critic, tokens], dim=1)  # (B, 17, D)
+        if self.n_summary_tokens > 0:
+            scratch = self.summary_scratch.unsqueeze(0).expand(B, -1, -1)   # (B, K, D)
+            x = torch.cat([actor, critic, tokens, scratch], dim=1)          # (B, 16+K, D)
+        else:
+            x = torch.cat([actor, critic, tokens], dim=1)                   # (B, 16, D)
 
-        # Add token type embeddings
-        # 16 tokens: actor(0), critic(1), field(2), transition(3), our_poke*6(4), opp_poke*6(5)
-        type_ids = torch.tensor(
-            [0, 1, 2, 3] + [4] * 6 + [5] * 6,
-            device=device, dtype=torch.long,
-        ).unsqueeze(0).expand(B, -1)
+        # Token type IDs
+        type_list = [0, 1, 2, 3] + [4] * 6 + [5] * 6 + [6] * self.n_summary_tokens
+        type_ids = torch.tensor(type_list, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
         assert type_ids.shape[1] == self.n_tokens, f"type_ids {type_ids.shape[1]} != n_tokens {self.n_tokens}"
         x = x + self.token_type_embed(type_ids)
 
-        # Spatial transformer with Poke-Mask
         if self.gradient_checkpoint and self.training:
             x = torch.utils.checkpoint.checkpoint(
                 self.transformer, x, self.poke_mask, use_reentrant=False,
@@ -382,13 +408,17 @@ class SpatialTransformer(nn.Module):
         else:
             x = self.transformer(x, mask=self.poke_mask)
 
-        # Attention pooling for turn summary (FP32 to prevent FP16 overflow in attention scores)
-        query = self.summary_query.unsqueeze(0).unsqueeze(1).expand(B, -1, -1)  # (B, 1, D)
-        with torch.amp.autocast("cuda", enabled=False):
-            summary, _ = self.summary_attn(query.float(), x.float(), x.float())  # (B, 1, D)
-            summary = self.summary_norm(summary.squeeze(1))  # (B, D)
-
-        return x, summary
+        if self.n_summary_tokens == 0:
+            # Legacy attention-pool summary (FP32 to prevent FP16 overflow in attention scores)
+            query = self.summary_query.unsqueeze(0).unsqueeze(1).expand(B, -1, -1)  # (B, 1, D)
+            with torch.amp.autocast("cuda", enabled=False):
+                summary, _ = self.summary_attn(query.float(), x.float(), x.float())
+                summary = self.summary_norm(summary.squeeze(1))  # (B, D)
+            return x, summary
+        else:
+            # Scratch-token summaries: (B, K, D)
+            summaries = x[:, self.n_base:, :]
+            return x, summaries
 
 
 # =============================
@@ -398,24 +428,24 @@ class SpatialTransformer(nn.Module):
 class TemporalTransformer(nn.Module):
     """Processes turn summaries across time with causal attention.
 
-    Summary mode: each turn is 1 vector (d_model). Max 200 turns.
-    Frames mode: each turn is 17 vectors. Max N turns (for cloud GPU).
+    Operates in d_temporal, which may differ from d_spatial. When differ, a
+    projection layer in PokeTransformer maps the flattened spatial summary
+    (K * d_spatial) to d_temporal before this module sees the sequence.
     """
 
-    def __init__(self, cfg: PokeTransformerConfig):
+    def __init__(self, cfg: PokeTransformerConfig, d_temporal: int):
         super().__init__()
-        self.d_model = cfg.d_model
+        self.d_temporal = d_temporal
         self.temporal_context = cfg.temporal_context
         self.temporal_mode = cfg.temporal_mode
         self.gradient_checkpoint = cfg.gradient_checkpoint
 
-        # Positional encoding for turn positions
-        self.pos_embed = nn.Embedding(cfg.temporal_context, cfg.d_model)
+        self.pos_embed = nn.Embedding(cfg.temporal_context, d_temporal)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
+            d_model=d_temporal,
             nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_model * cfg.ff_mult,
+            dim_feedforward=d_temporal * cfg.ff_mult,
             dropout=cfg.dropout,
             activation="gelu",
             batch_first=True,
@@ -428,10 +458,10 @@ class TemporalTransformer(nn.Module):
     def forward(self, summaries: torch.Tensor, seq_lens: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Full recompute forward (used during training / PPO update).
 
-        summaries: (B, T, d_model) -- T turn summaries (most recent last)
+        summaries: (B, T, d_temporal) -- T turn summaries (most recent last)
         seq_lens: (B,) optional -- actual lengths per batch item
 
-        Returns: (B, d_model) -- temporal context from the last turn
+        Returns: (B, d_temporal) -- temporal context from the last turn
         """
         B, T, D = summaries.shape
         device = summaries.device
@@ -483,7 +513,7 @@ class TemporalTransformer(nn.Module):
 class ActionSlotEncoder(nn.Module):
     """Encodes active move slots and switch slots for action-aware policy head."""
 
-    def __init__(self, cfg: PokeTransformerConfig, move_net: MoveNet):
+    def __init__(self, cfg: PokeTransformerConfig, move_net: MoveNet, d_out: int):
         super().__init__()
         self.move_net = move_net  # shared MoveNet
 
@@ -495,8 +525,8 @@ class ActionSlotEncoder(nn.Module):
             nn.LayerNorm(cfg.move_dim),
         )
 
-        # Project 4 move vecs + 5 switch vecs to per-action context
-        self.action_proj = nn.Linear(cfg.move_dim, cfg.d_model)
+        # Project 4 move vecs + 5 switch vecs to per-action context (d_spatial)
+        self.action_proj = nn.Linear(cfg.move_dim, d_out)
 
     def forward(self, move_ids: torch.Tensor, move_banks: Dict[str, torch.Tensor],
                 move_cont: torch.Tensor, switch_ids: torch.Tensor,
@@ -551,33 +581,59 @@ class PokeTransformer(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        # Resolve dim variants. When d_spatial/d_temporal are None, use d_model
+        # (legacy behavior). When explicitly set, allows asymmetric shapes per
+        # Metamon-style capacity allocation (temporal > spatial).
+        self.d_spatial = cfg.d_spatial if cfg.d_spatial is not None else cfg.d_model
+        self.d_temporal = cfg.d_temporal if cfg.d_temporal is not None else cfg.d_model
+        self.n_summary_tokens = cfg.n_summary_tokens
+
         # Shared MoveNet (used by PokemonNet and ActionSlotEncoder)
         self.move_net = MoveNet(cfg)
 
-        # Sub-networks
-        self.pokemon_net = PokemonNet(cfg, self.move_net)
-        self.field_net = FieldNet(cfg)
-        self.transition_net = TransitionNet(cfg)
+        # Sub-networks — all operate in d_spatial
+        self.pokemon_net = PokemonNet(cfg, self.move_net, self.d_spatial)
+        self.field_net = FieldNet(cfg, self.d_spatial)
+        self.transition_net = TransitionNet(cfg, self.d_spatial)
 
-        # Transformers
-        self.spatial = SpatialTransformer(cfg)
-        self.temporal = TemporalTransformer(cfg)
+        # Spatial transformer (d_spatial) → summaries
+        self.spatial = SpatialTransformer(cfg, self.d_spatial)
 
-        # Action slot encoder
-        self.action_encoder = ActionSlotEncoder(cfg, self.move_net)
+        # Summary → temporal projection. In legacy mode (K=0), summary is already
+        # (B, d_spatial); project to d_temporal only if dims differ. In new mode
+        # (K≥1), flatten K scratch tokens and project (B, K*d_spatial → d_temporal).
+        if self.n_summary_tokens == 0:
+            if self.d_spatial == self.d_temporal:
+                self.summary_to_temporal = nn.Identity()
+            else:
+                self.summary_to_temporal = nn.Linear(self.d_spatial, self.d_temporal)
+        else:
+            self.summary_to_temporal = nn.Linear(
+                self.n_summary_tokens * self.d_spatial, self.d_temporal,
+            )
 
-        # Policy head: actor_output + temporal_context + action_context -> logits
+        # Temporal transformer (d_temporal)
+        self.temporal = TemporalTransformer(cfg, self.d_temporal)
+
+        # Action slot encoder — outputs per-action d_spatial (matches spatial tokens)
+        self.action_encoder = ActionSlotEncoder(cfg, self.move_net, self.d_spatial)
+
+        # Policy head: actor (d_spatial) + temporal_ctx (d_temporal) + action_ctx (d_spatial)
+        policy_in = 2 * self.d_spatial + self.d_temporal
+        policy_hidden = max(self.d_spatial, self.d_temporal)
         self.policy_head = nn.Sequential(
-            nn.Linear(cfg.d_model * 3, cfg.d_model),
+            nn.Linear(policy_in, policy_hidden),
             nn.GELU(),
-            nn.Linear(cfg.d_model, 1),
+            nn.Linear(policy_hidden, 1),
         )
 
-        # Value head: critic_output + temporal_context -> distributional bins
+        # Value head: critic (d_spatial) + temporal_ctx (d_temporal)
+        value_in = self.d_spatial + self.d_temporal
+        value_hidden = max(self.d_spatial, self.d_temporal)
         self.value_head = nn.Sequential(
-            nn.Linear(cfg.d_model * 2, cfg.d_model),
+            nn.Linear(value_in, value_hidden),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.v_bins),
+            nn.Linear(value_hidden, cfg.v_bins),
         )
 
         # Value support (bin centers)
@@ -655,12 +711,21 @@ class PokeTransformer(nn.Module):
         return tokens
 
     def forward_spatial(self, batch: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run spatial transformer on a single turn.
+        """Run spatial transformer + project summaries to d_temporal.
 
-        Returns: (full_output (B, 17, D), summary (B, D))
+        Returns:
+            spatial_out: (B, n_tokens, d_spatial)
+            summary_temporal: (B, d_temporal) — ready for temporal model
         """
         entity_tokens = self._encode_entities(batch)
-        return self.spatial(entity_tokens)
+        spatial_out, raw_summary = self.spatial(entity_tokens)
+        # Legacy (K=0): raw_summary is (B, d_spatial). New (K≥1): (B, K, d_spatial).
+        if self.n_summary_tokens == 0:
+            summary_temporal = self.summary_to_temporal(raw_summary)  # (B, d_temporal)
+        else:
+            B = raw_summary.shape[0]
+            summary_temporal = self.summary_to_temporal(raw_summary.reshape(B, -1))
+        return spatial_out, summary_temporal
 
     def forward(self, batch: dict, history: Optional[torch.Tensor] = None,
                 history_lens: Optional[torch.Tensor] = None) -> dict:
@@ -674,56 +739,51 @@ class PokeTransformer(nn.Module):
             action_logits: (B, 9)
             value: (B,) expected value
             v_logits: (B, 51) distributional logits
-            summary: (B, d_model) turn summary for temporal buffer
-            spatial_output: (B, 17, d_model) all spatial tokens
+            summary: (B, d_temporal) turn summary for temporal buffer (projected)
+            spatial_output: (B, n_tokens, d_spatial) all spatial tokens
         """
         B = batch["field_cont"].shape[0]
         device = batch["field_cont"].device
 
-        # 1. Spatial transformer
+        # 1. Spatial transformer (projects summary to d_temporal)
         spatial_out, summary = self.forward_spatial(batch)
 
-        # 2. Temporal transformer
+        # 2. Temporal transformer (operates in d_temporal)
         if history is not None and history.shape[1] > 0:
-            # Append current summary to history
             all_summaries = torch.cat([history, summary.unsqueeze(1)], dim=1)
             if history_lens is not None:
                 temporal_lens = history_lens + 1
             else:
                 temporal_lens = None
         else:
-            all_summaries = summary.unsqueeze(1)  # (B, 1, D)
+            all_summaries = summary.unsqueeze(1)  # (B, 1, d_temporal)
             temporal_lens = None
 
-        temporal_ctx = self.temporal(all_summaries, temporal_lens)  # (B, D)
+        temporal_ctx = self.temporal(all_summaries, temporal_lens)  # (B, d_temporal)
 
-        # 3. Policy head
-        actor_out = spatial_out[:, 0, :]  # actor decision token
-        critic_out = spatial_out[:, 1, :]  # critic decision token
+        # 3. Policy head — actor (d_spatial) + temporal_ctx (d_temporal) + action_ctx (d_spatial)
+        actor_out = spatial_out[:, 0, :]   # (B, d_spatial)
+        critic_out = spatial_out[:, 1, :]  # (B, d_spatial)
 
-        # Encode action slots for action-conditioned policy
         action_ctx = self.action_encoder(
             batch["active_move_ids"], batch["active_move_banks"],
             batch["active_move_cont"], batch["switch_ids"], batch["switch_cont"],
-        )  # (B, 9, D)
+        )  # (B, 9, d_spatial)
 
-        # Per-action logits: dot(actor+temporal, action_context)
-        actor_temporal = torch.cat([actor_out, temporal_ctx], dim=-1)  # (B, 2D)
-        # Expand and concat with each action context
-        actor_temporal_exp = actor_temporal.unsqueeze(1).expand(-1, 9, -1)  # (B, 9, 2D)
-        policy_input = torch.cat([actor_temporal_exp, action_ctx], dim=-1)  # (B, 9, 3D)
+        actor_temporal = torch.cat([actor_out, temporal_ctx], dim=-1)  # (B, d_spatial + d_temporal)
+        actor_temporal_exp = actor_temporal.unsqueeze(1).expand(-1, 9, -1)
+        policy_input = torch.cat([actor_temporal_exp, action_ctx], dim=-1)  # (B, 9, 2*d_spatial + d_temporal)
         action_logits = self.policy_head(policy_input).squeeze(-1)  # (B, 9)
 
-        # Apply legal mask
         if "legal_mask" in batch:
             mask = batch["legal_mask"]
             action_logits = action_logits.masked_fill(mask < 0.5, -100.0)
 
-        # 4. Value head
-        value_input = torch.cat([critic_out, temporal_ctx], dim=-1)  # (B, 2D)
-        v_logits = self.value_head(value_input)  # (B, 51)
+        # 4. Value head — critic (d_spatial) + temporal_ctx (d_temporal)
+        value_input = torch.cat([critic_out, temporal_ctx], dim=-1)  # (B, d_spatial + d_temporal)
+        v_logits = self.value_head(value_input)
         v_probs = F.softmax(v_logits, dim=-1)
-        value = (v_probs * self.v_support).sum(-1)  # (B,) expected value
+        value = (v_probs * self.v_support).sum(-1)
 
         return {
             "action_logits": action_logits,
@@ -835,27 +895,26 @@ class PokeTransformer(nn.Module):
             "pp": amb[:, :, 2], "prio": amb[:, :, 3],
         }
 
-        # Run spatial on entire mega-batch at once
+        # Run spatial on entire mega-batch at once.
+        # forward_spatial already projects summary to d_temporal.
+        # spatial_out: (N_valid, n_tokens, d_spatial); all_summaries: (N_valid, d_temporal)
         spatial_out, all_summaries = self.forward_spatial(mega_batch)
-        # spatial_out: (N_valid, 16, D), all_summaries: (N_valid, D)
+        n_tokens = spatial_out.shape[1]
 
-        # Also get action context from the mega-batch
+        # Action context from the mega-batch (d_spatial)
         action_ctx = self.action_encoder(
             mega_batch["active_move_ids"], mega_batch["active_move_banks"],
             mega_batch["active_move_cont"], mega_batch["switch_ids"],
             mega_batch["switch_cont"],
-        )  # (N_valid, 9, D)
+        )  # (N_valid, 9, d_spatial)
 
-        # --- Phase 2: Scatter summaries to (B, T, D) grid, run temporal batched per turn ---
-        summary_grid = torch.zeros(B, T, self.cfg.d_model, device=device)
-        for idx, (b, t) in enumerate(valid_indices):
-            summary_grid[b, t] = all_summaries[idx]
-
-        # Scatter spatial outputs and action contexts to (B, T, ...) grids too
-        spatial_grid = torch.zeros(B, T, 16, self.cfg.d_model, device=device)
-        actctx_grid = torch.zeros(B, T, 9, self.cfg.d_model, device=device)
+        # --- Phase 2: Scatter to (B, T, ...) grids ---
+        summary_grid = torch.zeros(B, T, self.d_temporal, device=device)
+        spatial_grid = torch.zeros(B, T, n_tokens, self.d_spatial, device=device)
+        actctx_grid = torch.zeros(B, T, 9, self.d_spatial, device=device)
         legal_grid = torch.zeros(B, T, 9, device=device)
         for idx, (b, t) in enumerate(valid_indices):
+            summary_grid[b, t] = all_summaries[idx]
             spatial_grid[b, t] = spatial_out[idx]
             actctx_grid[b, t] = action_ctx[idx]
             legal_grid[b, t] = mega_batch["legal_mask"][idx]
@@ -933,6 +992,13 @@ def add_model_args(parser):
     g.add_argument("--entity-embed-dim", type=int, default=32)
     g.add_argument("--v-bins", type=int, default=51)
     g.add_argument("--gradient-checkpoint", action="store_true")
+    # Capacity reallocation (Session 37)
+    g.add_argument("--d-spatial", type=int, default=None,
+                   help="Spatial encoder d_model (defaults to --d-model)")
+    g.add_argument("--d-temporal", type=int, default=None,
+                   help="Temporal encoder d_model (defaults to --d-model)")
+    g.add_argument("--n-summary-tokens", type=int, default=0,
+                   help="K scratch summary tokens per turn (0 = legacy attention pool)")
     return parser
 
 
@@ -952,4 +1018,7 @@ def config_from_args(args) -> PokeTransformerConfig:
         entity_embed_dim=args.entity_embed_dim,
         v_bins=args.v_bins,
         gradient_checkpoint=args.gradient_checkpoint,
+        d_spatial=getattr(args, "d_spatial", None),
+        d_temporal=getattr(args, "d_temporal", None),
+        n_summary_tokens=getattr(args, "n_summary_tokens", 0),
     )

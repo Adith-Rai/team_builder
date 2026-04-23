@@ -100,7 +100,8 @@ def _inference_server_process(
     model.load_state_dict(model_state_dict)
     model.eval()
 
-    D = cfg.d_model
+    # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy configs)
+    D = cfg.d_temporal if cfg.d_temporal is not None else cfg.d_model
     max_temporal = cfg.temporal_context
     batch_timeout = batch_timeout_ms / 1000.0
     history: Dict[Tuple[int, str], torch.Tensor] = {}

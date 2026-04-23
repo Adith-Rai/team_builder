@@ -154,7 +154,9 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 # --- Sequential temporal + heads ---
                 all_logits = []
                 all_vlogits = []
-                summary_buf = torch.zeros(1, 0, cfg.d_model, device=device)
+                # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy configs)
+                _d_sum = cfg.d_temporal if cfg.d_temporal is not None else cfg.d_model
+                summary_buf = torch.zeros(1, 0, _d_sum, device=device)
 
                 for t in range(T):
                     s = all_summaries[t:t+1].unsqueeze(0)

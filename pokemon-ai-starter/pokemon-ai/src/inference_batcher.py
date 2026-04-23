@@ -34,7 +34,8 @@ class InferenceBatcher:
         self.timeout_s = timeout_ms / 1000.0
         self._pending: List[Tuple[dict, Optional[torch.Tensor], int, asyncio.Future]] = []
         self._lock = asyncio.Lock()
-        self._d_model = model.cfg.d_model
+        # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy checkpoints)
+        self._d_model = getattr(model, "d_temporal", model.cfg.d_model)
         # Profiling counters (reset per collection)
         self._prof_batch_sizes = []
         self._prof_gpu_times = []
