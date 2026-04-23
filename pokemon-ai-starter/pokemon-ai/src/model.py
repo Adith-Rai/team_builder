@@ -966,10 +966,10 @@ class PokeTransformer(nn.Module):
             vl = self.value_head(vi)                            # (n_valid, 51)
             val = (F.softmax(vl, dim=-1) * self.v_support).sum(-1)  # (n_valid,)
 
-            # Scatter back
-            out_logits[valid_mask_t, t] = logits
-            out_vlogits[valid_mask_t, t] = vl
-            out_value[valid_mask_t, t] = val
+            # Scatter back (cast to destination dtype — AMP produces fp16 sources)
+            out_logits[valid_mask_t, t] = logits.to(out_logits.dtype)
+            out_vlogits[valid_mask_t, t] = vl.to(out_vlogits.dtype)
+            out_value[valid_mask_t, t] = val.to(out_value.dtype)
 
         return {
             "action_logits": out_logits,
