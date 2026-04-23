@@ -1,11 +1,12 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-21 (Session 36 final — multi-gen is the next phase)**
+**Last updated: 2026-04-22 (Session 37 — Metamon study + multi-gen prep + capacity reshape done)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
 
 Supporting documents:
+- `docs/METAMON_LEARNINGS.md` — Session 37 Metamon architecture study + recommendations
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
 - `docs/CLOUD_DEPLOY.md` — cloud migration plan
@@ -33,13 +34,52 @@ individually against bots (14,000 games). Early results show savg 51-77% dependi
 on team — massive variance. Fixed-team play is MUCH stronger than random-from-pool.
 Results will be in `team_selection_results.json` when complete.
 
-**Next phase: MULTI-GEN + GEN-AGNOSTIC PREP.** User direction: do multi-gen before any
-model size changes (capacity reallocation, BC scaling) so all future work builds on a
-multi-gen-ready foundation. See "What to do next" section below.
+**Session 37 status — TWO major prep milestones done:**
+
+1. **Metamon study complete** (`docs/METAMON_LEARNINGS.md`). Confirmed from direct config
+   read that every Metamon size variant uses 5-8× temporal:spatial d_model — strongest
+   evidence yet that Option A (capacity reallocation) is the right next architectural lever.
+
+2. **Multi-gen prep DONE** (commit `18e965c`). Previous sessions had already implemented
+   90%: vocab loops gens 1-9, features has Mega/Z-move/Dynamax/Tera flags, team_generator
+   has per-gen ban lists, format_from_str parses gen. Session 37 fixed two real bugs —
+   `ProceduralTeambuilder` wasn't passing `gen` to `load_pokemon_pool` (always loaded
+   gen9 tiers), and OU rating threshold was hardcoded `1695` (gen9 only; gen6-8 use `1760`
+   in 2024-04 data). Verified gen6/7/8/9 teams now generate era-appropriate mons
+   (gen6 HP Ice Thundurus, gen7 Z-crystal Dragonite, gen8 Double Iron Bash Melmetal).
+
+3. **Capacity reshape implemented** (commit `76acca8`). Added `d_spatial`, `d_temporal`,
+   `n_summary_tokens` to PokeTransformerConfig. Legacy defaults (None/0) preserve exact
+   sp2979 param count (13,382,572, strict=True load verified). New reshape config
+   (256/512/3L/3L/K=4/dropout=0.05) instantiates at 14.28M, forward + multi-turn works
+   cleanly, FP16 smoke-tested on CUDA. See `docs/METAMON_LEARNINGS.md` §5 for design rationale.
+
+**Next concrete step:** Launch BC retrain with reshape config. Command below.
 
 ---
 
 ## Quick-reference commands
+
+### BC retrain with capacity reshape (Session 37 — the NEXT step)
+```bash
+cd pokemon-ai-starter/pokemon-ai/src
+python -u train_bc.py \
+  --memmap-dir data/datasets/memmap_v8 \
+  --device cuda --fp16 \
+  --d-spatial 256 --d-temporal 512 \
+  --n-spatial-layers 3 --n-temporal-layers 3 \
+  --n-summary-tokens 4 \
+  --dropout 0.05 \
+  --lr 1e-4 --weight-decay 1e-4 --grad-clip 2.0 \
+  --batch-size 16 --epochs 10 --sched cosine --warmup-steps 200 \
+  --eval-games 200 \
+  2>&1 | tee bc_reshape.log
+```
+
+Expected: ~14.28M params. The reshape tests whether Metamon-style temporal:spatial
+(2:1 d_model, equal layer count, K=4 summary scratch tokens) closes the gap to
+MM-SmallRLG9 on the PokeAgent ladder. Runs entirely on existing memmap (stale 107/28
+dims, auto-padded — the 2 missing type_eff dims are not the bottleneck per METAMON_LEARNINGS §5).
 
 ### Resume training from current best (with safeguards ON)
 ```bash
