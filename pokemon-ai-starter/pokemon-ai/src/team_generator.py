@@ -239,10 +239,17 @@ def parse_usage_file(path: str, ban_list: set = None) -> List[PokemonData]:
 
 
 def _default_tiers(gen: int = 9) -> list:
-    """Default tier list for a given generation."""
+    """Default tier list for a given generation.
+
+    OU rating threshold differs by gen (Smogon's historical cutoff):
+    - gen9: 1695 (current)
+    - gen4-8: 1760 (legacy)
+    Lower tiers use 1500 for all gens.
+    """
     prefix = f"gen{gen}"
+    ou_rating = "1695" if gen == 9 else "1760"
     return [
-        (f"{prefix}ou", "1695"),
+        (f"{prefix}ou", ou_rating),
         (f"{prefix}uu", "1500"),
         (f"{prefix}ru", "1500"),
         (f"{prefix}nu", "1500"),
@@ -469,7 +476,7 @@ class ProceduralTeambuilder(_Teambuilder):
         super().__init__()
         self.gen = gen
         self.ban_list = get_ban_list(gen)
-        self.pool = load_pokemon_pool(stats_dir, ban_list=self.ban_list)
+        self.pool = load_pokemon_pool(stats_dir, ban_list=self.ban_list, gen=gen)
         self.random_pct = random_pct
         # Precompute uniform weights for random teams
         self._uniform_weights = {

@@ -80,6 +80,9 @@ package-lock.json
 pokemon-ai-starter/pokemon-showdown/
 pokemon-ai-starter/showdown-reference/
 
+# Reference repos (read-only clones, not our code)
+metamon_ref/
+
 # Generated output (replays, eval reports)
 **/replays*/
 **/eval_reports/
