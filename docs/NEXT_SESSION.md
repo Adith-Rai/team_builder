@@ -225,7 +225,30 @@ The hyperparameter refinement lever is exhausted (confirmed by Exp 5). Multi-gen
 prep comes FIRST before any model size changes, so all future work builds on a
 multi-gen-ready foundation.
 
-### IMMEDIATE NEXT: Multi-gen + gen-agnostic prep
+### IMMEDIATE NEXT: Study Metamon architecture + apply learnings
+
+**PokeAgent ladder results (Session 36):**
+Our model (13.38M) submitted to the PokeAgent Challenge live ladder.
+- **Skill Rating 1444±30 with TEAM_T** — rank #12, ABOVE MM-Minikazam (4.7M, 1429)
+- **Skill Rating 1376±24 with TEAM_AU** — rank #15
+- Team choice moved us 68 points (more than all hyperparameter experiments combined)
+- Gap to MM-SmallRLG9 (15M, same size as us): 73 points — they use params more efficiently
+- Gap to MM-Kakuna (142M, best): 409 points
+- We beat ALL heuristic baselines (BH tier: 1185-1240) by 200+ points
+
+**Key insight: Metamon's 4.7M model nearly matches our 13.38M.** The gap is architecture
+and methodology, not model size. Metamon is open source — study their design, apply to ours.
+
+**Metamon reference repo cloned:** `metamon_ref/` (shallow clone, read-only reference).
+Study these files (DO NOT modify our code to copy theirs — learn principles, apply to our design):
+- Architecture: temporal:spatial ratio, entity token handling, layer configs
+- BC data pipeline: preprocessing, quality filters, data scale
+- Offline RL recipe: Binary+MaxQ methodology (different from our PPO)
+- Minikazam (4.7M) vs Kakuna (142M): what scales and what doesn't
+
+**After understanding Metamon's design, THEN do:**
+
+### Multi-gen + gen-agnostic prep
 
 **Why first:** User direction (Session 33, reconfirmed Session 36): multi-gen before
 BC scaling or capacity reallocation. Reasoning: if we change model size or retrain BC
