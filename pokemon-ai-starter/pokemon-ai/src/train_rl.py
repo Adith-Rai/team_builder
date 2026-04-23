@@ -46,7 +46,9 @@ from rl_collection import _make_server, collect_v9, BackgroundCollector
 
 def parse_args():
     p = argparse.ArgumentParser(description="Self-Play PPO with Batched Inference")
-    p.add_argument("--init-from", required=True, help="Init checkpoint (e.g. iter80)")
+    p.add_argument("--init-from", default=None,
+                   help="Init checkpoint (e.g. iter80). Optional when --resume is provided; "
+                        "the resume checkpoint is used as the init source in that case.")
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--opponent-device", default="cuda")
@@ -492,8 +494,19 @@ def main():
     device = torch.device(args.device)
     battle_format = args.format
 
+    # Resolve initial checkpoint source. Require at least one of --init-from / --resume
+    # (previously --init-from was always required; making it fallback-friendly so you
+    # can resume sp2979-style runs without passing a BC checkpoint path).
+    init_path = args.init_from or args.resume
+    if init_path is None:
+        raise SystemExit("ERROR: must provide --init-from or --resume")
+    if args.init_from is None:
+        print(f"[init] --init-from not given; using --resume path ({args.resume}) as init source", flush=True)
+    # Track the effective init path for downstream code (snapshot pool, logs, etc.)
+    args.init_from = init_path
+
     # Load model
-    model, cfg, _ = load_checkpoint(args.init_from, device)
+    model, cfg, _ = load_checkpoint(init_path, device)
     model.to(device)
 
     # torch.compile (Linux/cloud only)

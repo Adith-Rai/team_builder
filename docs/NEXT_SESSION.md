@@ -82,11 +82,15 @@ MM-SmallRLG9 on the PokeAgent ladder. Runs entirely on existing memmap (stale 10
 dims, auto-padded — the 2 missing type_eff dims are not the bottleneck per METAMON_LEARNINGS §5).
 
 ### Resume training from current best (with safeguards ON)
+BC_base (`data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt`) was removed during the
+Session 37 cleanup. `train_rl.py` still requires `--init-from` (argparse-enforced),
+but when `--resume` is also provided the init weights are overwritten. Pass the same
+sp2979 path for both — it's a safe workaround until `--init-from` is made optional.
 ```bash
 cd pokemon-ai-starter/pokemon-ai/src
 # Start battle servers first (see below)
 python -u train_rl.py \
-  --init-from data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt \
+  --init-from data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt \
   --resume data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt \
   --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
   --games-per-iter 200 --max-concurrent 200 --n-iters 500 --warmup-iters 0 \
