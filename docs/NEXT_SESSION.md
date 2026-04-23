@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-23 (Session 38 — BC reshape launched, interrupted by BSOD cluster)**
+**Last updated: 2026-04-23 (Session 38 — BC reshape trained on bot data, human memmap regen'd)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -15,37 +15,79 @@ Supporting documents:
 
 ## Session 38 status (READ THIS FIRST)
 
-**BC reshape run was launched and crashed mid-epoch-2 due to a Windows BSOD cluster, not a
-training bug.** Details below. User is rebooting after NVIDIA driver update; next session
-needs to pick up the BC retrain from the last saved checkpoint.
+**Session 38 completed two workstreams: (a) BC reshape trained to completion on the old
+bot-generated memmap, reaching smart_avg 21.2% at epoch 4 (below the historical 22-26%
+ceiling — a small regression); (b) regenerated the training data from 100k ≥1500-Elo
+human Showdown replays, with current 109/30 features (type-effectiveness dims now present).
+The reshape hypothesis is untested against the better data source, and that's what next
+session should do.** Full details below.
 
-### What was running
-`train_bc.py` with the Session 37 reshape config (d_spatial=256, d_temporal=512,
-3L/3L, K=4, dropout=0.05, fp16). Log: `pokemon-ai-starter/pokemon-ai/src/bc_reshape.log`.
-Output dir: `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v8_bc_20260423_031532/`.
+### TL;DR for next session
+1. Launch BC reshape training on the new human memmap (`data/datasets/human_v8_100k/`)
+   — same reshape config, same 10 epochs. See "Next concrete step" below.
+2. If `best.pt` beats 22-26% smart_avg, the capacity reshape + human data combination
+   works. If flat at ~21%, we're at the BC ceiling and PPO is the next lever.
 
-Model: **14,284,716 params** (matches Session 37 design target of ~14.28M).
+### BC reshape run on bot data — DONE (final result)
 
-### What completed before crash
-- **Epoch 0**: train_loss=0.989 train_acc=0.634 val_acc=0.671 v_loss=0.420
-  bot eval: SH=21%, SmartDmg=22%, Tactical=18%, Strategic=18%, **smart_avg=20.0%** → saved `best.pt`
-- **Epoch 1**: train_loss=0.837 train_acc=0.673 val_acc=0.675 v_loss=0.423
-  bot eval: SH=18%, SmartDmg=24%, Tactical=20%, Strategic=18%, **smart_avg=19.6%** (no new best)
-- **Epoch 2**: stopped at step [40] (~41s in)
+Run dir: `data/models/bc/v8_bc_20260423_124909/` (restarted after the mid-run BSOD kill).
+All 10 epochs completed. Best at **epoch 4: smart_avg 21.2%** (SH=21, SmartDmg=20,
+Tactical=22, Strategic=22). Per-epoch curve showed classic BC overfit signature:
+val_acc climbed monotonically 0.671→0.713 while smart_avg plateaued at ~20%.
 
-Smart_avg 20% at epoch 1/10 is below BC_base's 22-26% but not predictive — too early to
-judge the reshape. Resume and let the full 10 epochs complete before making architecture
-decisions.
+| Epoch | SH | SmDmg | Tact | Strat | avg | val_acc |
+|---|---|---|---|---|---|---|
+| 0 | 21 | 22 | 18 | 18 | 20.0 | 0.671 |
+| 1 | 18 | 24 | 20 | 18 | 19.6 | 0.675 |
+| 2 | 27 | 23 | 16 | 16 | 20.6 | 0.683 |
+| 3 | 20 | 19 | 20 | 20 | 19.8 | 0.699 |
+| **4** | **21** | **20** | **22** | **22** | **21.2** | **0.706** ← best.pt |
+| 5 | 16 | 26 | 22 | 19 | 20.6 | 0.706 |
+| 6 | 15 | 17 | 22 | 12 | 16.4 | 0.710 |
+| 7 | 21 | 18 | 20 | 20 | 20.0 | 0.713 |
+| 8 | 26 | 20 | 16 | 20 | 20.5 | 0.712 |
+| 9 | 22 | 17 | 18 | 23 | 20.2 | 0.713 |
 
-### Checkpoints available for resume
-All in `data/models/bc/v8_bc_20260423_031532/`:
-- `best.pt` — epoch 0 weights only (20.0% smart_avg)
-- `epoch_000.pt` — full resumable state (model + optimizer + scheduler + epoch/step)
-- `epoch_001.pt` — full resumable state at end of epoch 1 ← **use this to resume**
-- `step_1356.pt` — mid-epoch-2 checkpoint (optional, more recent but epoch boundary cleaner)
-- `replays_epoch000/`, `replays_epoch001/` — eval replays from bot games
+Interpretation: this was on the STALE memmap (107/28 dims, 4 missing type_eff scalars
+silently zero-padded). Reshape underperformed old BC_base's 22-26% ceiling, but the gap
+is within 200-game eval noise (±2-3% per bot, ±1.5% on the 4-bot mean). Not a verdict
+on the reshape itself — the real test is on the human memmap with full 109/30 features.
 
-### Crashes and fix (the real reason training stopped)
+### New human memmap — DONE
+
+`data/datasets/human_v8_100k/` — generated via `replay_to_memmap.py` streaming from HF
+dataset `jakegrigsby/metamon-raw-replays`, filtered to gen9ou, min_rating=1500.
+
+- **100,000 replays** accepted (from 457,739 streamed; 78% skipped by rating filter)
+- **199,919 episodes** (both perspectives via `--log-both=True`)
+- **5,084,603 records** (14× the old bot memmap's 361k)
+- **move_cont_dim=109, switch_cont_dim=30** — full type-effectiveness features present
+  (the old bot memmap is 107/28 with zero-padded type_eff)
+- **Size on disk: 104 GB** (post-trim; pre-trim was 163 GB due to preallocation slack)
+- **Zero errors, zero validation failures** during 2h5min of streaming
+
+Integrity verified: file sizes match N rows exactly, boundary row unchanged pre/post
+trim (sum_abs=92.67), no NaN across 100k random sample, every legal-mask row has ≥1
+active action, episode_index end row matches num_records exactly.
+
+### Pipeline bug fixes (commit `61c665f`)
+
+Two bugs blocked the regen and forced a manual fix mid-session:
+
+1. `replay_parser.py:37` imported `make_obs_mask_and_slots` — a function removed in the
+   Session 34 refactor. Top-level import failed, so `replay_to_memmap.py` couldn't even
+   start. Fix: dropped the import (function was only used by the legacy `_parse_perspective`
+   path, not called externally).
+
+2. `MemmapV8Writer.finalize()` claimed to "trim memmaps to actual size" but only wrote
+   `metadata.num_records` — the raw `.npy` files stayed at `max_rows`, wasting ~60 GB of
+   preallocation. Fix: added `_trim_files_to_n_rows()` module-level helper that
+   `os.truncate()`s each raw-memmap file to `N * per_row_bytes`, and called it from
+   `finalize()` after releasing memmap handles (`mm._mmap.close()` + `gc.collect()`).
+
+The fix was verified on the live data: reclaimed 63.67 GB, no integrity regression.
+
+### Crashes earlier in session (context)
 **Three BSODs on 2026-04-23 (all bugcheck `0x0000019C` KERNEL_AUTO_BOOST_INVALID_LOCK_RELEASE, Arg1=0x50):**
 - 02:26 AM (killed BC training mid-epoch-2)
 - 08:36 AM (after user rebooted)
@@ -71,20 +113,37 @@ Same bugcheck + same Arg1 three times = specific driver synchronization bug. **N
   NBFoundation / Nahimic next.
 - VirtualBox `VBoxNetLwf` errors on every boot (uninstall VirtualBox if not needed).
 
-### Next concrete step (after driver update + reboot)
+### Next concrete step — BC reshape on HUMAN data
 1. `nvidia-smi` to confirm driver 595.79 and no lingering processes.
 2. Start battle servers (commands in "Quick-reference commands" below).
-3. Resume BC retrain — same command as "BC retrain with capacity reshape" section below
-   but add: `--resume data/models/bc/v8_bc_20260423_031532/epoch_001.pt`
-4. If another BSOD hits, stop, uninstall MSI bloatware (list above), reboot, retry.
+3. Launch BC reshape training on the new human memmap:
+   ```bash
+   cd pokemon-ai-starter/pokemon-ai/src
+   python -u train_bc.py \
+     --memmap-dir data/datasets/human_v8_100k \
+     --device cuda --fp16 \
+     --d-spatial 256 --d-temporal 512 \
+     --n-spatial-layers 3 --n-temporal-layers 3 \
+     --n-summary-tokens 4 --dropout 0.05 \
+     --lr 1e-4 --weight-decay 1e-4 --grad-clip 2.0 \
+     --batch-size 16 --epochs 10 --sched cosine --warmup-steps 200 \
+     --eval-games 200 2>&1 | tee bc_reshape_human.log
+   ```
+4. If another BSOD hits, stop, uninstall MSI bloatware (list below), reboot, retry.
 
-### Uncommitted files in the tree (as of reboot)
+**Expected runtime**: 14× more records than the bot memmap → ~14× epoch time, so ~3 hours
+per epoch vs. the old ~13 min/epoch → **~30 hours total for 10 epochs**. Longer than one
+session. If time-constrained, start with `--epochs 3` to see initial trajectory, then
+continue with `--resume` after reviewing epoch-0/1/2 smart_avg.
+
+### Uncommitted files in the tree (as of this session end)
 - `watch.ps1` (project root) — PowerShell system monitor (GPU/VRAM/CPU/RAM/disk every 5s
   to `system_watch.log`). Created this session to catch the next BSOD; not committed yet.
   Safe to keep or commit as-is.
 
 ### Commits this session
 - `cf38cf2` model.py: cast scatter sources to destination dtype in forward
+- `61c665f` Fix replay_to_memmap regen: drop stale import, actually trim files
 
 ---
 
@@ -135,13 +194,12 @@ Results will be in `team_selection_results.json` when complete.
 
 ## Quick-reference commands
 
-### BC retrain with capacity reshape (Session 38 — RESUME after BSOD cluster)
+### BC retrain with capacity reshape on HUMAN data (Session 38 — current plan)
 
-**Resume from epoch 1 (recommended — 8 epochs remaining):**
 ```bash
 cd pokemon-ai-starter/pokemon-ai/src
 python -u train_bc.py \
-  --memmap-dir data/datasets/memmap_v8 \
+  --memmap-dir data/datasets/human_v8_100k \
   --device cuda --fp16 \
   --d-spatial 256 --d-temporal 512 \
   --n-spatial-layers 3 --n-temporal-layers 3 \
@@ -150,23 +208,20 @@ python -u train_bc.py \
   --lr 1e-4 --weight-decay 1e-4 --grad-clip 2.0 \
   --batch-size 16 --epochs 10 --sched cosine --warmup-steps 200 \
   --eval-games 200 \
-  --resume data/models/bc/v8_bc_20260423_031532/epoch_001.pt \
-  2>&1 | tee -a bc_reshape.log
+  2>&1 | tee bc_reshape_human.log
 ```
 
-`--resume` loads model+optimizer+scheduler+epoch+step, so training picks up at epoch 2.
-Run output goes to the SAME directory (`v8_bc_20260423_031532`) — new epoch_NNN files
-append cleanly. Use `tee -a` to append to the existing log rather than overwrite.
+~14.28M params on 5.08M records of human Showdown replays (Elo ≥1500), 109/30 feature
+dims. Tests whether capacity reshape + better data combined beats the old 22-26% BC
+ceiling. Expected runtime: ~3 hours per epoch (14× the old 13 min), so ~30 hrs for 10
+epochs — spans multiple sessions. Consider `--epochs 3` to gauge trajectory first.
 
-**Fresh run (if you want to start over — not recommended, throws away 2 epochs of work):**
-```bash
-# Same as above but omit --resume, and use `tee bc_reshape.log` (no -a).
-```
+### Old BC reshape run on bot data — completed, best.pt saved (reference only)
 
-Expected: ~14.28M params. The reshape tests whether Metamon-style temporal:spatial
-(2:1 d_model, equal layer count, K=4 summary scratch tokens) closes the gap to
-MM-SmallRLG9 on the PokeAgent ladder. Runs entirely on existing memmap (stale 107/28
-dims, auto-padded — the 2 missing type_eff dims are not the bottleneck per METAMON_LEARNINGS §5).
+Run dir: `data/models/bc/v8_bc_20260423_124909/`. Best checkpoint `best.pt` is epoch 4
+weights at smart_avg=21.2% (SH=21, SmDmg=20, Tact=22, Strat=22). Trained on stale
+bot-generated memmap_v8 with zero-padded type_eff features. Use for PPO-from-BC
+comparison experiments, not as the go-forward baseline.
 
 ### Resume training from current best (with safeguards ON)
 BC_base (`data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt`) was removed during the
