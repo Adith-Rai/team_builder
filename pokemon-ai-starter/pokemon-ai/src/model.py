@@ -40,7 +40,9 @@ class PokeTransformerConfig:
     n_temporal_layers: int = 2
     n_heads: int = 4
     ff_mult: int = 4          # feedforward expansion
-    dropout: float = 0.1
+    # Dropout 0.05 matches Metamon's IL + RL configs. Old default was 0.1;
+    # loading old checkpoints preserves the saved 0.1 via from_dict.
+    dropout: float = 0.05
 
     # --- Capacity reallocation (Session 37, Metamon-inspired) ---
     # When d_spatial / d_temporal are None, fall back to d_model (old behavior).
@@ -87,6 +89,13 @@ class PokeTransformerConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "PokeTransformerConfig":
         valid = {f.name for f in cls.__dataclass_fields__.values()}
+        dropped = [k for k in d.keys() if k not in valid]
+        if dropped:
+            import logging
+            logging.getLogger("pokemon_ai").warning(
+                "PokeTransformerConfig.from_dict: dropping unknown keys %s "
+                "(checkpoint has fields not present in current code)", dropped,
+            )
         return cls(**{k: v for k, v in d.items() if k in valid})
 
 
@@ -984,7 +993,7 @@ def add_model_args(parser):
     g.add_argument("--n-temporal-layers", type=int, default=2)
     g.add_argument("--n-heads", type=int, default=4)
     g.add_argument("--ff-mult", type=int, default=4)
-    g.add_argument("--dropout", type=float, default=0.1)
+    g.add_argument("--dropout", type=float, default=0.05)
     g.add_argument("--temporal-context", type=int, default=200)
     g.add_argument("--temporal-mode", choices=["summary", "frames"], default="summary")
     g.add_argument("--move-dim", type=int, default=128)

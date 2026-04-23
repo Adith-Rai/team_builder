@@ -29,10 +29,27 @@ from model import PokeTransformer, PokeTransformerConfig, add_model_args, config
 
 def masked_policy_ce(logits: torch.Tensor, actions: torch.Tensor,
                      legal: torch.Tensor, label_smoothing: float = 0.0) -> torch.Tensor:
-    """Cross-entropy loss over legal actions with optional label smoothing."""
-    # Mask illegal actions
+    """Cross-entropy loss over legal actions.
+
+    When label_smoothing > 0, smooths ONLY over legal actions (not all action
+    classes). Using F.cross_entropy's built-in label_smoothing with masked
+    logits would distribute probability mass uniformly to every class
+    including illegal ones, giving illegal actions non-zero target weight.
+    """
     masked_logits = logits.masked_fill(legal < 0.5, -100.0)
-    return F.cross_entropy(masked_logits, actions, label_smoothing=label_smoothing)
+    if label_smoothing <= 0.0:
+        return F.cross_entropy(masked_logits, actions)
+
+    # Defensive: zero-legal-actions should never happen (every state has at least
+    # one legal action in poke-env). If it does, fall back to uniform.
+    n_legal = legal.sum(dim=-1).clamp(min=1.0)  # (N,)
+    log_probs = F.log_softmax(masked_logits, dim=-1)  # (N, A)
+    # Uniform distribution over legal actions
+    smooth_target = legal.float() / n_legal.unsqueeze(-1)  # (N, A)
+    # One-hot target for the demonstrator's action
+    hot_target = F.one_hot(actions, num_classes=logits.shape[-1]).float()  # (N, A)
+    target = (1.0 - label_smoothing) * hot_target + label_smoothing * smooth_target
+    return -(target * log_probs).sum(-1).mean()
 
 
 def compute_accuracy(logits: torch.Tensor, actions: torch.Tensor,
@@ -58,6 +75,8 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
     total_vloss = 0.0
     n_batches = 0
     n_turns = 0
+    n_skipped_empty = 0   # batches dropped because no valid turns
+    n_skipped_nan = 0     # batches dropped due to NaN loss
     t0 = time.time()
     use_amp = scaler is not None
 
@@ -77,6 +96,8 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
             # Flatten valid turns for loss computation
             valid = (mask > 0.5) & (actions >= 0)  # (B, T)
             if not valid.any():
+                # Silent skips hide systematic data issues. Track and surface.
+                n_skipped_empty += 1
                 continue
 
             flat_logits = logits[valid].float()  # (N_valid, 9) — float32 for loss
@@ -98,6 +119,14 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
                 v_loss = F.cross_entropy(vl, twohot) * 0.5
 
             total_batch_loss = pi_loss + v_loss
+
+        # Guard against NaN/Inf loss before stepping optimizer — a silent NaN
+        # step propagates NaN to all parameters permanently.
+        if torch.isnan(total_batch_loss) or torch.isinf(total_batch_loss):
+            print(f"  [WARN] NaN/Inf loss at batch {batch_idx} (pi={pi_loss.item()}, v={v_loss.item()}), skipping", flush=True)
+            n_skipped_nan += 1
+            optimizer.zero_grad()
+            continue
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -155,6 +184,14 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
     avg_loss = total_loss / max(1, n_batches)
     avg_acc = total_acc / max(1, n_turns)
     avg_vloss = total_vloss / max(1, n_batches)
+    # Surface silent batch skips if substantial — helps diagnose data/loss issues
+    # that would otherwise just look like slow training.
+    total_batches_seen = n_batches + n_skipped_empty + n_skipped_nan
+    if total_batches_seen > 0:
+        skip_frac = (n_skipped_empty + n_skipped_nan) / total_batches_seen
+        if skip_frac >= 0.01 or n_skipped_nan > 0:
+            print(f"  [epoch {epoch} skip summary] empty={n_skipped_empty} nan={n_skipped_nan} "
+                  f"total_seen={total_batches_seen} ({100*skip_frac:.1f}% skipped)", flush=True)
     return avg_loss, avg_acc, avg_vloss, global_step
 
 
@@ -276,8 +313,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    # Defaults match Metamon's IL recipe (il/train.py): WD 1e-4, grad clip 2.0.
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=2.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--sched", choices=["cosine", "constant", "psppo"], default="cosine",
@@ -329,8 +367,16 @@ def main():
     cfg = config_from_args(args)
     model = PokeTransformer(cfg).to(device)
     print(f"Model: {model.count_parameters():,} params")
-    print(f"Config: d_model={cfg.d_model}, spatial={cfg.n_spatial_layers}L, "
-          f"temporal={cfg.n_temporal_layers}L, heads={cfg.n_heads}")
+    # Print effective (resolved) dims so reshape runs are obvious in logs.
+    print(f"Config: d_spatial={model.d_spatial}, d_temporal={model.d_temporal}, "
+          f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
+          f"heads={cfg.n_heads}, n_summary_tokens={cfg.n_summary_tokens}, "
+          f"dropout={cfg.dropout}")
+    # Echo training hyperparams to log — prevents silent-config debugging pain.
+    print(f"Train: lr={args.lr}, wd={args.weight_decay}, grad_clip={args.grad_clip}, "
+          f"label_smoothing={args.label_smoothing}, batch_size={args.batch_size}, "
+          f"epochs={args.epochs}, fp16={args.fp16}, sched={args.sched}, "
+          f"warmup={args.warmup_steps}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                    weight_decay=args.weight_decay)

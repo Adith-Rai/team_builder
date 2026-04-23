@@ -109,9 +109,18 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
     No KL penalty term — instead stops PPO epochs early if policy changes too much.
     grad_accum: accumulate gradients over N episodes before each optimizer step."""
     model.train()
-    stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0}
+    stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
+             # Diagnostic counters — catch silent policy/value pathologies early
+             # (Exp 4-style collapse: value drifts while policy keeps training).
+             "ratio_clip_frac": 0.0,   # fraction of ratios outside [1-clip, 1+clip]
+             "value_mean": 0.0,        # mean predicted value (drift indicator)
+             "return_mean": 0.0,       # mean return target (compare to value_mean)
+             "adv_abs_mean": 0.0,      # advantage magnitude (normalization sanity)
+             }
     n = 0
     n_failed = 0  # episodes that raised an exception (CUDA error, OOM, etc.)
+    n_skipped_kl = 0       # episodes gated by per-episode KL check (silent otherwise)
+    n_skipped_nan = 0      # episodes skipped due to NaN in advantages/returns/forward
     kl_early_stopped = False
 
     for ppo_ep in range(epochs):
@@ -132,6 +141,15 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 advantages = torch.tensor(ep["advantages"], dtype=torch.float32, device=device)
                 returns = torch.tensor(ep["returns"], dtype=torch.float32, device=device)
                 masks = torch.tensor(ep["action_masks"], dtype=torch.float32, device=device)
+
+                # Defensive: NaN in advantages/returns indicates upstream GAE bug
+                # or corrupt trajectory. Skip loudly rather than silently propagate
+                # NaN into the optimizer.
+                if (torch.isnan(advantages).any() or torch.isinf(advantages).any()
+                        or torch.isnan(returns).any() or torch.isinf(returns).any()):
+                    print(f"  [WARN] NaN/Inf in advantages/returns (T={T}), skipping episode", flush=True)
+                    n_skipped_nan += 1
+                    continue
 
                 # --- Batch all T turns' spatial processing at once ---
                 def _stack_field(key):
@@ -186,12 +204,17 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 # NaN check
                 if logits_seq.isnan().any() or vlogits_seq.isnan().any():
                     print(f"  [WARN] NaN in forward, skip (T={T})", flush=True)
+                    n_skipped_nan += 1
                     continue
 
                 # Policy loss
                 lp = F.log_softmax(logits_seq, dim=-1)
                 new_logp = lp.gather(1, actions.unsqueeze(1)).squeeze(1)
                 ratio = torch.exp(new_logp - old_logp)
+                # Track ratio-clip fraction — if consistently high, policy is drifting
+                # too fast per update (Exp 4-style instability signal).
+                with torch.no_grad():
+                    clipped_frac = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item()
                 s1 = ratio * advantages
                 s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
                 pi_loss = -torch.min(s1, s2).mean()
@@ -212,6 +235,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
                 # Per-episode KL gate: skip this episode entirely if policy diverged too much
                 if abs(approx_kl) > target_kl * 5:
+                    n_skipped_kl += 1
                     continue  # no backward, no step — episode discarded
 
                 # Loss: no KL penalty term — early stopping replaces it
@@ -239,6 +263,15 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 stats["v"] += v_loss.item()
                 stats["ent"] += entropy.item()
                 stats["kl"] += abs(approx_kl)
+                stats["ratio_clip_frac"] += clipped_frac
+                # Drift diagnostics: value_mean vs return_mean — if they diverge,
+                # critic is learning the wrong scale (Exp 4 post-mortem symptom).
+                with torch.no_grad():
+                    v_probs_step = F.softmax(vlogits_seq, dim=-1)
+                    v_pred_step = (v_probs_step * model.v_support).sum(-1)
+                    stats["value_mean"] += v_pred_step.mean().item()
+                    stats["return_mean"] += returns.mean().item()
+                    stats["adv_abs_mean"] += advantages.abs().mean().item()
                 epoch_kl_sum += abs(approx_kl)
                 epoch_kl_count += 1
                 n += 1
@@ -276,6 +309,20 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
     # Bookkeeping (added after the divide so they're not normalized)
     stats["n_succeeded"] = n
     stats["n_failed"] = n_failed
+    stats["n_skipped_kl"] = n_skipped_kl
+    stats["n_skipped_nan"] = n_skipped_nan
+    # Surface silent discards if substantial — these episodes produce no gradient
+    # but still consume a training slot. Useful for diagnosing low-effective-batch regimes.
+    total_eps = n + n_failed + n_skipped_kl + n_skipped_nan
+    if total_eps > 0 and (n_skipped_kl + n_skipped_nan) >= max(3, total_eps // 10):
+        print(f"  [NOTICE] PPO discarded {n_skipped_kl} KL + {n_skipped_nan} NaN "
+              f"episodes out of {total_eps} ({100*(n_skipped_kl+n_skipped_nan)/total_eps:.1f}%)",
+              flush=True)
+    # Surface value/return drift — if |value_mean - return_mean| grows, critic is wrong.
+    vm, rm = stats["value_mean"], stats["return_mean"]
+    if abs(vm - rm) > 0.3:
+        print(f"  [NOTICE] Value drift: value_mean={vm:.3f} vs return_mean={rm:.3f} "
+              f"(gap={abs(vm-rm):.3f}). Critic may be miscalibrated.", flush=True)
     return stats
 
 

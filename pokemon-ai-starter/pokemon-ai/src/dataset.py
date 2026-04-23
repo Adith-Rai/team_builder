@@ -63,13 +63,17 @@ class MemmapDataset(Dataset):
         self._pad_move = max(0, MOVE_SLOT_CONT_DIM - mcd)
         self._pad_switch = max(0, SWITCH_SLOT_CONT_DIM - scd)
         if self._pad_move > 0 or self._pad_switch > 0:
-            import logging
-            logging.getLogger("pokemon_ai").warning(
+            import logging, sys
+            msg = (
                 f"Memmap dimension mismatch (will zero-pad): "
-                f"move_cont {mcd}→{MOVE_SLOT_CONT_DIM} (+{self._pad_move}), "
-                f"switch_cont {scd}→{SWITCH_SLOT_CONT_DIM} (+{self._pad_switch}). "
+                f"move_cont {mcd}->{MOVE_SLOT_CONT_DIM} (+{self._pad_move}), "
+                f"switch_cont {scd}->{SWITCH_SLOT_CONT_DIM} (+{self._pad_switch}). "
                 f"Consider regenerating memmaps with current features.py."
             )
+            logging.getLogger("pokemon_ai").warning(msg)
+            # Also print so it's visible when no logging handler is configured
+            # (train_bc.py / train_rl.py don't set one up by default).
+            print(f"  [WARN] {msg}", file=sys.stderr, flush=True)
         assert pcd == POKEMON_CONT_DIM, f"pokemon_cont_dim mismatch: memmap has {pcd}, features.py expects {POKEMON_CONT_DIM}"
         assert fcd == FIELD_CONT_DIM, f"field_cont_dim mismatch: memmap has {fcd}, features.py expects {FIELD_CONT_DIM}"
         assert tcd == TRANSITION_CONT_DIM, f"trans_cont_dim mismatch: memmap has {tcd}, features.py expects {TRANSITION_CONT_DIM}"
