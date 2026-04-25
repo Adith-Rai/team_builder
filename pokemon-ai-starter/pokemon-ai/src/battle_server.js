@@ -251,8 +251,11 @@ function handleMessage(ws, raw) {
 
         // Notify the target about the challenge via updatechallenges
         sendToUser(target, `|updatechallenges|{"challengesFrom":{"${name}":"${format}"},"challengeTo":null}`);
-        // Also send pm-based challenge notification (poke-env checks both paths)
-        sendToUser(target, `|pm| ${name}| ${target}|/challenge ${format}`);
+        // Also send pm-based challenge notification in Showdown standard format.
+        // Foul Play splits this on `|` and strictly requires len == 9 with
+        // split[5] == format. So the message has exactly 8 pipes (9 fields):
+        //   ['', 'pm', ' sender', ' target', '/challenge', 'format', '', '', '']
+        sendToUser(target, `|pm| ${name}| ${target}|/challenge|${format}|||`);
         log(`Challenge: ${name} -> ${target} (${format})`);
         return;
     }
