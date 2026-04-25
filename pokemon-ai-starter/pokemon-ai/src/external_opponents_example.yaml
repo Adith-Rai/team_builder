@@ -1,0 +1,120 @@
+# external_opponents.yaml — config for --external-opponents flag of train_rl.py
+#
+# Each `opponents` entry spawns a bot subprocess that connects to one of our
+# local battle servers as a unique Showdown username. PFSP collection then
+# challenges that username, treating the external bot as just another opponent
+# in the pool (with the same `(1-wr)^2` weighting as our .pt snapshots).
+#
+# Architecture notes:
+# - Each bot runs in its own process and venv (avoids dependency conflicts
+#   between e.g. Metamon's amago + our torch/poke-env stack).
+# - Process manager (external_opponent_manager.py) auto-spawns + restarts.
+# - Bots connect via the websocket URIs of our existing battle servers.
+# - Teams: the `--team-name` arg points to a folder we control, so we can
+#   feed any team distribution we want (procedural, fixed pool, etc.).
+
+# Battle servers our bots will connect to. Must match train_rl.py's --servers.
+servers:
+  - ws://127.0.0.1:9000/showdown/websocket
+  - ws://127.0.0.1:9001/showdown/websocket
+  - ws://127.0.0.1:9002/showdown/websocket
+
+# Default team folder for opponents that don't override. Created as a
+# rotating snapshot of our procedural_teambuilder output (regenerated
+# every N iters via a hook in the manager) — keeps team distribution
+# matched between sides per game.
+default_team_folder: ./external_opponents/teams_shared
+
+opponents:
+  # ── Foul Play (PokeAgent Track 1 winner, MCTS) ──────────────────
+  - name: foulplay
+    description: "Foul Play - MCTS bot, peak 1879 Gen9 OU GXE"
+    cwd: ../../../foul_play_ref      # relative to src/
+    venv: ../../../foul_play_venv    # python interpreter inside this venv used as cmd[0]
+    command:
+      - python
+      - run.py
+      - --websocket-uri=ws://127.0.0.1:9000/showdown/websocket
+      - --ps-username=FoulPlayBot
+      - --ps-password=fp-changeme
+      - --bot-mode=accept_challenge
+      - --pokemon-format=gen9ou
+      - --team-name=external_pool          # foul_play resolves under teams/teams/gen9ou/
+      - --run-count=100000
+      - --search-time-ms=200
+    showdown_username: FoulPlayBot
+    auto_restart: true
+    log_file: logs/external/foulplay.log
+
+  # ── Metamon checkpoints ─────────────────────────────────────────
+  # All entries below share the same launcher pattern. Add/remove freely.
+  # Metamon checkpoints auto-download from HF on first use.
+
+  - name: metamon-minikazam
+    description: "Metamon Minikazam — 4.7M params (smallest)"
+    cwd: ../../../metamon_ref
+    venv: ../../../metamon_venv
+    command:
+      - python
+      - -m
+      - metamon.rl.self_play.serve_model
+      - --username=mm-minikazam
+      - --format=gen9ou
+      - --config=metamon_local.yaml
+    showdown_username: mm-minikazam
+    auto_restart: true
+    log_file: logs/external/metamon_minikazam.log
+
+  - name: metamon-small-rl
+    description: "Metamon SmallRL — ~15M params"
+    cwd: ../../../metamon_ref
+    venv: ../../../metamon_venv
+    command:
+      - python
+      - -m
+      - metamon.rl.self_play.serve_model
+      - --username=mm-small-rl
+      - --format=gen9ou
+      - --config=metamon_local.yaml
+    showdown_username: mm-small-rl
+    auto_restart: true
+    log_file: logs/external/metamon_small_rl.log
+
+  - name: metamon-small-rl-gen9beta
+    description: "Metamon SmallRL gen9-specific variant"
+    cwd: ../../../metamon_ref
+    venv: ../../../metamon_venv
+    command:
+      - python
+      - -m
+      - metamon.rl.self_play.serve_model
+      - --username=mm-small-gen9
+      - --format=gen9ou
+      - --config=metamon_local.yaml
+    showdown_username: mm-small-gen9
+    auto_restart: true
+    log_file: logs/external/metamon_small_gen9.log
+
+  - name: metamon-medium-rl
+    description: "Metamon MediumRL — ~50M params, tight on 6GB but fits"
+    cwd: ../../../metamon_ref
+    venv: ../../../metamon_venv
+    command:
+      - python
+      - -m
+      - metamon.rl.self_play.serve_model
+      - --username=mm-medium-rl
+      - --format=gen9ou
+      - --config=metamon_local.yaml
+    showdown_username: mm-medium-rl
+    auto_restart: true
+    log_file: logs/external/metamon_medium_rl.log
+
+  # Add more variants here once the wrapper is validated:
+  #   metamon-abra, metamon-small-il, metamon-small-rl-aug,
+  #   metamon-small-rl-binary, metamon-small-rl-maxq,
+  #   metamon-small-rl-exp-extreme, metamon-medium-il,
+  #   metamon-medium-rl-aug, metamon-medium-rl-maxq
+  #
+  # Skip (won't fit on 6GB VRAM):
+  #   kakuna, large-il, large-rl, superkazam
