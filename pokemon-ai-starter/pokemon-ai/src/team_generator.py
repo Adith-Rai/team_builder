@@ -498,6 +498,104 @@ def procedural_teambuilder(stats_dir: str, random_pct: float = 0.05, gen: int = 
     return ProceduralTeambuilder(stats_dir, random_pct=random_pct, gen=gen)
 
 
+class StaticTeamPool(_Teambuilder):
+    """Yields random teams from a directory of Showdown team text files.
+
+    Used to wrap external team libraries (e.g. Foul Play's curated teams,
+    or pre-generated pools from Metamon's TeamPredictor). Each call picks
+    a uniformly-random team from the directory, parses it, and returns
+    the packed format poke-env expects.
+
+    Args:
+        team_dir: directory containing one or more Showdown team text files
+                  (recursively scanned). Each file should be a single team
+                  in standard Showdown export format.
+    """
+
+    def __init__(self, team_dir):
+        super().__init__()
+        from pathlib import Path as _Path
+        self.team_dir = _Path(team_dir)
+        self._teams = []
+        if self.team_dir.exists():
+            for fp in self.team_dir.rglob('*'):
+                if not fp.is_file() or fp.name.startswith('.'):
+                    continue
+                try:
+                    with open(fp, encoding='utf-8') as f:
+                        text = f.read().strip()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if text:
+                    self._teams.append(text)
+        if not self._teams:
+            raise ValueError(f"No team files found in {team_dir}")
+        print(f"StaticTeamPool: loaded {len(self._teams)} teams from {team_dir}")
+
+    def yield_team(self) -> str:
+        text = random.choice(self._teams)
+        mons = self.parse_showdown_team(text)
+        return self.join_team(mons)
+
+
+class MultiSourceTeambuilder(_Teambuilder):
+    """Teambuilder that delegates each yield_team() call to a randomly chosen source.
+
+    Designed for training where we want each game to draw teams from one of
+    several team-generation philosophies (e.g. our procedural Smogon-weighted
+    builder, Metamon's TeamPredictor, a Foul-Play-curated pool). Within a
+    single game both sides should call the SAME MultiSourceTeambuilder
+    instance so they get matched-source teams; PFSP collection plumbing is
+    responsible for that.
+
+    Args:
+        sources: dict {name: teambuilder} where each teambuilder has
+                 .yield_team() -> str (packed format)
+        weights: optional dict {name: float}; non-normalized values OK,
+                 normalized internally. Defaults to uniform across sources.
+
+    Diagnostics:
+        last_source: name of the source picked on the most recent call,
+                     useful for logging team-distribution stats per iter.
+    """
+
+    def __init__(self, sources, weights=None):
+        super().__init__()
+        if not sources:
+            raise ValueError("sources must be non-empty")
+        self.sources = dict(sources)
+        names = list(self.sources.keys())
+        if weights:
+            raw = [float(weights.get(k, 1.0)) for k in names]
+        else:
+            raw = [1.0] * len(names)
+        total = sum(raw)
+        if total <= 0:
+            raise ValueError(f"sum of weights must be positive, got {total}")
+        self._names = names
+        self._weights = [w / total for w in raw]
+        self.last_source = None  # set after each yield_team for diagnostics
+        # Track per-source selection counts for diagnostics
+        self._selection_counts = {n: 0 for n in names}
+        weight_str = ", ".join(f"{n}={w:.2f}" for n, w in zip(self._names, self._weights))
+        print(f"MultiSourceTeambuilder: {len(self._names)} sources [{weight_str}]")
+
+    def yield_team(self) -> str:
+        name = random.choices(self._names, weights=self._weights, k=1)[0]
+        self.last_source = name
+        self._selection_counts[name] += 1
+        return self.sources[name].yield_team()
+
+    def selection_stats(self):
+        """Return {source_name: count} for telemetry/logging."""
+        return dict(self._selection_counts)
+
+
+def multi_source_teambuilder(sources, weights=None) -> MultiSourceTeambuilder:
+    """Convenience constructor."""
+    return MultiSourceTeambuilder(sources, weights=weights)
+
+
 # ---------------------------------------------------------------------------
 # CLI test
 # ---------------------------------------------------------------------------
