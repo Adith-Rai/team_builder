@@ -1263,10 +1263,217 @@ def filter_by_opponent(battles, our_prefix='BCPolicyPlayer'):
     return grouped
 
 
+# ── Iter-trajectory mode ──
+# Walks a PPO run dir's replays_iter*/ subdirs to produce a per-iter
+# evolution table. Useful for spotting style shifts across training.
+
+def _scan_iter_dirs(run_dir):
+    """Find replays_iter*/ subdirs under run_dir, sorted by iter number."""
+    run = Path(run_dir)
+    if not run.exists():
+        return []
+    out = []
+    for p in run.glob('replays_iter*'):
+        m = re.search(r'iter(\d+)', p.name)
+        if m and p.is_dir():
+            out.append((int(m.group(1)), p))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+# Columns shown in trajectory and matchup tables. Tuple: (profile-key, header, format-spec).
+# Format-spec: "%" → multiplied by 100 with trailing %, "f" → float as-is.
+_TRAJ_COLS = [
+    ('win_rate',              'WR',       '%'),
+    ('switch_rate',           'Sw',       '%'),
+    ('voluntary_switch_rate', 'vSw',      '%'),
+    ('attack_pct',            'Atk',      '%'),
+    ('setup_pct',             'Set',      '%'),
+    ('pivot_pct',             'Piv',      '%'),
+    ('hazard_pct',            'Haz',      '%'),
+    ('status_pct',            'Sts',      '%'),
+    ('se_ratio',              'SE',       '%'),
+    ('immune_of_all',         'Imm',      '%'),
+    ('ko_ratio',              'KO',       'f'),
+    ('avg_turns',             'Turn',     'f'),
+    ('spam_streaks_per_game', 'Spam',     'f'),
+]
+
+
+def _format_traj_value(key, val, fmt):
+    if val is None:
+        return '   -  '
+    if fmt == '%':
+        return f"{val * 100:5.1f}%"
+    return f"{val:6.2f}"
+
+
+def trajectory_mode(run_dir, our_prefix='BCPolicyPlayer', by_opponent=False):
+    """Print a per-iteration playstyle trajectory across a PPO run's eval dirs.
+
+    With by_opponent=True, prints a separate row per (iter, opponent) pair.
+    """
+    iter_dirs = _scan_iter_dirs(run_dir)
+    if not iter_dirs:
+        print(f"No replays_iter*/ subdirs found under {run_dir}")
+        return
+
+    print(f"\n{'='*65}")
+    print(f"  TRAJECTORY: {run_dir}")
+    print(f"  {len(iter_dirs)} eval iters: {iter_dirs[0][0]}..{iter_dirs[-1][0]}")
+    print(f"{'='*65}\n")
+
+    headers = ['iter', 'games'] + [c[1] for c in _TRAJ_COLS]
+    if by_opponent:
+        headers = ['iter', 'opp', 'games'] + [c[1] for c in _TRAJ_COLS]
+    head_line = " ".join(f"{h:>6}" for h in headers)
+    print(head_line)
+    print('-' * len(head_line))
+
+    for it, dpath in iter_dirs:
+        battles = load_replays(str(dpath))
+        if not battles:
+            continue
+        if by_opponent:
+            grouped = filter_by_opponent(battles, our_prefix=our_prefix)
+            for opp_name in sorted(grouped.keys()):
+                stats = analyze_battles(grouped[opp_name], our_player_prefix=our_prefix)
+                profile = compute_playstyle_profile(stats)
+                if not profile:
+                    continue
+                vals = [_format_traj_value(k, profile.get(k), f) for k, _, f in _TRAJ_COLS]
+                print(f"{it:>6} {opp_name[:6]:>6} {len(grouped[opp_name]):>6} {' '.join(vals)}")
+        else:
+            stats = analyze_battles(battles, our_player_prefix=our_prefix)
+            profile = compute_playstyle_profile(stats)
+            if not profile:
+                continue
+            vals = [_format_traj_value(k, profile.get(k), f) for k, _, f in _TRAJ_COLS]
+            print(f"{it:>6} {len(battles):>6} {' '.join(vals)}")
+
+
+# ── Team usage stats ──
+# Tracks which mons we lead with, which mons get sent out most often,
+# which faint first/last, and which we win most with.
+
+def compute_team_usage(battles, our_player_prefix='BCPolicyPlayer'):
+    """Aggregate team-level stats: lead mon, send-out frequency, faint order, win rate by lead."""
+    lead = Counter()
+    send_outs = Counter()        # any time we switch in
+    first_faint = Counter()      # which of our mons faints first per battle
+    last_faint = Counter()       # which of our mons is the LAST to faint (the one we lost on)
+    faint_frequency = Counter()  # raw faint count per mon
+    wins_by_lead = defaultdict(lambda: [0, 0])  # mon -> [wins, losses]
+    total_wins = 0
+    total_losses = 0
+
+    for b in battles:
+        if not b:
+            continue
+        if our_player_prefix == 'p1':
+            our_key = 'p1'
+        elif our_player_prefix == 'p2':
+            our_key = 'p2'
+        else:
+            is_p1 = our_player_prefix in (b['p1'] or '')
+            our_key = 'p1' if is_p1 else 'p2'
+        our_short = our_key[:2]
+
+        # Lead = first switch action of turn 1 by our side, or first non-switch mon mentioned.
+        our_lead = None
+        if b['turns']:
+            for action in b['turns'][0][f'{our_key}_actions']:
+                if action['type'] == 'switch':
+                    our_lead = action['mon']
+                    break
+            if our_lead is None:
+                # No explicit lead-switch — derive from |poke| order (team[0]).
+                team = b.get(f'{our_key}_team', [])
+                if team:
+                    our_lead = team[0]
+        if our_lead:
+            lead[our_lead] += 1
+            send_outs[our_lead] += 1
+
+        # Walk events to capture faint order on our side; count send-outs from switches.
+        our_faint_order = []
+        for turn in b['turns']:
+            for action in turn[f'{our_key}_actions']:
+                if action['type'] == 'switch' and action['mon'] != our_lead:
+                    send_outs[action['mon']] += 1
+            for event in turn['events']:
+                if event[0] == 'faint':
+                    mon_ref = event[1] or ''
+                    if mon_ref.startswith(our_short):
+                        species = mon_ref.split(': ')[1] if ': ' in mon_ref else mon_ref
+                        our_faint_order.append(species)
+                        faint_frequency[species] += 1
+
+        if our_faint_order:
+            first_faint[our_faint_order[0]] += 1
+            last_faint[our_faint_order[-1]] += 1
+
+        # Win/loss attribution
+        if b['winner'] is not None:
+            won = our_player_prefix in (b['winner'] or '')
+            if won:
+                total_wins += 1
+                if our_lead:
+                    wins_by_lead[our_lead][0] += 1
+            else:
+                total_losses += 1
+                if our_lead:
+                    wins_by_lead[our_lead][1] += 1
+
+    return {
+        'lead': lead,
+        'send_outs': send_outs,
+        'first_faint': first_faint,
+        'last_faint': last_faint,
+        'faint_frequency': faint_frequency,
+        'wins_by_lead': dict(wins_by_lead),
+        'total_wins': total_wins,
+        'total_losses': total_losses,
+    }
+
+
+def print_team_usage(usage, top_n=10):
+    """Pretty-print team usage stats."""
+    print(f"\n{'─'*65}")
+    print(f"  TEAM USAGE")
+    print(f"{'─'*65}")
+
+    total_leads = sum(usage['lead'].values())
+    print(f"\n  Lead pokemon (top {top_n}, of {total_leads} games with detected lead):")
+    for mon, n in usage['lead'].most_common(top_n):
+        wins, losses = usage['wins_by_lead'].get(mon, [0, 0])
+        decided = wins + losses
+        wr = wins / decided if decided else 0
+        bar = '█' * int(n / max(1, total_leads) * 30)
+        print(f"    {mon:20s}  {n:4d} ({n/total_leads*100:5.1f}%)  WR {wr*100:5.1f}%  {bar}")
+
+    total_so = sum(usage['send_outs'].values())
+    print(f"\n  Send-out frequency (top {top_n}, of {total_so} total send-outs):")
+    for mon, n in usage['send_outs'].most_common(top_n):
+        print(f"    {mon:20s}  {n:4d} ({n/max(1, total_so)*100:5.1f}%)")
+
+    total_ff = sum(usage['first_faint'].values())
+    if total_ff > 0:
+        print(f"\n  First-to-faint (top {top_n}, of {total_ff} games where we lost a mon):")
+        for mon, n in usage['first_faint'].most_common(top_n):
+            print(f"    {mon:20s}  {n:4d} ({n/total_ff*100:5.1f}%)")
+
+    total_lf = sum(usage['last_faint'].values())
+    if total_lf > 0:
+        print(f"\n  Last-stand (top {top_n}, of {total_lf} games — mons we lost the game on):")
+        for mon, n in usage['last_faint'].most_common(top_n):
+            print(f"    {mon:20s}  {n:4d} ({n/total_lf*100:5.1f}%)")
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Analyze Pokemon AI replay playstyles')
-    p.add_argument('--replay-dir', nargs='+', required=True,
+    p.add_argument('--replay-dir', nargs='+', default=None,
                    help='One or more replay directories to analyze and compare')
     p.add_argument('--labels', nargs='+', default=None,
                    help='Labels for each replay directory (default: dir names)')
@@ -1276,7 +1483,22 @@ def main():
                    help='Player name prefix to identify "our" side (default: BCPolicyPlayer). Use "p1" or "p2" for H2H.')
     p.add_argument('--deep', action='store_true', default=False,
                    help='Enable deep qualitative analysis (switch quality, momentum, HP management, etc.)')
+    p.add_argument('--iter-trajectory', default=None,
+                   help='Path to a PPO run dir; auto-discovers replays_iter*/ subdirs and prints a per-iter trajectory table')
+    p.add_argument('--by-opponent', action='store_true', default=False,
+                   help='With --iter-trajectory, split each iter row by opponent bot')
+    p.add_argument('--team-usage', action='store_true', default=False,
+                   help='Show team usage stats (lead mon, send-out freq, faint order) for each --replay-dir')
     args = p.parse_args()
+
+    # Iter-trajectory mode runs standalone and exits.
+    if args.iter_trajectory:
+        trajectory_mode(args.iter_trajectory, our_prefix=args.player_prefix,
+                        by_opponent=args.by_opponent)
+        return
+
+    if not args.replay_dir:
+        p.error('--replay-dir is required (or use --iter-trajectory)')
 
     labels = args.labels or [Path(d).name for d in args.replay_dir]
 
@@ -1311,6 +1533,10 @@ def main():
         if args.deep:
             deep = deep_analyze_battles(battles, our_player_prefix=args.player_prefix)
             print_deep_report(deep, stats['total_battles'])
+
+        if args.team_usage:
+            usage = compute_team_usage(battles, our_player_prefix=args.player_prefix)
+            print_team_usage(usage)
 
     # Comparison table if multiple directories
     if len(all_profiles) >= 2:
