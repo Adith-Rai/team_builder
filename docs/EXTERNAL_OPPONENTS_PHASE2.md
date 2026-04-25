@@ -1,5 +1,40 @@
 # Phase 2 — Install & Smoke-Test External Opponents
 
+> **STATUS (end of Session 39):** the original "spawn external bot as
+> separate Showdown client + PPO challenges via `send_challenges`" design
+> hit a wall. Server protocol bugs are fixed (committed), Foul Play *does*
+> accept challenges and *does* start battles, but the battle never plays
+> through to completion. Root cause: `Player.send_challenges()` standalone
+> does not coordinate move dispatch the way `Player.battle_against()` does
+> when both sides are poke-env Players sharing Python state. With Foul
+> Play running as a separate process, there's no shared state, so the
+> battle sits idle after init.
+>
+> **Recommended path going forward:** drop the "external Showdown user"
+> design. Instead, write a Python `Player` adapter that runs Foul Play's
+> MCTS directly via the `poke-engine` Rust library (which Foul Play itself
+> uses). This adapter is a normal poke-env `Player` subclass, so it slots
+> straight into the existing PPO collection (`battle_against` works
+> as-is, PFSP weighting works as-is). Same pattern for Metamon — write
+> a `MetamonPlayer` that wraps their pretrained model + amago agent into
+> a `Player` via `choose_move()`. The subprocess + YAML config skeleton
+> we built (`external_opponent_manager.py`, `external_opponents_example.yaml`)
+> isn't lost work — it's still useful if a bot doesn't have a clean
+> Python entry point — but it should not be the default.
+>
+> Estimated effort for the adapter approach (revised):
+> - Foul Play `PokeEnginePlayer`: ~half day. We need to drive poke-engine
+>   ourselves (set state, run MCTS, read out best move). poke-engine has
+>   a Python interface and Foul Play's own search code (`fp/search/main.py`
+>   `find_best_move`) is the working reference.
+> - Metamon `MetamonPlayer`: ~half day to a full day. Wrap their amago
+>   agent's `step` into `choose_move`. Their `metamon.rl.metamon_to_amago`
+>   module is the conversion bridge to study.
+> - PFSP pool extension (`PoolEntry` dataclass, branch in
+>   `_play_one_opponent`): ~2 hours.
+> - End-to-end validation: ~1 hour.
+> Total: ~2-3 days for both bots wired in cleanly.
+
 After the running PPO finishes, work through this top-to-bottom. Each step
 is small enough to fail fast; if any step breaks, fix before moving on.
 

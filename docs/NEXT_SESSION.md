@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-23 (Session 38 — BC reshape trained on bot data, human memmap regen'd)**
+**Last updated: 2026-04-25 (Session 39 — PPO from human BC hit smart_avg 64% all-time-record; external-opponent integration path identified)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -13,7 +13,137 @@ Supporting documents:
 
 ---
 
-## Session 38 status (READ THIS FIRST)
+## Session 39 status (READ THIS FIRST)
+
+**Two big outcomes, one wall hit:**
+
+1. **PPO from the new human-data BC produced the all-time best smart_avg
+   (64% at iter 219).** Per `data/eval/registry/evals.jsonl` (236 eval
+   entries across project history), iter 219 is rank #1, beating the
+   previous record (sp2999/sp2019 era at 60.8%). 6 of the top 10 evals
+   in registry history are from this run.
+
+2. **External-opponent integration (Foul Play, Metamon) hit a design
+   wall and needs an adapter rewrite.** See `docs/EXTERNAL_OPPONENTS_PHASE2.md`
+   for the full status block at the top of that doc. Short version:
+   we built process-manager + YAML config skeleton, fixed two real
+   server protocol bugs (committed), got Foul Play to *accept*
+   challenges and *start* battles — but the battle never plays through
+   because `Player.send_challenges` standalone doesn't coordinate move
+   dispatch the way `Player.battle_against` does. The right path is
+   writing a Python `Player` adapter that drives Foul Play's MCTS via
+   `poke-engine` directly (no separate Showdown client process). Same
+   pattern for Metamon.
+
+### TL;DR for next session
+1. **Decide first whether to do the Elo measurement or the external-
+   opponent adapter work.** Both are pending.
+2. **Elo measurement (~2.5 hr):** "Useful" set per the Session 39
+   discussion = new BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 + sp_0229.
+   Adds them incrementally to `data/eval/elo_exp5_FINAL.json`. Anchors
+   on sp2979 (Elo 1058, still on disk, surviving in pruning).
+3. **External adapter (~2-3 days):** see Phase 2 runbook for the
+   revised plan. Write `PokeEnginePlayer` first (Foul Play's MCTS via
+   poke-engine), validate end-to-end with `battle_against`, then
+   `MetamonPlayer`, then add `PoolEntry` to `rl_collection.py`.
+
+### PPO run on the human-data BC — DONE
+
+Run dir: `data/models/rl_v9/selfplay_v9_20260425_062416/` (resumed from
+the prev run's snapshot_0029). 200 iters total (iters 30 through 229).
+Settings: `lr=3e-5`, `lam=0.95`, `ent-coef=0.02`, `--adaptive-entropy`,
+`--win-rate-mode ema`, procedural teams. **Note: lr=1e-4 caused 80%+
+KL discard in the original attempt; lr=3e-5 is the right starting point
+from a 45% BC.** All eleven 20-iter evals plus the manual final eval:
+
+| Iter | SH | SmDmg | Tact | Strat | smart_avg |
+|---|---|---|---|---|---|
+| 19 | 52 | 56 | 48 | 55 | 53.0 |
+| 39 | 70 | 58 | 62 | 58 | 62.0 |
+| 59 | 57 | 54 | 60 | 56 | 56.0 |
+| 79 | 66 | 66 | 56 | 56 | 61.0 |
+| 99 | 63 | 56 | 57 | 60 | 59.0 |
+| 119 | 61 | 63 | 48 | 60 | 58.0 |
+| 139 | 59 | 61 | 60 | 60 | 60.0 |
+| 159 | 60 | 68 | 60 | 65 | 63.0 |
+| 179 | 62 | 60 | 59 | 64 | 61.0 |
+| 199 | 62 | 57 | 57 | 54 | 58.0 |
+| **219** | **61** | **68** | **60** | **66** | **64.0** ← all-time peak |
+| 229 (final, manual) | 67 | 61 | 56 | 69 | 63.4 |
+
+Best snapshots: `sp_0219.pt` (peak 64%) and `sp_0229.pt` (final 63.4%).
+Both are statistically tied; either could be best in actual Elo terms.
+
+**Internal PFSP win rates** (after fixing my misread of the EMA file
+format — `[wr*eff_games, eff_games]`, divide by 50 for %):
+- vs **sp2979** (the historical Elo 1058 ceiling): we win **63%**
+- vs **BC_base** (our new 45% BC): 86%
+- vs hardest recent self-play (sp_0189): 35%
+- vs prev-run snapshots (sp_0004…sp_0019): 75-76%
+**i.e. we are solidly past sp2979 in actual head-to-head play, even
+though smart_avg vs the bot anchors plateaued at ~60%.** Smart_avg has
+likely saturated against the eval bots; the policy is genuinely
+stronger than the metric resolves.
+
+### External opponents — SKELETON DONE, ADAPTER WORK PENDING
+
+What's committed (~5 commits, see git log):
+- `external_opponent_manager.py` — process manager + YAML config (still
+  useful if/when a bot doesn't have a clean Python entrypoint)
+- `external_opponents_example.yaml` — config schema
+- `metamon_local.yaml` — agents config for `metamon.rl.self_play.serve_model`
+- `team_generator.py` — added `MultiSourceTeambuilder` + `StaticTeamPool`
+- `battle_server.js` — `e01a37f` patches the /challenge PM to standard
+  Showdown 9-field format (was 5-field inline; broke Foul Play's parser)
+
+What we *learned* and *did not* commit upstream:
+- `foul_play_ref/fp/websocket_client.py` needs a 1-line patch to do
+  case-insensitive `_to_id`-style username comparison. Documented in
+  `docs/EXTERNAL_OPPONENTS_PHASE2.md` step 1. Lives only in the local
+  clone of foul_play_ref/, since that's an upstream repo we don't
+  vendor.
+- `poke-engine` (FoulPlay's MCTS dependency) builds via PEP 517 + Rust
+  toolchain transparently; no manual Rust install needed.
+
+What's broken / re-thought:
+- Subprocess-bot + send_challenges design doesn't drive battles to
+  completion. Phase 2 runbook now leads with the recommended adapter
+  approach (Python Player wrapping `poke-engine` directly).
+
+### Analysis tooling — DONE
+
+`analyze_eval.py` extended with 5 features (3 commits this session):
+- `--iter-trajectory <run_dir>` — per-iter playstyle table across
+  `replays_iter*/` subdirs
+- `--by-opponent` — split trajectory rows by opponent bot
+- `--team-usage` — lead mon, send-out frequency, faint order
+- `--decision-quality` — attacks-into-immune, switches-into-SE,
+  setup-at-low-HP, recovery-at-full-HP rates
+- `--human-baseline N` — stream N HF replays at >=1500 Elo, compute
+  same playstyle profile, add as comparison column
+
+Findings from running these on the current PPO run (iter 39 → iter 179):
+- Voluntary switches halved (12% → 6.5%) — model committing more
+- SE rate +4.5pts (49 → 53.5%) — better type targeting
+- Setup-at-low-HP −5pts (19 → 14%) — fewer wasted setups
+- **Surprise:** immune-attack rate went UP (11.4% → 13.5%). Worth
+  flagging — possibly because the policy converged on a smaller set of
+  preferred moves and some of those happen to hit immunities. Doesn't
+  block training but is a real failure mode to investigate.
+
+### Pipeline + infrastructure fixes (committed)
+
+- `replay_to_memmap.py`: stale `make_obs_mask_and_slots` import removed;
+  `MemmapV8Writer.finalize()` now actually trims raw .npy files instead
+  of just claiming to. Reclaimed 63.67 GB from the existing
+  `human_v8_100k/` memmap (174→111 GB).
+- BC reshape on `human_v8_100k` produced `best.pt` at smart_avg 45.1%
+  (epoch 2, 14.28M params, 2:1 temporal:spatial reshape). This is the
+  BC base for the PPO run above.
+
+---
+
+## Session 38 status (kept for context)
 
 **Session 38 completed two workstreams: (a) BC reshape trained to completion on the old
 bot-generated memmap, reaching smart_avg 21.2% at epoch 4 (below the historical 22-26%
@@ -194,55 +324,50 @@ Results will be in `team_selection_results.json` when complete.
 
 ## Quick-reference commands
 
-### BC retrain with capacity reshape on HUMAN data (Session 38 — current plan)
+### Resume PPO from current peak (sp_0219, the all-time-best smart_avg)
 
 ```bash
 cd pokemon-ai-starter/pokemon-ai/src
-python -u train_bc.py \
-  --memmap-dir data/datasets/human_v8_100k \
-  --device cuda --fp16 \
-  --d-spatial 256 --d-temporal 512 \
-  --n-spatial-layers 3 --n-temporal-layers 3 \
-  --n-summary-tokens 4 \
-  --dropout 0.05 \
-  --lr 1e-4 --weight-decay 1e-4 --grad-clip 2.0 \
-  --batch-size 16 --epochs 10 --sched cosine --warmup-steps 200 \
-  --eval-games 200 \
-  2>&1 | tee bc_reshape_human.log
-```
-
-~14.28M params on 5.08M records of human Showdown replays (Elo ≥1500), 109/30 feature
-dims. Tests whether capacity reshape + better data combined beats the old 22-26% BC
-ceiling. Expected runtime: ~3 hours per epoch (14× the old 13 min), so ~30 hrs for 10
-epochs — spans multiple sessions. Consider `--epochs 3` to gauge trajectory first.
-
-### Old BC reshape run on bot data — completed, best.pt saved (reference only)
-
-Run dir: `data/models/bc/v8_bc_20260423_124909/`. Best checkpoint `best.pt` is epoch 4
-weights at smart_avg=21.2% (SH=21, SmDmg=20, Tact=22, Strat=22). Trained on stale
-bot-generated memmap_v8 with zero-padded type_eff features. Use for PPO-from-BC
-comparison experiments, not as the go-forward baseline.
-
-### Resume training from current best (with safeguards ON)
-BC_base (`data/models/rl_v8/BEST_PPO_iter80_h2h_52.8pct.pt`) was removed during the
-Session 37 cleanup. `train_rl.py` still requires `--init-from` (argparse-enforced),
-but when `--resume` is also provided the init weights are overwritten. Pass the same
-sp2979 path for both — it's a safe workaround until `--init-from` is made optional.
-```bash
-cd pokemon-ai-starter/pokemon-ai/src
-# Start battle servers first (see below)
 python -u train_rl.py \
-  --init-from data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt \
-  --resume data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt \
+  --init-from data/models/bc/v8_bc_20260423_195603/best.pt \
+  --resume data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0219.pt \
   --device cuda --servers 9000,9001,9002 --fp16 --pipeline \
-  --games-per-iter 200 --max-concurrent 200 --n-iters 500 --warmup-iters 0 \
+  --games-per-iter 200 --max-concurrent 200 --n-iters 200 \
+  --warmup-iters 0 \
+  --lr 3e-5 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
-  --adaptive-entropy --early-stop \
+  --adaptive-entropy --win-rate-mode ema \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
-  2>&1 | tee new_run.log
+  2>&1 | tee -a ppo_human_bc_lr3e5.log
 ```
 
-Add `--win-rate-mode ema` to enable EMA PFSP (fixes stale-rating issue). Default is cumulative.
+**Critical: `--lr 3e-5` not `1e-4`.** From a 45% BC, lr=1e-4 caused 80%+
+KL discard and the policy diverged in 3 iters. lr=3e-5 produces clean
+multi-epoch updates.
+
+### BC reshape on human data — done, checkpoint locked
+
+Run dir: `data/models/bc/v8_bc_20260423_195603/`. `best.pt` is epoch 2
+weights at smart_avg 45.1% (14.28M params, 256/512 spatial/temporal,
+3L/3L, K=4). Use this as `--init-from` for PPO. Per-epoch curve:
+
+| Epoch | smart_avg | val_acc |
+|---|---|---|
+| 0 | 31.1 | 0.671 |
+| 1 | 44.4 | 0.683 |
+| **2** | **45.1** | **0.706** ← best.pt |
+| 3 | 39.9 | 0.706 |
+| 4-9 | 16-22 | 0.71-0.713 |
+
+Classic BC overfit after epoch 2 (val_acc keeps climbing, smart_avg
+plateaus then regresses). The reshape + human data + restored type_eff
+combo broke the old 22-26% BC ceiling decisively.
+
+### Old BC reshape run on bot data — reference only
+
+Run dir: `data/models/bc/v8_bc_20260423_124909/`. `best.pt` at smart_avg
+21.2%. Trained on stale `memmap_v8` (107/28 zero-padded). Don't use as
+go-forward base.
 
 ### Start 3 battle servers (Windows)
 ```bash
@@ -257,28 +382,39 @@ curl -s -o /dev/null -w "9001:%{http_code} " http://127.0.0.1:9001/action.php?
 curl -s -o /dev/null -w "9002:%{http_code}\n" http://127.0.0.1:9002/action.php?
 ```
 
-### Incremental Elo measurement
-```bash
-# 3 shards on 3 servers, parallel (~5 hours for 19 snapshots)
-cd pokemon-ai-starter/pokemon-ai/src
-SNAPS="path/to/snap1.pt path/to/snap2.pt ..."
-NAMES="sp1000 sp1010 ..."
+### Incremental Elo measurement — the "Useful" set we agreed on (Session 39)
 
-# Shard 0 (on server 9000):
+5 snapshots: new BC + early/mid/peak/final from this run. Anchors on
+sp2979 (Elo 1058) which is still on disk. Note that ~38 of the 52 old
+snapshots in `elo_exp5_FINAL.json` were pruned and won't have real
+matches against ours — but sp2979, sp2999, sp0284, sp0839, sp1199, etc.
+do exist, so the comparison is meaningful.
+
+```bash
+cd pokemon-ai-starter/pokemon-ai/src
+
+# Single shard (~2.5 hr for 5 snapshots × ~12 surviving opponents × ~30 min)
 python -u eval_elo_ladder.py --add-to data/eval/elo_exp5_FINAL.json \
-  --snapshots $SNAPS --names $NAMES \
+  --snapshots \
+    data/models/bc/v8_bc_20260423_195603/best.pt \
+    data/models/rl_v9/selfplay_v9_20260424_213428/snapshot_0029.pt \
+    data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0099.pt \
+    data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0159.pt \
+    data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0219.pt \
+    data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt \
+  --names new_bc sp_pre_29 sp_0099 sp_0159 sp_0219 sp_0229 \
   --n-games 100 --concurrency 70 --device cuda \
   --server ws://127.0.0.1:9000/showdown/websocket \
-  --shard 0/3 --out-json data/eval/elo_sessionXX_shard0.json &
-
-# Shards 1 and 2 identical but with --server 9001/9002 and --shard 1/3, 2/3
-# Then combine:
-python eval_elo_ladder.py --combine \
-  data/eval/elo_sessionXX_shard0.json \
-  data/eval/elo_sessionXX_shard1.json \
-  data/eval/elo_sessionXX_shard2.json \
-  --out-json data/eval/elo_sessionXX_FINAL.json
+  --out-json data/eval/elo_session39.json
 ```
+
+What we expect to find: sp_0219 should land near or above sp2979 (1058)
+in Elo terms — internal PFSP wr says we beat sp2979 63%. If Elo confirms,
+real strength gain is real. If sp_0219 sits below 1058, the smart_avg
+gain is mostly bot-eval-specific noise.
+
+For 3-shard parallel (faster), use `--shard 0/3` etc. on different
+servers as in the old eval_elo_ladder.py docs.
 
 ### Monitor training (PowerShell)
 ```powershell
