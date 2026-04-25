@@ -44,28 +44,35 @@ agents:
   mm-minikazam:
     model_name: Minikazam
 
-  # ── Small ─────────────────────────────────────────────────
+  mm-abra:
+    model_name: Abra
+
+  # ── Small (~15M) ──────────────────────────────────────────
   mm-small-rl:
     model_name: SmallRL
 
   mm-small-il:
     model_name: SmallIL
 
+  mm-small-il-fa:
+    model_name: SmallILFA
+
   mm-small-rl-aug:
-    model_name: SmallRLAug
+    model_name: SmallRL_Aug
 
   mm-small-rl-binary:
-    model_name: SmallRLBinary
+    model_name: SmallRL_BinaryFilter
 
-  # SmallRLGen9Beta is the gen9-specific variant per docs. Verify exact name
-  # in get_pretrained_model_names() during Phase 2 smoke test; rename if needed.
+  mm-small-rl-extreme:
+    model_name: SmallRL_ExtremeFilter
+
+  mm-small-rl-maxq:
+    model_name: SmallRL_MaxQ
+
   mm-small-gen9:
     model_name: SmallRLGen9Beta
 
-  mm-small-rl-maxq:
-    model_name: SmallRLMaxQ
-
-  # ── Medium (tight on 6GB but should fit with fp16) ────────
+  # ── Medium (~50M, tight on 6GB; should fit with fp16) ─────
   mm-medium-rl:
     model_name: MediumRL
 
@@ -73,11 +80,24 @@ agents:
     model_name: MediumIL
 
   mm-medium-rl-aug:
-    model_name: MediumRLAug
+    model_name: MediumRL_Aug
 
   mm-medium-rl-maxq:
-    model_name: MediumRLMaxQ
+    model_name: MediumRL_MaxQ
+
+  # ── Synthetic-RL family (size TBD; check during Phase 2) ──
+  # mm-synrl-v0:
+  #   model_name: SyntheticRLV0
+  # mm-synrl-v1:
+  #   model_name: SyntheticRLV1
+  # mm-synrl-v2:
+  #   model_name: SyntheticRLV2
+
+  # ── Kadabra family (mid-large, size unknown; verify VRAM) ─
+  # mm-kadabra:
+  #   model_name: Kadabra
+  # mm-kadabra2:
+  #   model_name: Kadabra2
 
   # ── Skip — won't fit on 6GB ───────────────────────────────
-  # large-il, large-rl, kakuna, superkazam, synthetic-* (verify sizes
-  # before adding any of these in Phase 2)
+  # LargeIL, LargeRL, Alakazam, Superkazam, Kakuna
