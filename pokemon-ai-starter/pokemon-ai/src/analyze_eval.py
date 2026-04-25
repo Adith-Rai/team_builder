@@ -1470,6 +1470,147 @@ def print_team_usage(usage, top_n=10):
             print(f"    {mon:20s}  {n:4d} ({n/total_lf*100:5.1f}%)")
 
 
+# ── Decision-quality metrics ──
+# Light-touch counters based on already-parsed battle data. These flag
+# decisions that are *usually* mistakes — they have legitimate exceptions
+# (predicting a switch, dual-type attacks where one half is hitting normally),
+# so report them as rates to track relative changes across iters, not as
+# absolute "bug counts."
+
+def compute_decision_quality(battles, our_player_prefix='BCPolicyPlayer'):
+    """Compute heuristic decision-quality metrics across a set of battles.
+
+    Returns:
+      attacks_into_immune: count of our attacks that hit a 0x immune target
+      attacks_into_resisted: count of our attacks that hit 0.5x or worse (excl. immune)
+      attacks_super_effective: count of our SE hits (mirrors stats counter, here for ratio)
+      attacks_total_flagged: SE + resisted + immune (i.e. moves with effectiveness flagged)
+      voluntary_switch_into_se: count of voluntary switches where opponent's NEXT
+        turn move was super-effective on the switched-in mon
+      voluntary_switch_total: total voluntary switches (denominator for above)
+      setup_at_low_hp: setup moves used while own active HP < 25%
+      recovery_at_full_hp: recovery moves used while own active HP > 90%
+      total_setup, total_recovery: denominators
+    """
+    out = {
+        'attacks_into_immune': 0,
+        'attacks_into_resisted': 0,
+        'attacks_super_effective': 0,
+        'attacks_total_flagged': 0,
+        'voluntary_switch_into_se': 0,
+        'voluntary_switch_total': 0,
+        'setup_at_low_hp': 0,
+        'total_setup': 0,
+        'recovery_at_full_hp': 0,
+        'total_recovery': 0,
+    }
+
+    for b in battles:
+        if not b:
+            continue
+        if our_player_prefix == 'p1':
+            our_key = 'p1'
+        elif our_player_prefix == 'p2':
+            our_key = 'p2'
+        else:
+            is_p1 = our_player_prefix in (b['p1'] or '')
+            our_key = 'p1' if is_p1 else 'p2'
+        our_short = our_key[:2]
+
+        # Walk turns, tracking our active mon and HP at start-of-turn (best-effort).
+        our_active = None
+        our_hp = None  # 0..100 percent
+        turns = b['turns']
+
+        for t_idx, turn in enumerate(turns):
+            our_actions = turn[f'{our_key}_actions']
+
+            # Detect voluntary switches this turn (not after a faint).
+            faint_this_turn = any(
+                ev[0] == 'faint' and (ev[1] or '').startswith(our_short)
+                for ev in turn['events']
+            )
+            for action in our_actions:
+                if action['type'] == 'switch':
+                    new_mon = action['mon']
+                    incoming_hp = action.get('hp')
+                    if not faint_this_turn:
+                        out['voluntary_switch_total'] += 1
+                        # Check NEXT turn's opp super-effective hit on the switched-in mon.
+                        if t_idx + 1 < len(turns):
+                            for ev in turns[t_idx + 1]['events']:
+                                if ev[0] == 'supereffective' and ev[1] != our_key:
+                                    out['voluntary_switch_into_se'] += 1
+                                    break
+                    our_active = new_mon
+                    if incoming_hp is not None:
+                        our_hp = incoming_hp
+                elif action['type'] == 'move':
+                    move_name = action['move']
+                    if move_name in SETUP_MOVES:
+                        out['total_setup'] += 1
+                        if our_hp is not None and our_hp < 25:
+                            out['setup_at_low_hp'] += 1
+                    elif move_name in RECOVERY_MOVES:
+                        out['total_recovery'] += 1
+                        if our_hp is not None and our_hp > 90:
+                            out['recovery_at_full_hp'] += 1
+
+            # Update HP tracker from events (damage/heal/faint).
+            for ev in turn['events']:
+                kind = ev[0]
+                if kind == 'damage' and our_active and (ev[1] or '').startswith(our_short):
+                    parsed = _parse_hp_str(ev[2] or '')
+                    if parsed is not None:
+                        our_hp = parsed
+                elif kind == 'heal' and our_active and (ev[1] or '').startswith(our_short):
+                    parsed = _parse_hp_str(ev[2] or '')
+                    if parsed is not None:
+                        our_hp = parsed
+                elif kind == 'faint' and (ev[1] or '').startswith(our_short):
+                    our_hp = 0
+                # Effectiveness flagged after our move.
+                elif kind == 'supereffective' and ev[1] == our_key:
+                    out['attacks_super_effective'] += 1
+                    out['attacks_total_flagged'] += 1
+                elif kind == 'resisted' and ev[1] == our_key:
+                    out['attacks_into_resisted'] += 1
+                    out['attacks_total_flagged'] += 1
+                elif kind == 'immune' and ev[1] == our_key:
+                    out['attacks_into_immune'] += 1
+                    out['attacks_total_flagged'] += 1
+
+    return out
+
+
+def print_decision_quality(dq):
+    """Pretty-print decision-quality metrics."""
+    print(f"\n{'─'*65}")
+    print(f"  DECISION QUALITY (heuristic — high rates suggest mispredictions)")
+    print(f"{'─'*65}")
+
+    flag = dq['attacks_total_flagged']
+    if flag > 0:
+        print(f"\n  Attack effectiveness (of {flag} flagged-effectiveness hits):")
+        print(f"    Super-effective:    {dq['attacks_super_effective']:5d} ({dq['attacks_super_effective']/flag*100:5.1f}%)")
+        print(f"    Resisted (0.5x):    {dq['attacks_into_resisted']:5d} ({dq['attacks_into_resisted']/flag*100:5.1f}%)")
+        print(f"    Immune (0x):        {dq['attacks_into_immune']:5d} ({dq['attacks_into_immune']/flag*100:5.1f}%)  ← always wasted")
+
+    vs = dq['voluntary_switch_total']
+    if vs > 0:
+        rate = dq['voluntary_switch_into_se'] / vs * 100
+        print(f"\n  Voluntary switches: {vs}")
+        print(f"    Eat super-effective hit next turn:  {dq['voluntary_switch_into_se']:5d} ({rate:5.1f}%)")
+        print(f"    (legitimate when predicting a switch — but elevated rate ≈ bad reads)")
+
+    if dq['total_setup'] > 0:
+        print(f"\n  Setup moves: {dq['total_setup']}  |  at <25% HP: {dq['setup_at_low_hp']} "
+              f"({dq['setup_at_low_hp']/dq['total_setup']*100:5.1f}%)")
+    if dq['total_recovery'] > 0:
+        print(f"  Recovery moves: {dq['total_recovery']}  |  at >90% HP: {dq['recovery_at_full_hp']} "
+              f"({dq['recovery_at_full_hp']/dq['total_recovery']*100:5.1f}%)  ← wasted turn")
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Analyze Pokemon AI replay playstyles')
@@ -1489,6 +1630,8 @@ def main():
                    help='With --iter-trajectory, split each iter row by opponent bot')
     p.add_argument('--team-usage', action='store_true', default=False,
                    help='Show team usage stats (lead mon, send-out freq, faint order) for each --replay-dir')
+    p.add_argument('--decision-quality', action='store_true', default=False,
+                   help='Show heuristic decision-quality metrics (attacks into immune, switches into SE hits, setup at low HP, recovery at full HP)')
     args = p.parse_args()
 
     # Iter-trajectory mode runs standalone and exits.
@@ -1537,6 +1680,10 @@ def main():
         if args.team_usage:
             usage = compute_team_usage(battles, our_player_prefix=args.player_prefix)
             print_team_usage(usage)
+
+        if args.decision_quality:
+            dq = compute_decision_quality(battles, our_player_prefix=args.player_prefix)
+            print_decision_quality(dq)
 
     # Comparison table if multiple directories
     if len(all_profiles) >= 2:
