@@ -1,0 +1,83 @@
+# metamon_local.yaml — config consumed by metamon.rl.self_play.serve_model
+#
+# Schema reverse-engineered from metamon_ref/metamon/rl/self_play/earlygen_config.yaml
+# and the serve_model.py launcher source.
+#
+# Each `agents` entry is one Showdown account that runs an instance of the
+# named model. Defaults apply to all agents and can be overridden per agent.
+#
+# IMPORTANT: serve_model launches a QueueOnLocalLadder env, meaning the bot
+# joins the local Showdown ladder queue rather than accepting direct
+# /challenge messages. Our PPO currently uses challenge-mode via poke-env's
+# battle_against. Phase 2 needs to either:
+#   (a) modify our PPO collection to use ladder-queue mode, or
+#   (b) wrap Metamon's bot to expose an accept_challenge interface.
+# Until that's resolved, this config is for smoke-testing the bot loop only.
+
+defaults:
+  # Which team distribution Metamon's bot uses for itself. "modern_replays_v2"
+  # is what the upstream earlygen_config.yaml uses; other options exist in
+  # metamon_ref/metamon/env/wrappers.py:get_metamon_teams. We can override
+  # per-agent if a specific Metamon variant has a preferred team set.
+  team_set: modern_replays_v2
+
+  # "metamon" uses their forked Showdown protocol; "poke-env" uses standard
+  # poke-env. Stick with metamon for now (matches their published config).
+  battle_backend: metamon
+
+  # null = use the default checkpoint from HF for the model. Specific ints
+  # let you target a particular training checkpoint (some models like
+  # Alakazam expose checkpoints 30/40/48/etc).
+  checkpoints: [null]
+
+  # Action sampling temperature. Their config samples uniformly from this
+  # list per-battle; sticking to 1.0 for deterministic-ish play.
+  temperatures: [1.0]
+
+  # 1 process per username. Use higher (e.g. 4) if you want one model
+  # to occupy multiple ladder slots simultaneously. Multiplies username
+  # via -1 -2 -3 etc suffix.
+  num_agents: 1
+
+agents:
+  # ── Tiny ──────────────────────────────────────────────────
+  mm-minikazam:
+    model_name: Minikazam
+
+  # ── Small ─────────────────────────────────────────────────
+  mm-small-rl:
+    model_name: SmallRL
+
+  mm-small-il:
+    model_name: SmallIL
+
+  mm-small-rl-aug:
+    model_name: SmallRLAug
+
+  mm-small-rl-binary:
+    model_name: SmallRLBinary
+
+  # SmallRLGen9Beta is the gen9-specific variant per docs. Verify exact name
+  # in get_pretrained_model_names() during Phase 2 smoke test; rename if needed.
+  mm-small-gen9:
+    model_name: SmallRLGen9Beta
+
+  mm-small-rl-maxq:
+    model_name: SmallRLMaxQ
+
+  # ── Medium (tight on 6GB but should fit with fp16) ────────
+  mm-medium-rl:
+    model_name: MediumRL
+
+  mm-medium-il:
+    model_name: MediumIL
+
+  mm-medium-rl-aug:
+    model_name: MediumRLAug
+
+  mm-medium-rl-maxq:
+    model_name: MediumRLMaxQ
+
+  # ── Skip — won't fit on 6GB ───────────────────────────────
+  # large-il, large-rl, kakuna, superkazam, synthetic-* (verify sizes
+  # before adding any of these in Phase 2)
