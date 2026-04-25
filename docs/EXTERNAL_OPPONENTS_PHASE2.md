@@ -11,9 +11,40 @@ is small enough to fail fast; if any step breaks, fix before moving on.
 - Python 3.11 (matches our main env)
 - Working internet for HF / pip downloads
 
-## 1. Foul Play (~30 min, simplest first)
+## 1. Foul Play (~30 min, simplest first) — VALIDATED
 
 Light deps. No torch, no GPU.
+
+**Protocol fixes required (already applied to our codebase + upstream clone):**
+
+1. `pokemon-ai-starter/pokemon-ai/src/battle_server.js`: send the |pm|
+   /challenge in Showdown standard format (8 pipes, 9 split-fields). Was
+   inline-format which Foul Play silently rejected. Committed as e01a37f.
+
+2. `foul_play_ref/fp/websocket_client.py:accept_challenge`: do case-
+   insensitive "id"-form comparison of the target username (Showdown sends
+   lowercase ids; --ps-username was CamelCase). Patch (apply to a fresh
+   clone — not committed to our repo since foul_play_ref is upstream):
+
+   ```python
+   # near line 153 in fp/websocket_client.py
+   def _to_id(s):
+       return ''.join(c for c in s.lower() if c.isalnum())
+   if (
+       len(split_msg) == 9
+       and split_msg[1] == "pm"
+       and _to_id(split_msg[3].replace("!", "").replace("‽", ""))
+       == _to_id(self.username)
+       and split_msg[4].startswith("/challenge")
+       and split_msg[5] == battle_format
+   ):
+       username = split_msg[2].strip()
+   ```
+
+   Without this, Foul Play's accept_challenge loop sits forever even
+   after the protocol-format fix.
+
+After these two patches the smoke test below passes.
 
 ```bash
 cd C:/Users/raiad/OneDrive/Desktop/team_builder
