@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyze eval replays to understand model behavior patterns and compare playstyles."""
 
-import re, sys, os, glob, json, math
+import re, sys, os, glob, json, math, time
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -129,12 +129,18 @@ def parse_replay(filepath):
         return None
 
     log = m.group(1).strip()
-    lines = log.split('\n')
-
-    # Extract battle_id from filename (e.g. "battle-gen9ou-220725")
     fname = os.path.basename(filepath)
     bid_match = re.search(r'(battle-\S+?)\.html', fname)
     battle_id = bid_match.group(1) if bid_match else fname
+    return _parse_battle_log(log, battle_id, fname=fname)
+
+
+def _parse_battle_log(log, battle_id, fname=''):
+    """Parse a raw Showdown protocol log into structured battle data.
+
+    Used by parse_replay (HTML-wrapped) and parse_hf_battle (raw HF log).
+    """
+    lines = log.split('\n')
 
     battle = {
         'file': fname,
@@ -1470,6 +1476,82 @@ def print_team_usage(usage, top_n=10):
             print(f"    {mon:20s}  {n:4d} ({n/total_lf*100:5.1f}%)")
 
 
+# ── Human baseline (HuggingFace stream) ──
+# Stream a sample of human Showdown replays from jakegrigsby/metamon-raw-replays
+# and parse them through the same pipeline as our eval HTML replays. Gives us
+# a "what do humans play like at >=1500 Elo" baseline column for comparison.
+# Pure-CPU streaming; no model loaded.
+
+def parse_hf_battle(log_text, replay_id):
+    """Parse a single HF metamon-raw-replays log text into our battle-dict format."""
+    if not log_text or len(log_text) < 50:
+        return None
+    return _parse_battle_log(log_text, replay_id, fname=replay_id)
+
+
+def load_hf_replays(n_samples=2000, min_rating=1500, fmt='gen9ou', verbose=True):
+    """Stream + parse N gen9ou replays at >=min_rating from HF.
+
+    Returns a list of battle dicts in the same format as load_replays(). Caller
+    should pass the result to analyze_battles() with our_player_prefix='p1' (or
+    'p2') — doesn't matter which, since both sides are humans and the playstyle
+    profile averages over the chosen perspective.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError('pip install datasets — required for --human-baseline')
+
+    if verbose:
+        print(f"\nStreaming HF dataset (target: {n_samples} replays at "
+              f"{fmt} rating>={min_rating})...", flush=True)
+
+    ds = load_dataset('jakegrigsby/metamon-raw-replays', split='train', streaming=True)
+    fmt_clean = re.sub(r'[^a-z0-9]', '', fmt.lower())
+
+    parsed = []
+    n_seen = n_skip_fmt = n_skip_rat = n_skip_parse = 0
+    t_start = time.time()
+    for row in ds:
+        if len(parsed) >= n_samples:
+            break
+        n_seen += 1
+
+        format_id = row.get('formatid') or row.get('format') or ''
+        if fmt_clean not in re.sub(r'[^a-z0-9]', '', str(format_id).lower()):
+            n_skip_fmt += 1
+            continue
+
+        try:
+            rating = int(row.get('rating') or 0)
+        except (ValueError, TypeError):
+            rating = 0
+        if rating < min_rating:
+            n_skip_rat += 1
+            continue
+
+        log = row.get('log', '')
+        replay_id = str(row.get('id', f'hf-{n_seen}'))
+        battle = parse_hf_battle(log, replay_id)
+        if battle is None or not battle['turns']:
+            n_skip_parse += 1
+            continue
+        parsed.append(battle)
+
+        if verbose and len(parsed) % 200 == 0:
+            elapsed = time.time() - t_start
+            rate = len(parsed) / elapsed if elapsed > 0 else 0
+            print(f"  [{len(parsed)}/{n_samples}] rate={rate:.1f}/s "
+                  f"skip(fmt={n_skip_fmt}, rat={n_skip_rat}, parse={n_skip_parse})",
+                  flush=True)
+
+    if verbose:
+        elapsed = time.time() - t_start
+        print(f"  Done: {len(parsed)} replays parsed in {elapsed:.1f}s", flush=True)
+
+    return parsed
+
+
 # ── Decision-quality metrics ──
 # Light-touch counters based on already-parsed battle data. These flag
 # decisions that are *usually* mistakes — they have legitimate exceptions
@@ -1632,6 +1714,10 @@ def main():
                    help='Show team usage stats (lead mon, send-out freq, faint order) for each --replay-dir')
     p.add_argument('--decision-quality', action='store_true', default=False,
                    help='Show heuristic decision-quality metrics (attacks into immune, switches into SE hits, setup at low HP, recovery at full HP)')
+    p.add_argument('--human-baseline', type=int, default=0, metavar='N',
+                   help='Stream N human Showdown replays from HF (jakegrigsby/metamon-raw-replays) at >=1500 Elo and add as an extra comparison column')
+    p.add_argument('--human-baseline-rating', type=int, default=1500,
+                   help='Min rating filter for --human-baseline (default 1500)')
     args = p.parse_args()
 
     # Iter-trajectory mode runs standalone and exits.
@@ -1684,6 +1770,23 @@ def main():
         if args.decision_quality:
             dq = compute_decision_quality(battles, our_player_prefix=args.player_prefix)
             print_decision_quality(dq)
+
+    # Optional human baseline column (HuggingFace stream)
+    if args.human_baseline > 0:
+        hf_battles = load_hf_replays(
+            n_samples=args.human_baseline,
+            min_rating=args.human_baseline_rating,
+        )
+        if hf_battles:
+            # Both sides are human; just analyze p1's perspective. The profile
+            # averages over a population of humans, so per-side bias is small.
+            hf_stats = analyze_battles(hf_battles, our_player_prefix='p1')
+            hf_profile = compute_playstyle_profile(hf_stats)
+            label = f'Human≥{args.human_baseline_rating} (n={len(hf_battles)})'
+            print_playstyle_report(hf_stats, hf_profile, label)
+            all_profiles.append(hf_profile)
+            all_stats.append(hf_stats)
+            labels = list(labels) + [label]
 
     # Comparison table if multiple directories
     if len(all_profiles) >= 2:
