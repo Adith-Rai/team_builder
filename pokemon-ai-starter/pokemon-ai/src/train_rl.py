@@ -587,16 +587,25 @@ def main():
         start_iter, snapshot_pool = _resume_from_checkpoint(
             args, model, optimizer, snapshot_pool, device)
 
-    # External in-process opponents — appended AFTER resume so resumed pool
-    # state stays clean (resume loads only local snapshot paths, externals
-    # are re-instantiated each run from the YAML).
+    # External opponents — appended AFTER resume so resumed pool state stays clean
+    # (resume loads only local snapshot paths; externals are re-instantiated each
+    # run from the YAML). Subprocess adapters (metamon) get spawned + supervised
+    # by an ExternalOpponentManager which we keep alive for the rest of training.
+    external_manager = None
     if getattr(args, "external_adapters", None):
         from external_adapters import load_pool_entries
-        ext_entries = load_pool_entries(args.external_adapters)
+        default_port = int(args.servers.split(",")[0].strip())
+        ext_entries, external_manager = load_pool_entries(
+            args.external_adapters, default_server_port=default_port
+        )
         if ext_entries:
             snapshot_pool.extend(ext_entries)
             ext_keys = ", ".join(e.key for e in ext_entries)
             print(f"  [PFSP] +{len(ext_entries)} external adapters: {ext_keys}", flush=True)
+        if external_manager is not None:
+            print(f"  [PFSP] starting {len(external_manager.opponents)} subprocess adapter(s)",
+                  flush=True)
+            external_manager.start_all()
 
     loop = asyncio.new_event_loop()
 

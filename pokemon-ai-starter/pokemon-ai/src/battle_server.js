@@ -55,7 +55,14 @@ function sendTo(ws, msg) {
 
 function sendToUser(name, msg) {
     const u = users.get(name);
-    if (u) sendTo(u.ws, msg);
+    if (u) {
+        sendTo(u.ws, msg);
+        if (process.env.BS_TRACE_USER && process.env.BS_TRACE_USER === name) {
+            process.stderr.write(`[BS-TX:${name}] ${msg.slice(0, 200)}\n`);
+        }
+    } else if (process.env.BS_TRACE_MISS) {
+        process.stderr.write(`[BS-MISS] sendToUser to absent name=${name}\n`);
+    }
 }
 
 function toId(name) {

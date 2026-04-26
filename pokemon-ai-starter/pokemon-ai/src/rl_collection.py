@@ -37,22 +37,33 @@ _collect_round = 0
 
 @dataclass
 class PoolEntry:
-    """Unified PFSP pool entry — local snapshot or external in-process adapter.
+    """Unified PFSP pool entry — local snapshot, in-process adapter, or external user.
 
     `key` is what gets stored in the win_rates dict. For local entries that's
     the checkpoint path (preserves backward compat with existing keys); for
     external adapters it's a stable display name like "foulplay".
 
-    External entries wrap a Player factory: `factory(server_configuration,
-    account_configuration, team)` returns a poke-env Player ready to face our
-    V9RLPlayer via `battle_against`. The factory is called once per opponent
-    "wave" inside `_play_one_opponent`.
+    Three flavors of external entry:
+
+    - **In-process adapter** (`factory` set): the factory builds a poke-env
+      Player in our process. We face it via `player.battle_against(opp, n)`.
+      Used by PokeEnginePlayer.
+
+    - **External Showdown user** (`showdown_username` set, no factory): the
+      opponent is a separate process (e.g. a Metamon subprocess running
+      `metamon_accept_serve.py`) connected to the same Showdown server. We
+      face it via `player.send_challenges(username, n)`. Used by Metamon
+      because its dep stack (torch>=2.6, poke-env fork) conflicts with ours.
+
+    - **Local snapshot** (`path` set, kind='local'): the existing
+      SelfPlayOpponent path.
     """
     kind: str  # 'local' or 'external'
     key: str
-    path: Optional[str] = None              # local: .pt file
-    factory: Optional[Callable[..., Player]] = None  # external: builds the Player
+    path: Optional[str] = None                       # local: .pt file
+    factory: Optional[Callable[..., Player]] = None  # external in-process
     factory_kwargs: dict = field(default_factory=dict)
+    showdown_username: Optional[str] = None          # external subprocess
     weight: float = 1.0
 
 
@@ -230,6 +241,7 @@ async def collect_v9(
             server_configuration=srv,
         )
 
+        opponent = None  # only set for local + in-process external paths
         if entry.kind == "local":
             is_latest = (latest_snapshot is not None and entry.key == latest_snapshot)
             if len(snapshot_pool) > 15 or not is_latest:
@@ -248,8 +260,8 @@ async def collect_v9(
                 account_configuration=AccountConfiguration(f"Op{_pid_tag}r{batch_id}", None),
                 server_configuration=srv,
             )
-        else:
-            # External adapter — factory(server_configuration, account_configuration, team, **kw)
+        elif entry.factory is not None:
+            # External in-process adapter (e.g. PokeEnginePlayer)
             opp_tb = teambuilder or random_pool_teambuilder()
             try:
                 opponent = entry.factory(
@@ -265,12 +277,30 @@ async def collect_v9(
                 _cancel_listener(player)
                 del player
                 return [], 0, 0, 0, f"{entry.key}=0/0(factory)", entry.key
+        elif entry.showdown_username is not None:
+            # External Showdown user (subprocess) — challenge by username, no in-process opponent
+            pass
+        else:
+            print(f"  [ERROR] PoolEntry {entry.key} has neither factory nor showdown_username; skipping",
+                  flush=True)
+            _cancel_listener(player)
+            del player
+            return [], 0, 0, 0, f"{entry.key}=0/0(misconfigured)", entry.key
 
         try:
-            await asyncio.wait_for(
-                player.battle_against(opponent, n_battles=n_battles),
-                timeout=max(180, n_battles * 25),
-            )
+            if opponent is not None:
+                await asyncio.wait_for(
+                    player.battle_against(opponent, n_battles=n_battles),
+                    timeout=max(180, n_battles * 25),
+                )
+            else:
+                # Subprocess opponent — challenge their username and play out n battles.
+                # Throughput is capped by the subprocess's parallel_actors (typically 1
+                # for a Metamon agent), so we allow more wall time per game.
+                await asyncio.wait_for(
+                    player.send_challenges(entry.showdown_username, n_challenges=n_battles),
+                    timeout=max(300, n_battles * 60),
+                )
         except asyncio.TimeoutError:
             print(f"  [WARN] Timed out vs {opp_name} after {n_battles} games", flush=True)
         except Exception as e:
@@ -285,13 +315,17 @@ async def collect_v9(
             player.reset_battles()
         except EnvironmentError:
             pass
-        try:
-            opponent.reset_battles()
-        except EnvironmentError:
-            pass
+        if opponent is not None:
+            try:
+                opponent.reset_battles()
+            except EnvironmentError:
+                pass
         _cancel_listener(player)
-        _cancel_listener(opponent)
-        del player, opponent
+        if opponent is not None:
+            _cancel_listener(opponent)
+        del player
+        if opponent is not None:
+            del opponent
 
         return trajs, w, l, ties, f"{short}={w}/{w+l}", entry.key
 
