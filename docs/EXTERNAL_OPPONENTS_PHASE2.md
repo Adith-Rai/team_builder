@@ -1,15 +1,16 @@
 # External Opponents Integration — VALIDATED END-TO-END
 
-> **STATUS (end of Session 42, 2026-04-26): all four opponent paths play
-> a full battle to completion against a poke-env 0.10 sender on the local
-> battle_server, validated with `diag_cross_venv.py`:**
+> **STATUS (end of Session 42, 2026-04-26): full PPO smoke with all 4
+> opponent routes (self-play, in-process mcts, FP subprocess, MM subprocess)
+> in the PFSP pool completes a clean iter end-to-end. 9 protocol bugs
+> found and fixed.**
 >
-> | Path | Adapter | Validated |
-> |---|---|---|
-> | Self-play | `SelfPlayOpponent` (in-process) | ✓ |
-> | Foul Play MCTS core | `mcts` / `pokeengine` (in-process via poke-engine) | ✓ |
-> | Real Foul Play | `foulplay` subprocess in `foul_play_venv` | ✓ |
-> | Metamon | `metamon` subprocess in `metamon_venv` | ✓ (Minikazam) |
+> | Path | Adapter | Single-battle | Multi-battle | In real PPO iter |
+> |---|---|---|---|---|
+> | Self-play | `SelfPlayOpponent` (in-process) | ✓ | ✓ | ✓ |
+> | Foul Play MCTS core | `mcts` (in-process via poke-engine) | ✓ | ✓ | ✓ |
+> | Real Foul Play | `foulplay` subprocess in `foul_play_venv` | ✓ | ✓ | ✓ |
+> | Metamon (Minikazam) | `metamon` subprocess in `metamon_venv` | ✓ | ✓ | ✓ |
 >
 > The hybrid subprocess design works. The earlier "drop the external user
 > design and rewrite as in-process Players" recommendation is **obsolete**
@@ -84,21 +85,46 @@
 >    re-emit `|updatechallenges|...` + `|pm|...`. Idempotent — extra /pms
 >    are harmless if the target is already in accept_challenge.
 
-> **Multi-battle proof:** with bugs #6 and #7 applied,
-> `diag_cross_venv.py --opponent FoulPlayBot --n-games 2` runs
-> back-to-back battles end-to-end (`done. W=2 L=0` in 38.7s, both clean).
+> 8. **Multi-battle: poke-env's `_challenge_queue` was double-populated**
+>    (Session 42, third pass). poke-env (in metamon's 0.8.3.3 fork) registers
+>    the challenger on `_challenge_queue` from BOTH `_update_challenges`
+>    (handles `|updatechallenges|`) AND `_handle_challenge_request` (handles
+>    `|pm|/challenge`). battle_server.js was sending both for one /challenge,
+>    so the queue got two entries. Metamon's `_accept_loop` iter 1 consumed
+>    one entry and /accepted normally (battle 1 plays). Iter 2 starts and
+>    immediately consumes the duplicate, sending a stale `/accept diagsender`
+>    to a `pendingChallenges` map that was already cleared. battle_server
+>    logs `No pending challenge from diagsender for mmminikazam` and Metamon's
+>    iter 2 sits forever waiting for a new battle that already happened.
+>    Fix: send `|pm|/challenge` only (FP needs it; MM accepts it via
+>    `_handle_challenge_request`). Drop the `|updatechallenges|` send.
+>    Foul Play only reads `|pm|`, so it doesn't care.
+>
+> 9. **Multi-battle: Metamon's openai_api 50s idle timeout** (Session 42,
+>    third pass). poke-env's `OpenAIGymEnv.reset` polls for a challenge
+>    `_INIT_RETRIES * _TIME_BETWEEN_RETRIES` = 100 * 0.5 = 50 seconds before
+>    raising `RuntimeError("Agent is not challenging")`. amago's
+>    `evaluate_test` calls reset() right after every battle expecting the
+>    next one in flight. PFSP can leave Metamon idle minutes between waves.
+>    Fix: override the constants on `AcceptChallengesOnLocal` (class
+>    attributes, picked up via MRO when openai_api does
+>    `self._INIT_RETRIES`). Bumped to ~1 hour total wait
+>    (`_INIT_RETRIES = 7200`).
 
-> **OPEN — Metamon multi-battle / amago session management.** Metamon's
-> amago `evaluate_test` loop wraps poke-env's `openai_api` differently
-> from FP's straight `accept_challenges`. When the trainer's send_challenges
-> doesn't deliver a challenge in time (e.g. PFSP picked another opponent
-> first), amago's `env.reset()` fires `RuntimeError: Agent is not challenging`
-> and the metamon subprocess crashes. Single-battle Metamon works (1.7s
-> diag); multi-battle inside a real PPO iter still has timing issues with
-> back-to-back challenges separated by other opponents. Likely fix is
-> either (a) a longer poke-env idle timeout in metamon_accept_serve.py, or
-> (b) loosening amago's strict reset-must-be-challenging guard. Defer to
-> next session — does not block the FP path or `mcts` in-process path.
+> **Multi-battle proof:** with bugs #6-#9 applied:
+> - `diag_cross_venv.py --opponent FoulPlayBot --n-games 2` →
+>   `done. W=2 L=0` in 45.7s.
+> - `diag_cross_venv.py --opponent MM-Minikazam --n-games 1` × 2 with a
+>   30s gap between → both clean, MM `Average Win Rate 1.0`.
+> - **1-iter PPO smoke with `mcts-fast + foulplay-100ms + metamon-minikazam`
+>   in pool**: completes cleanly with `Iter 0: W/L/T=3/6/0 (33.3%),
+>   collect=65s, update=2s, vs sp0229=2/3 mcts-fast=1/2 foulplay-100ms=0/2
+>   metamon-minikazam=0/2`. **All four PFSP routes (self-play, in-process
+>   mcts, FP subprocess, MM subprocess) drove a real PPO iter end-to-end.**
+
+> **Bonus: timestamps in battle_server logs.** `function log` now prefixes
+> with `HH:MM:SS.mmm` so future protocol debugging can correlate frames
+> across the bs / FP / MM logs without guessing.
 >
 > **One Windows-specific Metamon gotcha:** `_factory_metamon` in
 > `external_adapters.py` now sets `TORCHDYNAMO_DISABLE=1` automatically on

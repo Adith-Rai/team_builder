@@ -85,6 +85,18 @@ class AcceptChallengesOnLocal(QueueOnLocalLadder):
       battle server, rather than poke-env's default LocalhostServerConfiguration.
     """
 
+    # poke-env's `OpenAIGymEnv.reset` polls `agent.current_battle` up to
+    # `_INIT_RETRIES * _TIME_BETWEEN_RETRIES` seconds (default 100*0.5=50s)
+    # before raising `RuntimeError("Agent is not challenging")`. amago's
+    # `evaluate_test` calls reset() right after every battle ends, expecting
+    # the next battle to already be in flight. In our PPO loop, PFSP can
+    # leave Metamon idle for several minutes between waves while the
+    # trainer plays self-play / Foul Play. Bump to ~1 hour total wait so MM
+    # sits patiently across PFSP gaps. Inherited via MRO; openai_api uses
+    # `self._INIT_RETRIES`, so our override wins.
+    _INIT_RETRIES = 7200          # × _TIME_BETWEEN_RETRIES = 60 minutes
+    _TIME_BETWEEN_RETRIES = 0.5
+
     def __init__(
         self,
         battle_format: str,

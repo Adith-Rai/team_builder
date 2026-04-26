@@ -23,7 +23,10 @@ for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1], 10);
 }
 
-function log(...a) { process.stderr.write(`[battle_server] ${a.join(' ')}\n`); }
+function log(...a) {
+    const t = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+    process.stderr.write(`[battle_server ${t}] ${a.join(' ')}\n`);
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -280,7 +283,10 @@ function cleanupBattle(tag) {
     for (const idle of idleUsers) {
         for (const [challenger, challenge] of pendingChallenges) {
             if (challenge.target !== idle) continue;
-            sendToUser(idle, `|updatechallenges|{"challengesFrom":{"${challenger}":"${challenge.format}"},"challengeTo":null}`);
+            // |pm| only — see comment in /challenge handler for why we don't
+            // also send |updatechallenges| (poke-env puts the challenger on
+            // its `_challenge_queue` from BOTH frames, causing a double-/accept
+            // and a stale "No pending challenge" log on the second attempt).
             sendToUser(idle, `|pm| ${challenger}| ${idle}|/challenge|${challenge.format}|||`);
             log(`Resent pending challenge ${challenger} -> ${idle} after battle cleanup`);
         }
@@ -404,12 +410,20 @@ function handleMessage(ws, raw) {
 
         pendingChallenges.set(name, { target, format });
 
-        // Notify the target about the challenge via updatechallenges
-        sendToUser(target, `|updatechallenges|{"challengesFrom":{"${name}":"${format}"},"challengeTo":null}`);
-        // Also send pm-based challenge notification in Showdown standard format.
-        // Foul Play splits this on `|` and strictly requires len == 9 with
-        // split[5] == format. So the message has exactly 8 pipes (9 fields):
+        // Send |pm|/challenge in Showdown standard format. Foul Play splits
+        // this on `|` and strictly requires len == 9 with split[5] == format,
+        // so the message has exactly 8 pipes (9 fields):
         //   ['', 'pm', ' sender', ' target', '/challenge', 'format', '', '', '']
+        //
+        // Why we DON'T also send |updatechallenges|: poke-env (in metamon's
+        // 0.8.3.3 fork) registers the challenger on `_challenge_queue` from
+        // BOTH `_update_challenges` (handles |updatechallenges|) AND
+        // `_handle_challenge_request` (handles |pm|/challenge). Sending both
+        // means two queue.put() calls for one challenge — `_accept_loop`'s
+        // first iter consumes one, second iter consumes the duplicate and
+        // immediately /accepts a stale challenger that's no longer pending.
+        // Just sending |pm| keeps the queue at 1 entry per challenge. Foul
+        // Play only reads |pm|, doesn't care about |updatechallenges|.
         sendToUser(target, `|pm| ${name}| ${target}|/challenge|${format}|||`);
         log(`Challenge: ${name} -> ${target} (${format})`);
         return;
@@ -419,7 +433,7 @@ function handleMessage(ws, raw) {
         const challenger = toId(cmdBody.slice(8).trim());
         const challenge = pendingChallenges.get(challenger);
         if (!challenge || challenge.target !== name) {
-            log(`No pending challenge from ${challenger} for ${name}`);
+            log(`No pending challenge from ${challenger} for ${name} (raw msg=${msg.slice(0,80)})`);
             return;
         }
         pendingChallenges.delete(challenger);

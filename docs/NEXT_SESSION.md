@@ -34,7 +34,7 @@ the original subprocess design completes battles cleanly. The skeleton
 we built (process manager, QueueTeambuilder, MultiSourceTeambuilder,
 PoolEntry) is all in production use.
 
-**Seven protocol bugs fixed this session — see `docs/EXTERNAL_OPPONENTS_PHASE2.md`
+**Nine protocol bugs fixed this session — see `docs/EXTERNAL_OPPONENTS_PHASE2.md`
 for the postmortem and a 5-min reproducer recipe.** Short version:
 1. Per-recipient framing in `pumpPlayer` (5-frame Showdown-faithful for
    FP/MM, bundled for poke-env 0.10).
@@ -54,41 +54,43 @@ for the postmortem and a 5-min reproducer recipe.** Short version:
 7. **Multi-battle: `cleanupBattle` re-emits pending `|pm|/challenge`** to
    users who just became idle. Pre-fix, /pms sent during a battle were
    silently consumed by `pokemon_battle` and never reached `accept_challenge`.
+8. **Multi-battle: drop `|updatechallenges|`, send only `|pm|/challenge`**.
+   poke-env (in metamon's 0.8.3.3 fork) registers the challenger on
+   `_challenge_queue` from BOTH frames, double-populating the queue.
+   Metamon's iter 1 consumed one and /accepted; iter 2 consumed the
+   duplicate and sent a stale /accept that battle_server rejected with
+   "No pending challenge". FP only reads `|pm|`, so it's fine without
+   `|updatechallenges|`.
+9. **Multi-battle: bump Metamon's openai_api 50s idle timeout to 1 hour**
+   via class attribute override (`_INIT_RETRIES = 7200`,
+   `_TIME_BETWEEN_RETRIES = 0.5`) on `AcceptChallengesOnLocal`. Default
+   raised `RuntimeError("Agent is not challenging")` 50s after each battle
+   ended if the next /challenge didn't arrive in time — PFSP gaps blew
+   that. Override picked up via MRO when openai_api does
+   `self._INIT_RETRIES`.
 
-**Multi-battle FP validated:** `diag_cross_venv.py --opponent FoulPlayBot
---n-games 2` runs back-to-back battles; FP reports `done. W=2 L=0` in 38.7s.
+**Full PPO smoke validated.** `train_rl.py --external-adapters
+external_adapters_all3_smoke.yaml --games-per-iter 9 --max-concurrent 3
+--n-iters 1 --init-from <sp0229.pt>` completes cleanly:
+`Iter 0: W/L/T=3/6/0 (33.3%), collect=65s, update=2s, vs sp0229=2/3
+mcts-fast=1/2 foulplay-100ms=0/2 metamon-minikazam=0/2`. All 4 routes
+(self-play, in-process mcts, FP subprocess, MM subprocess) drove the
+real PFSP collection loop end-to-end.
 
-**Known open issue: Metamon multi-battle inside a real PPO iter** throws
-`RuntimeError: Agent is not challenging` from amago's `evaluate_test`
-`env.reset()` when the trainer's next /challenge to MM hasn't arrived yet
-(e.g. PFSP picked another opponent first). Single-battle Metamon works
-fine (1.7s diag, full clean exit). Likely fix: longer poke-env idle
-timeout in metamon_accept_serve.py, or loosen amago's strict
-reset-must-be-challenging guard. **Doesn't block FP / mcts paths.**
+**Bonus:** `battle_server.js` now prefixes log lines with
+`HH:MM:SS.mmm` timestamps for future protocol debugging.
 
 ### TL;DR for next session
 
-**Three pending items**, in priority order:
+**Two pending items**, in priority order:
 
-1. **Resolve the Metamon multi-battle / amago session-timing issue.** This
-   is the only remaining blocker for a clean 3-adapter PPO smoke. The
-   error is `RuntimeError: Agent is not challenging` from
-   `metamon_venv/Lib/site-packages/poke_env/player/openai_api.py:320`,
-   raised when amago's `evaluate_test` calls `env.reset()` and the
-   underlying poke-env Player has no challenge in flight. Two paths:
-   (a) configure a generous idle timeout in `metamon_accept_serve.py`
-   (look at `accept_challenges(timeout=...)` or the poke-env idle-detection
-   knob); (b) override `AcceptChallengesOnLocal.reset` to await for a
-   challenge instead of failing. Once this is fixed, run the smoke command
-   that already exists: `train_rl.py --external-adapters
-   external_adapters_all3_smoke.yaml --games-per-iter 9 ...` (full command
-   in `data/models/rl_v9_all3_smoke_s42/...`).
-
-2. **Throughput** (Task #19 in old list): a single Foul Play subprocess
-   plays serially. For PPO scale (200 games/iter), spawn N=4-8 Foul Play
-   subprocesses in parallel + `parallel_actors=N` for Metamon. The
-   PoolEntry/manager design already supports multiple subprocesses per
-   `name`. ~half day of work.
+1. **Throughput** (Task #19 in old list): a single Foul Play subprocess
+   plays serially. The validated 1-iter smoke ran 9 games in 67s
+   (collect=65s) — fine for the smoke, way too slow for full 200-game
+   iters. Spawn N=4-8 Foul Play subprocesses in parallel + `parallel_actors=N`
+   for Metamon. The `ExternalOpponentManager` design already supports
+   multiple subprocesses per `name` — the YAML just lists each as a
+   separate entry. ~half day of work.
 
 3. **Incremental Elo on the 6-snapshot "Useful" set** (~2.5 hr): orthogonal
    to external opponents. New BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 +
