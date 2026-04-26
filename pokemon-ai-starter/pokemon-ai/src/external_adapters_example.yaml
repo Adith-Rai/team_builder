@@ -1,0 +1,37 @@
+# external_adapters_example.yaml — in-process external opponent adapters.
+#
+# Loaded by train_rl.py via --external-adapters <this-file>. Each entry adds
+# one Player subclass to the PFSP snapshot pool, sampled and weighted just
+# like our own snapshots.
+#
+# Differences from external_opponents_example.yaml:
+# - This config is for the **in-process adapter** path (Phase 2).
+#   The other YAML is for the **subprocess + send_challenges** path that
+#   hit a wall in Session 39 — kept around in case a bot lacks a clean
+#   Python entrypoint.
+#
+# Adapter types:
+# - pokeengine: Foul Play-style MCTS via the poke-engine Rust library.
+#   Lightweight (no torch). Must have `pip install poke-engine` in this venv.
+# - metamon: NOT YET IMPLEMENTED. Will need amago + transformers in this venv.
+
+opponents:
+  # Cheap MCTS — fast, weak. Useful as a baseline non-NN opponent during early
+  # training so we know we're not just overfitting to other neural nets.
+  - name: foulplay-100ms
+    type: pokeengine
+    search_time_ms: 100
+    weight: 1.0
+
+  # Stronger MCTS. Higher weight = sampled more often by PFSP, regardless of
+  # observed win rate, so we ensure exposure to a strong non-NN baseline.
+  - name: foulplay-300ms
+    type: pokeengine
+    search_time_ms: 300
+    weight: 1.5
+
+  # Metamon adapter — uncomment after the MetamonPlayer adapter is implemented:
+  # - name: metamon-minikazam
+  #   type: metamon
+  #   model: Minikazam
+  #   weight: 1.0

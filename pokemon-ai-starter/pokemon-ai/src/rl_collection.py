@@ -13,12 +13,14 @@ import time
 import traceback
 import threading
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
+from poke_env.player import Player
 from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
 
@@ -31,6 +33,39 @@ from rl_player import V9RLPlayer, SelfPlayOpponent
 import os
 _pid_tag = os.getpid() % 10000
 _collect_round = 0
+
+
+@dataclass
+class PoolEntry:
+    """Unified PFSP pool entry — local snapshot or external in-process adapter.
+
+    `key` is what gets stored in the win_rates dict. For local entries that's
+    the checkpoint path (preserves backward compat with existing keys); for
+    external adapters it's a stable display name like "foulplay".
+
+    External entries wrap a Player factory: `factory(server_configuration,
+    account_configuration, team)` returns a poke-env Player ready to face our
+    V9RLPlayer via `battle_against`. The factory is called once per opponent
+    "wave" inside `_play_one_opponent`.
+    """
+    kind: str  # 'local' or 'external'
+    key: str
+    path: Optional[str] = None              # local: .pt file
+    factory: Optional[Callable[..., Player]] = None  # external: builds the Player
+    factory_kwargs: dict = field(default_factory=dict)
+    weight: float = 1.0
+
+
+def _coerce_entry(item: Union[str, "PoolEntry"]) -> "PoolEntry":
+    """Wrap a bare path string as a local PoolEntry — preserves backward
+    compatibility with code that passes `snapshot_pool: List[str]`."""
+    if isinstance(item, PoolEntry):
+        return item
+    return PoolEntry(kind="local", path=item, key=item)
+
+
+def _entry_key(item) -> str:
+    return _coerce_entry(item).key
 
 
 def _make_server(ws_url: str) -> ServerConfiguration:
@@ -46,41 +81,42 @@ def _make_server(ws_url: str) -> ServerConfiguration:
 
 
 def pfsp_sample(
-    snapshot_pool: List[str],
+    snapshot_pool: List[Union[str, PoolEntry]],
     win_rates: Dict[str, list],
     n_opponents: int = 15,
     uniform_frac: float = 0.15,
     latest_snapshot: Optional[str] = None,
-) -> List[str]:
+) -> List[Union[str, PoolEntry]]:
     """Select opponents using Prioritized Fictitious Self-Play (PFSP).
 
-    Weights each checkpoint by (1 - win_rate)^2: harder opponents are sampled
-    more often. A fraction of slots are filled by uniform random sampling for
-    anti-forgetting (re-tests opponents with stale ratings).
+    Weights each entry by (1 - win_rate)^2 × entry.weight: harder opponents
+    are sampled more often. A fraction of slots are filled by uniform random
+    sampling for anti-forgetting (re-tests opponents with stale ratings).
 
     Args:
-        snapshot_pool: all available checkpoints
-        win_rates: {checkpoint_path: [wins, games]} — missing = default 0.5
+        snapshot_pool: list of paths (legacy) and/or PoolEntry objects
+        win_rates: {entry_key: [wins, games]} — missing = default 0.5
         n_opponents: total opponents to select
         uniform_frac: fraction of slots for uniform random (anti-forgetting)
-        latest_snapshot: always include this checkpoint if provided
+        latest_snapshot: always include this checkpoint path if provided
 
     Returns:
-        list of selected checkpoint paths (no duplicates)
+        list of selected pool items (originals, not coerced — preserves type)
     """
     pool_size = len(snapshot_pool)
     if pool_size <= n_opponents:
         return list(snapshot_pool)
 
-    # Compute PFSP weights: (1 - win_rate)^2
+    # Compute PFSP weights: (1 - win_rate)^2 × entry.weight
     weights = np.empty(pool_size, dtype=np.float64)
-    for i, sp in enumerate(snapshot_pool):
-        wr_data = win_rates.get(sp)
+    for i, item in enumerate(snapshot_pool):
+        entry = _coerce_entry(item)
+        wr_data = win_rates.get(entry.key)
         if wr_data and wr_data[1] > 0:
             wr = wr_data[0] / wr_data[1]
         else:
             wr = 0.5  # unknown opponent — assume even match
-        weights[i] = (1.0 - wr) ** 2
+        weights[i] = ((1.0 - wr) ** 2) * float(entry.weight or 1.0)
 
     # Prevent all-zero weights (if model wins 100% vs everything)
     if weights.sum() < 1e-12:
@@ -108,11 +144,11 @@ def pfsp_sample(
         uniform_indices = random.sample(remaining, min(n_uniform, len(remaining)))
         selected_set.update(uniform_indices)
 
-    # Always include latest
+    # Always include latest (matched by key)
     if has_latest:
         latest_idx = None
-        for i, sp in enumerate(snapshot_pool):
-            if sp == latest_snapshot:
+        for i, item in enumerate(snapshot_pool):
+            if _entry_key(item) == latest_snapshot:
                 latest_idx = i
                 break
         if latest_idx is not None:
@@ -125,7 +161,7 @@ async def collect_v9(
     model: PokeTransformer, device: torch.device,
     server_pool: List[ServerConfiguration],
     n_games: int = 200, max_concurrent: int = 20,
-    snapshot_pool: List[str] = None, fp16: bool = True,
+    snapshot_pool: List[Union[str, PoolEntry]] = None, fp16: bool = True,
     reward_shaper_cfg: Optional[dict] = None,
     temp_range: Tuple[float, float] = (1.0, 2.25),
     opponent_device: str = "cuda",
@@ -155,8 +191,9 @@ async def collect_v9(
                                uniform_frac=0.15, latest_snapshot=latest_snapshot)
     else:
         selected = random.sample(snapshot_pool, max_opponents)
-        if latest_snapshot and latest_snapshot not in selected:
-            selected[-1] = latest_snapshot
+        if latest_snapshot and not any(_entry_key(s) == latest_snapshot for s in selected):
+            selected[-1] = next((s for s in snapshot_pool if _entry_key(s) == latest_snapshot),
+                                selected[-1])
 
     # Distribute games across opponents (roughly equal)
     games_per_opp = max(1, n_games // len(selected))
@@ -173,9 +210,13 @@ async def collect_v9(
     n_servers = len(server_pool)
     conc_per_pair = max_concurrent
 
-    async def _play_one_opponent(oi, opp_ckpt, n_battles, batcher, srv, batch_id):
-        """Play n_battles against one opponent. Returns (trajs, wins, losses, ties, short_name)."""
-        opp_name = Path(opp_ckpt).stem
+    async def _play_one_opponent(oi, opp_item, n_battles, batcher, srv, batch_id):
+        """Play n_battles against one opponent. Returns (trajs, wins, losses, ties,
+        short_name, opp_key). `opp_item` is either a checkpoint path string (legacy)
+        or a PoolEntry — for external entries we instantiate via entry.factory."""
+        entry = _coerce_entry(opp_item)
+        opp_name = Path(entry.path).stem if entry.kind == "local" and entry.path else entry.key
+
         tb = teambuilder or random_pool_teambuilder()
         player = V9RLPlayer(
             batcher=batcher, device=device,
@@ -189,23 +230,41 @@ async def collect_v9(
             server_configuration=srv,
         )
 
-        is_latest = (latest_snapshot is not None and opp_ckpt == latest_snapshot)
-        if len(snapshot_pool) > 15 or not is_latest:
-            opp_temp_range = (1.0, 1.0)
-        else:
-            opp_temp_range = temp_range
+        if entry.kind == "local":
+            is_latest = (latest_snapshot is not None and entry.key == latest_snapshot)
+            if len(snapshot_pool) > 15 or not is_latest:
+                opp_temp_range = (1.0, 1.0)
+            else:
+                opp_temp_range = temp_range
 
-        opp_tb = teambuilder or random_pool_teambuilder()
-        opponent = SelfPlayOpponent(
-            checkpoint_path=opp_ckpt,
-            device=opponent_device,
-            temp_range=opp_temp_range,
-            battle_format=battle_format,
-            team=opp_tb,
-            max_concurrent_battles=conc_per_pair,
-            account_configuration=AccountConfiguration(f"Op{_pid_tag}r{batch_id}", None),
-            server_configuration=srv,
-        )
+            opp_tb = teambuilder or random_pool_teambuilder()
+            opponent = SelfPlayOpponent(
+                checkpoint_path=entry.path,
+                device=opponent_device,
+                temp_range=opp_temp_range,
+                battle_format=battle_format,
+                team=opp_tb,
+                max_concurrent_battles=conc_per_pair,
+                account_configuration=AccountConfiguration(f"Op{_pid_tag}r{batch_id}", None),
+                server_configuration=srv,
+            )
+        else:
+            # External adapter — factory(server_configuration, account_configuration, team, **kw)
+            opp_tb = teambuilder or random_pool_teambuilder()
+            try:
+                opponent = entry.factory(
+                    server_configuration=srv,
+                    account_configuration=AccountConfiguration(f"Op{_pid_tag}r{batch_id}", None),
+                    team=opp_tb,
+                    battle_format=battle_format,
+                    max_concurrent_battles=conc_per_pair,
+                    **(entry.factory_kwargs or {}),
+                )
+            except Exception as e:
+                print(f"  [ERROR] external factory for {entry.key} failed: {e}", flush=True)
+                _cancel_listener(player)
+                del player
+                return [], 0, 0, 0, f"{entry.key}=0/0(factory)", entry.key
 
         try:
             await asyncio.wait_for(
@@ -234,15 +293,15 @@ async def collect_v9(
         _cancel_listener(opponent)
         del player, opponent
 
-        return trajs, w, l, ties, f"{short}={w}/{w+l}", opp_ckpt
+        return trajs, w, l, ties, f"{short}={w}/{w+l}", entry.key
 
     # Build opponent tasks
     opp_tasks = []
-    for oi, opp_ckpt in enumerate(selected):
+    for oi, opp_item in enumerate(selected):
         n = games_per_opp + (1 if oi < remainder else 0)
         if n <= 0:
             continue
-        opp_tasks.append((oi, opp_ckpt, n))
+        opp_tasks.append((oi, opp_item, n))
 
     # Process in waves of n_servers (parallel within wave, sequential across waves)
     for wave_start in range(0, len(opp_tasks), n_servers):
@@ -256,10 +315,10 @@ async def collect_v9(
         )
 
         coros = []
-        for wi, (oi, opp_ckpt, n) in enumerate(wave):
+        for wi, (oi, opp_item, n) in enumerate(wave):
             batch_id = rid * 100 + oi
             srv = server_pool[wi % n_servers]
-            coros.append(_play_one_opponent(oi, opp_ckpt, n, batcher, srv, batch_id))
+            coros.append(_play_one_opponent(oi, opp_item, n, batcher, srv, batch_id))
 
         wave_results = await asyncio.gather(*coros, return_exceptions=True)
 
@@ -267,7 +326,7 @@ async def collect_v9(
             if isinstance(result, Exception):
                 print(f"  [ERROR] Wave opponent failed: {result}", flush=True)
                 continue
-            trajs, w, l, ties, summary, ckpt_path = result
+            trajs, w, l, ties, summary, opp_key = result
             all_trajs.extend(trajs)
             total_wins += w
             total_losses += l
@@ -276,10 +335,10 @@ async def collect_v9(
             # Track per-opponent results for PFSP win rate updates
             games = w + l
             if games > 0:
-                rec = opp_records.get(ckpt_path, [0, 0])
+                rec = opp_records.get(opp_key, [0, 0])
                 rec[0] += w
                 rec[1] += games
-                opp_records[ckpt_path] = rec
+                opp_records[opp_key] = rec
 
         # Print batcher profiling for this wave
         prof = batcher.prof_summary()
@@ -340,7 +399,7 @@ class BackgroundCollector:
     def _run(self, collect_model, device, fp16, opp_device, server_pool, snapshot_pool, a, win_rates):
         try:
             loop = asyncio.new_event_loop()
-            latest_sp = snapshot_pool[-1] if len(snapshot_pool) > 1 else None
+            latest_sp = _entry_key(snapshot_pool[-1]) if len(snapshot_pool) > 1 else None
             self._result = loop.run_until_complete(
                 collect_v9(
                     collect_model, device, server_pool,

@@ -131,6 +131,9 @@ def parse_args():
                    help="InferenceBatcher batch timeout in ms")
     p.add_argument("--reward-style", choices=["dense", "sparse", "terminal"], default="dense",
                    help="Reward shaping style: dense (KO+HP+terminal), sparse (terminal+immune), terminal (win/loss only)")
+    p.add_argument("--external-adapters", default=None,
+                   help="Path to external_adapters.yaml — adds in-process opponent "
+                        "adapters (e.g. PokeEnginePlayer) to the PFSP pool")
     add_model_args(p)
     return p.parse_args()
 
@@ -365,7 +368,7 @@ def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
         sp_path = str(run_dir / f"snapshot_{it:04d}.pt").replace("\\", "/")
         save_checkpoint(sp_path, model, cfg, optimizer, it, metrics={
             "win_rate": wr, "best_eval_wr": best_eval_wr,
-            "snapshot_pool": snapshot_pool,
+            "snapshot_pool": [s for s in snapshot_pool if isinstance(s, str)],
         })
         snapshot_pool.append(sp_path)
         print(f"  Snapshot saved: {sp_path} (pool={len(snapshot_pool)})", flush=True)
@@ -584,6 +587,17 @@ def main():
         start_iter, snapshot_pool = _resume_from_checkpoint(
             args, model, optimizer, snapshot_pool, device)
 
+    # External in-process opponents — appended AFTER resume so resumed pool
+    # state stays clean (resume loads only local snapshot paths, externals
+    # are re-instantiated each run from the YAML).
+    if getattr(args, "external_adapters", None):
+        from external_adapters import load_pool_entries
+        ext_entries = load_pool_entries(args.external_adapters)
+        if ext_entries:
+            snapshot_pool.extend(ext_entries)
+            ext_keys = ", ".join(e.key for e in ext_entries)
+            print(f"  [PFSP] +{len(ext_entries)} external adapters: {ext_keys}", flush=True)
+
     loop = asyncio.new_event_loop()
 
     # Print banner
@@ -674,7 +688,7 @@ def main():
             try:
                 emerg = str(run_dir / f"emergency_iter_{it:04d}.pt")
                 save_checkpoint(emerg, model, cfg, optimizer, it, metrics={
-                    "win_rate": wr, "snapshot_pool": snapshot_pool})
+                    "win_rate": wr, "snapshot_pool": [s for s in snapshot_pool if isinstance(s, str)]})
                 print(f"  [FATAL] Saved: {emerg}", flush=True)
             except Exception as e:
                 print(f"  [FATAL] Save failed: {e}", flush=True)
@@ -766,7 +780,7 @@ def main():
     # Final save
     final_path = str(run_dir / "final.pt")
     save_checkpoint(final_path, model, cfg, optimizer, start_iter + args.n_iters - 1,
-                    metrics={"best_eval_wr": best_eval_wr, "snapshot_pool": snapshot_pool})
+                    metrics={"best_eval_wr": best_eval_wr, "snapshot_pool": [s for s in snapshot_pool if isinstance(s, str)]})
     print(f"\nTraining complete. Final checkpoint: {final_path}", flush=True)
     writer.close()
     loop.close()
