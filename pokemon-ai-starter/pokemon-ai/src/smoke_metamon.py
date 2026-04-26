@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import time
 
 from poke_env.player import MaxBasePowerPlayer
@@ -18,6 +19,8 @@ from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
 
 from teams_ou import random_pool_teambuilder
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s][%(levelname)s] %(message)s")
 
 
 async def main():

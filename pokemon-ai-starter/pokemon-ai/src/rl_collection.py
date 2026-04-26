@@ -296,10 +296,13 @@ async def collect_v9(
             else:
                 # Subprocess opponent — challenge their username and play out n battles.
                 # Throughput is capped by the subprocess's parallel_actors (typically 1
-                # for a Metamon agent), so we allow more wall time per game.
+                # for a Metamon agent on a CPU-bound transformer step), so allow lots
+                # of wall time. Each Metamon turn is 100-500ms even on GPU; a battle
+                # of 30-60 turns × parallel_actors=1 is ~minutes per game. Generous
+                # default; PFSP weight controls how often a slow opponent gets sampled.
                 await asyncio.wait_for(
                     player.send_challenges(entry.showdown_username, n_challenges=n_battles),
-                    timeout=max(300, n_battles * 60),
+                    timeout=max(900, n_battles * 600),
                 )
         except asyncio.TimeoutError:
             print(f"  [WARN] Timed out vs {opp_name} after {n_battles} games", flush=True)

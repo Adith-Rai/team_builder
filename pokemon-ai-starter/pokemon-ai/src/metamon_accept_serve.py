@@ -16,6 +16,16 @@ explicit pairing. PFSP needs explicit pairing — sender targets a specific
 username, that bot accepts. So we add an `AcceptChallengesOnLocal` wrapper
 sibling to `QueueOnLocalLadder`.
 
+Setup (one-time):
+    python -m venv metamon_venv
+    metamon_venv/Scripts/pip install -e metamon_ref/   # pulls torch+cpu by default
+    # Reinstall torch with CUDA — metamon's transformer is CPU-bound otherwise
+    # (~5-15 min per battle vs seconds on GPU):
+    metamon_venv/Scripts/pip install --index-url https://download.pytorch.org/whl/cu121 \\
+                                     --force-reinstall torch
+    # The `torch>=2.6` requirement in metamon's pyproject is too strict for what's
+    # actually on PyPI's CUDA index — torch 2.5.1+cu121 works fine in practice.
+
 Example invocation (from main project — external_opponent_manager.py runs this):
 
     metamon_venv/Scripts/python.exe metamon_accept_serve.py \\
