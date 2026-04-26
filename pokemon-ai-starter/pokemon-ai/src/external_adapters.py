@@ -116,6 +116,19 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
     log_dir = _PROJECT_ROOT / "logs" / "external"
     log_path = log_dir / f"{name}.log"
 
+    # Coordinator-managed team queue. We hand Metamon our procedural Smogon
+    # teams per battle so both sides match per-game without sharing process
+    # state. Set to a unique-per-name dir so multiple Metamon variants don't
+    # collide. `use_our_teams: false` in the YAML reverts to metamon's static
+    # team set (legacy behavior, useful for verifying the ladder rating side
+    # without our team distribution).
+    use_our_teams = bool(spec.get("use_our_teams", True))
+    if use_our_teams:
+        team_queue_dir = _PROJECT_ROOT / "data" / "external_team_queue" / name
+        team_queue_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        team_queue_dir = None
+
     cmd = [
         str(venv_python),
         str(serve_script),
@@ -124,9 +137,12 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
         "--server-port", str(server_port),
         "--format", str(battle_format),
         "--num-battles", str(num_battles),
-        "--team-set", str(team_set),
         "--temperature", str(temperature),
     ]
+    if team_queue_dir is not None:
+        cmd += ["--team-queue", str(team_queue_dir)]
+    else:
+        cmd += ["--team-set", str(team_set)]
     if checkpoint is not None:
         cmd += ["--checkpoint", str(int(checkpoint))]
 
@@ -150,6 +166,7 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
         kind="external",
         key=name,
         showdown_username=showdown_username,
+        team_queue_dir=str(team_queue_dir) if team_queue_dir else None,
         weight=weight,
     )
     return pool_entry, spawn_spec

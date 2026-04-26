@@ -597,6 +597,111 @@ def multi_source_teambuilder(sources, weights=None) -> MultiSourceTeambuilder:
 
 
 # ---------------------------------------------------------------------------
+# Queue-based teambuilder for cross-process team handoff
+# ---------------------------------------------------------------------------
+
+class QueueTeambuilder(_Teambuilder):
+    """yield_team() pops the next team from a shared on-disk queue directory.
+
+    Used by subprocess opponents (Metamon's metamon_accept_serve.py, real
+    Foul Play in foul_play_venv) so we can hand them OUR procedural Smogon
+    team per battle. The coordinator in our main process calls
+    `enqueue_team(queue_dir, packed_team)` before sending each challenge;
+    the subprocess's accept-challenges loop calls yield_team(), which pops
+    the next file. Both sides matched per game without sharing process
+    memory or Python venvs.
+
+    Atomic semantics: enqueue_team writes `<stamp>.tmp` and renames to
+    `<stamp>.team` (atomic on POSIX and modern Windows NTFS). yield_team
+    selects the oldest `.team` file, reads it, and unlinks. Concurrent
+    parallel-actor subprocesses race for the same files but each succeeds
+    or fails atomically.
+
+    Args:
+        queue_dir: directory the coordinator writes packed teams into.
+        wait_timeout_s: yield_team blocks up to this long for a file to
+            appear; raises if none arrives. Default 30s — generous for
+            slow PFSP waves; subprocess shouldn't hit this if the
+            coordinator is running.
+        poll_interval_s: how often to recheck the queue while waiting.
+        clean_on_init: if True, delete any stale `.team`/`.tmp` files on
+            init (defensive against previous-run leftovers when subprocess
+            is restarted).
+    """
+
+    def __init__(self, queue_dir, wait_timeout_s: float = 30.0,
+                 poll_interval_s: float = 0.05, clean_on_init: bool = True):
+        super().__init__()
+        self.queue_dir = Path(queue_dir)
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+        self.wait_timeout_s = float(wait_timeout_s)
+        self.poll_interval_s = float(poll_interval_s)
+        if clean_on_init:
+            for p in list(self.queue_dir.glob("*.team")) + list(self.queue_dir.glob("*.tmp")):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    def _next_file(self) -> Optional[Path]:
+        try:
+            files = sorted(self.queue_dir.glob("*.team"),
+                           key=lambda p: p.stat().st_mtime_ns)
+        except OSError:
+            return None
+        return files[0] if files else None
+
+    def yield_team(self) -> str:
+        import time
+        deadline = time.time() + self.wait_timeout_s
+        while True:
+            f = self._next_file()
+            if f is not None:
+                try:
+                    text = f.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    # Lost the race or file corrupt — try to remove and continue.
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    f.unlink()
+                except OSError:
+                    # Another actor consumed the file first; loop to find another.
+                    continue
+                return text.strip()
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"QueueTeambuilder({self.queue_dir}) timed out after "
+                    f"{self.wait_timeout_s:.1f}s waiting for a team file. "
+                    f"Coordinator may not be writing teams — check that "
+                    f"enqueue_team() is called before each challenge."
+                )
+            time.sleep(self.poll_interval_s)
+
+
+def enqueue_team(queue_dir, packed_team: str) -> Path:
+    """Write a packed-format team to the queue directory atomically.
+
+    Returns the final `.team` path. Filename includes a nanosecond timestamp
+    so QueueTeambuilder.yield_team() consumes in FIFO order.
+    """
+    import time
+    import uuid as _uuid
+    queue = Path(queue_dir)
+    queue.mkdir(parents=True, exist_ok=True)
+    stamp = f"{time.time_ns():020d}_{_uuid.uuid4().hex[:8]}"
+    tmp = queue / f"{stamp}.tmp"
+    final = queue / f"{stamp}.team"
+    tmp.write_text(packed_team.strip() + "\n", encoding="utf-8")
+    # Path.replace is atomic on the same filesystem, including Windows NTFS.
+    tmp.replace(final)
+    return final
+
+
+# ---------------------------------------------------------------------------
 # CLI test
 # ---------------------------------------------------------------------------
 

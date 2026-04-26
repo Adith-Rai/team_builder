@@ -66,6 +66,11 @@ class PoolEntry:
     factory: Optional[Callable[..., Player]] = None  # external in-process
     factory_kwargs: dict = field(default_factory=dict)
     showdown_username: Optional[str] = None          # external subprocess
+    # External-subprocess only: directory the coordinator writes a procedural
+    # team to (via team_generator.enqueue_team) before each send_challenges so
+    # the subprocess pops a matching team from QueueTeambuilder. None means
+    # "this subprocess uses its own internal team source" (legacy behavior).
+    team_queue_dir: Optional[str] = None
     weight: float = 1.0
 
 
@@ -316,6 +321,19 @@ async def collect_v9(
                 # of wall time. Each Metamon turn is 100-500ms even on GPU; a battle
                 # of 30-60 turns × parallel_actors=1 is ~minutes per game. Generous
                 # default; PFSP weight controls how often a slow opponent gets sampled.
+
+                # If this entry uses a coordinator-managed team queue, enqueue
+                # one procedural team per challenge so the subprocess plays a
+                # matched-source team. teambuilder is guaranteed non-None here
+                # (we raise above otherwise).
+                if entry.team_queue_dir:
+                    from team_generator import enqueue_team
+                    for _ in range(n_battles):
+                        try:
+                            enqueue_team(entry.team_queue_dir, teambuilder.yield_team())
+                        except Exception as e:
+                            print(f"  [WARN] enqueue_team for {entry.key} failed: {e}", flush=True)
+
                 await asyncio.wait_for(
                     player.send_challenges(entry.showdown_username, n_challenges=n_battles),
                     timeout=max(900, n_battles * 600),

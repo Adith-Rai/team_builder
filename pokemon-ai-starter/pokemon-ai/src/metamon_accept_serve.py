@@ -41,6 +41,7 @@ import logging
 import os
 import random
 import warnings
+from pathlib import Path
 
 # Bypass Metamon's strict poke-env version pin (installed 0.8.3.3 vs metamon's
 # 0.8.3.2 expectation; the diff is a couple of unrelated commits).
@@ -222,7 +223,15 @@ def main():
     p.add_argument("--num-battles", type=int, default=10000,
                    help="Total battles to accept before exit (set high for long-running)")
     p.add_argument("--team-set", default="competitive",
-                   help="Metamon team set name (competitive / modern_replays / etc.)")
+                   help="Metamon team set name (competitive / modern_replays / etc.). "
+                        "Ignored if --team-queue is given.")
+    p.add_argument("--team-queue", default=None,
+                   help="Path to a coordinator-controlled team queue dir. When set, "
+                        "we use QueueTeambuilder to pop one packed team per battle "
+                        "from this dir, instead of metamon's own static team set. "
+                        "Coordinator (in main project venv) must call enqueue_team() "
+                        "before each challenge. This is how the coordinator hands "
+                        "Metamon procedural Smogon teams matching what V9RLPlayer is using.")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Sampling temperature for MetamonDiscrete")
     p.add_argument("--checkpoint", type=int, default=None,
@@ -239,7 +248,22 @@ def main():
           flush=True)
 
     agent_maker = get_pretrained_model(args.model)
-    team_set = get_metamon_teams(args.format, args.team_set)
+    if args.team_queue:
+        # Pop one team from a coordinator-managed queue per battle. Lets the
+        # main process hand us its own procedural Smogon teams so both sides
+        # play matched-source teams without us shipping the procedural builder
+        # into metamon_venv.
+        # team_generator.py is plain stdlib (the procedural code only needs
+        # poke-env's Teambuilder base class which exists in this fork too),
+        # so we can import it from the main src/ via path injection.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from team_generator import QueueTeambuilder
+        print(f"[metamon] team source: queue dir {args.team_queue}", flush=True)
+        team_set = QueueTeambuilder(args.team_queue, wait_timeout_s=60.0)
+    else:
+        print(f"[metamon] team source: metamon's '{args.team_set}' set", flush=True)
+        team_set = get_metamon_teams(args.format, args.team_set)
     agent = agent_maker.initialize_agent(
         checkpoint=args.checkpoint, log=False, action_temperature=args.temperature
     )
