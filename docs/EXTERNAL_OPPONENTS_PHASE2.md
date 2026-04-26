@@ -1,42 +1,120 @@
-# Phase 2 — Install & Smoke-Test External Opponents
+# External Opponents Integration — VALIDATED END-TO-END
 
-> **STATUS (end of Session 39):** the original "spawn external bot as
-> separate Showdown client + PPO challenges via `send_challenges`" design
-> hit a wall. Server protocol bugs are fixed (committed), Foul Play *does*
-> accept challenges and *does* start battles, but the battle never plays
-> through to completion. Root cause: `Player.send_challenges()` standalone
-> does not coordinate move dispatch the way `Player.battle_against()` does
-> when both sides are poke-env Players sharing Python state. With Foul
-> Play running as a separate process, there's no shared state, so the
-> battle sits idle after init.
+> **STATUS (end of Session 42, 2026-04-26): all four opponent paths play
+> a full battle to completion against a poke-env 0.10 sender on the local
+> battle_server, validated with `diag_cross_venv.py`:**
 >
-> **Recommended path going forward:** drop the "external Showdown user"
-> design. Instead, write a Python `Player` adapter that runs Foul Play's
-> MCTS directly via the `poke-engine` Rust library (which Foul Play itself
-> uses). This adapter is a normal poke-env `Player` subclass, so it slots
-> straight into the existing PPO collection (`battle_against` works
-> as-is, PFSP weighting works as-is). Same pattern for Metamon — write
-> a `MetamonPlayer` that wraps their pretrained model + amago agent into
-> a `Player` via `choose_move()`. The subprocess + YAML config skeleton
-> we built (`external_opponent_manager.py`, `external_opponents_example.yaml`)
-> isn't lost work — it's still useful if a bot doesn't have a clean
-> Python entry point — but it should not be the default.
+> | Path | Adapter | Validated |
+> |---|---|---|
+> | Self-play | `SelfPlayOpponent` (in-process) | ✓ |
+> | Foul Play MCTS core | `mcts` / `pokeengine` (in-process via poke-engine) | ✓ |
+> | Real Foul Play | `foulplay` subprocess in `foul_play_venv` | ✓ |
+> | Metamon | `metamon` subprocess in `metamon_venv` | ✓ (Minikazam) |
 >
-> Estimated effort for the adapter approach (revised):
-> - Foul Play `PokeEnginePlayer`: ~half day. We need to drive poke-engine
->   ourselves (set state, run MCTS, read out best move). poke-engine has
->   a Python interface and Foul Play's own search code (`fp/search/main.py`
->   `find_best_move`) is the working reference.
-> - Metamon `MetamonPlayer`: ~half day to a full day. Wrap their amago
->   agent's `step` into `choose_move`. Their `metamon.rl.metamon_to_amago`
->   module is the conversion bridge to study.
-> - PFSP pool extension (`PoolEntry` dataclass, branch in
->   `_play_one_opponent`): ~2 hours.
-> - End-to-end validation: ~1 hour.
-> Total: ~2-3 days for both bots wired in cleanly.
+> The hybrid subprocess design works. The earlier "drop the external user
+> design and rewrite as in-process Players" recommendation is **obsolete**
+> — the failures we hit in Session 39 were all server-side protocol bugs
+> in `battle_server.js`, not architectural limits of the subprocess design.
+> Once those bugs were fixed (Session 42), the original design completes
+> battles in 1.7s (Metamon) / 19s (Foul Play 100ms MCTS) / 6s (mcts)
+> against `diag_cross_venv.py`.
+>
+> **The four bugs we found and fixed (read these so future sessions don't
+> rediscover them):**
+>
+> 1. **`battle_server.js` /challenge PM had wrong field count** (Session 39,
+>    commit `e01a37f`). Foul Play silently rejected our PM until we matched
+>    real Showdown's 8-pipe / 9-split-field format.
+>
+> 2. **Foul Play's `accept_challenge` did exact-string username comparison**
+>    (Session 39 patch to `foul_play_ref/fp/websocket_client.py`). Showdown
+>    sends usernames in lowercase id-form (`diagsender`); FP compared against
+>    the CamelCase `--ps-username` arg (`DiagSender`). Patched to use a local
+>    `_to_id` helper. **Patch is on disk in `foul_play_ref/`, not committed
+>    upstream.** If `foul_play_ref/` is re-cloned, re-apply.
+>
+> 3. **`battle_server.js` bundled all init events into one ws frame**
+>    (Session 42). poke-env 0.10 wants this; Foul Play's parser does
+>    `msg.split("|")[2]` expecting the slot, gets the prior field's value
+>    (e.g. a `|t:|<timestamp>` value). And Metamon's parser saw the
+>    bundled `|player|...|request|...|player|...` and re-counted pokes
+>    from a stale poke_list slot, raising `UnusualTeamSize: 7 pokemon`.
+>    Fix: detect the recipient via username and switch to a 5-frame
+>    Showdown-faithful layout for FP/MM clients (init+title together,
+>    each `|player|` alone, the rest minus `|request|` together,
+>    `|request|` standalone with an injected monotonic rqid). poke-env 0.10
+>    keeps the bundled layout. See `pumpPlayer` in `battle_server.js`.
+>
+> 4. **`battle_server.js` only handled `/choose` and `/team`, not bare
+>    `/switch` or `/move`** (Session 42). Foul Play's `format_decision`
+>    sends `/switch <index>|<rqid>` directly (not via `/choose switch`).
+>    Battle hung silently mid-battle the first time a forced switch fired.
+>    Fix: handle `/switch ` and `/move ` symmetrically with `/choose`.
+>    All four also strip the trailing `|<rqid>` before forwarding to
+>    BattleStream — real-Showdown clients always append it; BattleStream
+>    doesn't understand it and rejects the choice.
+>
+> 5. **`isShowdownFaithful('mmminikazam')` returned false** (Session 42).
+>    The faithful-detection check looked for `mm-` prefix, but the username
+>    arrives in toId form with the dash stripped. Fix: also accept
+>    `/^mm[a-z]/` plus a `mm-` check on the display name. False positives
+>    are harmless (poke-env 0.10 also accepts the per-event layout — real
+>    Showdown sent it that way for years).
+>
+> **One Windows-specific Metamon gotcha:** `_factory_metamon` in
+> `external_adapters.py` now sets `TORCHDYNAMO_DISABLE=1` automatically on
+> Windows. Metamon's amago integration tries `torch.compile` on first
+> inference; that needs Triton; Triton has no Windows wheels; the agent
+> crashes before its first move otherwise.
 
-After the running PPO finishes, work through this top-to-bottom. Each step
-is small enough to fail fast; if any step breaks, fix before moving on.
+## Reproducing the smoke (5 min, no code changes needed)
+
+`diag_cross_venv.py` is the canonical end-to-end smoke. It spins up a
+minimal poke-env 0.10 client (`_Sender`, random moves) and sends one
+challenge to a target username. If the target completes the battle —
+`[diag] OK — battles 1 in <T>s` — the bridge works.
+
+```bash
+cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+
+# Terminal 1 — battle server (one-shot, kill manually after)
+../../../tools/node-v20.18.1-win-x64/node.exe battle_server.js --port 9000
+
+# Terminal 2 — Foul Play subprocess
+../../../foul_play_venv/Scripts/python.exe -u foul_play_accept_serve.py \
+    --username FoulPlayBot --server-port 9000 \
+    --num-battles 1 --search-time-ms 100 \
+    --team-queue ../../../data/external_team_queue/foulplay \
+    --queue-wait-timeout-s 300 --log-level INFO
+# Wait for: "iter 1/1 — got team, awaiting challenge"
+
+# Terminal 3 — enqueue ONE team for FP, then run diag
+python -c "
+import sys; sys.path.insert(0, '.')
+from team_generator import enqueue_team
+from teams_ou import random_pool_teambuilder
+enqueue_team('../../../data/external_team_queue/foulplay',
+             random_pool_teambuilder().yield_team())
+"
+python -u diag_cross_venv.py --opponent FoulPlayBot --port 9000 --timeout-s 180
+# Expect: [diag] OK — battles 1 in 19.4s, FP log: "Winner: FoulPlayBot"
+
+# Same recipe for Metamon (different venv + cache var):
+TORCHDYNAMO_DISABLE=1 METAMON_CACHE_DIR=$(pwd)/../../../metamon_cache \
+../../../metamon_venv/Scripts/python.exe -u metamon_accept_serve.py \
+    --model Minikazam --username MM-Minikazam \
+    --server-port 9000 --num-battles 1 --format gen9ou \
+    --team-queue ../../../data/external_team_queue/metamon \
+    --queue-wait-timeout-s 300
+# Then: enqueue → diag --opponent MM-Minikazam → expect 1.7s clean win.
+```
+
+**Critical setup detail:** `QueueTeambuilder.__init__(clean_on_init=True)`
+deletes any pre-existing files in the queue directory. So you must enqueue
+**after** the subprocess has started. In production
+(`rl_collection.py:_play_one_opponent`), the coordinator enqueues right
+before calling `send_challenges` — that's already wired. For the manual
+smoke, just enqueue after the subprocess prints "got team / awaiting".
 
 ## Prereqs
 - PPO has finished and battle servers are idle (or only running 9001/9002,

@@ -105,49 +105,133 @@ function startBattle(p1Name, p2Name, format, p1Team, p2Team) {
     return tag;
 }
 
+// Showdown-faithful clients: usernames that need real-Showdown's per-event
+// frame layout instead of poke-env 0.10's "everything bundled" layout. Their
+// protocol parsers (Foul Play's fp/run_battle.py, Metamon's poke-env fork)
+// hang or KeyError when given the bundled form. We match against the *display*
+// name (with dashes intact), since the toId form strips the `MM-` dash. The
+// `mm` ID-form prefix is also accepted as a fallback for resilience.
+function isShowdownFaithful(displayOrId) {
+    if (!displayOrId) return false;
+    const lc = displayOrId.toLowerCase();
+    if (lc.startsWith('foulplay')) return true;
+    if (lc.startsWith('metamon')) return true;
+    if (lc.startsWith('mm-')) return true;       // display: MM-Minikazam, MM-SmallRL, etc.
+    if (/^mm[a-z]/.test(lc)) return true;        // toId: mmminikazam, mmsmallrl
+    return false;
+}
+
+// Inject a monotonic rqid into the JSON of a |request| line. BattleStream's
+// |request| omits rqid; Foul Play's user_json[constants.RQID] crashes without
+// it. poke-env 0.10 doesn't use rqid for anything stateful.
+function injectRqid(line, entry) {
+    const prefix = '|request|';
+    if (!line.startsWith(prefix)) return line;
+    const json = line.slice(prefix.length);
+    if (!json || /"rqid":/.test(json)) return line;
+    try {
+        const parsed = JSON.parse(json);
+        entry._rqidCounter = (entry._rqidCounter || 0) + 1;
+        parsed.rqid = entry._rqidCounter;
+        return prefix + JSON.stringify(parsed);
+    } catch (_) {
+        return line;
+    }
+}
+
 async function pumpPlayer(tag, slot, userName, playerStream, entry) {
     try {
         let first = true;
         let chunk;
+        const faithful = isShowdownFaithful(userName);
         while ((chunk = await playerStream.read()) !== null) {
             if (entry.ended) break;
 
-            // Drain all immediately-available chunks and combine them.
-            // BattleStream writes multiple chunks synchronously (gametype, player,
-            // request, start+switches), and poke-env expects them in one message
-            // so that |request| (which sets player_role) arrives before |switch|.
+            // Drain all immediately-available BattleStream chunks into one
+            // logical batch. BattleStream emits gametype/player/request/etc
+            // synchronously, so a single drain captures the full event burst.
             let combined = chunk;
             while (playerStream.buf.length > 0) {
                 const extra = await playerStream.read();
                 if (extra === null) break;
                 combined += '\n' + extra;
             }
-
             if (first) {
-                // Prepend |init|battle and |title| so poke-env creates the battle object
                 combined = `|init|battle\n|title|${entry.p1Display} vs. ${entry.p2Display}\n${combined}`;
                 first = false;
             }
-            // Send with battle room prefix, exactly as Showdown does.
-            //
-            // NOTE: Foul Play (foul_play_ref/, accept-mode subprocess) does NOT
-            // work with this layout. Foul Play's protocol parser
-            // (fp/run_battle.py:get_first_request_json,
-            // fp/run_battle.py:start_standard_battle) expects:
-            //   - |init|battle + |title| in the FIRST ws msg
-            //   - |player|p1|, |player|p2| in subsequent SEPARATE msgs
-            //   - |teamsize|+|gen|+|tier|+|rule|+|clearpoke|+|poke|+|teampreview|
-            //     bundled together in ONE msg
-            //   - |request|<json with rqid> as the FINAL standalone msg
-            // poke-env 0.10 conversely needs everything bundled. Splitting in a
-            // way that satisfies both is doable (per-chunk + |request|-stripped
-            // follow-up + rqid-injected) but every variation we tried either
-            // broke poke-env's challenge handshake or failed Foul Play's parser
-            // at a different point. See git history c.session 41-42 for attempts.
-            // For now, optimized for poke-env (works) — Foul Play subprocess
-            // ADAPTER PATH IS BROKEN. PokeEnginePlayer (in-process MCTS, type:
-            // mcts in YAML) does work cross-venv since it shares poke-env 0.10.
-            sendToUser(userName, `>${tag}\n${combined}`);
+
+            if (!faithful) {
+                // poke-env 0.10 wants the whole batch as one ws frame.
+                sendToUser(userName, `>${tag}\n${combined}`);
+            } else {
+                // Showdown-faithful layout. Required by Foul Play's parser
+                // and Metamon's fork. Frame breakdown:
+                //   1. |init|battle + |title|<title>   (paired, first only)
+                //   2. |player|p1|<name>|              (its own frame)
+                //   3. |player|p2|<name>|              (its own frame)
+                //   4. main bundle: everything else (|t:|, |gametype|,
+                //      |teamsize|, |gen|, |tier|, |rule|, |clearpoke|,
+                //      |poke|, |teampreview|) minus |request|
+                //   5. |request|<json+rqid>            (separate, last)
+                //
+                // Why each frame must look this way:
+                //  - frame 1: FP's get_battle_tag_and_opponent reads
+                //    split_msg[4] expecting the title.
+                //  - frames 2/3: FP's start_battle_common loop matches on
+                //    `|player|` substring AND opponent_name, then reads
+                //    msg.split("|")[2] as the slot (p1/p2). If |player|
+                //    is bundled with |t:|<timestamp> or |gametype|, split[2]
+                //    is the timestamp/value of THAT prior field instead of
+                //    the slot, and ID_LOOKUP raises KeyError.
+                //  - frame 4: FP's clearpoke loop reads until the msg
+                //    contains "clearpoke", then parses |poke| from
+                //    msg.split("clearpoke")[-1]. Bundling clearpoke + pokes
+                //    + teampreview keeps the parse working.
+                //  - frame 5: FP's get_first_request_json wants
+                //    split_msg[1] == "request" as a standalone msg.
+                const allLines = combined.split('\n');
+                const used = new Set();
+                const findIdx = (pred) => allLines.findIndex(pred);
+
+                // Frame 1: |init|battle + |title|
+                const initIdx = findIdx(l => l.startsWith('|init|battle'));
+                const titleIdx = findIdx(l => l.startsWith('|title|'));
+                const initFrame = [];
+                if (initIdx >= 0) { initFrame.push(allLines[initIdx]); used.add(initIdx); }
+                if (titleIdx >= 0) { initFrame.push(allLines[titleIdx]); used.add(titleIdx); }
+                if (initFrame.length > 0) {
+                    sendToUser(userName, `>${tag}\n${initFrame.join('\n')}`);
+                }
+
+                // Frames 2 & 3: |player|p1|... and |player|p2|... each as own frame
+                for (let i = 0; i < allLines.length; i++) {
+                    if (used.has(i)) continue;
+                    if (allLines[i].startsWith('|player|')) {
+                        sendToUser(userName, `>${tag}\n${allLines[i]}`);
+                        used.add(i);
+                    }
+                }
+
+                // Frame 4: rest of the bundle (excluding |request|)
+                const restLines = [];
+                const requestLines = [];
+                for (let i = 0; i < allLines.length; i++) {
+                    if (used.has(i)) continue;
+                    const ln = allLines[i];
+                    if (!ln) continue;
+                    if (ln.startsWith('|request|')) requestLines.push(ln);
+                    else restLines.push(ln);
+                }
+                if (restLines.length > 0) {
+                    sendToUser(userName, `>${tag}\n${restLines.join('\n')}`);
+                }
+
+                // Frame 5: |request|<json+rqid> separately
+                for (const reqLine of requestLines) {
+                    sendToUser(userName, `>${tag}\n${injectRqid(reqLine, entry)}`);
+                }
+            }
 
             // Detect battle end from |win| or |tie| in the pumped chunks
             // and schedule cleanup after a short delay to let final messages flow.
@@ -206,16 +290,37 @@ function handleMessage(ws, raw) {
             return;
         }
         if (cmd.startsWith('/choose ')) {
-            const choice = cmd.slice(8);
+            // Real-Showdown clients (Foul Play) append "|<rqid>" for stale-move
+            // detection: "/choose move swordsdance|42". BattleStream doesn't
+            // interpret rqid; strip it before writing or the choice is rejected.
+            const choice = cmd.slice(8).split('|')[0].trim();
             const slot = (name === entry.p1) ? 'p1' : 'p2';
             entry.players[slot].write(choice);
             return;
         }
         if (cmd.startsWith('/team ')) {
-            // Team preview lead order: /team 123456
-            const teamOrder = cmd.slice(1); // keep "team 123456"
+            // Team preview lead order: "/team 123456" or "/team 123456|<rqid>"
+            const teamOrder = cmd.slice(1).split('|')[0].trim(); // "team 123456"
             const slot = (name === entry.p1) ? 'p1' : 'p2';
             entry.players[slot].write(teamOrder);
+            return;
+        }
+        if (cmd.startsWith('/switch ')) {
+            // Forced switch after a faint: Foul Play sends "/switch 2|<rqid>".
+            // Real Showdown accepts /switch as a top-level command; BattleStream
+            // expects "switch 2" written to the player stream (same as the
+            // payload of /choose switch 2). Strip rqid, drop the leading '/'.
+            const switchCmd = cmd.slice(1).split('|')[0].trim(); // "switch 2"
+            const slot = (name === entry.p1) ? 'p1' : 'p2';
+            entry.players[slot].write(switchCmd);
+            return;
+        }
+        if (cmd.startsWith('/move ')) {
+            // Symmetric with /switch — FP's format_decision can also emit
+            // bare "/move <name>" in some paths. Strip rqid and forward.
+            const moveCmd = cmd.slice(1).split('|')[0].trim(); // "move <name>"
+            const slot = (name === entry.p1) ? 'p1' : 'p2';
+            entry.players[slot].write(moveCmd);
             return;
         }
         if (cmd === '/timer on' || cmd === '/timer off') return;

@@ -149,6 +149,14 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
     os.environ["METAMON_CACHE_DIR"] = metamon_cache  # for completeness; subprocess inherits
     Path(metamon_cache).mkdir(parents=True, exist_ok=True)
 
+    # Disable torch.compile / dynamo. Metamon's amago integration tries to
+    # torch.compile the policy on first inference, which requires Triton.
+    # Triton has no Windows wheels, so the compile fails and the agent crashes
+    # before its first move. Eager mode is fine — Minikazam is 4.7M params,
+    # CPU/GPU eager is plenty fast for our throughput.
+    if os.name == "nt":
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
     spawn_spec = ExternalOpponent(
         name=name,
         showdown_username=showdown_username,

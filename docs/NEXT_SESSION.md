@@ -1,11 +1,12 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-25 (Session 39 — PPO from human BC hit smart_avg 64% all-time-record; external-opponent integration path identified)**
+**Last updated: 2026-04-26 (Session 42 — external-opponent integration VALIDATED end-to-end; protocol bridge bugs all fixed)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
 
 Supporting documents:
+- `docs/EXTERNAL_OPPONENTS_PHASE2.md` — **READ THIS** for the protocol-bug postmortem and reproducer
 - `docs/METAMON_LEARNINGS.md` — Session 37 Metamon architecture study + recommendations
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
@@ -13,39 +14,62 @@ Supporting documents:
 
 ---
 
-## Session 39 status (READ THIS FIRST)
+## Session 42 status (READ THIS FIRST)
 
-**Two big outcomes, one wall hit:**
+**External-opponent integration is now WORKING.** All four opponent paths
+play a complete battle to completion against a poke-env 0.10 sender on
+the local battle_server, validated with `diag_cross_venv.py`:
 
-1. **PPO from the new human-data BC produced the all-time best smart_avg
-   (64% at iter 219).** Per `data/eval/registry/evals.jsonl` (236 eval
-   entries across project history), iter 219 is rank #1, beating the
-   previous record (sp2999/sp2019 era at 60.8%). 6 of the top 10 evals
-   in registry history are from this run.
+| Path | Adapter | First battle clean? |
+|---|---|---|
+| Self-play | `SelfPlayOpponent` (in-process) | ✓ |
+| Foul Play MCTS core | `mcts` / `pokeengine` (in-process via poke-engine) | ✓ |
+| Real Foul Play | `foulplay` subprocess in `foul_play_venv` | ✓ (19s, 100ms MCTS) |
+| Metamon (Minikazam, 4.7M) | `metamon` subprocess in `metamon_venv` | ✓ (1.7s) |
 
-2. **External-opponent integration (Foul Play, Metamon) hit a design
-   wall and needs an adapter rewrite.** See `docs/EXTERNAL_OPPONENTS_PHASE2.md`
-   for the full status block at the top of that doc. Short version:
-   we built process-manager + YAML config skeleton, fixed two real
-   server protocol bugs (committed), got Foul Play to *accept*
-   challenges and *start* battles — but the battle never plays through
-   because `Player.send_challenges` standalone doesn't coordinate move
-   dispatch the way `Player.battle_against` does. The right path is
-   writing a Python `Player` adapter that drives Foul Play's MCTS via
-   `poke-engine` directly (no separate Showdown client process). Same
-   pattern for Metamon.
+The Session 39 conclusion ("subprocess design hit a wall, need to rewrite
+as in-process Players") was **wrong**. The wall was server-side protocol
+bugs in `battle_server.js`, not architectural. Once fixed (Session 42),
+the original subprocess design completes battles cleanly. The skeleton
+we built (process manager, QueueTeambuilder, MultiSourceTeambuilder,
+PoolEntry) is all in production use.
+
+**Five protocol bugs fixed this session — see `docs/EXTERNAL_OPPONENTS_PHASE2.md`
+for the postmortem and a 5-min reproducer recipe.** Short version:
+1. Per-recipient framing in `pumpPlayer` (5-frame Showdown-faithful for
+   FP/MM, bundled for poke-env 0.10).
+2. `/choose`, `/team`, `/switch`, `/move` all strip trailing `|<rqid>`
+   before forwarding to BattleStream (real-Showdown clients always append
+   it; BattleStream rejects).
+3. `isShowdownFaithful` checks display name (with dash) since toId form
+   strips the `MM-` dash.
+4. `_factory_metamon` sets `TORCHDYNAMO_DISABLE=1` on Windows (Triton has
+   no Windows wheels; Metamon's `torch.compile` crashes otherwise).
+5. (Session 39, already committed) `/challenge` PM uses Showdown-standard
+   8-pipe / 9-split-field format.
 
 ### TL;DR for next session
-1. **Decide first whether to do the Elo measurement or the external-
-   opponent adapter work.** Both are pending.
-2. **Elo measurement (~2.5 hr):** "Useful" set per the Session 39
-   discussion = new BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 + sp_0229.
-   Adds them incrementally to `data/eval/elo_exp5_FINAL.json`. Anchors
-   on sp2979 (Elo 1058, still on disk, surviving in pruning).
-3. **External adapter (~2-3 days):** see Phase 2 runbook for the
-   revised plan. Write `PokeEnginePlayer` first (Foul Play's MCTS via
-   poke-engine), validate end-to-end with `battle_against`, then
-   `MetamonPlayer`, then add `PoolEntry` to `rl_collection.py`.
+
+**Three pending items**, in priority order:
+
+1. **1-iter PPO smoke with all 3 adapters live** (~30 min): the protocol
+   bridge is validated against a stub sender; now run a real PPO iteration
+   with `mcts + foulplay + metamon` all in the pool to confirm
+   `_play_one_opponent` routes correctly under load. Use
+   `external_opponents_example.yaml` as the spec; pass via
+   `--external-adapters` to `train_rl.py`.
+
+2. **Throughput** (Task #19 in old list): a single Foul Play subprocess
+   plays serially. For PPO scale (200 games/iter), spawn N=4-8 Foul Play
+   subprocesses in parallel + `parallel_actors=N` for Metamon. The
+   PoolEntry/manager design already supports multiple subprocesses per
+   `name`. ~half day of work.
+
+3. **Incremental Elo on the 6-snapshot "Useful" set** (~2.5 hr): orthogonal
+   to external opponents. New BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 +
+   sp_0229. Adds incrementally to `data/eval/elo_exp5_FINAL.json`. Anchors
+   on sp2979 (Elo 1058, still on disk). Settles whether the Session 39
+   smart_avg gain (64% all-time peak) is a real Elo gain.
 
 ### PPO run on the human-data BC — DONE
 
