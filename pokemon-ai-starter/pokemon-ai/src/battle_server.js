@@ -261,11 +261,30 @@ function cleanupBattle(tag) {
     try { entry.stream.destroy(); } catch (_) {}
     battles.delete(tag);
     // Remove from user tracking
+    const idleUsers = [];
     for (const name of [entry.p1, entry.p2]) {
         const s = userBattles.get(name);
-        if (s) { s.delete(tag); if (s.size === 0) userBattles.delete(name); }
+        if (s) { s.delete(tag); if (s.size === 0) { userBattles.delete(name); idleUsers.push(name); } }
+        else { idleUsers.push(name); }
     }
     log(`Cleaned up ${tag} (${battles.size} active)`);
+
+    // Multi-battle subprocess flow: if a /challenge was issued while the
+    // target was still in this battle, the |pm| /challenge was consumed by
+    // the target's `pokemon_battle` loop (which silently swallows /pm
+    // messages — there's no handler for them in mid-battle parsing). When
+    // the target loops back to `accept_challenge` and waits for /pm, the
+    // original is already gone and the loop hangs forever. Resend the |pm|
+    // for any pending challenges targeted at users who just became idle so
+    // their fresh accept loop picks them up.
+    for (const idle of idleUsers) {
+        for (const [challenger, challenge] of pendingChallenges) {
+            if (challenge.target !== idle) continue;
+            sendToUser(idle, `|updatechallenges|{"challengesFrom":{"${challenger}":"${challenge.format}"},"challengeTo":null}`);
+            sendToUser(idle, `|pm| ${challenger}| ${idle}|/challenge|${challenge.format}|||`);
+            log(`Resent pending challenge ${challenger} -> ${idle} after battle cleanup`);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +305,13 @@ function handleMessage(ws, raw) {
         if (!entry) return;
 
         if (cmd.startsWith('/leave')) {
-            // no-op, battle cleans up on |win|
+            // Real Showdown emits `>battle-tag\n|deinit` to confirm room
+            // departure. Foul Play's `leave_battle` blocks on
+            //    while True: msg = await recv(); if tag in msg and "deinit" in msg: return
+            // so without this echo, FP hangs after every battle and never
+            // loops to its next iter. Without this fix, even a 2-game run
+            // against FP completes only the 1st battle.
+            sendToUser(name, `>${tag}\n|deinit`);
             return;
         }
         if (cmd.startsWith('/choose ')) {
@@ -411,7 +436,17 @@ function handleMessage(ws, raw) {
     }
 
     if (cmdBody.startsWith('/leave ')) {
-        return; // ignore
+        // Foul Play sends "/leave <battle-tag>" as a GLOBAL command (empty
+        // room prefix), not a battle-room one — so this branch handles it
+        // (the per-battle /leave at the top of handleMessage is unreachable
+        // for FP). Echo back `>battle-tag\n|deinit` to unblock its
+        // `leave_battle` await loop. Without this, FP hangs after every
+        // single battle and never reaches its next iter.
+        const tag = cmdBody.slice(7).trim();
+        if (tag.startsWith('battle-')) {
+            sendToUser(name, `>${tag}\n|deinit`);
+        }
+        return;
     }
 
     log(`Unhandled message from ${name}: ${msg}`);

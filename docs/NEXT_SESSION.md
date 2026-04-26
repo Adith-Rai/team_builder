@@ -34,7 +34,7 @@ the original subprocess design completes battles cleanly. The skeleton
 we built (process manager, QueueTeambuilder, MultiSourceTeambuilder,
 PoolEntry) is all in production use.
 
-**Five protocol bugs fixed this session — see `docs/EXTERNAL_OPPONENTS_PHASE2.md`
+**Seven protocol bugs fixed this session — see `docs/EXTERNAL_OPPONENTS_PHASE2.md`
 for the postmortem and a 5-min reproducer recipe.** Short version:
 1. Per-recipient framing in `pumpPlayer` (5-frame Showdown-faithful for
    FP/MM, bundled for poke-env 0.10).
@@ -47,17 +47,42 @@ for the postmortem and a 5-min reproducer recipe.** Short version:
    no Windows wheels; Metamon's `torch.compile` crashes otherwise).
 5. (Session 39, already committed) `/challenge` PM uses Showdown-standard
    8-pipe / 9-split-field format.
+6. **Multi-battle: `/leave <battle-tag>` echoes `>tag\n|deinit`** so FP's
+   `leave_battle` returns. Without this FP hangs after every battle. FP
+   sends /leave as a global command (`|/leave battle-tag`, empty room
+   prefix) — fix is in the global /leave branch, not per-battle one.
+7. **Multi-battle: `cleanupBattle` re-emits pending `|pm|/challenge`** to
+   users who just became idle. Pre-fix, /pms sent during a battle were
+   silently consumed by `pokemon_battle` and never reached `accept_challenge`.
+
+**Multi-battle FP validated:** `diag_cross_venv.py --opponent FoulPlayBot
+--n-games 2` runs back-to-back battles; FP reports `done. W=2 L=0` in 38.7s.
+
+**Known open issue: Metamon multi-battle inside a real PPO iter** throws
+`RuntimeError: Agent is not challenging` from amago's `evaluate_test`
+`env.reset()` when the trainer's next /challenge to MM hasn't arrived yet
+(e.g. PFSP picked another opponent first). Single-battle Metamon works
+fine (1.7s diag, full clean exit). Likely fix: longer poke-env idle
+timeout in metamon_accept_serve.py, or loosen amago's strict
+reset-must-be-challenging guard. **Doesn't block FP / mcts paths.**
 
 ### TL;DR for next session
 
 **Three pending items**, in priority order:
 
-1. **1-iter PPO smoke with all 3 adapters live** (~30 min): the protocol
-   bridge is validated against a stub sender; now run a real PPO iteration
-   with `mcts + foulplay + metamon` all in the pool to confirm
-   `_play_one_opponent` routes correctly under load. Use
-   `external_opponents_example.yaml` as the spec; pass via
-   `--external-adapters` to `train_rl.py`.
+1. **Resolve the Metamon multi-battle / amago session-timing issue.** This
+   is the only remaining blocker for a clean 3-adapter PPO smoke. The
+   error is `RuntimeError: Agent is not challenging` from
+   `metamon_venv/Lib/site-packages/poke_env/player/openai_api.py:320`,
+   raised when amago's `evaluate_test` calls `env.reset()` and the
+   underlying poke-env Player has no challenge in flight. Two paths:
+   (a) configure a generous idle timeout in `metamon_accept_serve.py`
+   (look at `accept_challenges(timeout=...)` or the poke-env idle-detection
+   knob); (b) override `AcceptChallengesOnLocal.reset` to await for a
+   challenge instead of failing. Once this is fixed, run the smoke command
+   that already exists: `train_rl.py --external-adapters
+   external_adapters_all3_smoke.yaml --games-per-iter 9 ...` (full command
+   in `data/models/rl_v9_all3_smoke_s42/...`).
 
 2. **Throughput** (Task #19 in old list): a single Foul Play subprocess
    plays serially. For PPO scale (200 games/iter), spawn N=4-8 Foul Play

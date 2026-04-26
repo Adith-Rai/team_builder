@@ -61,6 +61,45 @@
 >    are harmless (poke-env 0.10 also accepts the per-event layout — real
 >    Showdown sent it that way for years).
 >
+> 6. **Multi-battle: `/leave <battle-tag>` was a no-op; FP hung after every
+>    battle** (Session 42, second pass). FP's `leave_battle` blocks on
+>    `while True: msg=recv(); if tag in msg and "deinit" in msg: return`.
+>    Real Showdown emits `>battle-tag\n|deinit` after `/leave`; our server
+>    silently dropped the `/leave`. So FP completed battle 1, sent /leave,
+>    waited forever for the deinit echo. Fix: in `cmdBody.startsWith('/leave ')`
+>    branch, parse the trailing tag and emit `>tag\n|deinit` to the user.
+>    FP sends /leave as a *global* command (`|/leave battle-tag`, empty
+>    room prefix) NOT a per-battle one — so the global handler is what gets
+>    hit, not the per-battle `/leave` at the top of `handleMessage`.
+>
+> 7. **Multi-battle: pending /challenge consumed mid-battle** (Session 42,
+>    second pass). When the sender issues `/challenge` while the target is
+>    still in a battle, server emits `|pm|/challenge` to the target — but
+>    target's `pokemon_battle` loop is the one calling `receive_message`,
+>    and it silently swallows /pm (no handler in mid-battle parsing).
+>    When `pokemon_battle` returns and target loops back to
+>    `accept_challenge`, the /pm is already gone and accept loops forever.
+>    Fix: in `cleanupBattle`, after a battle ends, iterate
+>    `pendingChallenges` for any targeted at users who just became idle and
+>    re-emit `|updatechallenges|...` + `|pm|...`. Idempotent — extra /pms
+>    are harmless if the target is already in accept_challenge.
+
+> **Multi-battle proof:** with bugs #6 and #7 applied,
+> `diag_cross_venv.py --opponent FoulPlayBot --n-games 2` runs
+> back-to-back battles end-to-end (`done. W=2 L=0` in 38.7s, both clean).
+
+> **OPEN — Metamon multi-battle / amago session management.** Metamon's
+> amago `evaluate_test` loop wraps poke-env's `openai_api` differently
+> from FP's straight `accept_challenges`. When the trainer's send_challenges
+> doesn't deliver a challenge in time (e.g. PFSP picked another opponent
+> first), amago's `env.reset()` fires `RuntimeError: Agent is not challenging`
+> and the metamon subprocess crashes. Single-battle Metamon works (1.7s
+> diag); multi-battle inside a real PPO iter still has timing issues with
+> back-to-back challenges separated by other opponents. Likely fix is
+> either (a) a longer poke-env idle timeout in metamon_accept_serve.py, or
+> (b) loosening amago's strict reset-must-be-challenging guard. Defer to
+> next session — does not block the FP path or `mcts` in-process path.
+>
 > **One Windows-specific Metamon gotcha:** `_factory_metamon` in
 > `external_adapters.py` now sets `TORCHDYNAMO_DISABLE=1` automatically on
 > Windows. Metamon's amago integration tries `torch.compile` on first
