@@ -334,9 +334,14 @@ async def collect_v9(
                         except Exception as e:
                             print(f"  [WARN] enqueue_team for {entry.key} failed: {e}", flush=True)
 
+                # Cap each game's wall time at 5 min (gen9ou battles are ~30-60 turns;
+                # even Foul Play at 200ms/turn × 50 turns = 10s of MCTS, plus
+                # protocol overhead, well under 5 min). If a game blows past
+                # that, something's wrong (subprocess hung, infinite loop) and
+                # we'd rather move on than wait an hour.
                 await asyncio.wait_for(
                     player.send_challenges(entry.showdown_username, n_challenges=n_battles),
-                    timeout=max(900, n_battles * 600),
+                    timeout=max(300, n_battles * 300),
                 )
         except asyncio.TimeoutError:
             print(f"  [WARN] Timed out vs {opp_name} after {n_battles} games", flush=True)

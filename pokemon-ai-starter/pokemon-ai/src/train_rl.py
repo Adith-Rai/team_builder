@@ -619,6 +619,18 @@ def main():
             print(f"  [PFSP] starting {len(external_manager.opponents)} subprocess adapter(s)",
                   flush=True)
             external_manager.start_all()
+            # Block until every subprocess has logged into Showdown and entered
+            # its accept loop. Metamon's model-load takes ~30s, Foul Play ~10s.
+            # Without this gate, V9RLPlayer's challenges hit not-yet-ready
+            # subprocesses → wait_for timeout per opponent → wave-time blow up.
+            print(f"  [PFSP] waiting up to 180s for subprocess adapter(s) to be ready...",
+                  flush=True)
+            ready = external_manager.wait_until_ready(per_opp_timeout_s=180.0)
+            if ready:
+                print(f"  [PFSP] all subprocess adapter(s) ready", flush=True)
+            else:
+                print(f"  [PFSP] WARN — one or more subprocess adapter(s) not ready; "
+                      f"proceeding anyway, expect timeouts", flush=True)
 
     loop = asyncio.new_event_loop()
 

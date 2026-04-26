@@ -135,6 +135,61 @@ class ExternalOpponentManager:
         )
         self._monitor_thread.start()
 
+    # Per-launcher "ready" markers we tail the log file for. Each launcher
+    # prints these once it has logged into Showdown and entered its accept
+    # loop. metamon's marker fires after the env constructor's `Laddering
+    # for N battles`. foul_play prints "iter 1/N — waiting for team in queue".
+    _READY_MARKERS = (
+        "iter 1/",                  # foul_play_accept_serve.py
+        "metamon-accept] iter 1/",  # metamon_accept_serve.py
+        "Laddering for",            # metamon parent QueueOnLocalLadder fallback
+    )
+
+    def wait_until_ready(self, per_opp_timeout_s: float = 120.0) -> bool:
+        """Block until every spawned opponent's log file contains a "ready"
+        marker, or per_opp_timeout_s elapses for any. Returns True if all
+        opponents reported ready, False if any timed out (caller's choice
+        whether to abort or proceed).
+
+        Without this, train_rl can dive into a collection wave before the
+        subprocesses have logged into Showdown, then sit in send_challenges
+        timeouts for many minutes. Metamon's model-load + amago env
+        construction takes ~30s; Foul Play's data-load ~10s.
+        """
+        all_ready = True
+        for opp in self.opponents:
+            if not opp.log_file:
+                # No log file — can't wait, just sleep a little to let it spawn.
+                time.sleep(2)
+                continue
+            log_path = self._resolve_path(opp.log_file)
+            deadline = time.time() + per_opp_timeout_s
+            ready = False
+            while time.time() < deadline:
+                # Subprocess might have died without ever writing to the log.
+                if opp.proc and opp.proc.poll() is not None:
+                    logger.warning(
+                        f"{opp.name} exited rc={opp.proc.returncode} before signaling ready"
+                    )
+                    all_ready = False
+                    break
+                try:
+                    if log_path and log_path.exists():
+                        with open(log_path, 'r', errors='ignore') as f:
+                            text = f.read()
+                        if any(m in text for m in self._READY_MARKERS):
+                            ready = True
+                            break
+                except OSError:
+                    pass
+                time.sleep(1)
+            if ready:
+                logger.info(f"{opp.name} ready (after {time.time() - (deadline - per_opp_timeout_s):.1f}s)")
+            else:
+                logger.warning(f"{opp.name} did NOT signal ready in {per_opp_timeout_s:.0f}s")
+                all_ready = False
+        return all_ready
+
     def stop_all(self, timeout: float = 10.0):
         self._stop_event.set()
         for opp in self.opponents:

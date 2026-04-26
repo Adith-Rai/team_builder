@@ -1,0 +1,21 @@
+# All-three-adapter smoke: mcts in-process + foulplay subprocess + metamon subprocess.
+# Runs with the 1-iter PPO smoke to confirm production path works through every type.
+
+opponents:
+  - name: mcts-fast
+    type: mcts
+    search_time_ms: 80
+    weight: 1.0
+
+  - name: foulplay-100ms
+    type: foulplay
+    search_time_ms: 100
+    server_port: 9000
+    weight: 1.0
+
+  - name: metamon-minikazam
+    type: metamon
+    model: Minikazam
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0

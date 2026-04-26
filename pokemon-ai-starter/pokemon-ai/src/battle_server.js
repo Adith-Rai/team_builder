@@ -128,7 +128,25 @@ async function pumpPlayer(tag, slot, userName, playerStream, entry) {
                 combined = `|init|battle\n|title|${entry.p1Display} vs. ${entry.p2Display}\n${combined}`;
                 first = false;
             }
-            // Send with battle room prefix, exactly as Showdown does
+            // Send with battle room prefix, exactly as Showdown does.
+            //
+            // NOTE: Foul Play (foul_play_ref/, accept-mode subprocess) does NOT
+            // work with this layout. Foul Play's protocol parser
+            // (fp/run_battle.py:get_first_request_json,
+            // fp/run_battle.py:start_standard_battle) expects:
+            //   - |init|battle + |title| in the FIRST ws msg
+            //   - |player|p1|, |player|p2| in subsequent SEPARATE msgs
+            //   - |teamsize|+|gen|+|tier|+|rule|+|clearpoke|+|poke|+|teampreview|
+            //     bundled together in ONE msg
+            //   - |request|<json with rqid> as the FINAL standalone msg
+            // poke-env 0.10 conversely needs everything bundled. Splitting in a
+            // way that satisfies both is doable (per-chunk + |request|-stripped
+            // follow-up + rqid-injected) but every variation we tried either
+            // broke poke-env's challenge handshake or failed Foul Play's parser
+            // at a different point. See git history c.session 41-42 for attempts.
+            // For now, optimized for poke-env (works) — Foul Play subprocess
+            // ADAPTER PATH IS BROKEN. PokeEnginePlayer (in-process MCTS, type:
+            // mcts in YAML) does work cross-venv since it shares poke-env 0.10.
             sendToUser(userName, `>${tag}\n${combined}`);
 
             // Detect battle end from |win| or |tie| in the pumped chunks
