@@ -26,7 +26,9 @@ from poke_env.ps_client.server_configuration import ServerConfiguration
 
 from model import PokeTransformer
 from ppo import Trajectory, _cancel_listener
-from teams_ou import random_pool_teambuilder
+# teams_ou.random_pool_teambuilder (the 70 hand-curated eval teams) is intentionally
+# NOT imported here — it's eval-only. Training callers must pass a procedural
+# teambuilder via the teambuilder= kwarg below; we raise if not.
 from inference_batcher import InferenceBatcher
 from rl_player import V9RLPlayer, SelfPlayOpponent
 
@@ -228,7 +230,19 @@ async def collect_v9(
         entry = _coerce_entry(opp_item)
         opp_name = Path(entry.path).stem if entry.kind == "local" and entry.path else entry.key
 
-        tb = teambuilder or random_pool_teambuilder()
+        # Training MUST be passed a procedural teambuilder. The previous silent
+        # fallback to random_pool_teambuilder() (= the 70 hand-curated eval teams)
+        # caused thousands of iters of training on the same teams. The 70-team
+        # pool is for eval only; if you reach this branch with teambuilder=None,
+        # the call site is misconfigured.
+        if teambuilder is None:
+            raise RuntimeError(
+                "rl_collection.collect_v9 requires teambuilder=. The previous "
+                "fallback to random_pool_teambuilder() (the 70 static eval teams) "
+                "is removed; use procedural_teambuilder(stats_dir) instead. "
+                "If you really mean to use the eval teams, pass them explicitly."
+            )
+        tb = teambuilder
         player = V9RLPlayer(
             batcher=batcher, device=device,
             reward_shaper_cfg=rs_cfg,
@@ -249,20 +263,22 @@ async def collect_v9(
             else:
                 opp_temp_range = temp_range
 
-            opp_tb = teambuilder or random_pool_teambuilder()
+            # Both sides share THE SAME teambuilder instance — each .yield_team()
+            # call samples independently from the same procedural source.
             opponent = SelfPlayOpponent(
                 checkpoint_path=entry.path,
                 device=opponent_device,
                 temp_range=opp_temp_range,
                 battle_format=battle_format,
-                team=opp_tb,
+                team=teambuilder,
                 max_concurrent_battles=conc_per_pair,
                 account_configuration=AccountConfiguration(f"Op{_pid_tag}r{batch_id}", None),
                 server_configuration=srv,
             )
         elif entry.factory is not None:
-            # External in-process adapter (e.g. PokeEnginePlayer)
-            opp_tb = teambuilder or random_pool_teambuilder()
+            # External in-process adapter (e.g. PokeEnginePlayer). Same matched
+            # teambuilder so both sides draw from the same procedural source.
+            opp_tb = teambuilder
             try:
                 opponent = entry.factory(
                     server_configuration=srv,

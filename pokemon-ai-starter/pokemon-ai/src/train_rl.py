@@ -535,9 +535,22 @@ def main():
     snapshot_pool = [args.init_from]
     rs_cfg = _build_reward_config(args)
 
-    # Team builder (procedural for training, handcrafted for eval)
-    train_teambuilder = (procedural_teambuilder(args.procedural_teams, random_pct=args.random_team_pct)
-                         if args.procedural_teams else None)
+    # Team builder. Training MUST use procedural Smogon-usage teams to avoid
+    # overtraining on the 70 hand-curated teams in teams_ou.py (those are eval-only).
+    # If --procedural-teams isn't passed, try the canonical project path; otherwise
+    # raise loudly. The previous silent fallback to random_pool_teambuilder() (= the
+    # 70 static teams) caused thousands of iters of training on the same teams.
+    _CANON_PROC_PATH = Path(__file__).resolve().parents[3] / "raw_data" / "pokemon_usage" / "2024-04"
+    proc_path = args.procedural_teams or (str(_CANON_PROC_PATH) if _CANON_PROC_PATH.exists() else None)
+    if not proc_path:
+        raise SystemExit(
+            "ERROR: training requires --procedural-teams <stats_dir>. "
+            f"Canonical path is {_CANON_PROC_PATH} (not found). "
+            "The 70 static teams in teams_ou.py are eval-only — "
+            "do not use them for training."
+        )
+    train_teambuilder = procedural_teambuilder(proc_path, random_pct=args.random_team_pct)
+    print(f"  Train teambuilder: ProceduralTeambuilder({proc_path}, random_pct={args.random_team_pct})", flush=True)
 
     # Save config
     config = vars(args)
