@@ -1,0 +1,6 @@
+opponents:
+  - name: foulplay-200ms
+    type: foulplay
+    search_time_ms: 200
+    server_port: 9000
+    weight: 1.0

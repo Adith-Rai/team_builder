@@ -1,8 +1,8 @@
 # Minimal external_adapters config for the train_rl.py smoke test.
-# Just one fast MCTS opponent — enough to confirm the PoolEntry path works end-to-end.
+# One fast MCTS opponent — confirms PoolEntry path works end-to-end.
 
 opponents:
-  - name: foulplay-fast
-    type: pokeengine
+  - name: mcts-fast
+    type: mcts
     search_time_ms: 80
     weight: 1.0

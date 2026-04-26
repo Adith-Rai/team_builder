@@ -238,6 +238,9 @@ def main():
                    help="Override default checkpoint epoch")
     p.add_argument("--opponent-username", default=None,
                    help="If set, only accept challenges from this user (default: anyone)")
+    p.add_argument("--queue-wait-timeout-s", type=float, default=3600.0,
+                   help="Seconds QueueTeambuilder waits for a team before crashing "
+                        "(default 1 hour, used only when --team-queue is set).")
     args = p.parse_args()
 
     if "METAMON_CACHE_DIR" not in os.environ:
@@ -260,7 +263,9 @@ def main():
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from team_generator import QueueTeambuilder
         print(f"[metamon] team source: queue dir {args.team_queue}", flush=True)
-        team_set = QueueTeambuilder(args.team_queue, wait_timeout_s=60.0)
+        # Big timeout — subprocess should sit waiting between PFSP waves, not crash.
+        team_set = QueueTeambuilder(args.team_queue,
+                                    wait_timeout_s=float(args.queue_wait_timeout_s))
     else:
         print(f"[metamon] team source: metamon's '{args.team_set}' set", flush=True)
         team_set = get_metamon_teams(args.format, args.team_set)

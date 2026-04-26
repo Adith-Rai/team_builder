@@ -8,15 +8,14 @@ Two flavors of adapter, depending on whether the opponent's deps are
 compatible with our main venv:
 
 - **In-process adapter** (factory-based): a poke-env Player subclass we
-  instantiate directly in our process. Used for `pokeengine` (lightweight,
-  same venv).
+  instantiate directly in our process. Used for `mcts` (poke-engine MCTS,
+  lightweight, same venv).
 
 - **Subprocess adapter** (showdown_username-based): an external bot running
   in its own venv as a separate process, connected to the same Showdown
-  server. We send_challenges to its username. Used for `metamon` because
-  metamon's pinned deps (torch>=2.6, gymnasium<=0.29.1, the UT-Austin-RPL
-  poke-env fork) conflict with ours. The subprocess is spawned + restarted
-  by ExternalOpponentManager.
+  server. We send_challenges to its username. Used for `metamon` and real
+  `foulplay` because their pinned deps conflict with ours. The subprocess
+  is spawned + restarted by ExternalOpponentManager.
 
 Both flavors plug into the same `PoolEntry` and the same PFSP win-rate
 tracking — opponent identity is the entry's `key`.
@@ -25,14 +24,13 @@ Example YAML:
 
 ```yaml
 opponents:
-  - name: foulplay-fast
-    type: pokeengine
+  - name: mcts-fast
+    type: mcts
     search_time_ms: 100
     weight: 1.0
   - name: metamon-minikazam
     type: metamon
     model: Minikazam
-    team_set: competitive
     temperature: 1.0
     server_port: 9000
     weight: 1.0
@@ -172,8 +170,84 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
     return pool_entry, spawn_spec
 
 
+def _factory_foulplay(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent]:
+    """Subprocess adapter — real Foul Play in foul_play_venv. Pops our
+    procedural Smogon teams from a coordinator-controlled queue."""
+    name = spec["__name__"]
+    weight = spec["__weight__"]
+    showdown_username = spec.get("showdown_username") or "FoulPlayBot"
+    battle_format = spec.get("format", "gen9ou")
+    server_port = int(spec.get("server_port", ctx.get("default_server_port", 9000)))
+    num_battles = int(spec.get("num_battles", 100000))
+    search_time_ms = int(spec.get("search_time_ms", 200))
+    search_parallelism = int(spec.get("search_parallelism", 1))
+    log_level = spec.get("log_level", "WARNING")
+
+    venv_python = (
+        _PROJECT_ROOT / "foul_play_venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else _PROJECT_ROOT / "foul_play_venv" / "bin" / "python"
+    )
+    if not venv_python.exists():
+        raise FileNotFoundError(
+            f"foul_play_venv not found at {venv_python}. Run: "
+            f"python -m venv foul_play_venv && "
+            f"foul_play_venv/Scripts/pip install -r foul_play_ref/requirements.txt"
+        )
+
+    serve_script = Path(__file__).parent / "foul_play_accept_serve.py"
+    if not serve_script.exists():
+        raise FileNotFoundError(f"foul_play_accept_serve.py missing at {serve_script}")
+
+    log_dir = _PROJECT_ROOT / "logs" / "external"
+    log_path = log_dir / f"{name}.log"
+
+    # Real Foul Play always uses our procedural teams (matched source per game).
+    team_queue_dir = _PROJECT_ROOT / "data" / "external_team_queue" / name
+    team_queue_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(venv_python),
+        str(serve_script),
+        "--username", str(showdown_username),
+        "--server-port", str(server_port),
+        "--format", str(battle_format),
+        "--num-battles", str(num_battles),
+        "--search-time-ms", str(search_time_ms),
+        "--search-parallelism", str(search_parallelism),
+        "--team-queue", str(team_queue_dir),
+        "--log-level", str(log_level),
+    ]
+
+    spawn_spec = ExternalOpponent(
+        name=name,
+        showdown_username=showdown_username,
+        command=cmd,
+        cwd=str(_PROJECT_ROOT / "foul_play_ref"),  # Foul Play imports relative to its own dir
+        venv=None,
+        auto_restart=True,
+        log_file=str(log_path),
+        description=f"Foul Play {search_time_ms}ms (in foul_play_venv subprocess)",
+    )
+
+    pool_entry = PoolEntry(
+        kind="external",
+        key=name,
+        showdown_username=showdown_username,
+        team_queue_dir=str(team_queue_dir),
+        weight=weight,
+    )
+    return pool_entry, spawn_spec
+
+
 _FACTORY_REGISTRY = {
+    # `mcts` is the canonical name (it's MCTS via the poke-engine Rust library
+    # — NOT the same as Foul Play, which adds Smogon-set-guessing on top of
+    # poke-engine). `pokeengine` kept as alias for older YAML configs.
+    "mcts": _factory_pokeengine,
     "pokeengine": _factory_pokeengine,
+    # Real Foul Play (full strategy: prepare_battles + multi-MCTS averaging).
+    "foulplay": _factory_foulplay,
     "metamon": _factory_metamon,
 }
 
