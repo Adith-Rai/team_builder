@@ -135,6 +135,42 @@ single-slot, all 9 external entries play battles cleanly. Smoke result:
 resend code in place — slightly slower than the 124s pre-fix run, within
 PFSP noise).
 
+### 5-iter PPO smoke (Session 42, full pool stability validation)
+
+To confirm the full pool isn't just one-shot stable, ran 5 consecutive
+iters with `external_adapters_full_pool.yaml` + `--servers 9000,9000,9000,9000`
++ `--games-per-iter 18 --max-concurrent 6 --eval-interval 999` (skip evals).
+All 5 iters reached PPO update; total wall-clock ~13 min:
+
+| Iter | W/L (%)      | Collect | Update | Notes                          |
+|------|--------------|---------|--------|--------------------------------|
+| 0    | 8/10 (44%)   | 123s    | 6s     | clean                          |
+| 1    | 4/14 (22%)   | 123s    | 7s     | clean                          |
+| 2    | 7/11 (39%)   | 162s    | 8s     | clean                          |
+| 3    | 8/10 (44%)   | 125s    | 6s     | clean                          |
+| 4    | 4/13 (24%)   | 235s    | 6s     | poke-engine PanicException     |
+
+**Iter 4's outlier**: one `mcts-fast` battle hit
+`PanicException('Encore should not be active when last used move is not
+a move')` — a niche edge case in the poke-engine Rust library validating
+illegal sim states. Trainer's `wait_for` caught it, logged
+`[WARN] Timed out vs mcts-fast after 2 games`, moved on. Lost 1 game
+out of ~90 (1% failure rate). Recovery is automatic — no manual
+intervention needed.
+
+**Stability evidence:**
+- Subprocess-side: no FP/MM crashes or auto-restarts across all 5 iters
+- Coordinator-side: 2 login-time resends (early iter), 20 cleanup-time
+  resends (~4/iter, normal for the multi-battle flow)
+- Memory: stable, no leaks across iters
+- PFSP win-rate evolution: visible across iters (e.g. mm-smallrl was
+  hard early, sampled more later by `(1-wr)^2` weighting)
+
+**Conclusion: full pool config is production-ready for long PPO runs.**
+Per-iter cost extrapolation: 200 games/iter ≈ 200/18 × 130s avg = ~24
+min/iter. A 50-iter run = ~20 hr. A 100-iter run = ~40 hr. Plan
+accordingly.
+
 **Caveat: SmallRLGen9Beta and other FlashAttention-required variants
 crash on Windows** (Triton-less). The 4 variants in the YAML use
 VanillaAttention fallback successfully. Adding more variants requires
