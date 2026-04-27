@@ -327,7 +327,8 @@ cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/sr
 python -u train_rl.py \
   --init-from data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt \
   --device cuda --servers 9000,9000,9000,9000 --fp16 --pipeline \
-  --games-per-iter 200 --max-concurrent 6 --n-iters 100 --warmup-iters 5 \
+  --games-per-iter 200 --max-concurrent 6 --n-iters 100 --warmup-iters 10 \
+  --lr 3e-5 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --adaptive-entropy --early-stop --win-rate-mode ema \
   --eval-interval 20 \
@@ -337,17 +338,29 @@ python -u train_rl.py \
   2>&1 | tee /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training.log
 ```
 
-**Why `--warmup-iters 5` for this run** (and not the legacy `--warmup-iters 0`):
-The legacy commands above use `--resume` which continues an existing PPO
-run with its already-calibrated value head. Our run uses `--init-from`
+> **CRITICAL — `--lr 3e-5` is mandatory, NOT optional.** The trainer's
+> default is `1e-4`. From a sharp PPO checkpoint (sp_0229) against this
+> new pool, `lr=1e-4` produces: KL early-stop firing on every iter at
+> epoch 0, 10-11% per-episode KL discards, win rate drift downward
+> (40% → 34% over 5 iters in the S43 first attempt), entropy collapse
+> requiring adaptive entropy intervention. `lr=3e-5` is the same value
+> that produced the S39 smart_avg-64% record. Do not omit this flag.
+
+**Why `--warmup-iters 10` for this run** (was `0` for legacy `--resume`,
+was `5` for the S43 first attempt):
+The legacy commands use `--resume` which continues an existing PPO run
+with its already-calibrated value head. Our run uses `--init-from`
 against a brand-new opponent pool (9 external entries the model has
 never seen). Warmup freezes the backbone+policy and trains only the
-value head for the first 5 iters (`train_rl.py:676-684`), letting the
+value head for the first N iters (`train_rl.py:676-684`), letting the
 value function recalibrate to the new state distribution against
 mcts-fast / FP / 4× MM variants before the policy starts drifting from
-sp_0229. ~5% time overhead, dramatically reduces early-iter KL spike
-risk against the strongest new opponent (MediumRL at 4× our params).
-Per-iter line shows `[WARMUP]` while frozen.
+sp_0229. The S43 first attempt used 5 warmup iters and observed
+v_loss stuck at 2.3-2.5 by iter 11 — value head not fully recalibrated.
+Bumping to 10 gives the value head ~2× the runway. ~10% time overhead
+(~4 hr out of 40), dramatically reduces early-iter KL spike risk
+against MediumRL (4× our params). Per-iter line shows `[WARMUP]`
+while frozen.
 
 The trainer auto-spawns FP and MM subprocesses via `ExternalOpponentManager`
 based on the YAML, so no separate launch step. Spawn takes ~30s
@@ -358,12 +371,14 @@ based on the YAML, so no separate launch step. Spawn takes ~30s
 | Flag | Purpose |
 |------|---------|
 | `--init-from <pt>` | Fresh PPO state from this checkpoint (separate optimizer state). Use `--resume <pt>` instead to continue an interrupted run with optimizer state preserved. |
+| **`--lr 3e-5`** | **MANDATORY for this pool — NOT the trainer default of 1e-4.** See critical callout above the table. S43 first attempt at default `1e-4` triggered 10%+ KL discards, every-iter KL early-stop, win-rate drift, and entropy collapse. `3e-5` is the lr S39 used to set the smart_avg-64% record. |
 | `--servers 9000,9000,9000,9000` | THE throughput knob. 4 server-pool slots all pointing at the same battle_server → 4× wave parallelism. Tested up to 4. **6+ stalls** (see deferred bugs above). |
 | `--fp16` | Mixed precision on inference + PPO. ~2× speedup, no quality regression measured. |
 | `--pipeline` | Background collector overlaps next iter's collection with current iter's PPO update. Saves the update wall-time on every iter (60–80s at 200 games). Costs ~1GB extra RAM (model copy on CPU). **Recommended on for production runs.** |
 | `--games-per-iter 200` | Standard for our PPO scale. Smaller = faster iters but noisier gradients. |
 | `--max-concurrent 6` | Per-opponent V9RLPlayer concurrent battles. With 4-slot wave × 6 = up to 24 concurrent battles. Higher works on bigger GPUs but doesn't help here. |
 | `--n-iters 100` | 100-iter run ≈ 40 hr at the measured ~24 min/iter. Adjust to budget. |
+| `--warmup-iters 10` | Value-head only training for first 10 iters (frozen backbone+policy). Recalibrates v_loss to the new pool's state distribution before the policy starts drifting. S43 first attempt used 5; observed v_loss stuck at 2.3-2.5 by iter 11. Bumped to 10 for ~2× runway. |
 | `--lam 0.95 --ent-coef 0.02` | Validated hyperparams from Session 39 (the smart_avg-64% record). |
 | `--adaptive-entropy --early-stop` | Safeguards from Session 35. Prevent entropy collapse. **Always on** for long runs. |
 | `--win-rate-mode ema` | EMA over last 50 games per opponent for PFSP. Better than cumulative for non-stationary policies. |
