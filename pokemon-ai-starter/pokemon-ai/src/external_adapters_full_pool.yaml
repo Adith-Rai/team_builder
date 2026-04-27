@@ -1,0 +1,91 @@
+# Full pool: in-process mcts + 4× Foul Play subprocesses (CPU) + 4× Metamon
+# variants (GPU). Designed for production PPO training at 200 games/iter.
+#
+# Rationale (Session 42 measurements + S42 conversation):
+# - FP has no neural model; multi-process is the natural parallelism.
+#   4 subprocesses ≈ 4× FP throughput vs the single-FP baseline (~20s/battle).
+# - Metamon variants: 4 different checkpoints give 4× *diversity* — the
+#   real reason to spawn multiple. Same model 4× would just be more
+#   throughput on identical policy distribution.
+# - VRAM measured (Session 42): Minikazam=173MB, SmallRL=218MB,
+#   SmallIL=215MB, MediumRL=530MB. Total ~1.14GB on top of trainer's
+#   ~3-4GB. Comfortable on 6GB GPU. Earlier estimates of "870MB per
+#   variant" were wrong — that was working-set RAM, not VRAM.
+#
+# Weights: each FP gets weight=0.25 so the FP "group" sums to 1.0,
+# matching mcts and self-play (snapshot pool default). Each MM variant
+# gets weight=0.25 likewise. PFSP's (1-wr)^2 still adjusts based on
+# per-entry win rates as battles accumulate.
+#
+# WARNING: SmallRLGen9Beta and other Flash-Attention-required variants
+# error with `Missing flash attention 2 install` on Windows (Triton-less).
+# Stick with the four below for the GPU pool. If you want more variants,
+# add them with `device: cpu` (TODO: factory doesn't expose this knob yet
+# — would need to plumb through to metamon_accept_serve.py).
+
+opponents:
+  # ── In-process MCTS via poke-engine ───────────────────────
+  - name: mcts-fast
+    type: mcts
+    search_time_ms: 80
+    weight: 1.0
+
+  # ── 4× Foul Play subprocesses (CPU, ~100ms MCTS each) ─────
+  # 4 distinct usernames + queue dirs so they're independent. Same
+  # search_time_ms across all so they're an interchangeable pool —
+  # PFSP win-rate tracking will treat them as 4 entries but their
+  # win-rate curves should converge.
+  - name: foulplay-100ms-1
+    type: foulplay
+    showdown_username: FoulPlayBot1
+    search_time_ms: 100
+    server_port: 9000
+    weight: 0.25
+  - name: foulplay-100ms-2
+    type: foulplay
+    showdown_username: FoulPlayBot2
+    search_time_ms: 100
+    server_port: 9000
+    weight: 0.25
+  - name: foulplay-100ms-3
+    type: foulplay
+    showdown_username: FoulPlayBot3
+    search_time_ms: 100
+    server_port: 9000
+    weight: 0.25
+  - name: foulplay-100ms-4
+    type: foulplay
+    showdown_username: FoulPlayBot4
+    search_time_ms: 100
+    server_port: 9000
+    weight: 0.25
+
+  # ── 4× Metamon variants (GPU, distinct policy distributions) ──
+  # Minikazam = small RL-tuned (4.7M).
+  # SmallRL = medium RL-tuned (13.9M, on 1B replay frames).
+  # SmallIL = imitation-only, no RL (13.7M; pure human-replay BC).
+  # MediumRL = larger RL-tuned (50.5M).
+  - name: mm-minikazam
+    type: metamon
+    model: Minikazam
+    temperature: 1.0
+    server_port: 9000
+    weight: 0.25
+  - name: mm-smallrl
+    type: metamon
+    model: SmallRL
+    temperature: 1.0
+    server_port: 9000
+    weight: 0.25
+  - name: mm-smallil
+    type: metamon
+    model: SmallIL
+    temperature: 1.0
+    server_port: 9000
+    weight: 0.25
+  - name: mm-mediumrl
+    type: metamon
+    model: MediumRL
+    temperature: 1.0
+    server_port: 9000
+    weight: 0.25

@@ -80,22 +80,68 @@ real PFSP collection loop end-to-end.
 **Bonus:** `battle_server.js` now prefixes log lines with
 `HH:MM:SS.mmm` timestamps for future protocol debugging.
 
+### Session 42 — Throughput pass (Task #19, partially complete)
+
+**Full opponent pool YAML** at `external_adapters_full_pool.yaml`:
+- `mcts-fast` (in-process MCTS via poke-engine, weight=1.0)
+- `foulplay-100ms-1..4` (4× FP subprocesses, each weight=0.25, sums to 1.0)
+- `mm-minikazam` / `mm-smallrl` / `mm-smallil` / `mm-mediumrl` (4 different
+  Metamon variants, each weight=0.25). Diverse policies: small RL, medium
+  RL, BC-only, gen9-tuned RL.
+
+**VRAM measured (Session 42, replacing earlier 870MB-per-MM estimate that
+was actually working-set RAM, not GPU):**
+- Minikazam (4.76M params): **173 MB GPU**
+- SmallRL (13.9M): **218 MB**
+- SmallIL (13.7M): **215 MB**
+- MediumRL (50.5M): **530 MB**
+- Total 4 MMs: **~1.14 GB** (comfortable on 6GB GPU alongside 3-4GB trainer)
+
+**Wave parallelism finding (THE key knob): `--servers 9000,9000,9000,9000`**
+creates 4 server-pool entries all pointing to the same battle_server.
+`rl_collection.py` processes opponents in waves of `n_servers`, so this
+yields 4× wave parallelism on a single battle_server with **zero code
+changes**. Validated 1-iter smoke: 18 games in **124s** (vs 236s baseline
+with single-slot wave) → **1.9× speedup**. PROF wave 0 hit batch=1.4
+peak=5 → InferenceBatcher actually batching now.
+
+**6-slot and 10-slot fail.** Same recipe with 6+ slots stalls — only the
+first wave's worth of battles plays, the rest hang. Likely a race in
+`send_challenges` from many V9RLPlayers connecting concurrently
+(challenges crossing, /pm dispatch contention). 4-slot is the validated
+ceiling for now. Worth investigating later — but 4-slot already gives
+the productivity win.
+
+**Caveat: SmallRLGen9Beta and other FlashAttention-required variants
+crash on Windows** (Triton-less). The 4 variants in the YAML use
+VanillaAttention fallback successfully. Adding more variants requires
+checking they don't hard-require flash attention.
+
 ### TL;DR for next session
 
 **Two pending items**, in priority order:
 
-1. **Throughput** (Task #19 in old list): a single Foul Play subprocess
-   plays serially. The validated 1-iter smoke ran 9 games in 67s
-   (collect=65s) — fine for the smoke, way too slow for full 200-game
-   iters. Spawn N=4-8 Foul Play subprocesses in parallel + `parallel_actors=N`
-   for Metamon. The `ExternalOpponentManager` design already supports
-   multiple subprocesses per `name` — the YAML just lists each as a
-   separate entry. ~half day of work.
+1. **Real long PPO run with the validated full-pool YAML.** Use the
+   command in section above with `--servers 9000,9000,9000,9000
+   --external-adapters external_adapters_full_pool.yaml`. Extrapolating
+   from 18 games / 124s, a 200-game iter ≈ 23 min. Tight but workable.
+   Optionally: `--pipeline` to overlap PPO update with next collection
+   (saves ~5s/iter). Tune `--games-per-iter` if collection time is
+   prohibitive — 100 games/iter gives ~12 min iters.
 
-3. **Incremental Elo on the 6-snapshot "Useful" set** (~2.5 hr): orthogonal
-   to external opponents. New BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 +
-   sp_0229. Adds incrementally to `data/eval/elo_exp5_FINAL.json`. Anchors
-   on sp2979 (Elo 1058, still on disk). Settles whether the Session 39
+2. **Optional**: investigate the 6+ slot wave stall. Likely either
+   (a) `_play_one_opponent`'s send_challenges call concurrency causing
+   /pm crossings on battle_server; (b) battle_server's pendingChallenges
+   map being keyed by (challenger,) so simultaneous challenges from N
+   different RL players to the same opponent overwrite each other (no
+   — different challengers, different keys); (c) ws backpressure on the
+   single battle_server from N concurrent senders. Diagnostic: enable
+   `BS_TRACE_USER=foulplaybot1` and watch where the deadlock forms.
+
+3. **Incremental Elo on the 6-snapshot "Useful" set** (~2.5 hr,
+   orthogonal): New BC + sp_0029 + sp_0099 + sp_0159 + sp_0219 + sp_0229.
+   Adds incrementally to `data/eval/elo_exp5_FINAL.json`. Anchors on
+   sp2979 (Elo 1058, still on disk). Settles whether the Session 39
    smart_avg gain (64% all-time peak) is a real Elo gain.
 
 ### PPO run on the human-data BC — DONE
