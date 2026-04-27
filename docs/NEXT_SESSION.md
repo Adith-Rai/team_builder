@@ -358,31 +358,60 @@ based on the YAML, so no separate launch step. Spawn takes ~30s
 | `--eval-interval 20` | Eval against the 4 fixed eval bots every 20 iters. Set to 999 for smokes (skip evals entirely). |
 | `--external-adapters <yaml>` | Wires the 9 external opponents into the snapshot pool with PFSP weights from the YAML. |
 
-**What to watch in `training.log`:**
+**What to watch in `training.log` — full visibility map:**
+
+Every failure mode below either prints to stdout/stderr (which `tee` captures)
+or routes through Python's `logging` lastResort handler (which surfaces WARNING+
+to stderr). Nothing is silent in the trainer log EXCEPT a battle_server.js
+crash — that lives in Terminal 1's separate log (see "Anomalies" below).
 
 - **Healthy iter line** (one per iter, ~24 min apart):
   `[HH:MM:SS] Iter N: W/L/T=W/L/0 (X%), N steps, collect=Ts, update=Ts, pi=... v=... ent=... kl=... vs=<per-opp> pool=10`
-- **Per-opponent W/L includes a forfeit suffix** when Layer 1 fires:
+- **Per-opponent W/L with a forfeit suffix** (Layer 1 — abrupt finish exclusion):
   `vs ... foulplay-100ms-2=3/5[+1fft] ...` — the `[+1fft]` says one battle
-  ended via abrupt WS drop and was excluded from training and PFSP. 0–1
-  per iter at 4-slot is expected. Many per iter = a subprocess is unstable.
-- **Forfeit log line (Layer 1 trigger):**
+  ended via abrupt WS drop / poke-engine panic / network blip and was
+  excluded from training AND from PFSP weight updates. **Real coverage** of
+  any failure mode that ends a game with one team still alive — generic.
+  0–1 per iter at 4-slot is expected. Many per iter = subprocess instability.
+- **Forfeit log line (Layer 1 trigger, one per dropped trajectory):**
   `[FORFEIT] battle-gen9ou-… (T turns, won=True, opp_fainted=N, my_fainted=M) — likely WS drop, dropping trajectory + W/L credit`
-- **Resends (normal, ~4/iter at 4-slot):**
+- **Subprocess crash → respawn (Layer 2 + restart-log dump):**
+  ```
+  <opp> exited rc=N after Xs (total restarts=Y)
+    --- last 30 lines of /path/to/<opp>.log ---
+    [last 30 lines of FP/MM stdout, including any traceback]
+    --- end tail ---
+  Spawning <opp> (user=..., restarts=Y+1)
+  ```
+  Examine the tail to diagnose the crash — this is the only forensic data
+  we capture for the still-not-root-caused Bug A.
+- **MCTS-fast (in-process pokeengine) PanicException (~1% of mcts battles):**
+  `WARNING:pokeengine_player:PokeEngine MCTS failed for battle-…: <err> (PanicException)` + traceback.
+  pokeengine_player catches `BaseException`, logs it with `exc_info=True`,
+  and returns `choose_random_move`. Battle continues from a bad state and
+  usually ends abruptly — Layer 1 then drops the trajectory.
+- **Battle hangs (no crash):**
+  `[WARN] Timed out vs <opp> after N games`. trainer's `wait_for` cap
+  is 5 min/game; firing means the opponent stopped responding without
+  crashing. 1–2/iter is OK; >5/iter = real problem.
+- **Other per-opponent errors:**
+  `[ERROR] vs <opp>: <e>` (caught in `_play_one_opponent`),
+  `[ERROR] Wave opponent failed: <e>` (caught in `asyncio.gather`).
+- **poke-env's own listener errors:**
+  `RL...rXXX - CRITICAL - Listen interrupted by ...` — normal at
+  end-of-iter cleanup; only alarming if it fires mid-iter.
+- **Resends from battle_server (normal, ~4/iter at 4-slot):**
   `[battle_server HH:MM:SS.mmm] Resent pending challenge X -> Y after battle cleanup`
-- **Subprocess restart (Layer 2 + restart-log dump):**
-  `<opp> exited rc=N after Xs (total restarts=Y)` followed by a 30-line
-  tail of the subprocess log. Examine the tail to diagnose the crash —
-  this is the only forensic data we capture for the still-not-root-caused
-  Bug A.
 - **Anomalies — investigate:**
-  - `[WARN] Timed out vs <opp>` (1–2/iter is OK from poke-engine panics;
-    >5/iter = real problem; combined with restart-log tail, you'll have
-    enough to root-cause)
-  - `Traceback` / `FATAL` anywhere not under a `--- last 30 lines ---` block
+  - `Traceback` / `FATAL` anywhere NOT inside a `--- last 30 lines ---` block
   - `KL early stop: epoch 0` on every iter (batch too small or LR too high)
-  - `[FORFEIT]` firing more than ~1/iter consistently — points to a real
-    subprocess instability worth investigating
+  - `[FORFEIT]` firing more than ~1/iter consistently → real subprocess instability
+  - All opponents simultaneously timing out → **battle_server.js may have
+    crashed in Terminal 1.** Check that terminal's tee'd
+    `logs/external/battle_server.log` for the proximate cause; restart it
+    if needed (the trainer doesn't auto-detect this).
+  - Every iter ending with the same opponent at `=0/N[+Nfft]` → that subprocess
+    is in a crash loop. Restart-tail will tell you why.
 
 **Resume an interrupted run:**
 

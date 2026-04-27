@@ -141,7 +141,11 @@ class ExternalOpponentManager:
         else:
             log_fh = subprocess.DEVNULL
 
-        logger.info(f"Spawning {opp.name} (user={opp.showdown_username}, restarts={opp.n_restarts})")
+        # logger.warning (not info) so it survives Python's default lastResort
+        # filter — we want every (re)spawn to be visible in training.log,
+        # otherwise the user sees "<opp> exited" without the matching restart
+        # acknowledgement and may think the subprocess is dead permanently.
+        logger.warning(f"Spawning {opp.name} (user={opp.showdown_username}, restarts={opp.n_restarts})")
         opp.proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
