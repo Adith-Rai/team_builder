@@ -384,6 +384,20 @@ function handleMessage(ws, raw) {
         // but since we already got /trn, just confirm with updateuser)
         sendTo(ws, `|updateuser| ${loginName}|1|`);
         log(`Login: ${id}`);
+
+        // Re-emit any |pm|/challenge that was issued to this user BEFORE they
+        // logged in. With multiple concurrent V9RLPlayers (4+ wave parallelism),
+        // the trainer races subprocess startup — challenges fire at iter start
+        // before all FP/MM subprocesses have finished their /trn handshake.
+        // Without this resend, those /pms are silently dropped by sendToUser
+        // (no ws yet) and the corresponding RL player's send_challenges hangs
+        // forever waiting for a battle that never starts. Same class as
+        // cleanupBattle's pending-challenge resend (bug #7), but at login time.
+        for (const [challenger, challenge] of pendingChallenges) {
+            if (challenge.target !== id) continue;
+            sendTo(ws, `|pm| ${challenger}| ${id}|/challenge|${challenge.format}|||`);
+            log(`Resent pending challenge ${challenger} -> ${id} on login`);
+        }
         return;
     }
 

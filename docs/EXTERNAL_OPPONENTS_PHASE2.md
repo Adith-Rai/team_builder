@@ -125,6 +125,17 @@
 > **Bonus: timestamps in battle_server logs.** `function log` now prefixes
 > with `HH:MM:SS.mmm` so future protocol debugging can correlate frames
 > across the bs / FP / MM logs without guessing.
+
+> 10. **Login-time pending-challenge resend** (Session 42, throughput pass).
+>     When the trainer issues N concurrent /challenges from N V9RLPlayers
+>     to N subprocess opponents in a single wave, FP/MM may not have
+>     finished their `/trn` handshake yet. battle_server's `sendToUser`
+>     silently drops the |pm| if the target's ws isn't registered yet.
+>     The opponent's `accept_challenges` loop then waits forever.
+>     Fix: in `/trn`, after registering the user, iterate
+>     `pendingChallenges` for entries targeting this user and emit |pm|
+>     directly. Same idempotent pattern as cleanupBattle's resend.
+>     Required for ANY wave parallelism > 4 (and helpful even at 4-slot).
 >
 > **One Windows-specific Metamon gotcha:** `_factory_metamon` in
 > `external_adapters.py` now sets `TORCHDYNAMO_DISABLE=1` automatically on

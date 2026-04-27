@@ -105,12 +105,35 @@ changes**. Validated 1-iter smoke: 18 games in **124s** (vs 236s baseline
 with single-slot wave) → **1.9× speedup**. PROF wave 0 hit batch=1.4
 peak=5 → InferenceBatcher actually batching now.
 
-**6-slot and 10-slot fail.** Same recipe with 6+ slots stalls — only the
-first wave's worth of battles plays, the rest hang. Likely a race in
-`send_challenges` from many V9RLPlayers connecting concurrently
-(challenges crossing, /pm dispatch contention). 4-slot is the validated
-ceiling for now. Worth investigating later — but 4-slot already gives
-the productivity win.
+**6-slot and 10-slot still fail (after one fix).** Diagnosis:
+
+1. **Login-time |pm|/challenge race (FIXED, bug #10).** When the trainer
+   issues N concurrent /challenges to N opponents, FP/MM subprocesses
+   may not have finished their `/trn` handshake yet. battle_server
+   silently dropped the |pm| (no ws to send to). Fix: in the /trn
+   handler, after registering the user, iterate `pendingChallenges` for
+   any entries targeting this user and emit |pm| directly. Validated at
+   4-slot (the existing ceiling), still safe — fires only when there's
+   a pending challenge.
+
+2. **Still broken at 6+ slots (NOT FIXED).** Two separate issues:
+   - **FP cascading restart starvation:** at 10-slot, FP1 hit
+     `websockets.ConnectionClosedError: no close frame received or sent`
+     mid-handshake, ExternalOpponentManager auto-restarted it, but its
+     enqueued team file had been consumed by the first instance's
+     `yield_team()`. The restarted FP1 sat on iter 1 with empty queue.
+   - **MM `_challenge_queue` AttributeError:**
+     `AttributeError: 'AcceptChallengesOnLocal' object has no attribute
+     '_challenge_queue'` from poke_env's `_handle_challenge_request`.
+     The login-time |pm| arrives during MM setup before the agent's
+     `_challenge_queue` is bound, and the handler crashes. This is in
+     metamon's poke-env fork (0.8.3.3) — not easily fixable from our side.
+
+**4-slot remains the validated production ceiling.** 1.9× speedup over
+single-slot, all 9 external entries play battles cleanly. Smoke result:
+`Iter 0: W/L/T=2/16/0 (11.1%), 18 games, collect=141s` (with new login-
+resend code in place — slightly slower than the 124s pre-fix run, within
+PFSP noise).
 
 **Caveat: SmallRLGen9Beta and other FlashAttention-required variants
 crash on Windows** (Triton-less). The 4 variants in the YAML use
