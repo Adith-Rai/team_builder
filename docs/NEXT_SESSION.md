@@ -176,6 +176,117 @@ crash on Windows** (Triton-less). The 4 variants in the YAML use
 VanillaAttention fallback successfully. Adding more variants requires
 checking they don't hard-require flash attention.
 
+### Production runbook (validated end of Session 42)
+
+Full PPO training run with the multi-opponent pool. Two terminals,
+copy-pasteable.
+
+**Pre-flight (run once before each fresh training run):**
+
+```bash
+# 1. Kill any stale processes from previous runs
+powershell -Command "Get-Process node, python -ErrorAction SilentlyContinue | Stop-Process -Force"
+
+# 2. Clean external opponent team queues (otherwise stale teams from
+#    aborted runs accumulate)
+rm -rf C:/Users/raiad/OneDrive/Desktop/team_builder/data/external_team_queue/foulplay-100ms-*/
+rm -rf C:/Users/raiad/OneDrive/Desktop/team_builder/data/external_team_queue/mm-*/
+
+# 3. Verify the init checkpoint exists (this is the Session 39 PPO record;
+#    swap path if resuming from a different snapshot)
+ls C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt
+
+# 4. Verify the full-pool YAML exists
+ls C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/external_adapters_full_pool.yaml
+```
+
+**Terminal 1 — battle_server (single instance handles 4-slot wave):**
+
+```bash
+C:/Users/raiad/OneDrive/Desktop/team_builder/tools/node-v20.18.1-win-x64/node.exe \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  --port 9000 \
+  2>&1 | tee C:/Users/raiad/OneDrive/Desktop/team_builder/logs/external/battle_server.log
+```
+
+Wait for `[battle_server HH:MM:SS.mmm] Listening on port 9000` then leave it running.
+
+**Terminal 2 — production training run:**
+
+```bash
+cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+python -u train_rl.py \
+  --init-from data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt \
+  --device cuda --servers 9000,9000,9000,9000 --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 6 --n-iters 100 --warmup-iters 0 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --adaptive-entropy --early-stop --win-rate-mode ema \
+  --eval-interval 20 \
+  --out-dir data/models/rl_v9_full_pool \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --external-adapters external_adapters_full_pool.yaml \
+  2>&1 | tee training.log
+```
+
+The trainer auto-spawns FP and MM subprocesses via `ExternalOpponentManager`
+based on the YAML, so no separate launch step. Spawn takes ~30s
+(Metamon model loads dominate; trainer waits via `wait_until_ready`).
+
+**Why each flag:**
+
+| Flag | Purpose |
+|------|---------|
+| `--init-from <pt>` | Fresh PPO state from this checkpoint (separate optimizer state). Use `--resume <pt>` instead to continue an interrupted run with optimizer state preserved. |
+| `--servers 9000,9000,9000,9000` | THE throughput knob. 4 server-pool slots all pointing at the same battle_server → 4× wave parallelism. Tested up to 4. **6+ stalls** (see deferred bugs above). |
+| `--fp16` | Mixed precision on inference + PPO. ~2× speedup, no quality regression measured. |
+| `--pipeline` | Background collector overlaps next iter's collection with current iter's PPO update. Saves the update wall-time on every iter (60–80s at 200 games). Costs ~1GB extra RAM (model copy on CPU). **Recommended on for production runs.** |
+| `--games-per-iter 200` | Standard for our PPO scale. Smaller = faster iters but noisier gradients. |
+| `--max-concurrent 6` | Per-opponent V9RLPlayer concurrent battles. With 4-slot wave × 6 = up to 24 concurrent battles. Higher works on bigger GPUs but doesn't help here. |
+| `--n-iters 100` | 100-iter run ≈ 40 hr at the measured ~24 min/iter. Adjust to budget. |
+| `--lam 0.95 --ent-coef 0.02` | Validated hyperparams from Session 39 (the smart_avg-64% record). |
+| `--adaptive-entropy --early-stop` | Safeguards from Session 35. Prevent entropy collapse. **Always on** for long runs. |
+| `--win-rate-mode ema` | EMA over last 50 games per opponent for PFSP. Better than cumulative for non-stationary policies. |
+| `--eval-interval 20` | Eval against the 4 fixed eval bots every 20 iters. Set to 999 for smokes (skip evals entirely). |
+| `--external-adapters <yaml>` | Wires the 9 external opponents into the snapshot pool with PFSP weights from the YAML. |
+
+**What to watch in `training.log`:**
+
+- **Healthy iter line** (one per iter, ~24 min apart):
+  `[HH:MM:SS] Iter N: W/L/T=W/L/0 (X%), N steps, collect=Ts, update=Ts, pi=... v=... ent=... kl=... vs=<per-opp> pool=10`
+- **Resends (normal, ~4/iter at 4-slot):**
+  `[battle_server HH:MM:SS.mmm] Resent pending challenge X -> Y after battle cleanup`
+- **Anomalies — investigate:**
+  `[WARN] Timed out vs <opp>` (1–2/iter is OK from poke-engine panics; >5/iter = real problem)
+  `Traceback` / `FATAL` (anywhere)
+  `KL early stop: epoch 0` on every iter (means batch is too small or learning rate too high)
+
+**Resume an interrupted run:**
+
+```bash
+# Find latest snapshot in the run dir
+ls -t data/models/rl_v9_full_pool/selfplay_v9_*/snapshot_*.pt | head -1
+# Then change --init-from to --resume in the Terminal 2 command
+```
+
+`--resume` preserves PPO optimizer state (Adam momentum/variance), the
+PFSP pool with its win-rate stats, the run dir. `--init-from` gives a
+fresh start.
+
+**Stop cleanly:**
+
+`Ctrl-C` the trainer in Terminal 2. The `ExternalOpponentManager` will
+SIGTERM all FP/MM subprocesses on shutdown. Final checkpoint saves to
+`<out_dir>/.../final.pt`. Battle_server in Terminal 1 keeps running
+(no state to clean up); Ctrl-C separately or leave for next run.
+
+**Throughput levers in priority order if 24 min/iter is too slow:**
+
+1. `--pipeline` (already in command above; saves ~60s/iter, free).
+2. Lower FP `search_time_ms` from 100 to 50 in `external_adapters_full_pool.yaml` (FP stays strong, ~2× faster per battle).
+3. Replace 2 of 4 `foulplay-100ms-N` entries with additional `mcts-fast` entries — in-process, no subprocess serialization.
+4. `--mp` flag for multiprocess collection (untested with current setup, exists in code).
+5. **DO NOT** push `--servers` past 4 slots (cascading FP restart + MM `_challenge_queue` race; see "deferred bugs" section above).
+
 ### TL;DR for next session
 
 **Two pending items**, in priority order:
