@@ -57,7 +57,15 @@ def parse_args():
     p.add_argument("--games-per-iter", type=int, default=200)
     p.add_argument("--max-concurrent", type=int, default=20)
     p.add_argument("--n-iters", type=int, default=500)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=3e-5,
+                   help="Adam learning rate. Default 3e-5 — the value S39 used "
+                        "to set the smart_avg-64% record (sp_0229). Default was "
+                        "1e-4 historically, but that consistently caused KL "
+                        "early-stop on every iter, ~10%% per-episode KL discards, "
+                        "and policy drift from sharp PPO checkpoints (observed in "
+                        "S39 from a 45%% BC base, and again in S43's first attempt "
+                        "from sp_0229). 3e-5 is safe for both BC->PPO transitions "
+                        "and PPO->PPO continuation. Override at your own risk.")
     p.add_argument("--gamma", type=float, default=0.9999)
     p.add_argument("--lam", type=float, default=0.75)
     p.add_argument("--clip-eps", type=float, default=0.2)
