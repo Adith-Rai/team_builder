@@ -327,15 +327,27 @@ cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/sr
 python -u train_rl.py \
   --init-from data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt \
   --device cuda --servers 9000,9000,9000,9000 --fp16 --pipeline \
-  --games-per-iter 200 --max-concurrent 6 --n-iters 100 --warmup-iters 0 \
+  --games-per-iter 200 --max-concurrent 6 --n-iters 100 --warmup-iters 5 \
   --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --adaptive-entropy --early-stop --win-rate-mode ema \
   --eval-interval 20 \
   --out-dir data/models/rl_v9_full_pool \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
   --external-adapters external_adapters_full_pool.yaml \
-  2>&1 | tee training.log
+  2>&1 | tee /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training.log
 ```
+
+**Why `--warmup-iters 5` for this run** (and not the legacy `--warmup-iters 0`):
+The legacy commands above use `--resume` which continues an existing PPO
+run with its already-calibrated value head. Our run uses `--init-from`
+against a brand-new opponent pool (9 external entries the model has
+never seen). Warmup freezes the backbone+policy and trains only the
+value head for the first 5 iters (`train_rl.py:676-684`), letting the
+value function recalibrate to the new state distribution against
+mcts-fast / FP / 4× MM variants before the policy starts drifting from
+sp_0229. ~5% time overhead, dramatically reduces early-iter KL spike
+risk against the strongest new opponent (MediumRL at 4× our params).
+Per-iter line shows `[WARMUP]` while frozen.
 
 The trainer auto-spawns FP and MM subprocesses via `ExternalOpponentManager`
 based on the YAML, so no separate launch step. Spawn takes ~30s
