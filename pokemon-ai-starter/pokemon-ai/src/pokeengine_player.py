@@ -448,10 +448,22 @@ class PokeEnginePlayer(Player):
         if n_calls_this_turn > self._MAX_RETRIES_PER_TURN:
             return self.choose_random_move(battle)
 
+        # poke-engine raises pyo3 PanicException (a BaseException subclass,
+        # NOT a regular Exception) on niche edge cases like
+        # `'Encore should not be active when last used move is not a move'`.
+        # Plain `except Exception` doesn't catch BaseException, so the panic
+        # propagates up through poke-env's _handle_battle_request and crashes
+        # the listener task — battle hangs, send_challenges times out (~600s),
+        # iter loses one game. Catching BaseException with explicit re-raise
+        # for KeyboardInterrupt / SystemExit lets us fall back to random move
+        # cleanly while preserving Ctrl-C semantics.
         try:
             state = _battle_to_pe_state(battle)
-        except Exception as e:
-            logger.warning("PokeEngine state build failed for %s: %s", battle.battle_tag, e, exc_info=True)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            logger.warning("PokeEngine state build failed for %s: %s (%s)",
+                           battle.battle_tag, e, type(e).__name__, exc_info=True)
             return self.choose_random_move(battle)
 
         loop = asyncio.get_event_loop()
@@ -462,12 +474,22 @@ class PokeEnginePlayer(Player):
                 state,
                 self.search_time_ms,
             )
-        except Exception as e:
-            logger.warning("PokeEngine MCTS failed for %s: %s", battle.battle_tag, e, exc_info=True)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            logger.warning("PokeEngine MCTS failed for %s: %s (%s)",
+                           battle.battle_tag, e, type(e).__name__, exc_info=True)
             return self.choose_random_move(battle)
 
-        choice = _select_choice_from_mcts(mcts_result)
-        return _choice_to_order(self, battle, choice)
+        try:
+            choice = _select_choice_from_mcts(mcts_result)
+            return _choice_to_order(self, battle, choice)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            logger.warning("PokeEngine choice translation failed for %s: %s (%s)",
+                           battle.battle_tag, e, type(e).__name__, exc_info=True)
+            return self.choose_random_move(battle)
 
     def _battle_finished_callback(self, battle):
         self._turn_call_count.pop(battle.battle_tag, None)
