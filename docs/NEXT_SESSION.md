@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-26 (Session 42 — external-opponent integration VALIDATED end-to-end; protocol bridge bugs all fixed)**
+**Last updated: 2026-04-26 (Session 43 — training-correctness defenses (forfeit filter + queue-restart resilience) added on top of S42's validated end-to-end pipeline; ready for the long PPO run)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -14,7 +14,84 @@ Supporting documents:
 
 ---
 
-## Session 42 status (READ THIS FIRST)
+## Session 43 status (READ THIS FIRST)
+
+**The training pipeline is production-ready at 4-slot wave parallelism.** Two
+defenses were added on top of S42's validated full-pool config:
+
+1. **Forfeit-finish filter (Layer 1, training correctness).** When any
+   opponent — subprocess WS drop, in-process poke-engine panic, network
+   blip — causes the local battle_server to emit `|win|RL_user` with their
+   team still alive, our trajectory used to gain a spurious +1 terminal
+   reward after only 1-3 turns of real play, AND the spurious win inflated
+   the opponent's PFSP cumulative win rate, dragging its `(1-wr)²` weight
+   below the YAML target. `V9RLPlayer._finish_looks_real` now requires one
+   team to be fully fainted (or self-initiated forfeit at turn cap) before
+   accepting the finish; otherwise the trajectory is dropped and the W/L
+   credit is excluded from PFSP via `n_forfeit_wins/losses` counters that
+   `rl_collection.py` subtracts. Generic — covers any abrupt termination,
+   not just the specific FP cascading-restart path. 11 unit tests in
+   `test_forfeit_filter.py`.
+
+2. **Queue-restart resilience (Layer 2, throughput protection).** When a
+   subprocess opponent crashes mid-iter, `ExternalOpponentManager` auto-
+   restarts it. Pre-fix, the restarted subprocess called
+   `QueueTeambuilder(clean_on_init=True)` and wiped any teams the trainer
+   had pre-enqueued during the crash window — leaving the new instance
+   waiting forever and the trainer's `wait_for` firing a 5-min timeout.
+   Fix: `foul_play_accept_serve.py` and `metamon_accept_serve.py` accept a
+   `--clean-on-init` flag (default `true`); `_spawn` injects
+   `--clean-on-init false` only when `n_restarts > 0`. First start still
+   wipes stale `.team` files; respawn preserves the in-flight queue.
+
+3. **Restart-log dump (instrumentation, no behavior change).**
+   `ExternalOpponentManager._monitor_loop` now emits the last 30 lines of
+   the dying subprocess's log alongside the exit warning. Free
+   post-mortem data if/when Bug A's still-not-root-caused
+   `ConnectionClosedError` actually fires during the long run.
+
+**The 1-iter smoke after S43's changes** (`external_adapters_all3_smoke.yaml`,
+9 games, 3 concurrent) completed cleanly: `Iter 0: W/L/T=2/7/0 (22.2%),
+290 steps, collect=84s, update=4s, vs sp0229=1/3 mcts-fast=1/2
+foulplay-100ms=0/2 metamon-minikazam=0/2 pool=4`. Zero `[FORFEIT]`, zero
+`[WARN]`, zero tracebacks, no subprocess restarts. FP and MM both logged
+`queue clean_on_init=True` on first start (correct default). Layer 1 + 2
+are ship-ready.
+
+### TL;DR for next session
+
+**Ship the long PPO run with the validated full-pool YAML.** Use the
+production runbook below — it's been updated to include `--pipeline` (the
+default for production, saves ~60s/iter via overlap) and a hardened pre-
+flight cleanup. Extrapolating from the 5-iter smoke (~125s/iter at 18
+games), 200 games/iter ≈ ~24 min/iter, 100 iters ≈ ~40 hr. Layer 1+2
+defenses mean any rare crash event drops the spurious data instead of
+poisoning the gradient.
+
+After the long run completes:
+1. **Incremental Elo** on the 6-snapshot "Useful" set (~2.5 hr) to settle
+   whether the smart_avg-64% peak translated to real Elo gain past
+   sp2979's 1058 ceiling.
+2. **Cloud architecture planning** — the real ~10× throughput lever, not
+   any local optimization. See `docs/CLOUD_DEPLOY.md`.
+
+### Known unfixed bugs (deferred — DO NOT FORGET)
+
+| ID | Symptom | Why deferred | Mitigation |
+|---|---|---|---|
+| **A** | FP `ConnectionClosedError: no close frame received or sent` mid-handshake at 6+ slots, prior session believed kick-on-relogin path but **unverified** | Only fires above the 4-slot validated ceiling. Generic Layer 1+2 defenses protect training correctness regardless of root cause. | Layer 2 keeps queue alive on respawn; Layer 1 drops any spurious +1 terminal; restart-log dump captures forensic data if it does fire. |
+| **B** | MM `_challenge_queue` AttributeError at 6+ slots; `_handle_challenge_request` runs before MM's accept-loop binds the attribute | Lives in metamon's poke-env 0.8.3.3 fork. Fix needs vendoring a patched poke-env in `metamon_venv` or monkey-patching at MM startup — both have ongoing maintenance cost. Only fires past 4-slot. | Stay at 4-slot. ~1.3-2× speedup not worth the upstream-fork burden for a local-only optimization. |
+| **C** | poke-engine `PanicException` in mcts-fast (~1% of mcts battles, e.g. "Encore should not be active when last used move is not a move") | Bug is in poke-engine's Rust validator. Upstream patch needed; rare enough not to block training. | Layer 1 drops the partial trajectory if a panic produces an abrupt finish; trainer's `wait_for` catches hung battles and moves on. |
+| **D** | poke-env's `_challenge_queue` register-from-both-frames behavior was the cause of bug #8 (now fixed by sending only `|pm|`, not `|updatechallenges|`) | n/a (fixed) | n/a |
+
+**Crucially, A and B are LOCAL-MACHINE-ONLY throughput limits.** Cloud
+deployment runs N independent 4-slot nodes in parallel for N× throughput
+without ever needing to fix A or B. Direct that energy at cloud planning
+instead of local optimization.
+
+---
+
+## Session 42 status (kept for context)
 
 **External-opponent integration is now WORKING.** All four opponent paths
 play a complete battle to completion against a poke-env 0.10 sender on
@@ -116,18 +193,42 @@ peak=5 → InferenceBatcher actually batching now.
    4-slot (the existing ceiling), still safe — fires only when there's
    a pending challenge.
 
-2. **Still broken at 6+ slots (NOT FIXED).** Two separate issues:
-   - **FP cascading restart starvation:** at 10-slot, FP1 hit
-     `websockets.ConnectionClosedError: no close frame received or sent`
-     mid-handshake, ExternalOpponentManager auto-restarted it, but its
-     enqueued team file had been consumed by the first instance's
-     `yield_team()`. The restarted FP1 sat on iter 1 with empty queue.
-   - **MM `_challenge_queue` AttributeError:**
+2. **6+ slot status:**
+   - **FP cascading restart starvation (Bug A — FIXED, Session 43).**
+     `foul_play_accept_serve.py` and `metamon_accept_serve.py` now accept
+     a `--clean-on-init` flag (default `true`). `ExternalOpponentManager._spawn`
+     injects `--clean-on-init false` only when `n_restarts > 0`. Result: the
+     trainer's pre-enqueued teams from the crash window survive a respawn,
+     so the restarted subprocess picks up the next team and the iter
+     completes without a 5-min `wait_for` timeout. Also covers the
+     additional training-correctness side of the same incident — see Bug 11
+     below — so the iter doesn't ingest a 1–3 turn forfeit-win trajectory
+     even on the very rare crash that sneaks past the queue fix.
+   - **MM `_challenge_queue` AttributeError (NOT FIXED, deferred):**
      `AttributeError: 'AcceptChallengesOnLocal' object has no attribute
      '_challenge_queue'` from poke_env's `_handle_challenge_request`.
      The login-time |pm| arrives during MM setup before the agent's
      `_challenge_queue` is bound, and the handler crashes. This is in
-     metamon's poke-env fork (0.8.3.3) — not easily fixable from our side.
+     metamon's poke-env fork (0.8.3.3) — fix would require monkey-patching
+     poke-env in `metamon_venv` or vendoring a patched fork. Only fires at
+     6+ slots, and 4-slot is the validated production ceiling, so this
+     is left deferred. Revisit if 4-slot throughput becomes the limiter.
+
+11. **Forfeit-finish filter on V9RLPlayer (Session 43, training correctness).**
+    When any opponent (subprocess WS drop, in-process panic, network blip)
+    causes the server to emit `|win|<RL_username>` with an alive opposing
+    team, poke-env flips `battle.won = True` and our trajectory ends with
+    a spurious +1 terminal after only 1–3 real turns of play. PPO trained
+    on those, and PFSP `(1-wr)²` weights drifted because the spurious wins
+    inflated the opponent's cumulative win rate. Fix: `V9RLPlayer._finish_looks_real`
+    in `rl_player.py` checks the team-fainted counts; a finish is only
+    treated as real if `opp_fainted >= team_size or my_fainted >= team_size`.
+    Forfeit finishes drop the trajectory from `completed_trajectories` and
+    increment `n_forfeit_wins` / `n_forfeit_losses`. `rl_collection._play_one_opponent`
+    subtracts those from the W/L counts that flow into `total_wins`,
+    `total_losses`, and `opp_records` (PFSP). The iter summary surfaces
+    forfeits as `<opp>=<W>/<G>[+Nfft]`. Generic — covers ANY abrupt
+    termination, not just the FP cascading-restart path.
 
 **4-slot remains the validated production ceiling.** 1.9× speedup over
 single-slot, all 9 external entries play battles cleanly. Smoke result:
@@ -176,28 +277,36 @@ crash on Windows** (Triton-less). The 4 variants in the YAML use
 VanillaAttention fallback successfully. Adding more variants requires
 checking they don't hard-require flash attention.
 
-### Production runbook (validated end of Session 42)
+### Production runbook (validated end of Session 43)
 
-Full PPO training run with the multi-opponent pool. Two terminals,
-copy-pasteable.
+Full PPO training run with the multi-opponent pool, Layer 1+2 defenses
+active. Two terminals, copy-pasteable.
 
 **Pre-flight (run once before each fresh training run):**
 
 ```bash
 # 1. Kill any stale processes from previous runs
-powershell -Command "Get-Process node, python -ErrorAction SilentlyContinue | Stop-Process -Force"
+powershell.exe -Command "Get-Process node, python -ErrorAction SilentlyContinue | Stop-Process -Force"
 
-# 2. Clean external opponent team queues (otherwise stale teams from
-#    aborted runs accumulate)
-rm -rf C:/Users/raiad/OneDrive/Desktop/team_builder/data/external_team_queue/foulplay-100ms-*/
-rm -rf C:/Users/raiad/OneDrive/Desktop/team_builder/data/external_team_queue/mm-*/
+# 2. Clean ALL external opponent team queues. The broad glob below catches
+#    legacy 'foulplay/' and 'metamon/' dirs from older runbooks too — without
+#    this, leftover .team files from aborted runs would be consumed by the
+#    new run's first iter (subprocesses use clean_on_init=true on first start
+#    by default, so this is belt-and-suspenders).
+rm -rf C:/Users/raiad/OneDrive/Desktop/team_builder/data/external_team_queue/*
 
-# 3. Verify the init checkpoint exists (this is the Session 39 PPO record;
-#    swap path if resuming from a different snapshot)
+# 3. Confirm the init checkpoint and full-pool YAML exist
 ls C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt
-
-# 4. Verify the full-pool YAML exists
 ls C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/external_adapters_full_pool.yaml
+
+# 4. Confirm GPU is free (no other python processes)
+nvidia-smi | head -25
+
+# 5. (Optional but recommended) Run the forfeit-filter unit tests so a
+#    future code change to _finish_looks_real doesn't silently regress
+#    training-data correctness.
+cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+python test_forfeit_filter.py
 ```
 
 **Terminal 1 — battle_server (single instance handles 4-slot wave):**
@@ -253,12 +362,27 @@ based on the YAML, so no separate launch step. Spawn takes ~30s
 
 - **Healthy iter line** (one per iter, ~24 min apart):
   `[HH:MM:SS] Iter N: W/L/T=W/L/0 (X%), N steps, collect=Ts, update=Ts, pi=... v=... ent=... kl=... vs=<per-opp> pool=10`
+- **Per-opponent W/L includes a forfeit suffix** when Layer 1 fires:
+  `vs ... foulplay-100ms-2=3/5[+1fft] ...` — the `[+1fft]` says one battle
+  ended via abrupt WS drop and was excluded from training and PFSP. 0–1
+  per iter at 4-slot is expected. Many per iter = a subprocess is unstable.
+- **Forfeit log line (Layer 1 trigger):**
+  `[FORFEIT] battle-gen9ou-… (T turns, won=True, opp_fainted=N, my_fainted=M) — likely WS drop, dropping trajectory + W/L credit`
 - **Resends (normal, ~4/iter at 4-slot):**
   `[battle_server HH:MM:SS.mmm] Resent pending challenge X -> Y after battle cleanup`
+- **Subprocess restart (Layer 2 + restart-log dump):**
+  `<opp> exited rc=N after Xs (total restarts=Y)` followed by a 30-line
+  tail of the subprocess log. Examine the tail to diagnose the crash —
+  this is the only forensic data we capture for the still-not-root-caused
+  Bug A.
 - **Anomalies — investigate:**
-  `[WARN] Timed out vs <opp>` (1–2/iter is OK from poke-engine panics; >5/iter = real problem)
-  `Traceback` / `FATAL` (anywhere)
-  `KL early stop: epoch 0` on every iter (means batch is too small or learning rate too high)
+  - `[WARN] Timed out vs <opp>` (1–2/iter is OK from poke-engine panics;
+    >5/iter = real problem; combined with restart-log tail, you'll have
+    enough to root-cause)
+  - `Traceback` / `FATAL` anywhere not under a `--- last 30 lines ---` block
+  - `KL early stop: epoch 0` on every iter (batch too small or LR too high)
+  - `[FORFEIT]` firing more than ~1/iter consistently — points to a real
+    subprocess instability worth investigating
 
 **Resume an interrupted run:**
 
@@ -285,9 +409,9 @@ SIGTERM all FP/MM subprocesses on shutdown. Final checkpoint saves to
 2. Lower FP `search_time_ms` from 100 to 50 in `external_adapters_full_pool.yaml` (FP stays strong, ~2× faster per battle).
 3. Replace 2 of 4 `foulplay-100ms-N` entries with additional `mcts-fast` entries — in-process, no subprocess serialization.
 4. `--mp` flag for multiprocess collection (untested with current setup, exists in code).
-5. **DO NOT** push `--servers` past 4 slots (cascading FP restart + MM `_challenge_queue` race; see "deferred bugs" section above).
+5. **DO NOT** push `--servers` past 4 slots (cascading FP restart + MM `_challenge_queue` race; see "Known unfixed bugs" near top of file). Layer 1+2 protect correctness if you do try, but throughput regresses from cascading timeouts.
 
-### TL;DR for next session
+### TL;DR for Session 42 (superseded — see Session 43 TL;DR at top of file)
 
 **Two pending items**, in priority order:
 

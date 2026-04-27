@@ -103,7 +103,17 @@ async def run_loop(args):
 
     # 1-hour timeout: between PFSP waves there can be multi-minute idle gaps
     # (PPO update + eval, etc.). The subprocess should sit waiting, not crash.
-    queue_tb = QueueTeambuilder(args.team_queue, wait_timeout_s=float(args.queue_wait_timeout_s))
+    # `clean_on_init=False` is set by ExternalOpponentManager on respawn so the
+    # trainer's already-enqueued teams from the crash window survive — without
+    # this, the restarted subprocess wipes them and sits idle until the
+    # trainer's per-opponent wait_for fires ~5 min later.
+    clean_on_init = str(args.clean_on_init).strip().lower() in ("true", "1", "yes")
+    queue_tb = QueueTeambuilder(
+        args.team_queue,
+        wait_timeout_s=float(args.queue_wait_timeout_s),
+        clean_on_init=clean_on_init,
+    )
+    print(f"[foulplay] queue clean_on_init={clean_on_init}", flush=True)
     print(f"[foulplay] using team queue: {args.team_queue}", flush=True)
 
     ws_client = await PSWebsocketClient.create(
@@ -162,6 +172,11 @@ def main():
                    help="Seconds to wait for a team file before crashing. Default 1 hour "
                         "to absorb idle gaps between PFSP waves; manager restarts the "
                         "subprocess if this fires.")
+    p.add_argument("--clean-on-init", default="true",
+                   help="Whether QueueTeambuilder wipes stale .team files on startup. "
+                        "Default true. ExternalOpponentManager overrides to false on "
+                        "respawn so teams the trainer enqueued during a mid-iter crash "
+                        "survive the restart.")
     p.add_argument("--log-level", default="WARNING")
     args = p.parse_args()
 

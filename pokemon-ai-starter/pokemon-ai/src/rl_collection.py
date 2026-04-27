@@ -348,10 +348,23 @@ async def collect_v9(
         except Exception as e:
             print(f"  [ERROR] vs {opp_name}: {e}", flush=True)
 
-        w, l = player.n_won_battles, player.n_lost_battles
+        # Subtract forfeit-finishes: poke-env's W/L counts every battle.won
+        # finish, including ones the server flipped on a WS drop. V9RLPlayer
+        # tracks those so we can exclude them from PFSP weights and the
+        # training W/L tally. Trajectories from forfeit finishes are already
+        # dropped on the player side.
+        w_raw, l_raw = player.n_won_battles, player.n_lost_battles
+        forfeit_w = getattr(player, 'n_forfeit_wins', 0)
+        forfeit_l = getattr(player, 'n_forfeit_losses', 0)
+        w = max(0, w_raw - forfeit_w)
+        l = max(0, l_raw - forfeit_l)
         trajs = list(player.completed_trajectories)
         ties = player.n_tied_battles
         short = opp_name.replace("snapshot_", "sp").replace("BEST_PPO_iter80_h2h_52.8pct", "init")
+        forfeit_total = forfeit_w + forfeit_l
+        summary = f"{short}={w}/{w+l}"
+        if forfeit_total > 0:
+            summary += f"[+{forfeit_total}fft]"
 
         try:
             player.reset_battles()
@@ -369,7 +382,7 @@ async def collect_v9(
         if opponent is not None:
             del opponent
 
-        return trajs, w, l, ties, f"{short}={w}/{w+l}", entry.key
+        return trajs, w, l, ties, summary, entry.key
 
     # Build opponent tasks
     opp_tasks = []

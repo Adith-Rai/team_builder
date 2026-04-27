@@ -107,6 +107,30 @@ class ExternalOpponentManager:
                 logger.warning(f"{opp.name}: venv python not found at {python}; "
                                f"falling back to system python")
 
+        # On respawn (n_restarts > 0), tell the subprocess NOT to wipe its team
+        # queue on startup. The trainer pre-enqueues all n_battles teams for the
+        # iter; if the subprocess crashed mid-iter and we let the restarted one
+        # wipe the queue, the iter's remaining teams are lost and the subprocess
+        # sits idle until the trainer's per-opponent wait_for fires (~5 min),
+        # corrupting throughput. First start keeps the default (clean=true) so
+        # leftover .team files from prior runs don't confuse the new iter. If
+        # the user set --clean-on-init in the YAML cmd, we strip it before
+        # appending the override so there's only one value on the cmdline.
+        if opp.n_restarts > 0 and any(
+            cmd_part.endswith("foul_play_accept_serve.py")
+            or cmd_part.endswith("metamon_accept_serve.py")
+            for cmd_part in cmd
+        ):
+            stripped = []
+            i = 0
+            while i < len(cmd):
+                if cmd[i] == "--clean-on-init":
+                    i += 2  # skip flag + its value
+                    continue
+                stripped.append(cmd[i])
+                i += 1
+            cmd = stripped + ["--clean-on-init", "false"]
+
         cwd = self._resolve_path(opp.cwd)
 
         # Open log file (append mode so restarts share a log).
@@ -212,6 +236,25 @@ class ExternalOpponentManager:
         if self._monitor_thread:
             self._monitor_thread.join(timeout=5)
 
+    def _tail_log(self, opp: ExternalOpponent, n_lines: int = 30) -> str:
+        """Best-effort tail of the subprocess's log file, for crash post-mortems.
+
+        Logged alongside the exit warning so the next session has the last
+        words of the dying process without needing to grep through gigabyte
+        log files. Silent on any error (we never want monitor failures to
+        mask the underlying crash).
+        """
+        log_path = self._resolve_path(opp.log_file) if opp.log_file else None
+        if not log_path or not log_path.exists():
+            return "(no log file)"
+        try:
+            with open(log_path, "r", errors="ignore") as f:
+                lines = f.readlines()
+            tail = lines[-n_lines:] if len(lines) > n_lines else lines
+            return "".join(tail).rstrip()
+        except OSError:
+            return "(log unreadable)"
+
     def _monitor_loop(self):
         """Background thread: detect exited processes and restart if configured."""
         while not self._stop_event.is_set():
@@ -222,9 +265,19 @@ class ExternalOpponentManager:
                 if rc is None:
                     continue  # still running
                 uptime = time.time() - opp.started_at
+                # Log the exit AND a tail of the subprocess log. Without the
+                # tail, post-mortem requires grepping a giant rolling log; with
+                # it, the proximate cause (traceback / WS error) is visible
+                # alongside the manager's restart line. This is the only data
+                # source we have for diagnosing the not-yet-root-caused FP/MM
+                # `ConnectionClosedError` crash mode at 6+ slots.
+                tail = self._tail_log(opp, n_lines=30)
                 logger.warning(
                     f"{opp.name} exited rc={rc} after {uptime:.0f}s "
-                    f"(total restarts={opp.n_restarts})"
+                    f"(total restarts={opp.n_restarts})\n"
+                    f"  --- last 30 lines of {opp.log_file or '(no log)'} ---\n"
+                    f"{tail}\n"
+                    f"  --- end tail ---"
                 )
                 if not opp.auto_restart:
                     opp.proc = None

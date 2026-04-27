@@ -253,6 +253,11 @@ def main():
     p.add_argument("--queue-wait-timeout-s", type=float, default=3600.0,
                    help="Seconds QueueTeambuilder waits for a team before crashing "
                         "(default 1 hour, used only when --team-queue is set).")
+    p.add_argument("--clean-on-init", default="true",
+                   help="Whether QueueTeambuilder wipes stale .team files on startup. "
+                        "Default true. ExternalOpponentManager overrides to false on "
+                        "respawn so teams the trainer enqueued during a mid-iter crash "
+                        "survive the restart.")
     args = p.parse_args()
 
     if "METAMON_CACHE_DIR" not in os.environ:
@@ -275,9 +280,16 @@ def main():
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from team_generator import QueueTeambuilder
         print(f"[metamon] team source: queue dir {args.team_queue}", flush=True)
+        # `clean_on_init=False` is set by ExternalOpponentManager on respawn so
+        # the trainer's already-enqueued teams from the crash window survive —
+        # without this, the restarted subprocess wipes them and sits idle until
+        # the trainer's per-opponent wait_for fires ~5 min later.
+        clean_on_init = str(args.clean_on_init).strip().lower() in ("true", "1", "yes")
+        print(f"[metamon] queue clean_on_init={clean_on_init}", flush=True)
         # Big timeout — subprocess should sit waiting between PFSP waves, not crash.
         team_set = QueueTeambuilder(args.team_queue,
-                                    wait_timeout_s=float(args.queue_wait_timeout_s))
+                                    wait_timeout_s=float(args.queue_wait_timeout_s),
+                                    clean_on_init=clean_on_init)
     else:
         print(f"[metamon] team source: metamon's '{args.team_set}' set", flush=True)
         team_set = get_metamon_teams(args.format, args.team_set)

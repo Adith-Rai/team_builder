@@ -1,9 +1,13 @@
 # External Opponents Integration — VALIDATED END-TO-END
 
-> **STATUS (end of Session 42, 2026-04-26): full PPO smoke with all 4
+> **STATUS (end of Session 43, 2026-04-26): full PPO smoke with all 4
 > opponent routes (self-play, in-process mcts, FP subprocess, MM subprocess)
-> in the PFSP pool completes a clean iter end-to-end. 9 protocol bugs
-> found and fixed.**
+> in the PFSP pool completes a clean iter end-to-end. 12 bugs found and
+> fixed across S42-S43; bugs 1-10 are protocol-level (battle_server.js
+> wire format, FP/MM serve scripts, poke-env quirks), bug 11 is the
+> trainer-side forfeit-finish filter, bug 12 is subprocess-restart queue
+> resilience. Two known bugs remain DEFERRED at 4-slot ceiling — see
+> docs/NEXT_SESSION.md "Known unfixed bugs" table.**
 >
 > | Path | Adapter | Single-battle | Multi-battle | In real PPO iter |
 > |---|---|---|---|---|
@@ -136,6 +140,50 @@
 >     `pendingChallenges` for entries targeting this user and emit |pm|
 >     directly. Same idempotent pattern as cleanupBattle's resend.
 >     Required for ANY wave parallelism > 4 (and helpful even at 4-slot).
+>
+> 11. **Trainer-side forfeit-finish filter** (Session 43, training
+>     correctness). Symptom: any abrupt termination — subprocess WS drop,
+>     in-process poke-engine `PanicException`, network blip — caused our
+>     local battle_server to emit `|win|<RL_user>` while the opponent's
+>     team was still mostly alive. poke-env flipped `battle.won = True`,
+>     `_battle_finished_callback` added a spurious +1 terminal to a 1-3
+>     turn trajectory, that trajectory entered the PPO buffer, and the
+>     spurious win counted toward the opponent's PFSP cumulative win rate
+>     (dragging its `(1-wr)²` weight below the YAML target across iters).
+>     Fix: `V9RLPlayer._finish_looks_real` requires `opp_fainted >=
+>     team_size` OR `my_fainted >= team_size` OR a self-initiated turn-cap
+>     forfeit before treating the finish as real. Forfeit finishes drop
+>     the trajectory and increment `n_forfeit_wins/losses`;
+>     `rl_collection._play_one_opponent` subtracts those from the W/L
+>     counts that drive PFSP `opp_records` and the iter summary. The iter
+>     line surfaces forfeits as `<opp>=<W>/<G>[+Nfft]`. Generic — covers
+>     ANY abrupt termination including ones we haven't root-caused yet.
+>     11 unit tests in `test_forfeit_filter.py` cover real OU wins/losses,
+>     FP-style forfeit-wins, ties, turn-cap self-forfeit, 4-mon format
+>     edge cases, empty teams, and broken-battle introspection errors.
+>
+> 12. **Subprocess restart queue resilience** (Session 43, throughput
+>     protection). Symptom: when an FP/MM subprocess crashed mid-iter,
+>     `ExternalOpponentManager` auto-restarted it but the new instance ran
+>     `QueueTeambuilder(clean_on_init=True)` and wiped any teams the
+>     trainer had pre-enqueued for the rest of the iter. The restarted
+>     subprocess then sat idle on `yield_team()` while the trainer's
+>     `wait_for` ticked toward its 5-min timeout, killing throughput.
+>     Fix: `foul_play_accept_serve.py` and `metamon_accept_serve.py` now
+>     accept a `--clean-on-init` flag (default `true`); the manager's
+>     `_spawn` strips any prior value from the cmdline and appends
+>     `--clean-on-init false` only when `n_restarts > 0`. First start
+>     still wipes stale `.team` files (defensive against prior-run
+>     leftovers); respawn preserves the in-flight queue so the new
+>     subprocess immediately picks up the next team. 5 dry-run cmd-rewrite
+>     scenarios validated (first start, respawn, cmdline dedup, MM, non-
+>     FP/MM scripts unchanged).
+>
+> **Bonus (Session 43):** `ExternalOpponentManager._monitor_loop` now
+> dumps the last 30 lines of the dying subprocess's log alongside the
+> exit warning. Pure additive logging — no behavior change. Gives a free
+> forensic trail if/when the not-yet-root-caused FP `ConnectionClosedError`
+> at 6+ slots actually fires during a long run.
 >
 > **One Windows-specific Metamon gotcha:** `_factory_metamon` in
 > `external_adapters.py` now sets `TORCHDYNAMO_DISABLE=1` automatically on
