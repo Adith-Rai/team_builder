@@ -16,8 +16,42 @@ Supporting documents:
 
 ## Session 43 status (READ THIS FIRST)
 
-**The training pipeline is production-ready at 4-slot wave parallelism.** Two
-defenses were added on top of S42's validated full-pool config:
+**100-iter PPO training run completed end-to-end; final checkpoint
+`snapshot_0114.pt` available.** Run trajectory was rocky (three relaunches
+because of bugs we surfaced in production) but the final 60-iter post-
+resume span ran to completion with zero subprocess crashes.
+
+### Key training run results
+
+Final run dir: `data/models/rl_v9_full_pool/selfplay_v9_20260428_030636/`
+- Started: `--resume sp_0054.pt --lr 3e-5 --ent-coef 0.01 --warmup-iters 0`
+- 60 iters complete (iter 55 → 114), final iter WR 55%
+- Three EVAL points: smart_avg 58 → 60 → 59 (regressed from sp_0229's 64% baseline)
+- Per-opponent class trends (early → late):
+  - **FP group: 7% → 14% (+7pt, doubled WR)** — real anti-search learning
+  - **MM-SmallRL: 53% → 68% (+14pt)** against peer-size 13.9M-param model
+  - **MM-Minikazam: 21% → 23%** (almost no movement, sample-starved)
+  - **vs sp_0229 (init): 42 → 53 → 44%** (peaked mid, did NOT durably exceed)
+  - **mcts-fast: 51% → 47%** (slight decline)
+- **Specialization regression on bot-eval**: lost ~5pt smart_avg vs sp_0229
+- **Real gain on MCTS-search-style opponents (FP)**: doubled WR
+
+### The trade-off this run revealed
+
+**Different metrics tell different stories.** sp_0229 is still strongest by
+smart_avg (64%). snapshot_0114 is likely stronger on the **PokeAgent live
+ladder** (where MCTS bots like Foul Play are common opponents) because of
+the FP/MCTS-anti-search learning. The smart_avg eval bots don't use search,
+so our anti-search learning doesn't show in that metric.
+
+**Honest verdict**: this isn't a "PPO didn't work" run, it's a "we trained
+for a different skill set than the eval measures" run. Real Elo gain
+(public ladder, head-to-head vs peers) should be measured directly, not
+inferred from smart_avg.
+
+### Bug fixes committed this session (validated end-to-end)
+
+Five S43 bugs surfaced + fixed in production:
 
 1. **Forfeit-finish filter (Layer 1, training correctness).** When any
    opponent — subprocess WS drop, in-process poke-engine panic, network
@@ -58,22 +92,72 @@ foulplay-100ms=0/2 metamon-minikazam=0/2 pool=4`. Zero `[FORFEIT]`, zero
 `queue clean_on_init=True` on first start (correct default). Layer 1 + 2
 are ship-ready.
 
+4. **MM cascade fix — three coordinated changes.** S43 attempt 3 in
+   production hit a different cascade pattern: MMs sat idle (correctly
+   under-sampled by PFSP after we mastered them) for >1 hour, hit
+   `_INIT_RETRIES * _TIME_BETWEEN_RETRIES` timeout, raised `RuntimeError`
+   inside amago's `evaluate_test`, but amago swallowed the exception
+   leaving the process alive-but-silent. Manager's `Popen.poll()` returned
+   None forever — never detected the dead MM. Three changes fix this:
+   (a) `_INIT_RETRIES = 7200 → 86400` (12-hour idle tolerance) in
+   `metamon_accept_serve.py`'s `AcceptChallengesOnLocal` class.
+   (b) Heartbeat threads in both FP and MM serve scripts (1-min
+   interval, daemon) print `[heartbeat HH:MM:SS]` regardless of main-loop
+   state, keeping log mtime fresh whenever scheduler is alive. Eliminates
+   false-positive ZOMBIE flags on legitimate idle.
+   (c) Manager's `_LIVENESS_MTIME_THRESHOLD_S = 5400 → 600` (90 min →
+   10 min). With heartbeats keeping logs fresh, ZOMBIE check can be
+   tighter; only fires on truly hung processes.
+   Validated: zero subprocess crashes across the 60-iter post-resume
+   training span.
+
+5. **Pool-curation hazard documented** — when `--resume` runs, the
+   trainer's default snapshot-pool scan re-discovers every snapshot
+   under `data/models/rl_v9/*` (not just current run + YAML opponents).
+   Old runs' mid-training snapshots dilute the configured external-
+   opponent emphasis AND introduce architecture-mismatch artifacts
+   (13.38M → 14.28M).  In our run, the resume jumped pool 18→33,
+   bringing in 25+ historic snapshots. This caused per-iter wr to LOOK
+   like it improved (more easy self-play in the mix) while smart_avg
+   regressed 6pts (specialization to the dirty pool). The fix for next
+   run: physically move old run dirs out (`mv data/models/rl_v9/selfplay_v9_2026[0-3]*
+   data/models/_archived_old_runs/`) before `--resume`, OR use
+   `--init-from` and explicitly --warmup-iters 10. Pool curation should
+   be a first-class hyperparameter.
+
 ### TL;DR for next session
 
-**Ship the long PPO run with the validated full-pool YAML.** Use the
-production runbook below — it's been updated to include `--pipeline` (the
-default for production, saves ~60s/iter via overlap) and a hardened pre-
-flight cleanup. Extrapolating from the 5-iter smoke (~125s/iter at 18
-games), 200 games/iter ≈ ~24 min/iter, 100 iters ≈ ~40 hr. Layer 1+2
-defenses mean any rare crash event drops the spurious data instead of
-poisoning the gradient.
+The S43 production run is **DONE**. Three useful checkpoints to choose from:
 
-After the long run completes:
-1. **Incremental Elo** on the 6-snapshot "Useful" set (~2.5 hr) to settle
-   whether the smart_avg-64% peak translated to real Elo gain past
-   sp2979's 1058 ceiling.
-2. **Cloud architecture planning** — the real ~10× throughput lever, not
-   any local optimization. See `docs/CLOUD_DEPLOY.md`.
+| Checkpoint | Strength | When to prefer |
+|---|---|---|
+| `sp_0229` | smart_avg 64%, project peak | bot-eval scenarios, strong heuristic opponents |
+| `snapshot_0114` (this run final) | FP wr 14% (+7pt), MM-SmallRL 68% (+14pt) | live ladder vs MCTS-style opponents |
+| `snapshot_0099` | mid-run, partial gains | balanced fallback if 0114 has issues |
+
+**Highest-leverage next steps** (priority order):
+
+1. **Submit `snapshot_0114` and `sp_0229` to PokeAgent ladder** in parallel
+   to get the cleanest comparison. They optimize for different opponent
+   types; the ladder will tell us which actually scores higher in real
+   competitive play. Cost: ~2 hr per submission, no compute. Returns:
+   the answer to "which checkpoint is genuinely stronger?"
+
+2. **Curated-pool restart** if continuing PPO. From `sp_0229` (or
+   `snapshot_0114`) with **`mv data/models/rl_v9/selfplay_v9_2026[0-3]*
+   data/models/_archived_old_runs/`** beforehand to prevent the dirty-pool
+   regression. Apply S43's bug fixes are already in place; just need
+   pool curation. Expected outcome: smart_avg recovery to 60-65 + retain
+   the FP gains, IF the curated pool gives gradient signal we don't get
+   from the dirty one.
+
+3. **Architectural levers** (from prior sessions, untouched):
+   - Capacity reshape further toward Metamon's 5-8:1 temporal:spatial ratio
+   - BC scaling (multi-gen data, larger model)
+   - Search at inference (MCTS on top of NN)
+
+4. **Cloud deployment** — separate project. Multi-node battle_servers gives
+   true 10× throughput, not the 1.3-2× local-only optimizations.
 
 ### Known unfixed bugs (deferred — DO NOT FORGET)
 
