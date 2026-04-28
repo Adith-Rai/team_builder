@@ -259,15 +259,68 @@ class ExternalOpponentManager:
         except OSError:
             return "(log unreadable)"
 
+    # If a subprocess's log file hasn't been touched in this many seconds AND
+    # `Popen.poll()` still returns None (process technically alive), treat it
+    # as a zombie and force-kill+respawn. Threshold needs to be longer than the
+    # longest legitimate quiet window (= QueueTeambuilder's --queue-wait-timeout-s
+    # of 14400s = 4 hours, after which the subprocess SHOULD raise+exit on its
+    # own). In S43 production, MMs idled out and amago's env loop swallowed the
+    # RuntimeError, leaving Popen.poll() == None forever — manager never
+    # respawned. Log-mtime catches that case: even a healthy idle FP/MM prints
+    # *some* line per iter (the "iter N — waiting for team" line), so a stale
+    # mtime past this threshold is a strong dead-zombie signal.
+    _LIVENESS_MTIME_THRESHOLD_S = 5400.0  # 90 min
+
+    def _is_zombie(self, opp: ExternalOpponent) -> bool:
+        """True iff Popen says alive but log mtime says dead."""
+        if opp.proc is None or opp.proc.poll() is not None:
+            return False  # not alive, regular exit-detection path handles it
+        if not opp.log_file:
+            return False  # no log file — can't check mtime
+        log_path = self._resolve_path(opp.log_file)
+        if not log_path or not log_path.exists():
+            return False
+        try:
+            stale_s = time.time() - log_path.stat().st_mtime
+        except OSError:
+            return False
+        # Also require the subprocess to have been up for at least the threshold;
+        # otherwise an old log file from a prior run masquerades as stale.
+        if (time.time() - opp.started_at) < self._LIVENESS_MTIME_THRESHOLD_S:
+            return False
+        return stale_s > self._LIVENESS_MTIME_THRESHOLD_S
+
     def _monitor_loop(self):
-        """Background thread: detect exited processes and restart if configured."""
+        """Background thread: detect exited (or zombie) processes and restart."""
         while not self._stop_event.is_set():
             for opp in self.opponents:
                 if opp.proc is None:
                     continue
                 rc = opp.proc.poll()
                 if rc is None:
-                    continue  # still running
+                    # Process technically alive — but is it actually doing work?
+                    # Layered check for the S43 zombie pattern (amago swallowed
+                    # the QueueTeambuilder RuntimeError, MM stayed alive but
+                    # silent, manager never detected).
+                    if self._is_zombie(opp):
+                        log_path = self._resolve_path(opp.log_file) if opp.log_file else None
+                        try:
+                            stale_min = (time.time() - log_path.stat().st_mtime) / 60 if log_path else -1
+                        except OSError:
+                            stale_min = -1
+                        logger.warning(
+                            f"{opp.name} ZOMBIE detected (Popen alive but log "
+                            f"stale {stale_min:.0f} min). Killing + respawning."
+                        )
+                        try:
+                            opp.proc.kill()
+                            opp.proc.wait(timeout=10)
+                        except Exception as e:
+                            logger.warning(f"  (kill failed: {e})")
+                        rc = opp.proc.returncode if opp.proc else -1
+                        # Fall through to the exit-handling block below.
+                    else:
+                        continue  # still running normally
                 uptime = time.time() - opp.started_at
                 # Log the exit AND a tail of the subprocess log. Without the
                 # tail, post-mortem requires grepping a giant rolling log; with

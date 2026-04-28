@@ -168,10 +168,13 @@ def main():
                    help="Coordinator-controlled directory we pop packed Showdown teams from "
                         "(one per battle). The main project's rl_collection.py writes one "
                         "procedural Smogon team per upcoming challenge.")
-    p.add_argument("--queue-wait-timeout-s", type=float, default=3600.0,
-                   help="Seconds to wait for a team file before crashing. Default 1 hour "
-                        "to absorb idle gaps between PFSP waves; manager restarts the "
-                        "subprocess if this fires.")
+    p.add_argument("--queue-wait-timeout-s", type=float, default=14400.0,
+                   help="Seconds to wait for a team file before crashing. Default 4 hours "
+                        "(was 1 hour). Bumped after S43 production hit a 79-min iter that "
+                        "left FP idle for 70+ min, blowing past the 1-hour limit and "
+                        "cascading 4-FP simultaneous crashes mid-iter. The manager's "
+                        "log-mtime liveness check (added same session) now catches truly "
+                        "hung subprocesses, so this can safely be longer.")
     p.add_argument("--clean-on-init", default="true",
                    help="Whether QueueTeambuilder wipes stale .team files on startup. "
                         "Default true. ExternalOpponentManager overrides to false on "

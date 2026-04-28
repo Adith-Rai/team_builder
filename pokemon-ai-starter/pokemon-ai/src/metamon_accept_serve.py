@@ -250,9 +250,13 @@ def main():
                    help="Override default checkpoint epoch")
     p.add_argument("--opponent-username", default=None,
                    help="If set, only accept challenges from this user (default: anyone)")
-    p.add_argument("--queue-wait-timeout-s", type=float, default=3600.0,
-                   help="Seconds QueueTeambuilder waits for a team before crashing "
-                        "(default 1 hour, used only when --team-queue is set).")
+    p.add_argument("--queue-wait-timeout-s", type=float, default=14400.0,
+                   help="Seconds QueueTeambuilder waits for a team before crashing. "
+                        "Default 4 hours (was 1 hour). Bumped after S43 production hit "
+                        "iter-times of 79 min from FP cascading restart, leaving MMs idle "
+                        "long enough to crash. Manager's log-mtime liveness check (added "
+                        "same session) catches truly hung subprocesses on a tighter "
+                        "schedule, so this longer fallback is safe.")
     p.add_argument("--clean-on-init", default="true",
                    help="Whether QueueTeambuilder wipes stale .team files on startup. "
                         "Default true. ExternalOpponentManager overrides to false on "
@@ -317,12 +321,31 @@ def main():
     ]
 
     print(f"[metamon] starting evaluate_test for {args.num_battles} battles", flush=True)
-    results = agent.evaluate_test(
-        make_envs,
-        timesteps=args.num_battles * 350,
-        episodes=args.num_battles,
-    )
-    print(f"[metamon] done. results: {results}", flush=True)
+    # Wrap evaluate_test so QueueTeambuilder timeouts (or any other unhandled
+    # exception inside amago's env loop) force a clean process exit with a
+    # non-zero rc. Without this, amago's evaluate_test sometimes catches/logs
+    # the exception but leaves the process alive — so ExternalOpponentManager's
+    # Popen.poll() returns None forever and the trainer hangs waiting for the
+    # zombie. Observed in S43 production: all 4 MMs zombied after 1-hour
+    # QueueTeambuilder timeouts; manager never detected. The explicit sys.exit
+    # here makes the error path observable and respawnable.
+    import sys
+    import traceback
+    try:
+        results = agent.evaluate_test(
+            make_envs,
+            timesteps=args.num_battles * 350,
+            episodes=args.num_battles,
+        )
+        print(f"[metamon] done. results: {results}", flush=True)
+    except RuntimeError as e:
+        print(f"[metamon] FATAL: RuntimeError during evaluate_test: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception:
+        print(f"[metamon] FATAL: unhandled exception during evaluate_test", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
