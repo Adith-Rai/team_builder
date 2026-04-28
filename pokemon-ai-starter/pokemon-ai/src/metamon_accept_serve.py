@@ -86,15 +86,18 @@ class AcceptChallengesOnLocal(QueueOnLocalLadder):
     """
 
     # poke-env's `OpenAIGymEnv.reset` polls `agent.current_battle` up to
-    # `_INIT_RETRIES * _TIME_BETWEEN_RETRIES` seconds (default 100*0.5=50s)
-    # before raising `RuntimeError("Agent is not challenging")`. amago's
-    # `evaluate_test` calls reset() right after every battle ends, expecting
-    # the next battle to already be in flight. In our PPO loop, PFSP can
-    # leave Metamon idle for several minutes between waves while the
-    # trainer plays self-play / Foul Play. Bump to ~1 hour total wait so MM
-    # sits patiently across PFSP gaps. Inherited via MRO; openai_api uses
-    # `self._INIT_RETRIES`, so our override wins.
-    _INIT_RETRIES = 7200          # × _TIME_BETWEEN_RETRIES = 60 minutes
+    # `_INIT_RETRIES * _TIME_BETWEEN_RETRIES` seconds before raising
+    # `RuntimeError("Agent is not challenging")`. amago's `evaluate_test`
+    # calls reset() between every battle, expecting the next to be in flight.
+    # In our PPO loop, PFSP correctly under-samples MMs we've mastered (e.g.
+    # mm-smallil at ~1% sample rate when we beat it 76%) — those legitimately
+    # sit idle for HOURS between samples. Bumped to ~12 hours so an MM at
+    # the lowest realistic sample rate doesn't false-crash from idle. Bug
+    # observed S43 attempt 3: at 1 hr (7200) MMs cascaded restarts
+    # repeatedly, each respawn just sat idle until next 1-hr crash. The
+    # heartbeat thread + 10-min mtime-based ZOMBIE check in the manager
+    # provide tight liveness detection so the long timeout here is safe.
+    _INIT_RETRIES = 86400         # × _TIME_BETWEEN_RETRIES = 12 hours
     _TIME_BETWEEN_RETRIES = 0.5
 
     def __init__(
@@ -219,7 +222,36 @@ def make_accept_env(
     return PSLadderAMAGOWrapper(menv)
 
 
+def _start_heartbeat_thread():
+    """Daemon thread that prints a [heartbeat] line every 60s.
+
+    Keeps the subprocess log file's mtime fresh whenever the process is
+    actually running, regardless of whether it's playing battles or sitting
+    idle waiting for PFSP to sample it. Without this, a legitimately idle
+    MM (low PFSP weight after we master it) would falsely trip the manager's
+    log-mtime ZOMBIE check. With this, ZOMBIE only fires on TRULY hung
+    processes that aren't even running their scheduler — much faster + more
+    accurate detection (10 min threshold instead of 90).
+    """
+    import threading
+    import time as _time
+
+    def _hb():
+        while True:
+            try:
+                _time.sleep(60)
+                print(f"[heartbeat {_time.strftime('%H:%M:%S')}]", flush=True)
+            except Exception:
+                # Daemon should never die; absorb any error and keep going.
+                pass
+
+    t = threading.Thread(target=_hb, daemon=True, name="metamon-heartbeat")
+    t.start()
+
+
 def main():
+    _start_heartbeat_thread()
+
     # Enable poke-env DEBUG so we see challenge receipt + accept dispatch in the log
     if os.environ.get("METAMON_DEBUG_POKEENV"):
         logging.basicConfig(

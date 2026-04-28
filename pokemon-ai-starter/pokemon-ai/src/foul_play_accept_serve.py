@@ -151,7 +151,33 @@ async def run_loop(args):
     await ws_client.close()
 
 
+def _start_heartbeat_thread():
+    """Daemon thread that prints a [heartbeat] line every 60s.
+
+    Keeps the subprocess log file's mtime fresh whenever the process is
+    actually running. Without this, FP idling 60+ min on yield_team()
+    (because PFSP didn't sample it for many iters in a row) would falsely
+    trip the manager's log-mtime ZOMBIE check. With this, ZOMBIE only
+    fires on truly hung processes — faster + more accurate detection.
+    """
+    import threading
+    import time as _time
+
+    def _hb():
+        while True:
+            try:
+                _time.sleep(60)
+                print(f"[heartbeat {_time.strftime('%H:%M:%S')}]", flush=True)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_hb, daemon=True, name="foulplay-heartbeat")
+    t.start()
+
+
 def main():
+    _start_heartbeat_thread()
+
     p = argparse.ArgumentParser(description="Foul Play accept-challenges subprocess")
     p.add_argument("--username", required=True, help="Showdown username (e.g. FoulPlayBot)")
     p.add_argument("--password", default=None, help="Optional password (local server: leave unset)")

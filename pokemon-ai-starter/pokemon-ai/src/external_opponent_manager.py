@@ -261,15 +261,20 @@ class ExternalOpponentManager:
 
     # If a subprocess's log file hasn't been touched in this many seconds AND
     # `Popen.poll()` still returns None (process technically alive), treat it
-    # as a zombie and force-kill+respawn. Threshold needs to be longer than the
-    # longest legitimate quiet window (= QueueTeambuilder's --queue-wait-timeout-s
-    # of 14400s = 4 hours, after which the subprocess SHOULD raise+exit on its
-    # own). In S43 production, MMs idled out and amago's env loop swallowed the
-    # RuntimeError, leaving Popen.poll() == None forever — manager never
-    # respawned. Log-mtime catches that case: even a healthy idle FP/MM prints
-    # *some* line per iter (the "iter N — waiting for team" line), so a stale
-    # mtime past this threshold is a strong dead-zombie signal.
-    _LIVENESS_MTIME_THRESHOLD_S = 5400.0  # 90 min
+    # as a zombie and force-kill+respawn. Designed in concert with the heartbeat
+    # threads in foul_play_accept_serve.py and metamon_accept_serve.py: a healthy
+    # subprocess prints a `[heartbeat HH:MM:SS]` line every 60s regardless of
+    # what its main loop is doing, so log mtime stays fresh whenever the process
+    # is actually running. This means a stale mtime past this threshold is a
+    # very strong "the process scheduler isn't running" signal — much more
+    # specific than the prior 90-min "I haven't been sampled in a while" check
+    # which falsely tripped on legitimately-idle MMs (PFSP correctly under-
+    # samples mastered opponents — see S43 attempt 3 cascade).
+    #
+    # 10 min is generous enough to absorb a slow heartbeat (e.g. heavy PPO
+    # update on the trainer side temporarily starving subprocess scheduling)
+    # but tight enough to catch true hangs quickly.
+    _LIVENESS_MTIME_THRESHOLD_S = 600.0  # 10 min
 
     def _is_zombie(self, opp: ExternalOpponent) -> bool:
         """True iff Popen says alive but log mtime says dead."""
