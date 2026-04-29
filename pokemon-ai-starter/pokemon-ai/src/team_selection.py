@@ -127,10 +127,23 @@ def main():
                         help="Games per team per bot (default 50, total = 70*4*50 = 14000)")
     parser.add_argument("--out-json", default="team_selection_results.json",
                         help="Output JSON path")
+    parser.add_argument("--teams", nargs="+", default=None,
+                        help="Specific team names to evaluate (default: all 70 from "
+                             "teams_ou.TEAMS). Use this to compare a new checkpoint "
+                             "against a known top-N from a prior full scan instead of "
+                             "redoing all 70. Example: --teams TEAM_AU TEAM_T TEAM_G "
+                             "TEAM_B TEAM_C  (the top 5 from S36's sp_2979 scan).")
     args = parser.parse_args()
 
     servers = [make_server(s.strip()) for s in args.servers.split(",")]
     team_names = list_teams()
+    if args.teams:
+        invalid = [t for t in args.teams if t not in team_names]
+        if invalid:
+            raise SystemExit(f"--teams: unknown team name(s): {invalid}. "
+                             f"Valid names are TEAM_A through TEAM_BR.")
+        team_names = list(args.teams)
+        print(f"Filtering to {len(team_names)} requested teams: {team_names}", flush=True)
 
     # Load checkpoint ONCE (avoids VRAM leak from repeated loads)
     print(f"Loading checkpoint once: {args.checkpoint}", flush=True)
