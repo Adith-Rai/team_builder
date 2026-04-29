@@ -131,25 +131,46 @@ The S43 production run is **DONE**. Three useful checkpoints to choose from:
 
 | Checkpoint | Strength | When to prefer |
 |---|---|---|
-| `sp_0229` | smart_avg 64%, project peak | bot-eval scenarios, strong heuristic opponents |
-| `snapshot_0114` (this run final) | FP wr 14% (+7pt), MM-SmallRL 68% (+14pt) | live ladder vs MCTS-style opponents |
+| `sp_0229` | smart_avg 64%, project peak (TEAM_AX 81.5%) | bot-eval scenarios, strong heuristic opponents, **best confirmed by full 70-team scan** |
+| `snapshot_0114` (this run final) | FP wr 14% (+7pt), MM-SmallRL 68% (+14pt), TEAM_AK 80.0% | live ladder vs MCTS-style opponents |
 | `snapshot_0099` | mid-run, partial gains | balanced fallback if 0114 has issues |
+
+### Full 70-team scan results (S43 retrospective, 2026-04-29)
+
+`team_selection.py` was run on all three checkpoints. Architecture-specific
+team preferences are dramatic:
+
+```
+                sp_2979 peak    sp_0229 peak    sp_0114 peak
+                TEAM_AU 78.5%   TEAM_AX 81.5%   TEAM_AK 80.0%
+                                ★ NEW PROJECT
+                                  PEAK
+```
+
+Top-5 mean savg: sp_0229=77.5%, sp_0114=76.6%, sp_2979=74.3%. **Both new-arch
+checkpoints converge on TEAM_AX, TEAM_P, TEAM_AK, TEAM_G as their preferred
+teams.** sp_2979's TEAM_AU dropped from 78.5% (its #1) → 59.0% on sp_0229
+(rank #9, -19.5pt) — confirming team selection is architecture-specific
+and old top-10 was filtered through sp_2979's preferences.
+
+Result files:
+- `data/eval/team_sel_sp_0229_full70.json` — sp_0229 full 70-team
+- `data/eval/team_sel_sp_0114_full70.json` — sp_0114 full 70-team
+- `team_selection_results.json` (project root) — sp_2979 full 70-team (S36)
 
 **Highest-leverage next steps** (priority order):
 
-1. **Submit `snapshot_0114` and `sp_0229` to PokeAgent ladder** in parallel
-   to get the cleanest comparison. They optimize for different opponent
-   types; the ladder will tell us which actually scores higher in real
-   competitive play. Cost: ~2 hr per submission, no compute. Returns:
-   the answer to "which checkpoint is genuinely stronger?"
+1. **PokeAgent ladder submissions IN PROGRESS** (S43-end, 2026-04-29):
+   - `pokeBot_rescale` running `sp_0229 + TEAM_AX` (500 games, ~17 hr)
+   - `pokeBot_newopp` running `sp_0114 + TEAM_AK` (500 games, ~17 hr)
+   - Both use the same account password (verified — agents share account creds)
+   - Compare to S36 baseline: `sp_2979 + TEAM_T` at SR 1444 (rank #12)
+   - Expected: sp_0229+TEAM_AX SR ~1470-1490 if smart_avg→Elo correlation holds
 
-2. **Curated-pool restart** if continuing PPO. From `sp_0229` (or
-   `snapshot_0114`) with **`mv data/models/rl_v9/selfplay_v9_2026[0-3]*
-   data/models/_archived_old_runs/`** beforehand to prevent the dirty-pool
-   regression. Apply S43's bug fixes are already in place; just need
-   pool curation. Expected outcome: smart_avg recovery to 60-65 + retain
-   the FP gains, IF the curated pool gives gradient signal we don't get
-   from the dirty one.
+2. **Curated-pool training restart** (READY TO LAUNCH after ladder finishes):
+   See "Curated-pool restart from sp_0229" section below for the validated
+   recipe. Avoids the S43 dirty-pool regression (where 30+ self-play
+   snapshots drowned out FP/MM signal, costing 5pt smart_avg).
 
 3. **Architectural levers** (from prior sessions, untouched):
    - Capacity reshape further toward Metamon's 5-8:1 temporal:spatial ratio
@@ -158,6 +179,96 @@ The S43 production run is **DONE**. Three useful checkpoints to choose from:
 
 4. **Cloud deployment** — separate project. Multi-node battle_servers gives
    true 10× throughput, not the 1.3-2× local-only optimizations.
+
+### Curated-pool restart from sp_0229 (recipe — RUN AFTER LADDER FINISHES)
+
+Goal: train sp_0229 against an externally-dominant pool to actually beat
+sp_0229's own peak by FP/MM head-to-head, without the S43 dirty-pool
+specialization regression that hurt smart_avg.
+
+**Pre-flight (must run BEFORE training launch — never with ladder running, GPU/CPU contention):**
+
+```bash
+# 1. Wait for ladder runs to fully exit
+powershell.exe -Command "Get-Process python -EA SilentlyContinue"
+# Should show 0 processes. If pokeBot_rescale/newopp still running, let them finish.
+
+# 2. Move pre-peak old run snapshot dirs out of the trainer's auto-discovery path
+cd C:/Users/raiad/OneDrive/Desktop/team_builder
+mkdir -p data/models/_archived_pre_peak
+mv pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260331_* data/models/_archived_pre_peak/ 2>/dev/null || true
+mv pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260402_* data/models/_archived_pre_peak/ 2>/dev/null || true
+mv pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260408_* data/models/_archived_pre_peak/ 2>/dev/null || true
+mv pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260410_* data/models/_archived_pre_peak/ 2>/dev/null || true
+
+# Move S43 prior run dir aside too (don't want sp_0114 / sp_0054 era snapshots
+# in the new pool — they're the destination not the start)
+mv pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9_full_pool data/models/_archived_pre_peak/ 2>/dev/null || true
+
+# 3. KEEP these (peak-era and current init):
+#    pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260413_061236  (sp_2979 era)
+#    pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260411_115905  (sp_2299 era)
+#    pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/selfplay_v9_20260425_062416  (sp_0229 init)
+
+# 4. Verify what'll be auto-discovered
+ls pokemon-ai-starter/pokemon-ai/src/data/models/rl_v9/
+
+# 5. Clean any external_team_queue stragglers
+rm -rf data/external_team_queue/*
+
+# 6. Confirm full curated YAML exists
+ls pokemon-ai-starter/pokemon-ai/src/external_adapters_curated.yaml
+```
+
+**Terminal 1 — battle_server:**
+
+```bash
+C:/Users/raiad/OneDrive/Desktop/team_builder/tools/node-v20.18.1-win-x64/node.exe \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  --port 9000 \
+  2>&1 | tee /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/battle_server_curated.log
+```
+
+**Terminal 2 — curated-pool training:**
+
+```bash
+cd /c/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+python -u train_rl.py \
+  --init-from data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt \
+  --device cuda --servers 9000,9000,9000,9000 --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 6 --n-iters 100 \
+  --warmup-iters 12 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.01 --grad-accum 1 \
+  --adaptive-entropy --early-stop --win-rate-mode ema \
+  --adaptive-entropy-min 0.003 \
+  --eval-interval 20 \
+  --out-dir data/models/rl_v9_curated_pool \
+  --procedural-teams /c/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --external-adapters external_adapters_curated.yaml \
+  2>&1 | tee /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training_curated.log
+```
+
+**Why each delta from S43's full-pool run:**
+
+| Param | Old | New | Why |
+|---|---|---|---|
+| `--external-adapters` | `external_adapters_full_pool.yaml` (MM=0.25 each) | `external_adapters_curated.yaml` (MM=0.5 each, FP=0.4) | Boost MM exposure; PFSP under-sampled mastered MMs in S43 |
+| `--warmup-iters` | 5 (S43 first attempt), 0 (S43 resumed) | **12** | New pool composition + new MM emphasis = bigger value-head recalibration window. Bumped from 10 → 12 since smaller pool = higher per-opp gradient variance early. |
+| `--init-from` | sp_0229 (S43) | sp_0229 (same) | Confirmed best baseline by 70-team scan; new arch peaks here. |
+| `--lr` | (default 3e-5 since S43 commit) | (still default 3e-5) | Validated. |
+| Pool composition | 9 externals + 30+ auto-discovered self-play | 9 externals + ~5 peak-era self-play (curated via mv) | Stop the dirty-pool dilution that hurt S43's smart_avg. |
+| `--out-dir` | `rl_v9_full_pool` | `rl_v9_curated_pool` | Isolate experiment. |
+
+**Validation step before letting it run for 30+ hr:**
+
+After kicking off the long run, verify iter 0 looks healthy:
+- Per-iter line shows MM samples for at least 2 of 4 MMs (vs S43's 0.8/iter average)
+- `pool=` count is in the ~13-16 range (curated, not 30+)
+- Heartbeats firing on all subprocesses (no ZOMBIE detection)
+- `[WARMUP]` marker on iter 0 (confirms warmup mode)
+
+If iter 0 looks wrong (e.g. pool > 20, or no MMs sampled), kill and re-investigate
+the pre-flight cleanup. Don't let a misconfigured run consume 30 hours.
 
 ### Known unfixed bugs (deferred — DO NOT FORGET)
 
