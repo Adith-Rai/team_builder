@@ -467,6 +467,102 @@ exists but is not the deliverable (smart_avg regressed). The attempt-11 resumed
 run picks up from `selfplay_v9_20260430_201427/snapshot_0024.pt`, which on
 Metamon competitive scored within noise of sp_0229.
 
+### KNOWN WEAK POINT: per-update batch size (`--games-per-iter`)
+
+**This deserves explicit attention from any future session.**
+
+Our `--games-per-iter 200` setting is **likely the single biggest lever we
+haven't pulled** for self-play stability. Quick comparison:
+
+| System | Trajectories per update | Env steps per update |
+|---|---|---|
+| Us (current) | 200 | ~6,000 |
+| Us at 400 (compromise) | 400 | ~12,000 |
+| Us at 1000 (cloud-scale) | 1,000 | ~30,000 |
+| OpenAI Five | — | ~131,000 |
+| AlphaStar | — | similarly large |
+| Metamon (offline RL) | replay buffer 16M+ | not directly comparable |
+
+**Why it matters: gradient variance scales as 1/√N.** Going 200→1000 reduces
+per-update gradient noise by ~55% (factor of √5 ≈ 2.2×). All published
+self-play systems use 10-100× our per-update batch size *specifically* for
+stability — high gradient variance is a known cycling driver.
+
+**Concrete symptoms of under-sampling we've observed:**
+
+- Smart_avg variance at 200×4 games is ±3.6pt (measured: sp_0229 vs
+  sp_warmup_0009 swing). This is the *eval-time* echo of the *train-time*
+  variance issue.
+- Per-opp W/L in iter line has only ~14 games per opp → ±13% std error.
+  Can't reliably distinguish cycling (sustained <50% vs past selves) from
+  noise without averaging many iters of data.
+- Attempts 9 and 10's "smart_avg regression" was probably 50-70%
+  measurement noise, not real policy drift — but we couldn't tell from
+  inside the run because per-iter sample size is too small to detect
+  small-but-real signals.
+
+**The cost-benefit at fixed wall-clock budget:**
+
+| Choice | Iters in 24 hr | Total games | Per-update sharpness | Per-iter sharpness |
+|---|---|---|---|---|
+| 200/iter @ ~7 min | ~200 | 40k | low | low |
+| 400/iter @ ~14 min | ~100 | 40k | medium | better |
+| 1000/iter @ ~35 min | ~40 | 40k | high | best |
+
+**Same total games, different distribution.** With 200/iter we get many
+small noisy updates; with 1000/iter we get fewer, sharper updates. The
+literature (Metamon S6.4, OAI Five paper, AlphaStar) is clear that **fewer-sharper
+beats many-noisier** at this scale. We've been doing many-noisier.
+
+**Recommended next-session experiments (in order):**
+
+1. **First: let the current attempt-11 run finish.** 200 iters at 200 games
+   = 40k total games, comparable budget to the recommended alternatives.
+   We'll know after this whether cycling persists at the new pool config.
+2. **If cycling persists**: launch attempt-12 at `--games-per-iter 400`
+   from the resumed-run's best snapshot. 2× wall-clock per iter, ~½ the
+   gradient variance, sharper per-opp signal.
+3. **If 400 still cycles or smart_avg flat**: this is the trigger to
+   evaluate moving to cloud (per CLOUD_DEPLOY.md). Local RTX 3060 Laptop
+   6 GB is the wrong compute regime for 1000+/iter experiments.
+
+**Why we haven't already pulled this lever**: every prior PPO run inherited
+`--games-per-iter 200` from the v8/v9 lineage as a wall-clock-friendly
+choice when each iter took 15-30 minutes anyway (FPs in pool). With the
+Phase 1 pool (no FPs) we run at ~7 min/iter, so we *could* afford bigger
+batches and we've just been carrying forward the historical default. **It's
+a config inertia issue, not a deliberate choice.**
+
+**Honest framing for the new reader**: we're training "thin" (fast
+iteration, noisy updates) when the published recipes say "fat" (slow
+iteration, sharp updates). Worth a deliberate experiment, with cost
+explicitly accounted for. The architectural ceiling at Elo 1058 (per
+S35 measurements) is one ceiling, but per-update batch size is plausibly
+*another* ceiling we're hitting before the architectural one — we
+genuinely don't know without running the experiment.
+
+### Other open questions / known weak points
+
+- **`max_concurrent_battles=6`** (per-V9RLPlayer in-flight battles): historic
+  self-play-only runs used 100-200. Can be bumped without triggering
+  Bug B (which is a wave-slot count limit, not a per-pair count limit).
+  Helps in-process opponents (self-play, mcts) but bottlenecked at
+  `parallel_actors=1` for MM subprocesses. Probable 5-10% iter time
+  reduction at most without changes to MM side. Low-priority.
+- **`parallel_actors=1` on MM subprocesses**: we never bumped this. Set
+  in `metamon_accept_serve.py` to a default `1`. Setting to `N` would
+  let one MM process N concurrent challenges. Risk: more
+  `_challenge_queue` race surface. Untested at scale.
+- **No popart on value head**: per METAMON_LEARNINGS.md "value-scale drift
+  is correlated with collapse" and popart is a cheap bolt-on. We haven't
+  done it. Would help if value targets drift during long runs (Exp 4
+  collapse pattern). Implementation cost: small. Untried.
+- **No explicit head-to-head Elo benchmark in training loop**. All eval is
+  vs heuristic bots. Real ladder rating (e.g., on PokeAgent ladder) is the
+  ground truth, but it requires a separate workflow (per memory, the
+  pokeBot_rescale/newopp/bc_ppo agents). Worth periodic ladder
+  submissions of current best snapshot.
+
 ---
 
 ## Session 43 status (READ THIS FIRST)
