@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-01 (Session 44 finalized — architecture audit identified two surgical fixes A+B for Session 45; current 200-iter PPO run continues until ~02:00 next day with Layers 1-5 defenses active)**
+**Last updated: 2026-05-01 (Session 44 finalized — pivoted from "implement A+B" to "skip incremental fixes, design architecture rewrite". Session 45 task: produce REWRITE_DESIGN.md. Current 200-iter PPO run is the final deliverable from MLP-architecture lineage.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -14,11 +14,31 @@ Supporting documents:
 
 ---
 
-## Session 44 status — TL;DR for new readers
+## Session 44 final status — TL;DR for new readers
 
-**A 200-iter PPO training run is currently in flight**, resumed from
-`snapshot_0024.pt` of the prior 100-iter run (which regressed; postmortem
-below). Run started ~01:15 on 2026-05-01, projected completion ~30 hr later.
+**Session 44 finalized with a pivot: skip A+B (and B+ and D), commit
+directly to architecture rewrite.** The careful analysis in S44 narrowed
+A+B's expected impact from "real architectural fix" to "modest accuracy/PP
+awareness for team moves" (1-3pt smart_avg gain at best, plausibly less,
+within measurement noise). Combined with the diagnostic value being
+limited (we already have strong evidence the ceiling is structural — see
+"Architectural insight: MLP encoding is a fundamental compositional
+bottleneck" section below), **A+B is not worth the session time. Roll its
+concerns into the rewrite.**
+
+**Session 45 task: produce REWRITE_DESIGN.md** — the design document for
+the architecture rewrite (pure transformer with attribute-level
+tokenization). See "The architecture rewrite plan" section below for the
+high-level approach. Session 45 is design, not implementation. See
+`next-prompt.txt` for detailed instructions.
+
+**A 200-iter PPO training run completed on 2026-05-01** (resumed from
+`snapshot_0024.pt` of the prior 100-iter run; both runs at attempt-11
+config with Layers 1-5 defenses). Final snapshot is the "best-of-MLP-
+architecture" deliverable. Smart_avg trajectory peaked at iter 119 = 66%
+on Metamon competitive (sp_0229 baseline 67.8%). NOT a breakthrough —
+confirms the architectural ceiling is real. Best snapshot for ladder
+submission: sp_0179 or sp_0199 (smart_avg=66% peaks).
 
 **To check the run's health:**
 
@@ -756,23 +776,48 @@ gain. But it's a slice of compositional generalization, not the full
 answer. **Reserve for "A+B+B+ done, ceiling still real, before going for
 the architectural rewrite."**
 
-### What we're doing next (Session 45 plan)
+### What we're doing next (Session 45 plan) — UPDATED 2026-05-01
 
-**Two phases:**
+**Pivoted from "implement A+B" to "design the architecture rewrite."**
 
-1. **Wait for attempt 11 to finish** (~24hr from 2026-05-01 ~01:15 launch).
-   Final snapshot ~sp_0224 becomes the resume point + ladder-submission baseline.
+The S44 analysis narrowed A+B's expected impact from "real architectural
+fix" to "modest accuracy/PP awareness for team moves" (1-3pt smart_avg
+gain at best). Combined with limited diagnostic value (we already strongly
+suspect the ceiling is structural; A+B's flat result wouldn't tell us
+anything new), **A+B isn't worth the session time. Roll its concerns into
+the rewrite.**
 
-2. **Session 45**: implement A + B as a single combined fix.
-   - Code change in `model.py` for team-move bank population (B)
-   - CLI flag `--n-summary-tokens 3` (A) — already supported, just use it
-   - Resume from attempt-11 final snapshot, warmup 12-20 iters, run 100-200 iters
-   - Compare smart_avg trajectory + per-opp trends to attempt 11 (controlled A/B)
+**Session 45 produces `docs/REWRITE_DESIGN.md`** — a design document for
+the pure-transformer-with-attribute-tokenization rewrite. This is design,
+not implementation. The document should specify:
 
-If A+B improves smart_avg ≥3pt past sp_0229's 67.8% baseline (above noise floor),
-we have real evidence that implementation shortcuts were limiting us. If flat,
-that's evidence the ceiling is more fundamental (size, data, or D's per-move
-attention pattern), and the next experiment is D or cloud-scale.
+1. **Tokenization scheme**: every token type, its dim, what it represents.
+   Decompose Pokemon into ~10-15 attribute tokens (species, item, ability,
+   6 stat tokens, 4 move tokens, status, types). Total battle-state
+   tokens ~80-120.
+2. **Attention architecture**: layer count, head count, attention masking
+   (e.g., player-mask similar to current PokeMask), positional/type
+   embeddings to disambiguate "this is a stat token" vs "this is a move
+   token".
+3. **Training pipeline**: BC dataset format (does memmap need regen? probably
+   yes — obs format is fundamentally different), BC training strategy,
+   PPO continuation strategy, evaluation methodology.
+4. **Implementation roadmap**: file-by-file what changes, in what order,
+   with milestones and decision points.
+5. **Risk identification**: what could go wrong (e.g., BC dataset regeneration
+   takes too long, attention scaling at 80-120 tokens has issues, training
+   instability with new architecture). Mitigation plans.
+6. **Reference comparison**: how our design compares to Metamon's
+   Perceiver-based approach. What we adopt, what we adapt, what we differ.
+
+Session 45 is **roughly half a day to a full day of focused design work**,
+not a multi-day implementation push. The output is a document that future
+sessions (46, 47, ...) can implement against.
+
+**The current attempt-11 PPO run continues until ~02:00 on 2026-05-02.** Final
+snapshot is the "best-of-MLP-arch" deliverable. Best by smart_avg: sp_0179 or
+sp_0199 (both 66% on Metamon competitive). Optionally ship one to PokeAgent
+ladder for historical record before pivoting fully to the rewrite.
 
 ### KNOWN WEAK POINT: per-update batch size (`--games-per-iter`)
 
