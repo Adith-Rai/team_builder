@@ -573,6 +573,91 @@ consistency the design always intended.** The MoveNet bank embedding
 tables exist for a reason; we're just feeding zero where real values
 should go.
 
+### Architectural insight: MLP encoding is a fundamental compositional bottleneck
+
+PokemonNet's pipeline `attributes → MLP → 384-dim token` must compress a
+combinatorially-explosive input space (species × items × abilities × stat
+spreads × movesets) into a fixed-dim representation. MLPs handle this
+through **memorization** (common patterns learned via gradient descent) +
+**smooth interpolation** (combinations near common patterns work via
+function approximation) + **unpredictable behavior far from training
+distribution** (rare/novel combinations have no guarantees).
+
+This is the "**beginner's luck — unusual set wrecks us**" failure mode.
+It is intrinsic to MLP-based encoding, not just a data scale issue. More
+training data shifts which combinations are "common enough" but never
+solves the open-ended combinatorial explosion.
+
+**This insight reframes the experiment ordering**:
+- **A+B** (Session 45): cheap, no retrain. Tests if architectural
+  *consistency* (bank zeros fixed) unlocks improvement within current
+  architecture. **Do this regardless** — it's almost free.
+- **B+ and D**: incremental fixes WITHIN MLP architecture. Both are
+  **subsumed by an architecture rewrite** (every attribute tokenized →
+  every move feature is a token, per-move attention is automatic).
+  **Skip if architecture rewrite is the next major project.**
+- **Architecture rewrite**: the principled answer to the wider novel-set
+  generalization problem. See "## The architecture rewrite plan" below.
+
+### The architecture rewrite plan (post-A+B)
+
+**Approach: pure transformer with attribute-level tokenization.** Each
+attribute of the battle state becomes its own token; attention over all
+tokens computes interactions at runtime rather than memorizing them in
+MLP weights.
+
+**Why this approach (vs other rewrites considered):**
+
+| Rewrite option | Verdict | Why |
+|---|---|---|
+| **Pure transformer w/ attribute tokenization** | ✓ chosen | Natural extension of current arch (we already use transformers); mature tooling; attention generalizes compositionally; tractable compute at battle-state size |
+| LLM approach (battle state as text) | rejected | Gimmicky; expensive inference per decision; clunky text representation when we have structured features |
+| Graph neural network (GNN) | rejected | Attention does everything edges do, simpler code, better tooling. Tedious and compute-heavy for marginal gain over attention. |
+| Test-time adaptation | rejected | Online weight updates DURING play. Complex, error-prone, niche research direction. |
+
+**What changes:**
+- `MoveNet`/`PokemonNet`/`FieldNet`/`ActionEncoder` → tokenizers that emit
+  per-attribute tokens (not per-entity)
+- Pokemon goes from 1 token containing "everything about this Pokemon" to
+  ~10-15 tokens (species token + item token + ability token + 6 stat
+  tokens + 4 move tokens + status token + ...)
+- Battle state goes from 14 entity tokens → ~80-120 attribute tokens
+- Spatial/temporal transformers operate on attribute tokens directly
+- Move's BP, accuracy, flags, drain, etc. each become their own token (or
+  features within move tokens) — B+ subsumed
+- Per-move attention across Pokemon happens automatically — D subsumed
+
+**What this looks like in practice (Metamon's approach):**
+
+Metamon's modern models use Perceiver-style cross-attention for
+tokenization. Looking at `metamon_ref/metamon/rl/pretrained.py`:
+- Minikazam uses `MetamonPerceiverTstepEncoder` with custom tokenizer
+- Larger variants (Kakuna 140M, Superkazam) use the same paradigm at
+  scale + 18M training trajectories
+
+Their 71% GXE on gen9OU human ladder comes from this approach combined
+with data scale and large models. Architecture alone doesn't get them
+there — but it's a necessary part of the recipe.
+
+**Cost estimate:**
+- 3-6 weeks of careful design + implementation
+- New BC training run from scratch (obs space changes; old BC checkpoints
+  incompatible)
+- New PPO run (need to verify the new model trains stably)
+- Likely needs cloud compute for the BC run at this scale
+
+**Decision point: when to commit to rewrite**
+
+Run A+B (Session 45). Evaluate smart_avg + per-opp trends honestly:
+
+- **If A+B unlocks ≥3pt smart_avg improvement past sp_0229's 67.8% baseline
+  sustained over 3+ evals**: ceiling was implementation, not architecture.
+  Ship best snapshot to ladder. Reconsider if rewrite is worth the cost.
+- **If A+B is flat (within ±2pt of baseline)**: ceiling is structural.
+  Skip B+ and D. Plan the architecture rewrite as the next major project.
+- **If A+B regresses**: something went wrong with the implementation;
+  diagnose before any further work.
+
 ### Deferred — not needed (or only if A+B insufficient)
 
 **C-as-cosmetic-cleanup. Drop the 84-dim padding** (split MoveNet by path or
