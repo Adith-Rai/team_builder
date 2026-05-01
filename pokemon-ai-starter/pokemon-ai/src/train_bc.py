@@ -248,15 +248,42 @@ def validate(model: PokeTransformer, loader: DataLoader, device: torch.device) -
 
 def eval_vs_bots(checkpoint_path: str, device: str = "cuda", n_battles: int = 200,
                   server_url: str = "ws://127.0.0.1:9000/showdown/websocket",
-                  replay_dir: str = None, battle_format: str = "gen9ou") -> dict:
+                  replay_dir: str = None, battle_format: str = "gen9ou",
+                  team_set: str = "pool") -> dict:
     """Run bot eval on a checkpoint. Returns dict of win rates + smart_avg.
-    Must be called when no other async loop is running."""
+    Must be called when no other async loop is running.
+
+    Args:
+        team_set: "pool" (default — 70-team teams_ou pool, RandomPoolTeambuilder)
+                  or "metamon-competitive" (16 curated Smogon teams from
+                  metamon_cache/teams/competitive/gen9ou; lower team-quality
+                  variance → cleaner skill measurement, ladder-validated).
+                  S44 finding: same-policy variance is ~3.6pt smart_avg /
+                  ~12pt single-bot at 200×4 games on either pool, but the
+                  metamon-competitive pool has tighter team-quality spread
+                  so absolute scores are more reproducible across evals.
+    """
     from poke_env.ps_client.account_configuration import AccountConfiguration
     from poke_env.ps_client.server_configuration import ServerConfiguration
     from poke_env.player.baselines import SimpleHeuristicsPlayer
     from policy_smartbots import SmartDamagePlayer, TacticalPlayer, StrategicPlayer
     from battle_agent import BattleAgent
-    from teams_ou import random_pool_teambuilder
+
+    if team_set == "metamon-competitive":
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        # ONE shared teambuilder instance — both sides sample from same
+        # 16-team pool. Loaded once, used for all matchups in this eval.
+        _shared_tb = MetamonCompetitiveTeambuilder()
+        def _make_tb():
+            return _shared_tb
+    elif team_set == "pool":
+        from teams_ou import random_pool_teambuilder
+        def _make_tb():
+            return random_pool_teambuilder()
+    else:
+        raise ValueError(
+            f"Unknown team_set={team_set!r}. Must be 'pool' or 'metamon-competitive'."
+        )
 
     SERVER = ServerConfiguration(server_url, None)
     opponents = [
@@ -277,13 +304,13 @@ def eval_vs_bots(checkpoint_path: str, device: str = "cuda", n_battles: int = 20
                 checkpoint_path, device=device,
                 account_configuration=AccountConfiguration.generate("Eval", rand=True),
                 battle_format=battle_format, max_concurrent_battles=5,
-                server_configuration=SERVER, team=random_pool_teambuilder(),
+                server_configuration=SERVER, team=_make_tb(),
                 save_replays=save_dir if save_dir else False,
             )
             p2 = opp_cls(
                 account_configuration=AccountConfiguration.generate(opp_name, rand=True),
                 battle_format=battle_format, max_concurrent_battles=5,
-                server_configuration=SERVER, team=random_pool_teambuilder(),
+                server_configuration=SERVER, team=_make_tb(),
             )
             await p1.battle_against(p2, n_battles=n_battles)
             wr = p1.n_won_battles / n_battles * 100

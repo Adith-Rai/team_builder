@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-29 (Session 44 — opponent-pool curriculum redesign: drop FPs to remove wall-clock waste, add 4 new MMs in size/style tiers; production launched fresh from sp_0229)**
+**Last updated: 2026-05-01 (Session 44 finalized — Layers 1-5 training defenses + pool curation flags + Metamon-competitive eval; second 200-iter PPO run resumed from sp_0024 in progress)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -14,15 +14,159 @@ Supporting documents:
 
 ---
 
-## Session 44 status (READ THIS FIRST)
+## Session 44 status — TL;DR for new readers
 
-**Opponent-pool curriculum redesigned.** After three failed attempts at the
-curated-pool training run (attempt 1 lr=1e-4 KL discards; attempt 2 4-FP
-killed by user for FP-iter-time concern; attempt 3 1-FP deadlock at iter 0;
-attempt 4 4-FP completed 9 WARMUP iters before being scrapped for the new
-curriculum), the launch shifted from "exact attempt-2 config" to a
-**curriculum design that drops FP entirely at this skill level and adds
-4 new MM variants for behavioral + strength diversity.**
+**A 200-iter PPO training run is currently in flight**, resumed from
+`snapshot_0024.pt` of the prior 100-iter run (which regressed; postmortem
+below). Run started ~01:15 on 2026-05-01, projected completion ~30 hr later.
+
+**To check the run's health:**
+
+```bash
+tail -f /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training_curated.log
+```
+
+Watch for: iter lines (every ~7 min), `[WARN] mm-X stalled` (handled by Layer 4
+auto-respawn), `EVAL:` lines (every 20 iters at 500 games × 4 bots on Metamon
+competitive teams), `[watchdog]` heartbeat lines (every 60s per stuck slot — proves
+poll loop alive even when an opp is stalling).
+
+**The five defense layers active in this run** (each addresses a bug class
+found in attempts 1-10 of the curated-pool work):
+
+| Layer | What it protects | Implementation |
+|---|---|---|
+| 1. Forfeit filter | Spurious +1 reward from server-flipped finishes | `V9RLPlayer._finish_looks_real` requires team-fully-fainted before accepting `won=True`; spurious finishes drop the trajectory, decrement W/L, recorded as `[+Nfft]` in iter line |
+| 2. Queue-restart resilience | Crashed subprocess respawn losing the trainer's enqueued teams | `--clean-on-init false` on respawn (fp/mm `accept_serve.py`); only first-spawn wipes stale `.team` files |
+| 3. Dispatch watchdog | Subprocess "alive but silent" (Popen running, no battles starting) | `rl_collection.py:_play_one_opponent` wraps `send_challenges` as a task; polls `n_won+n_lost+n_tied` every 15s; cancels at 5-min stall, prints `[WARN]`, skips remaining games for that opp |
+| 4. Auto-respawn on stall | Manual kill+respawn babysitting | When watchdog cancels stall, calls `external_manager.restart_subprocess(name)` → kills the stuck PID → Layer 2 monitor respawns clean for next iter |
+| 5. Pool curation | S43/S44 dirty-pool dilution (auto-discovery flooding pool with current-run snapshots → cycling/specialization regression) | New flags `--pool-anchors PATH[,PATH...]` and `--pool-max-current-run N`; defaults preserve old behavior |
+
+---
+
+## Quick-start: how to interact with the live run
+
+### Resume the run if you killed it (use `--resume`, all flags must match)
+
+```bash
+cd /c/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+
+nohup python -u train_rl.py \
+  --resume <LATEST_SNAPSHOT_FROM_RUN_DIR>.pt \
+  --pool-anchors C:/Users/raiad/OneDrive/Desktop/team_builder/data/models/_archived_pre_peak/rl_v9_full_pool/selfplay_v9_20260428_030636/snapshot_0114.pt \
+  --pool-max-current-run 2 \
+  --eval-team-set metamon-competitive \
+  --target-kl 0.02 \
+  --adaptive-entropy --adaptive-entropy-high 0.85 --adaptive-entropy-min 0.005 \
+  --eval-interval 20 --eval-games 500 --early-stop --early-stop-patience 3 \
+  --warmup-iters 0 --n-iters <REMAINING> \
+  --device cuda --servers 9000,9000,9000,9000 --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 6 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.01 \
+  --grad-accum 1 --lr 3e-5 --win-rate-mode ema \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --external-adapters external_adapters_curated.yaml \
+  --out-dir data/models/rl_v9_curated_pool \
+  > /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training_curated.log 2>&1 &
+```
+
+**Critical flags that MUST be re-passed on resume** (CLI args reset every launch):
+- `--pool-anchors` — without it, sp_0114 isn't protected (won't be pruned, but disappears from the iter-line output)
+- `--pool-max-current-run 2` — without it, defaults to -1 (unbounded) → dilution returns
+- `--eval-team-set metamon-competitive` — without it, evals revert to the noisy 70-team pool
+
+**Resume safety verified:** model + optimizer state restore correctly; `win_rates.json`
+loads from prior run dir; pool comes from saved checkpoint metadata; disk-scan
+glob (`data/models/rl_v9/selfplay_v9_*`) does NOT touch `data/models/rl_v9_curated_pool/`
+so we don't double-pollute. **One-shot resume safe; multi-resume accumulates ~3
+stale entries per resume in pool.**
+
+### Re-eval any checkpoint vs the 4 heuristic bots on Metamon competitive teams
+
+```bash
+cd /c/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+
+python -u eval_metamon_competitive.py \
+  --checkpoints \
+    label1=path1.pt \
+    label2=path2.pt \
+  --servers 9000 --n-games 200 --concurrency 8 --device cuda \
+  --out-json data/eval/<NAME>.json
+```
+
+Standalone, no trainer interaction needed. Each checkpoint × 4 bots × 200 games
+= ~5 min. Battle_server must be running on port 9000.
+
+### Spin up battle_server (the JS Showdown emulator)
+
+```bash
+C:/Users/raiad/OneDrive/Desktop/team_builder/tools/node-v20.18.1-win-x64/node.exe \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  --port 9000 \
+  2>&1 | tee /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/battle_server_curated2.log
+```
+
+Battle_server stays up across trainer restarts; only relaunch if its log file is
+missing or it crashed. Check status: `curl -s http://127.0.0.1:9000/`.
+
+### Per-opponent W/L analysis on a finished run
+
+```bash
+cd /c/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+python _analyze_run_log.py /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training_curated.log
+```
+
+Prints per-opp W/L by 10-iter decile + overall trend. Use this to diagnose
+"is the model winning/losing to specific opponents?" — needed to distinguish
+real cycling (consistent <50% vs past selves) from noise.
+
+---
+
+## What to watch for in the live run (success / failure criteria)
+
+**Run config** (current, attempt 11 = "resumed"):
+- Init: `snapshot_0024.pt` (start_iter=25; the 100-iter prior run's last snapshot)
+- 200 more iters → finishes at iter 224
+- `--target-kl 0.02`, `--adaptive-entropy-high 0.85`, `--ent-coef 0.01`
+- `--eval-interval 20 --eval-games 500 --eval-team-set metamon-competitive`
+- Pool: 16 entries (init sp_0229 + anchor sp_0114 + 5 disk-scanned peak-era + 3 leftover from prior session + 7 externals); Layer 5 prune caps current-run additions at 2
+
+**Success criteria (we've meaningfully improved on sp_0229):**
+- smart_avg ≥ 71% sustained across 3+ evals (sp_0229 baseline = 67.8% on Metamon
+  competitive at 200×4 games; ±3.5pt noise floor; ≥3pt above baseline = real signal)
+- W/L vs sp_0114 in iter line consistently ≥50% (we're keeping pace with the
+  S43 ladder champion)
+- W/L vs peak-era sp_2979/2999/3009/3029 climbing past 60% (showing real strength
+  vs older snapshots)
+- KL stable around 0.02 (the new target); not spiking past 0.04
+- Entropy stable in [0.70, 0.85]; not drifting up unchecked like attempt 9 did
+
+**Failure criteria (stop and re-investigate):**
+- smart_avg drops by ≥3pt sustained across 2 consecutive evals from baseline
+  (early-stop with patience=3 should fire at the 3rd; will halt training)
+- W/L vs *own past selves from this run* (sp0014/0019/0024/...) consistently <50%
+  for 3+ iters → cycling pattern, same as attempt 9
+- KL averages > 0.035 multiple iters (drift exceeding our new tighter target)
+- Layer 4 fires repeatedly on same MM (>3 stalls in 10 iters) → underlying
+  subprocess issue not just cold-start race
+
+**Things that are NORMAL (do not fail-stop):**
+- KL ≈ 0.029-0.031 (right at 1.5× target threshold). PPO's KL early-stop
+  fires often at epoch 0; that's intentional — epoch 0 fully processes before
+  the gate, just prevents epoch 1+. Standard ps-ppo behavior.
+- `[WARN] mm-X stalled at 0/N for 301s` ONCE per MM during cold-start
+  (Layer 4 respawns; that MM gets full samples next iter)
+- Per-iter W/L bouncing 45-55% — within ±3.6pt same-policy noise
+- Pool size growing to ~17 over the run as Layer 5 admits 2 rolling current-run
+  snapshots after each save (init + anchor + 5 disk-scan + 2 rolling + 7 ext + leftover)
+
+---
+
+## Session 44 history (10 attempts, what each taught us)
+
+**Each attempt ran from a clean kill of the prior, with code/config tweaks
+between launches.** The first 10 produced the iter-0-24 baseline checkpoint
+that the current resumed run continues from.
 
 ### Why drop FP at this stage
 
@@ -206,11 +350,24 @@ slot share ~70%, the run's gradient signal is concentrated on opponents
 that matter, and self-play has stable gravity wells (init + anchor)
 to prevent cycling.
 
-**Caveat — sp_2979 cannot be used as an anchor.** Despite being the
-all-time peak Elo (1058), it has 13.54M params (pre-S39-BC-reshape
-architecture). Current PPO models have 14.44M. Loading sp_2979 as a
-SelfPlayOpponent fails with state_dict size mismatch. Use sp_0114 or
-sp_0029 from the post-S39 lineage instead.
+**Pre-S39 snapshots (sp_2979/2999/3009/3029/3179) DO load successfully** as
+SelfPlayOpponent. They have ~13.4M params vs the current 14.44M, but
+`battle_agent.py:load_state_dict` has dim-expansion logic (zero-pads new
+feature columns added between sp_2979 era and now) that handles the
+mismatch automatically. They've been in the disk-scan pool of every PPO run
+since S35.
+
+**The S39 change was NOT an obs-feature change** (type-effectiveness slots
+were already there pre-S39). It was a *weight redistribution* between the
+spatial and temporal transformers: pre-S39 was 384d/384d (1:1 = 50/50);
+post-S39 is 256d/512d (2:1 = 33/66). Same total ~14M params, redistributed
+toward Metamon's heavier-temporal recipe (their Large is 8:1).
+
+So sp_2979 IS a valid anchor — and the disk-scan
+glob (`data/models/rl_v9/selfplay_v9_*` filtered by `MIN_SNAPSHOT_ITER=260`)
+already pulls it (and 4 other peak-era snapshots) into every resume's pool
+automatically. Explicit `--pool-anchors` is only needed for snapshots
+NOT in `data/models/rl_v9/` (e.g. sp_0114 lives in `_archived_pre_peak/`).
 
 **Companion hyperparameter changes for any future PPO run** (validated
 on attempt 10):
@@ -253,19 +410,62 @@ but never accepting challenges. The original symptom was MM's bug B
 (`_challenge_queue` not bound on first cold start) but the fix is
 generic to any flavor of subprocess wedge.
 
-### Phase 1 launch state (live now from sp_0229)
+### Attempts 1-10 timeline (the chronicle that produced the resumed run)
 
-YAML: `external_adapters_curated.yaml` (Phase 1 form — 8 MMs, 2 mcts, no FPs).
-Init: `data/models/rl_v9/_init_sp_0229/snapshot_0229.pt`.
-Out: `data/models/rl_v9_curated_pool/`.
-Warmup: 12 iters. Total: 100 iters expected ~22 hr at 13-min/iter post-warmup.
+| # | Config | Outcome | Lesson |
+|---|---|---|---|
+| 1 | curated YAML, lr=1e-4 default | KL discards every iter | Drop default lr to 3e-5 — bug A from S43 reconfirmed |
+| 2 | 4 FP + 4 MM, lr=3e-5 | 3 iters clean, killed by user for FP-iter-time | Reverted to attempt-2 config later as known-working baseline |
+| 3 | 1 FP + 4 MM | Deadlock at iter 0 | PFSP collisions on single FP subprocess; need ≥4 FPs if FPs are in the pool at all (MM is OK with N=1 because of `parallel_actors`) |
+| 4 | 4 FP + 4 MM revert | 9 iters clean WARMUP; scrapped to redesign curriculum | Confirmed attempt-2 path stable, but FP wall-clock cost too high |
+| 5 | 8 MMs (no FPs) — Phase 1 introduced | Hung at iter 0 | "Login race": MM logs in 10s after PFSP-ready signal, challenges arrive too early, `_challenge_queue` not bound; |pms dropped silently |
+| 6 | 5 MMs + 30s GUARD sleep | Same hang at iter 0 (slot 5 stuck on MM-SmallIL) | GUARD doesn't catch the same issue mid-run; need watchdog approach |
+| 7 | + Layer 3 watchdog (poll task progress, cancel at 5-min stall) | iter 0 cleared with mm-largerl skipped + WARN; Minikazam cold-start still stuck across iters | Watchdog correctly skips one iter, but doesn't recover the MM for the next |
+| 8 | + Layer 4 (auto-respawn on stall WARN) | First Layer 4 fire on Minikazam → respawned; mm-largerl crashed mid-iter1 (orphaned battle); subsequent slot 5 hang | `asyncio.shield(task)` had subtle interactions; switched to plain `asyncio.sleep` + done() check |
+| 9 | + simplified watchdog + Layer 4 | **Ran 100 iters cleanly.** WARN=1 (just iter 0 cold-start). But smart_avg regressed 63% iter 39 → 57% iter 99 | Run is end-to-end stable, but pool dilution still hurt smart_avg — same S43 dirty-pool pattern. → motivated Layer 5 |
+| 10 | + Layer 5 (--pool-anchors, --pool-max-current-run); 2 launches (10a relative path bug, 10b absolute) | Ran 24 iters before user requested mid-run eval | Per-iter pool stayed at 11; prune fired correctly at iter 14, 19, 24 dropping oldest current-run snapshot. Smart_avg trend: 59→60→63 (improving) — but post-eval analysis showed this is within noise floor |
+| **11** | **Resume from sp_0024** with 200 more iters, eval switched to Metamon competitive teams | **In progress as of 2026-05-01 ~01:15** | TBD — see "Success criteria" above |
 
-Validate iter 0 looks healthy before letting it run multi-day:
-- All 8 MM subprocesses spawn + reach "ready" within ~3 min
-- `[WARMUP]` tag on iter line
-- pool count ~14-16 (12 externals + ~7 self-play snapshots from disk)
-- VRAM stays under ~5.5 GB during collect phase (`nvidia-smi`)
-- No `Spawning ... restarts=[1-9]` events in iter 0
+### Smart_avg measurement: Metamon competitive teams (replaces 70-team pool)
+
+**Why we switched:** the 70-team eval pool has a **51-pt smart_avg spread** between
+TEAM_AX (81.5% on sp_0229) and TEAM_AR (30.5%). Random-team eval is dominated by
+team-draw noise. Metamon's `competitive` set is 16 human-made Smogon teams used
+by Kakuna/Abra (50% GXE on the human ladder) — much tighter team-quality variance.
+
+**Same-policy variance reference (measured):** at 200 games × 4 bots, smart_avg
+has ±3.6pt noise floor (sp_0229 vs sp_warmup_0009 swing was 3.6pt; same policy,
+different RNG). Per-bot 7-12pt swings within noise. **Bumped to 500 games × 4 bots
+in the resumed run for ±2.2pt CI** (cleaner regression detection).
+
+**5-checkpoint baseline (from `data/eval/metamon_competitive_eval.json`):**
+
+| Ckpt | smart_avg | Note |
+|---|---|---|
+| sp_0229 | 67.8% | The init/baseline |
+| sp_0114 | 64.5% | S43 ladder champion (1463 SR) |
+| sp_warmup_0009 | 71.4% | Same policy as sp_0229 (warmup-only); +3.6pt = pure noise |
+| sp_post_0019 | 68.0% | First post-WARMUP from prior run |
+| sp_best_0024 | 65.1% | Prior run's best by training-time eval (63%); ±3.5pt = within noise of baseline |
+
+**All 5 checkpoints are statistically indistinguishable at 200×4 games.** None
+clearly improved on sp_0229's 67.8%. The "regression" we attributed to attempt 9
+was likely 50-70% team-noise, not policy drift. The per-opp self-play data
+(losing to past selves at 36-47%) was a real cycling signal but the smart_avg
+trend on the 70-team pool was overstated.
+
+**Switch is committed**: training-time evals (`--eval-team-set metamon-competitive`)
+now run on the 16-team set; standalone re-evals use `eval_metamon_competitive.py`.
+All future smart_avg numbers comparable to each other; not directly comparable to
+historical 70-team pool numbers.
+
+### Phase 1 launch state (deprecated — superseded by attempt 11 resumed run)
+
+The attempt 9 fresh-from-sp_0229 run completed 100 iters. Final snapshot
+`data/models/rl_v9_curated_pool/selfplay_v9_20260429_224058/snapshot_0099.pt`
+exists but is not the deliverable (smart_avg regressed). The attempt-11 resumed
+run picks up from `selfplay_v9_20260430_201427/snapshot_0024.pt`, which on
+Metamon competitive scored within noise of sp_0229.
 
 ---
 

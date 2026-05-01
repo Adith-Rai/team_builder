@@ -124,6 +124,13 @@ def parse_args():
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
     p.add_argument("--eval-interval", type=int, default=20)
     p.add_argument("--eval-games", type=int, default=200)
+    p.add_argument("--eval-team-set", choices=["pool", "metamon-competitive"], default="pool",
+                   help="Team source for in-training bot evals. 'pool' = 70-team "
+                        "teams_ou pool (legacy default; ~30pt strength spread → "
+                        "noisy smart_avg). 'metamon-competitive' = 16 curated "
+                        "Smogon teams from metamon_cache (lower team-quality "
+                        "variance, ladder-validated, ~3.6pt same-policy noise "
+                        "floor at 200×4 games).")
     p.add_argument("--out-dir", default="data/models/rl_v9")
     p.add_argument("--immune-penalty", type=float, default=0.0,
                    help="Per-step penalty when our move hits immunity")
@@ -449,7 +456,8 @@ def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
         replay_path = str(run_dir / f"replays_iter{it:04d}")
         results = eval_vs_bots(tmp, device=str(device), n_battles=args.eval_games,
                                server_url=srv_url, replay_dir=replay_path,
-                               battle_format=battle_format)
+                               battle_format=battle_format,
+                               team_set=args.eval_team_set)
         sh = results.get("SH", 0)
         smd = results.get("SmartDmg", results.get("SmD", 0))
         tac = results.get("Tactical", results.get("Tac", 0))
