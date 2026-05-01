@@ -628,17 +628,48 @@ them).
 
 D would let attention compute things like "Sucker Punch on opp (priority +1,
 only works on attacking targets) vs my setup move (non-attacking)" directly.
-Plausibly handles novel Pokemon-move combos better.
+Plausibly better generalization for novel cross-move interactions because
+attention is permutation-equivariant and pairwise.
 
 Cost: spatial input grows 14 → ~38 tokens, attention compute ~7× (quadratic),
 implementation complexity, BC + PPO retrain.
 
-Verdict: speculative. **The case for D weakens significantly once we recognize
-the architecture's existing generalization machinery.** With shared MoveNet
-parameters and consistent inputs (B), the model already cross-applies move
-understanding between our/opp Pokemon. D isn't unlocking a new capability;
-it's offering different attention granularity. **Reserve for "A+B+B+ done, ceiling
-still real."**
+**Verdict — D is a tweak within MLP architecture, not THE solution to
+novel-set generalization.**
+
+The deeper problem is that MLP-based Pokemon encoding (`PokemonNet`) is a
+**fundamental compositional bottleneck**. The pipeline `attributes → MLP →
+384-dim token` must compress combinatorially-explosive input space (species
+× items × abilities × stat spreads × movesets) into fixed-dim. MLPs handle
+this through memorization and smooth interpolation; behavior is
+unpredictable for combinations far from training distribution. The
+"beginner's luck — unusual set wrecks us" failure mode is intrinsic to MLP
+encoding, not just a data scale issue.
+
+D addresses ONE slice of this (cross-move interaction generalization). It
+does NOT help with:
+- Unusual ability + stat + item combinations (per-Pokemon, not cross-move)
+- Novel Pokemon-Pokemon role matchups
+- Rare item / EV spread / ability interactions
+
+True solutions to the wider novel-set problem are architecturally larger:
+- **Foundation model approach**: train an LLM on Pokemon battles as text;
+  massive prior knowledge, native compositional generalization
+- **Graph neural networks**: each attribute is a node, learned edge
+  functions compute interactions
+- **Pure transformer over entity-level state**: every feature is a token,
+  attention does all composition
+- **Test-time adaptation**: model updates understanding on-the-fly from
+  early-turn observations of an unfamiliar opp
+
+These are paradigm shifts requiring weeks-to-months of work and likely
+cloud compute. Held in reserve as Session 50+ material.
+
+**For now**: D is a "tweak within MLP architecture." Worth trying because
+it's much cheaper than architectural rewrite and might capture some of the
+gain. But it's a slice of compositional generalization, not the full
+answer. **Reserve for "A+B+B+ done, ceiling still real, before going for
+the architectural rewrite."**
 
 ### What we're doing next (Session 45 plan)
 
