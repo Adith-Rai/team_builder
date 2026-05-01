@@ -365,6 +365,38 @@ class ExternalOpponentManager:
                 return opp.proc is not None and opp.proc.poll() is None
         return False
 
+    def restart_subprocess(self, name: str) -> bool:
+        """Force-kill a named subprocess; the monitor thread will respawn it.
+
+        Used by the trainer's dispatch watchdog (Layer 4) when an opponent
+        gets stuck in the silent "logged in but _challenge_queue not bound"
+        state — Popen still alive, heartbeats firing, but never accepting
+        challenges. Layer 2's exit-detection won't fire (the proc didn't
+        crash); Layer 2's zombie-detection won't fire (heartbeats keep log
+        mtime fresh). The watchdog has the only signal that something's
+        wrong (no battles finishing) and uses this to escalate.
+
+        Returns True if a process was killed, False if not found / not alive.
+        """
+        for opp in self.opponents:
+            if opp.name != name:
+                continue
+            if opp.proc is None or opp.proc.poll() is not None:
+                logger.warning(f"restart_subprocess({name}): not currently alive")
+                return False
+            logger.warning(
+                f"restart_subprocess({name}): force-killing for stall recovery; "
+                f"monitor thread will respawn"
+            )
+            try:
+                opp.proc.kill()
+            except Exception as e:
+                logger.warning(f"  (kill failed for {name}: {e})")
+                return False
+            return True
+        logger.warning(f"restart_subprocess({name}): no opponent with that name")
+        return False
+
     def status(self) -> List[dict]:
         """Snapshot of all opponents — for logging during training."""
         out = []

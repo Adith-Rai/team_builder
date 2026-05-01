@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-04-26 (Session 43 — training-correctness defenses (forfeit filter + queue-restart resilience) added on top of S42's validated end-to-end pipeline; ready for the long PPO run)**
+**Last updated: 2026-04-29 (Session 44 — opponent-pool curriculum redesign: drop FPs to remove wall-clock waste, add 4 new MMs in size/style tiers; production launched fresh from sp_0229)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -11,6 +11,261 @@ Supporting documents:
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
 - `docs/CLOUD_DEPLOY.md` — cloud migration plan
+
+---
+
+## Session 44 status (READ THIS FIRST)
+
+**Opponent-pool curriculum redesigned.** After three failed attempts at the
+curated-pool training run (attempt 1 lr=1e-4 KL discards; attempt 2 4-FP
+killed by user for FP-iter-time concern; attempt 3 1-FP deadlock at iter 0;
+attempt 4 4-FP completed 9 WARMUP iters before being scrapped for the new
+curriculum), the launch shifted from "exact attempt-2 config" to a
+**curriculum design that drops FP entirely at this skill level and adds
+4 new MM variants for behavioral + strength diversity.**
+
+### Why drop FP at this stage
+
+**Wall-clock cost is the issue, not gradient signal.** Per S42 measurements,
+an FP battle takes ~19s (100ms MCTS × ~30-60 turns + Smogon set-guessing
+parsing + IPC) vs ~1.7s for MM-Minikazam. With 4 FPs at weight 0.4 each
+(group total 1.6 of pool ~5.1 ≈ 32% slot share), most waves have at least
+one FP slot, and a wave finishes only when the slowest slot does. Drop FPs
+and wave time snaps from ~19s to ~3s. Empirically: 22 min/iter → expect
+13-15 min/iter, ~35-40% wall-clock saved.
+
+**The gradient loss is near-zero.** PFSP weights opponents by `(1-wr)²`. At
+~88% loss to FP, that's `(0.12)² = 0.014` — PFSP is *already* effectively
+skipping FP. We pay FP's wall-clock cost without much training payoff at
+sp_0229's skill level. Dropping FP formalizes what PFSP is doing anyway.
+
+**MCTS-style gradient diversity is preserved** by the in-process
+`mcts-fast` (80ms) and `mcts-medium` (200ms) — same poke-engine MCTS
+family minus FP's specific Smogon set-guessing layer.
+
+### The single-FP detour and what it taught us (deadlock postmortem)
+
+**Attempt 3 tried 1 FP for wall-clock savings. It deadlocked at iter 0.**
+Root cause: PFSP samples slots independently with replacement; in any 6-slot
+wave it can land 2+ slots on the same FoulPlayBot1 subprocess. FP's
+accept-serve loop processes one battle's frames in `pokemon_battle()` —
+that loop swallows the second incoming `|pm|`/challenge during frame
+consumption, so the 2nd challenge never gets accepted. The 2nd
+V9RLPlayer waits forever; the wave never closes. Same shape as S42 bug
+#7 (cleanupBattle re-emit fix), one floor lower in the protocol stack.
+
+**With 4 FPs, the same collision distributes across 4 different
+usernames → each FP subprocess only ever sees 1 simultaneous challenge.**
+Attempt 4 confirmed this works (3 iters clean before scrap). So 1 FP is
+not a viable simplification for FP specifically. **MM doesn't have this
+problem** — Metamon's amago wrapper has `parallel_actors=N` built in;
+one MM subprocess handles many concurrent battles natively. **This means
+we can scale MM count freely while needing 4 FPs minimum if FPs are in
+the pool at all.** Recorded as a constraint for any future FP re-add.
+
+### Phased curriculum design (Phase 1 launching now, Phases 2/3 documented)
+
+The framing: as the model gets stronger, gate harder opponents in over
+phases. PFSP self-corrects in the long run, but per-iter wall-clock waste
+on opponents we lose 90%+ to is real.
+
+**Phase 1 (now → ~40-50% W/L vs each MM):** drop all 4 FPs, keep 2 mcts +
+4 existing MMs, add 3 new MMs for size/style diversity.
+- Add **MediumIL** (BC-style, medium scale; SmallIL+MediumRL family but BC instead of RL)
+- Add **MediumRL_Aug** (augmented training data; similar strength to MediumRL but different failure modes)
+- Add **LargeRL** (paper, ~50M params, gen 1-4 strong)
+- ~~SmallRLGen9Beta~~ — DROPPED post-smoke. Hard-codes FlashAttention via
+  `gin_overrides`; flash_attn package isn't available on Windows. Failure
+  is `AssertionError: Missing flash attention 2 install (pip install
+  amago[flash])` on every spawn. Defer to cloud or post-flash-attn-install.
+
+YAML group total weights: 7 MMs × 0.4 = 2.8; 2 mcts (1.0+0.5) = 1.5;
+sp pool ≈ 0.5. Externals ~5:1 over self-play, no FP wall-clock tax.
+
+**Phase 2 (when ≥40-45% W/L on each Phase 1 MM):** swap *out* 1-2 weakest
+or most-redundant Phase 1 entries (probably SmallRL/SmallIL given they
+overlap with MediumIL/MediumRL_Aug). Add 1-2 from `Abra`, `Kadabra2`,
+`Alakazam` (~50M each, multitask gen9-trained, paper-level on gen9OU).
+**Re-add 1 FP at low weight** (0.2) for MCTS-anti-search learning at a
+level where we can plausibly close to ≥30% WR. PFSP will weight it
+correctly given empirical W/L.
+
+**Phase 3 (chasing ceiling — currently NOT FEASIBLE on this hardware):**
+add `Superkazam` and/or `Kakuna` (~140M params each). On RTX 3060 Laptop
+6 GB, this is **physically infeasible** — Kakuna alone needs ~1.5-2 GB
+inference, plus current 8 MMs (~3.4 GB) + trainer (~770 MB) puts total
+over the 6 GB cap. Phase 3 would require either (a) GPU upgrade to ≥10 GB
+VRAM, (b) cloud deployment with bigger GPUs (already-planned per
+CLOUD_DEPLOY.md), or (c) CPU offload of the big MM (10-15 min/battle =
+brutal wall-clock cost).
+
+**Mathematically, Phase 3 is also marginal even if feasible.** At Kakuna's
++409 ladder-pt gap, expected ~95% loss → PFSP weight ~0.0025 → trainer
+effectively skips it. Trajectories at that loss rate are low-information
+("everything I tried lost"). Cleanest path: hit Phase 2 strength locally,
+graduate to cloud for Phase 3.
+
+### VRAM budget (RTX 3060 Laptop, 6 GB total)
+
+Baseline trainer: ~770 MB (14M-param transformer at fp16 + activations + optimizer).
+Per-MM measurements (S42 logs + extrapolation by `*_agent.gin` size class):
+
+| MM | Approx size | Notes |
+|---|---|---|
+| Minikazam | 173 MB | RNN, 4.7M params |
+| SmallRL | 218 MB | small_agent.gin, ~10M |
+| SmallIL | 215 MB | small_agent.gin, ~10M |
+| MediumRL | 530 MB | medium_agent.gin, ~25M |
+| MediumIL (new) | ~530 MB | medium_agent.gin |
+| MediumRL_Aug (new) | ~530 MB | medium_agent.gin |
+| LargeRL (new) | ~1000 MB | large_agent.gin, ~50M |
+| ~~SmallRLGen9Beta~~ | ~~~250 MB~~ | DROPPED — flash_attn dependency, see above |
+
+**Phase 1 total** (smoke-validated 7 MMs): ~3.86 GB GPU during 7-MM
+smoke = ~550 MB/MM avg + Python overhead. Add 0.77 GB trainer = ~4.6 GB
+under load. Buffer ~1.4 GB. Workable.
+**Phase 2 total** (swap small for medium-multitask): would push to 5-5.5 GB. Need to drop 1-2 Phase 1 entries.
+**Phase 3 total**: 6.5+ GB. Over cap.
+
+### Why fresh restart from sp_0229 (not resume from attempt-4 iter 14)
+
+Drift contamination concern. 14 iters on the FP-heavy pool would have
+moved the policy slightly (KL accumulated ~0.04, ~3% of capacity), but
+more importantly Adam's running moment estimates would be calibrated
+against FP-flavored gradients. Resuming with the new pool would mean
+5-10 iters of optimizer momentum bias before re-aligning. Cost ≈ same as
+the WARMUP we'd skip by resuming, but in the form of contamination
+instead of clean wait. **Clean trajectory + properly-WARMUP-calibrated
+PFSP for the new MMs > 1.5 hr saved on a 30-hr run.**
+
+### Layer 3 — dispatch resilience watchdog (added attempt 7)
+
+Phase 1 attempts 5-6 surfaced a new failure mode: trainer-side
+`send_challenges()` to MM blocks indefinitely if MM is in some
+intermediate state where /pms get accepted into poke-env but
+`_challenge_queue` isn't yet bound, OR when MM crashes mid-iter, OR
+under the bug-B login race. None of Layer 1 (forfeit filter) or
+Layer 2 (queue restart) catch this — they protect the trainer's *win
+counts* and *post-crash respawn*, not the *original dispatch*.
+
+**Fix in `rl_collection.py:_play_one_opponent`** (subprocess opp path):
+wrap `send_challenges` as a task; poll `n_won + n_lost + n_tied` every
+15s. If no progress for 5 min OR total dispatch time hits 30 min,
+cancel the task, log a `[WARN]`, and skip remaining games for that
+opponent in this iter. PFSP just gets fewer games for that opp this
+iter, which is correct (low-info data isn't useful anyway). Trajectories
+were never created, so no discard needed on the trajectory side.
+
+The previous 30s post-`wait_until_ready` GUARD sleep (attempt 6) was
+removed — the watchdog catches the same case more gracefully and also
+catches mid-iter stalls that the GUARD couldn't.
+
+### Layer 5 — pool curation flags (added attempt 10)
+
+Session 44 attempt 9 ran 100 iters cleanly under the watchdog/Layer-4
+defenses but **regressed on smart_avg** (peak 63% at iter 39 → 57% at
+iter 99) — same dirty-pool dilution pattern as S43. The per-iter,
+per-opponent table generated post-run (`_analyze_run_log.py`) showed:
+
+- W/L vs externals: mostly flat or down (mcts-medium dropped -14pt over
+  the run, the worst case).
+- W/L vs *own past selves* from earlier iters: ~36-47% in the last
+  decile — the model was *losing to its own past versions*, classic
+  self-play cycling/drift.
+- Pool grew from 8 → 27 over the run (auto-discovery added every saved
+  snapshot to the pool); by iter 99, ~64% of slot share routed to
+  self-play snapshots vs ~36% to externals.
+
+**Two new CLI flags address this without breaking back-compat:**
+
+```
+--pool-anchors <path[,path...]>
+    Fixed checkpoints kept in the PFSP pool throughout training (e.g.
+    peak-era references). Always present; never pruned. Use absolute
+    paths — relative resolves from the trainer's CWD (src/).
+    Default empty = old behavior.
+
+--pool-max-current-run N
+    Cap on # self-play snapshots from the CURRENT run kept in the pool.
+    When N>=0 and the run has produced more than N snapshots, oldest
+    are dropped from the pool (still saved on disk). Anchors and the
+    init checkpoint are not affected.
+    Default -1 = unbounded (old behavior — caused S43/S44 dilution).
+```
+
+**Recommended values for any future PPO run from sp_0229 baseline:**
+
+```
+--pool-anchors C:/Users/raiad/OneDrive/Desktop/team_builder/data/models/_archived_pre_peak/rl_v9_full_pool/selfplay_v9_20260428_030636/snapshot_0114.pt
+--pool-max-current-run 2
+```
+
+This produces a pool of ~9-10 entries: 1 init (sp_0229) + 1 anchor
+(sp_0114) + 2 rolling current-run + 7 externals. Externals dominate
+slot share ~70%, the run's gradient signal is concentrated on opponents
+that matter, and self-play has stable gravity wells (init + anchor)
+to prevent cycling.
+
+**Caveat — sp_2979 cannot be used as an anchor.** Despite being the
+all-time peak Elo (1058), it has 13.54M params (pre-S39-BC-reshape
+architecture). Current PPO models have 14.44M. Loading sp_2979 as a
+SelfPlayOpponent fails with state_dict size mismatch. Use sp_0114 or
+sp_0029 from the post-S39 lineage instead.
+
+**Companion hyperparameter changes for any future PPO run** (validated
+on attempt 10):
+- `--target-kl 0.02` (down from 0.03; OAI-Five regime, tighter drift
+  bound; observed avg KL was 0.04+ at 0.03 target)
+- `--adaptive-entropy-high 0.85` (down from 0.95; catches drift when
+  entropy crosses 0.85, not 0.95 — attempt 9's entropy went 0.77→0.91
+  without ever triggering the 0.95 default)
+- `--adaptive-entropy-min 0.005` (up from 0.003; floor too low)
+- `--eval-interval 5` (down from 20; faster regression detection;
+  early-stop patience 3 fires by iter ~15 of regression)
+
+### Layer 4 — automatic stuck-subprocess respawn (added attempt 8)
+
+Layer 3 alone produced an annoying recurring pattern: once an MM
+subprocess hit the stuck state, it stayed stuck for *every* subsequent
+iter. Watchdog skipped it each iter, burning the 5-min stall threshold,
+~5 min/iter wasted per stuck opponent. Manual `Stop-Process` of the
+stuck PID worked (Layer 2's monitor respawned the pair clean), but
+required babysitting.
+
+**Fix**: when the watchdog cancels dispatch on a stall, it also calls
+`external_manager.restart_subprocess(entry.key)`. The manager kills
+the subprocess; Layer 2's monitor sees `rc != None` next poll cycle
+and respawns clean. Next iter that opponent is fresh.
+
+`ExternalOpponentManager.restart_subprocess(name)` is the new public
+method — kills the named opponent's Popen and lets the existing
+auto-restart machinery handle the respawn. Returns True/False for
+the trainer's logging.
+
+Threading: `external_manager` is now a parameter of `collect_v9`,
+`_collect_data` (in train_rl.py), `_start_background_collection`,
+and `BackgroundCollector.start`. Optional everywhere — callers that
+don't supply it get the Layer 3 behavior (skip + WARN, no respawn).
+
+**Bug class this catches**: any failure mode where a subprocess is
+"alive but silent" — Popen running, log mtime fresh from heartbeats,
+but never accepting challenges. The original symptom was MM's bug B
+(`_challenge_queue` not bound on first cold start) but the fix is
+generic to any flavor of subprocess wedge.
+
+### Phase 1 launch state (live now from sp_0229)
+
+YAML: `external_adapters_curated.yaml` (Phase 1 form — 8 MMs, 2 mcts, no FPs).
+Init: `data/models/rl_v9/_init_sp_0229/snapshot_0229.pt`.
+Out: `data/models/rl_v9_curated_pool/`.
+Warmup: 12 iters. Total: 100 iters expected ~22 hr at 13-min/iter post-warmup.
+
+Validate iter 0 looks healthy before letting it run multi-day:
+- All 8 MM subprocesses spawn + reach "ready" within ~3 min
+- `[WARMUP]` tag on iter line
+- pool count ~14-16 (12 externals + ~7 self-play snapshots from disk)
+- VRAM stays under ~5.5 GB during collect phase (`nvidia-smi`)
+- No `Spawning ... restarts=[1-9]` events in iter 0
 
 ---
 

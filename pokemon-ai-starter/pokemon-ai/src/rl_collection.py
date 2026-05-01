@@ -187,6 +187,7 @@ async def collect_v9(
     teambuilder=None,
     battle_format: str = "gen9ou",
     win_rates: Optional[Dict[str, list]] = None,
+    external_manager=None,
 ):
     """Pure self-play collection with batched inference.
     Plays against MULTIPLE opponents per iteration (uniform from pool, max 15).
@@ -334,15 +335,92 @@ async def collect_v9(
                         except Exception as e:
                             print(f"  [WARN] enqueue_team for {entry.key} failed: {e}", flush=True)
 
-                # Cap each game's wall time at 5 min (gen9ou battles are ~30-60 turns;
-                # even Foul Play at 200ms/turn × 50 turns = 10s of MCTS, plus
-                # protocol overhead, well under 5 min). If a game blows past
-                # that, something's wrong (subprocess hung, infinite loop) and
-                # we'd rather move on than wait an hour.
-                await asyncio.wait_for(
-                    player.send_challenges(entry.showdown_username, n_challenges=n_battles),
-                    timeout=max(300, n_battles * 300),
+                # Layer 3 — dispatch resilience watchdog (Session 44 fix).
+                # `send_challenges` blocks until all N battles complete (or fails
+                # silently if MM is in some intermediate state where /pms get
+                # dropped — observed in Phase 1 attempts when MM's poke-env fork
+                # has logged in but not yet bound _challenge_queue). Wrap as a
+                # task so we can monitor n_won/n_lost progress and bail if the
+                # subprocess is stuck for more than `stall_threshold_s`.
+                # Trajectories never existed for skipped battles, so there's
+                # nothing to discard on the trajectory side; PFSP win-rate just
+                # sees fewer games this iter for that opp.
+                stall_threshold_s = 5 * 60      # 5 min without a single battle finishing
+                hard_cap_s = 30 * 60            # absolute max per opponent per iter
+                poll_interval_s = 15
+
+                challenge_task = asyncio.create_task(
+                    player.send_challenges(entry.showdown_username, n_challenges=n_battles)
                 )
+                t_start_dispatch = time.time()
+                last_progress_t = t_start_dispatch
+                last_completed = 0
+                # Use plain asyncio.sleep + done() check rather than
+                # wait_for(shield(task), poll_interval) — the shield/wait_for
+                # combo had subtle interactions where if send_challenges
+                # had non-yielding internal work it could starve the timeout.
+                # asyncio.sleep is the simplest correct primitive here.
+                _last_log_t = t_start_dispatch
+                while not challenge_task.done():
+                    await asyncio.sleep(poll_interval_s)
+                    if challenge_task.done():
+                        break
+                    now = time.time()
+                    completed = (player.n_won_battles + player.n_lost_battles
+                                 + player.n_tied_battles)
+                    if completed > last_completed:
+                        last_completed = completed
+                        last_progress_t = now
+                    stalled_s = now - last_progress_t
+                    elapsed_s = now - t_start_dispatch
+                    # Periodic status (~every 60s): proves watchdog poll is live.
+                    if now - _last_log_t >= 60:
+                        print(f"  [watchdog] {entry.key}: {completed}/{n_battles} "
+                              f"after {int(elapsed_s)}s (stalled {int(stalled_s)}s)",
+                              flush=True)
+                        _last_log_t = now
+                    if completed >= n_battles:
+                        break  # task should be wrapping up; let it finish
+                    if stalled_s >= stall_threshold_s:
+                        print(f"  [WARN] {entry.key} stalled at {completed}/{n_battles} "
+                              f"for {int(stalled_s)}s with no battle finishing — "
+                              f"cancelling dispatch, skipping remaining "
+                              f"{n_battles - completed} games for this iter",
+                              flush=True)
+                        challenge_task.cancel()
+                        # Layer 4 — escalate: kill the stuck subprocess so the
+                        # monitor thread (Layer 2) respawns it clean for the next
+                        # iter. Without this, the same subprocess stays stuck
+                        # iter after iter and the watchdog burns the full
+                        # stall_threshold_s every iter on it.
+                        if external_manager is not None:
+                            try:
+                                killed = external_manager.restart_subprocess(entry.key)
+                                if killed:
+                                    print(f"  [INFO] {entry.key} subprocess force-killed "
+                                          f"for respawn (Layer 4 stall recovery)",
+                                          flush=True)
+                            except Exception as e:
+                                print(f"  [WARN] Layer 4 restart of {entry.key} failed: {e}",
+                                      flush=True)
+                        break
+                    if elapsed_s >= hard_cap_s:
+                        print(f"  [WARN] {entry.key} hit {hard_cap_s}s hard cap at "
+                              f"{completed}/{n_battles} — cancelling dispatch",
+                              flush=True)
+                        challenge_task.cancel()
+                        if external_manager is not None:
+                            try:
+                                external_manager.restart_subprocess(entry.key)
+                            except Exception as e:
+                                print(f"  [WARN] Layer 4 restart of {entry.key} failed: {e}",
+                                      flush=True)
+                        break
+                # Drain the cancelled task or let it finish cleanly
+                try:
+                    await asyncio.wait_for(challenge_task, timeout=30)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
         except asyncio.TimeoutError:
             print(f"  [WARN] Timed out vs {opp_name} after {n_battles} games", flush=True)
         except Exception as e:
@@ -457,9 +535,11 @@ class BackgroundCollector:
         self._error = None
         self.cpu_inference = cpu_inference
 
-    def start(self, model, device, server_pool, snapshot_pool, args_dict, win_rates=None):
+    def start(self, model, device, server_pool, snapshot_pool, args_dict, win_rates=None,
+              external_manager=None):
         """Start background collection with a deepcopy of the model."""
         self._win_rates = win_rates
+        self._external_manager = external_manager
         collect_model = deepcopy(model)
 
         # CPU inference: move model copy to CPU, zero GPU contention with PPO
@@ -480,12 +560,14 @@ class BackgroundCollector:
         self._thread = threading.Thread(
             target=self._run,
             args=(collect_model, collect_device, collect_fp16, collect_opp_device,
-                  server_pool, snapshot_pool, args_dict, self._win_rates),
+                  server_pool, snapshot_pool, args_dict, self._win_rates,
+                  self._external_manager),
             daemon=True,
         )
         self._thread.start()
 
-    def _run(self, collect_model, device, fp16, opp_device, server_pool, snapshot_pool, a, win_rates):
+    def _run(self, collect_model, device, fp16, opp_device, server_pool, snapshot_pool, a, win_rates,
+             external_manager=None):
         try:
             loop = asyncio.new_event_loop()
             latest_sp = _entry_key(snapshot_pool[-1]) if len(snapshot_pool) > 1 else None
@@ -502,6 +584,7 @@ class BackgroundCollector:
                     latest_snapshot=latest_sp,
                     teambuilder=a.get("teambuilder"),
                     win_rates=win_rates,
+                    external_manager=external_manager,
                 )
             )
             loop.close()

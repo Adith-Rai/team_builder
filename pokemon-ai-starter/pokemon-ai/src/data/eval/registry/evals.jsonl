@@ -236,3 +236,13 @@
 {"iter": 179, "run_dir": "data\\models\\rl_v9\\selfplay_v9_20260425_062416", "SH": 61.5, "SmartDmg": 60.0, "Tactical": 59.0, "Strategic": 64.5, "smart_avg": 61.25}
 {"iter": 199, "run_dir": "data\\models\\rl_v9\\selfplay_v9_20260425_062416", "SH": 62.0, "SmartDmg": 57.5, "Tactical": 57.0, "Strategic": 54.0, "smart_avg": 57.625}
 {"iter": 219, "run_dir": "data\\models\\rl_v9\\selfplay_v9_20260425_062416", "SH": 61.0, "SmartDmg": 68.5, "Tactical": 59.5, "Strategic": 65.5, "smart_avg": 63.625}
+{"iter": 19, "run_dir": "data\\models\\rl_v9_full_pool\\selfplay_v9_20260427_053813", "SH": 64.5, "SmartDmg": 66.5, "Tactical": 63.5, "Strategic": 61.0, "smart_avg": 63.875}
+{"iter": 39, "run_dir": "data\\models\\rl_v9_full_pool\\selfplay_v9_20260427_053813", "SH": 67.5, "SmartDmg": 62.5, "Tactical": 61.5, "Strategic": 60.0, "smart_avg": 62.875}
+{"iter": 59, "run_dir": "data\\models\\rl_v9_full_pool\\selfplay_v9_20260428_030636", "SH": 64.5, "SmartDmg": 58.5, "Tactical": 53.5, "Strategic": 54.0, "smart_avg": 57.625}
+{"iter": 79, "run_dir": "data\\models\\rl_v9_full_pool\\selfplay_v9_20260428_030636", "SH": 64.5, "SmartDmg": 62.5, "Tactical": 55.5, "Strategic": 57.5, "smart_avg": 60.0}
+{"iter": 99, "run_dir": "data\\models\\rl_v9_full_pool\\selfplay_v9_20260428_030636", "SH": 58.0, "SmartDmg": 58.5, "Tactical": 55.5, "Strategic": 63.0, "smart_avg": 58.75}
+{"iter": 19, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260429_224058", "SH": 59.5, "SmartDmg": 57.0, "Tactical": 58.5, "Strategic": 60.5, "smart_avg": 58.875}
+{"iter": 39, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260429_224058", "SH": 66.5, "SmartDmg": 65.0, "Tactical": 61.5, "Strategic": 58.0, "smart_avg": 62.75}
+{"iter": 59, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260429_224058", "SH": 58.0, "SmartDmg": 67.0, "Tactical": 64.5, "Strategic": 55.0, "smart_avg": 61.125}
+{"iter": 79, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260429_224058", "SH": 61.5, "SmartDmg": 57.0, "Tactical": 61.0, "Strategic": 55.5, "smart_avg": 58.75}
+{"iter": 99, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260429_224058", "SH": 56.5, "SmartDmg": 59.0, "Tactical": 55.0, "Strategic": 59.0, "smart_avg": 57.375}

@@ -1,31 +1,40 @@
-# Curated pool for the post-S43 training run from sp_0229.
+# Curated pool — Session 44 Phase 1 (FPs dropped, MM count expanded).
 #
-# Rationale (from S43 retrospective documented in docs/NEXT_SESSION.md):
-# - The S43 production run got 30+ self-play snapshots auto-discovered, drowning
-#   out the configured FP/MM weights. Smart_avg dropped 5pt while we gained
-#   only marginally on FP and lost vs mcts.
-# - Per the team_selection 70-team scan, sp_0229 already beats sp_2979 on
-#   most metrics (TEAM_AX 81.5% vs TEAM_AU 78.5%); we want to PUSH it past
-#   sp_0229's level on the FP/MM externals specifically without losing the
-#   bot-eval performance.
-# - Pool-curation hazard: must move pre-peak old runs aside on disk
-#   BEFORE launch (see pre-flight commands in NEXT_SESSION.md curated-pool
-#   section). Keeping peak-era references (sp_2979, sp_2999, sp_3009,
-#   sp_3029) is GOOD; mid-training pre-peak (sp_0284, sp_0439, sp_1199)
-#   inflates self-play sample share without giving real gradient signal.
+# Rationale (full writeup in docs/NEXT_SESSION.md "Session 44 status"):
+# - FP at sp_0229's skill level is wall-clock waste: ~88% loss → PFSP
+#   weight (1-wr)² ≈ 0.014 → near-zero gradient signal, but FP battles
+#   take ~19s each vs ~1.7s for MM. Most waves were waiting on FP slots.
+#   Drop FP entirely; expect 22 → 13-15 min/iter.
+# - MCTS-style gradient diversity preserved by in-process mcts-fast/medium.
+# - Add 4 new MM variants for size + style diversity (BC vs RL, paper vs
+#   gen9-tuned, small vs medium vs large): MediumIL, MediumRL_Aug, LargeRL,
+#   SmallRLGen9Beta. Each different enough that PFSP can weight by
+#   empirical hardness without redundant slot share.
+# - Per-MM-subprocess concurrent-challenge cap is the relevant safety bound
+#   (bug B fires at 6+ simultaneous challenges to ONE MM); adding more MM
+#   subprocesses LOWERS per-process concurrent load. Safer, not riskier.
+# - VRAM (RTX 3060 Laptop, 6 GB total): ~3.4 GB for 8 MMs + 0.77 GB
+#   trainer = 4.2 GB used, 1.8 GB buffer. Phase 2 with 50M-tier multitask
+#   models (Abra/Kadabra2/Alakazam) will need to swap-out, not stack.
+#   Phase 3 (Kakuna 140M) infeasible on this hardware; deferred to cloud.
 #
-# Weight design (group totals after PFSP boost will normalize):
-#   mcts group   1.5  (mcts-fast 1.0 + mcts-medium 0.5 = search-time diversity)
-#   FP group     1.6  (4 entries × 0.4 each, up from prior 0.25)
-#   MM group     2.0  (4 entries × 0.5 each, up from prior 0.25)
-#   self-play   ~0.4-0.6  (~5-8 curated peak-era + new run snapshots × ~0.06 each)
+# Weight design (PFSP normalizes per (1-wr)² × yaml_weight):
+#   mcts group  1.5  (mcts-fast 1.0 + mcts-medium 0.5 = search-time diversity)
+#   MM group    3.2  (8 entries × 0.4 each)
+#   self-play  ~0.4-0.5  (~7 curated peak-era + new run snapshots × ~0.06 each)
 #
-# Net: external opponents collectively ~5.1 vs self-play ~0.5. PFSP weights
-# the harder ones up further. Should yield ~1.5-2 MM samples per iter on
-# average (was ~0.8 in the diluted pool).
+# Net: externals ~4.7, sp ~0.5 → externals dominate ~10:1 by raw weight.
+# Each MM expected slot share ~7-8% → low collision probability.
+#
+# Phase progression (when to swap):
+# - Phase 2 trigger: ≥40-45% W/L on each Phase 1 MM. Swap out
+#   weakest/most-redundant 1-2 (likely SmallRL+SmallIL since covered by
+#   MediumIL/MediumRL_Aug). Add 1-2 from Abra/Kadabra2/Alakazam.
+#   Optionally re-add 1 FP at weight 0.2 if anti-search drift desired.
+# - Phase 3 (Kakuna/Superkazam): NOT FEASIBLE on this GPU. Cloud only.
 
 opponents:
-  # ─── In-process MCTS (search-strength diversity) ──────────────
+  # ─── In-process MCTS (search-strength diversity, GPU-free, fast) ──
   - name: mcts-fast
     type: mcts
     search_time_ms: 80
@@ -35,58 +44,65 @@ opponents:
     search_time_ms: 200
     weight: 0.5
 
-  # ─── 4× Foul Play (CPU MCTS + Smogon-set guessing) ────────────
-  # 4 instances for throughput parallelism (FP has no neural model;
-  # multi-process is the natural way to scale). All identical config.
-  - name: foulplay-100ms-1
-    type: foulplay
-    showdown_username: FoulPlayBot1
-    search_time_ms: 100
-    server_port: 9000
-    weight: 0.4
-  - name: foulplay-100ms-2
-    type: foulplay
-    showdown_username: FoulPlayBot2
-    search_time_ms: 100
-    server_port: 9000
-    weight: 0.4
-  - name: foulplay-100ms-3
-    type: foulplay
-    showdown_username: FoulPlayBot3
-    search_time_ms: 100
-    server_port: 9000
-    weight: 0.4
-  - name: foulplay-100ms-4
-    type: foulplay
-    showdown_username: FoulPlayBot4
-    search_time_ms: 100
-    server_port: 9000
-    weight: 0.4
-
-  # ─── 4× Metamon variants (boosted from 0.25 → 0.5 each) ───────
-  # Diversity: small RL, medium RL, BC-only, gen9-tuned RL.
-  # VRAM budget (S42 measurements): 173+218+215+530 = ~1.14 GB total.
+  # ─── 8× Metamon variants (Phase 1 — size + style diversity) ──────
+  #
+  # Original 4 (kept):
   - name: mm-minikazam
     type: metamon
     model: Minikazam
     temperature: 1.0
     server_port: 9000
-    weight: 0.5
+    weight: 0.4
   - name: mm-smallrl
     type: metamon
     model: SmallRL
     temperature: 1.0
     server_port: 9000
-    weight: 0.5
+    weight: 0.4
   - name: mm-smallil
     type: metamon
     model: SmallIL
     temperature: 1.0
     server_port: 9000
-    weight: 0.5
+    weight: 0.4
   - name: mm-mediumrl
     type: metamon
     model: MediumRL
     temperature: 1.0
     server_port: 9000
-    weight: 0.5
+    weight: 0.4
+
+  # New for Phase 1: behavioral + strength diversity at near-our-level.
+  #
+  # SAFEST FIRST: only LargeRL added on this attempt. After Phase 1's
+  # first hang at iter 0 (8 of 8 expected MM challenges never sent —
+  # trainer routed 25 self-play battles successfully then blocked on a
+  # wave-0 slot whose V9RLPlayer never issued a single challenge), the
+  # most likely culprit is one of the new MM usernames having an issue
+  # with poke-env's toId() or battle_server's user matching.
+  # MediumIL ("MM-MediumIL") and MediumRL_Aug ("MM-MediumRL_Aug" —
+  # underscore!) are the most suspicious. LargeRL ("MM-LargeRL") is
+  # closer to the established working pattern. We'll add them back
+  # one-at-a-time once 5-MM is validated.
+  - name: mm-largerl
+    type: metamon
+    model: LargeRL
+    temperature: 1.0
+    server_port: 9000
+    weight: 0.4
+
+  # ─── PARKED PHASE 1 ADDITIONS (re-enable one at a time after 5-MM works) ──
+  # - name: mm-mediumil       → MediumIL
+  # - name: mm-mediumrl-aug   → MediumRL_Aug  (underscore in showdown_username — investigate first)
+
+  # SmallRLGen9Beta DROPPED — its model registration hard-codes
+  # FlashAttention via gin_overrides, bypassing the standard fallback to
+  # VanillaAttention. flash_attn is unavailable on Windows (no prebuilt
+  # wheel for our CUDA + python combo), so the subprocess crashes with
+  # AssertionError on every spawn. Re-add post-cloud-deploy or after a
+  # flash_attn install effort (low priority).
+
+  # ─── Foul Play (DROPPED for Phase 1 — wall-clock waste at sp_0229
+  # skill level). Re-add 1 entry at weight 0.2 in Phase 2 once we're
+  # ≥30% WR vs FP. Note: must be ≥4 instances if FP comes back at all
+  # (single-FP deadlock per attempt 3 postmortem). ──────────────────

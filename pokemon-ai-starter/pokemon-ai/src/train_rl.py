@@ -142,6 +142,18 @@ def parse_args():
     p.add_argument("--external-adapters", default=None,
                    help="Path to external_adapters.yaml — adds in-process opponent "
                         "adapters (e.g. PokeEnginePlayer) to the PFSP pool")
+    # Pool curation (Session 44 — anti-dilution). Both default to old behavior.
+    p.add_argument("--pool-anchors", default="",
+                   help="Comma-separated paths to fixed anchor checkpoints kept in the "
+                        "PFSP pool throughout training (e.g. peak-era references). "
+                        "Always present; never pruned. Default empty = old behavior.")
+    p.add_argument("--pool-max-current-run", type=int, default=-1,
+                   help="Cap on number of self-play snapshots from the CURRENT run "
+                        "kept in the pool. When N>=0 and the current run has produced "
+                        "more than N snapshots, the oldest ones are dropped from the "
+                        "pool (still saved on disk). Anchor checkpoints and the init "
+                        "checkpoint are not affected. Default -1 = unbounded (old "
+                        "behavior — caused S43/S44 dilution).")
     add_model_args(p)
     return p.parse_args()
 
@@ -240,7 +252,8 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
 
 def _collect_data(args, model, device, server_pool, snapshot_pool,
                   rs_cfg, train_teambuilder, battle_format,
-                  loop, pending_collection, _flow, win_rates=None):
+                  loop, pending_collection, _flow, win_rates=None,
+                  external_manager=None):
     """Run one collection step. Returns (trajs, wins, losses, ties, steps, opp_name, collect_time, opp_records)."""
     if pending_collection is not None:
         _flow("using pre-collected data from background")
@@ -285,6 +298,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             teambuilder=train_teambuilder,
             battle_format=battle_format,
             win_rates=win_rates,
+            external_manager=external_manager,
         )
     )
     _flow(f"sync collection done: {result[6]:.0f}s, {len(result[0])} trajs")
@@ -293,7 +307,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
 
 def _start_background_collection(args, model, device, server_pool, snapshot_pool,
                                   collect_args, bg_collector, mp_bg_collector,
-                                  in_warmup, _flow):
+                                  in_warmup, _flow, external_manager=None):
     """Kick off background collection for the NEXT iteration (pipeline mode)."""
     if args.mp and args.pipeline and not in_warmup:
         from mp_collect_v2 import MPPipelineCollector
@@ -313,7 +327,8 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
     elif bg_collector and not in_warmup and not args.mp:
         _flow("starting BACKGROUND collection for next iter")
         bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
-                           win_rates=collect_args.get("win_rates"))
+                           win_rates=collect_args.get("win_rates"),
+                           external_manager=external_manager)
     return mp_bg_collector
 
 
@@ -364,8 +379,16 @@ def _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
 
 
 def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
-                         wr, best_eval_wr, snapshot_pool, run_dir):
-    """Save snapshot if interval reached and iter is clean."""
+                         wr, best_eval_wr, snapshot_pool, run_dir,
+                         protected_paths=None):
+    """Save snapshot if interval reached and iter is clean.
+
+    `protected_paths` (set of str) is the set of pool entries that must NEVER
+    be pruned: the init checkpoint and any --pool-anchors. When
+    --pool-max-current-run >= 0, the function caps the number of *unprotected*
+    self-play snapshots from this run; the oldest current-run snapshots beyond
+    the cap are dropped from the pool (still saved to disk).
+    """
     if (it + 1) % args.snapshot_interval != 0:
         return
     if steps < 100:
@@ -379,7 +402,30 @@ def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
             "snapshot_pool": [s for s in snapshot_pool if isinstance(s, str)],
         })
         snapshot_pool.append(sp_path)
-        print(f"  Snapshot saved: {sp_path} (pool={len(snapshot_pool)})", flush=True)
+
+        # Layer-5 anti-dilution prune (Session 44). When --pool-max-current-run
+        # is set, drop oldest current-run snapshots beyond the cap. Anchors and
+        # init are protected.
+        n_pruned = 0
+        if args.pool_max_current_run >= 0 and protected_paths is not None:
+            run_dir_prefix = str(run_dir).replace("\\", "/")
+            current_run_idx = [
+                i for i, s in enumerate(snapshot_pool)
+                if isinstance(s, str)
+                and s.replace("\\", "/").startswith(run_dir_prefix)
+                and s.replace("\\", "/") not in protected_paths
+            ]
+            excess = len(current_run_idx) - args.pool_max_current_run
+            if excess > 0:
+                # current_run_idx is in pool order, so oldest first → drop those
+                drop_indices = set(current_run_idx[:excess])
+                snapshot_pool[:] = [s for i, s in enumerate(snapshot_pool)
+                                    if i not in drop_indices]
+                n_pruned = excess
+
+        prune_str = f", pruned={n_pruned}" if n_pruned else ""
+        print(f"  Snapshot saved: {sp_path} (pool={len(snapshot_pool)}{prune_str})",
+              flush=True)
 
 
 def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
@@ -541,6 +587,28 @@ def main():
     # Infrastructure
     server_pool = [_make_server(s.strip()) for s in args.servers.split(",")]
     snapshot_pool = [args.init_from]
+
+    # Anchors — fixed checkpoints kept in the pool throughout training.
+    # Used to prevent self-play drift / cycling by giving PFSP stable
+    # reference points (e.g. peak-era sp_2979). Anchors are NEVER pruned by
+    # --pool-max-current-run.
+    anchor_set = set()
+    if args.pool_anchors:
+        for raw in args.pool_anchors.split(","):
+            p = raw.strip().replace("\\", "/")
+            if not p:
+                continue
+            if not Path(p).exists():
+                print(f"  [WARN] --pool-anchors path does not exist: {p} (skipping)",
+                      flush=True)
+                continue
+            if p == args.init_from.replace("\\", "/"):
+                continue  # init is already in the pool
+            if p in anchor_set:
+                continue
+            anchor_set.add(p)
+            snapshot_pool.append(p)
+            print(f"  [pool] anchor added: {p}", flush=True)
     rs_cfg = _build_reward_config(args)
 
     # Team builder. Training MUST use procedural Smogon-usage teams to avoid
@@ -639,6 +707,12 @@ def main():
             else:
                 print(f"  [PFSP] WARN — one or more subprocess adapter(s) not ready; "
                       f"proceeding anyway, expect timeouts", flush=True)
+            # NOTE: the 30s GUARD sleep we tried in attempt 6 was REPLACED by
+            # the dispatch watchdog in rl_collection.py `_play_one_opponent`.
+            # Watchdog catches the same login-race symptoms AND any other
+            # subprocess flakiness (post-login crashes, _challenge_queue
+            # binding race on subsequent waves not just iter 0, etc.) without
+            # imposing a fixed startup cost on healthy runs.
 
     loop = asyncio.new_event_loop()
 
@@ -673,6 +747,9 @@ def main():
     mp_bg_collector = None
     eval_history = []  # list of eval dicts for early-stopping check
 
+    # Pool entries that prune-on-save must NEVER drop: init + anchors. (Layer 5)
+    protected_paths = {args.init_from.replace("\\", "/")} | anchor_set
+
     # ---- Training loop ----
     for it in range(start_iter, start_iter + args.n_iters):
         _flow_t0 = time.time()
@@ -695,7 +772,8 @@ def main():
         collect_result = _collect_data(
             args, model, device, server_pool, snapshot_pool,
             rs_cfg, train_teambuilder, battle_format,
-            loop, pending_collection, _flow, win_rates=win_rates)
+            loop, pending_collection, _flow, win_rates=win_rates,
+            external_manager=external_manager)
         trajs, wins, losses, ties, steps, opp_name, collect_time = collect_result[:7]
         opp_records = collect_result[7] if len(collect_result) > 7 else {}
         pending_collection = None
@@ -794,7 +872,8 @@ def main():
 
         # ---- Snapshot (before background collection so new snapshot is in pool) ----
         _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
-                             wr, best_eval_wr, snapshot_pool, run_dir)
+                             wr, best_eval_wr, snapshot_pool, run_dir,
+                             protected_paths=protected_paths)
 
         # ---- Start background collection for next iter ----
         # Moved here from before PPO update so that the latest snapshot is in the
@@ -802,7 +881,8 @@ def main():
         # started before snapshot save, so the model never fought its most recent self.
         mp_bg_collector = _start_background_collection(
             args, model, device, server_pool, snapshot_pool,
-            collect_args, bg_collector, mp_bg_collector, in_warmup, _flow)
+            collect_args, bg_collector, mp_bg_collector, in_warmup, _flow,
+            external_manager=external_manager)
 
         # ---- Eval (runs while background collection is in progress) ----
         best_eval_wr, _, should_stop = _maybe_eval(

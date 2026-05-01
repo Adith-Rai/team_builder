@@ -333,3 +333,5 @@
 {"iter": 3139, "name": "e5sp3139", "elo": 1052.8, "ci_lo": 1035.2, "ci_hi": 1071.3, "ladder": "elo_exp5_shard2", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260416_041529/snapshot_3139.pt"}
 {"iter": 3159, "name": "e5sp3159", "elo": 1039.9, "ci_lo": 1020.2, "ci_hi": 1058.3, "ladder": "elo_exp5_shard2", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260416_041529/snapshot_3159.pt"}
 {"iter": 3174, "name": "e5sp3174", "elo": 1047.2, "ci_lo": 1025.4, "ci_hi": 1061.8, "ladder": "elo_exp5_shard2", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260416_041529/snapshot_3174.pt"}
+{"iter": 114, "name": "sp_0114", "elo": 1067.1, "ci_lo": 1030.5, "ci_hi": 1108.1, "ladder": "eval_s43_final", "n_games": 100, "ckpt": "data/models/rl_v9_full_pool/selfplay_v9_20260428_030636/snapshot_0114.pt"}
+{"iter": 229, "name": "sp_0229", "elo": 1065.9, "ci_lo": 1027.0, "ci_hi": 1115.3, "ladder": "eval_s43_final", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt"}
