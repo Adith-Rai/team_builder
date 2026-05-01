@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-01 (Session 44 finalized — Layers 1-5 training defenses + pool curation flags + Metamon-competitive eval; second 200-iter PPO run resumed from sp_0024 in progress)**
+**Last updated: 2026-05-01 (Session 44 finalized — architecture audit identified two surgical fixes A+B for Session 45; current 200-iter PPO run continues until ~02:00 next day with Layers 1-5 defenses active)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -466,6 +466,131 @@ The attempt 9 fresh-from-sp_0229 run completed 100 iters. Final snapshot
 exists but is not the deliverable (smart_avg regressed). The attempt-11 resumed
 run picks up from `selfplay_v9_20260430_201427/snapshot_0024.pt`, which on
 Metamon competitive scored within noise of sp_0229.
+
+---
+
+## Architecture audit (Session 44 finalization, 2026-05-01)
+
+**This audit was triggered by the observation that we lose 28% vs Minikazam
+(4.7M params) despite our 14M params. A 3× larger model losing to a
+specialized smaller one is strong evidence of implementation issues, not
+just scale disadvantage.** What follows is the verified-from-code reading
+of where our model takes shortcuts vs where it does things properly.
+
+### What our model does properly (verified, no fix needed)
+
+- **Active-move encoding has full info per move.** `ActionEncoder` (model.py:540-571)
+  feeds each of the 4 currently-pickable moves through `MoveNet` individually,
+  with the full 109-dim continuous block (`_project_move_flags` returns 107 +
+  type_eff + opp_threat = 109 dims) AND real bank values (BP, accuracy, PP,
+  priority embeddings). Each move becomes its own attention token in the
+  9-token action context (4 moves + 5 switches). This is "doing things
+  properly" — when picking a move, the model sees full per-move detail.
+- **Per-Pokemon entity tokens for both teams.** Spatial transformer attends
+  over 14 tokens: actor + critic + field + transition + 6 ours + 6 opp.
+  Opp Pokemon tokens contain their full state (species, item, ability,
+  HP%, types, stats) including 4 compact-encoded revealed moves.
+- **Type effectiveness is computed and surfaced.** Both `_compute_type_effectiveness`
+  (move vs opp active) and `_max_opp_threat` (opp moves vs us) are explicit
+  inputs to the active-move encoding.
+
+### Real shortcuts identified (need fixing)
+
+**A. Single pooled temporal summary** (`n_summary_tokens=0` default)
+
+When `n_summary_tokens=0` (the default we've always used), spatial transformer's
+14 entity outputs collapse via attention pooling to **ONE 384-dim vector** per
+turn → goes to temporal transformer. Per `METAMON_LEARNINGS.md`:
+
+> "Metamon keeps multiple summary vectors per turn (they flatten, not pool).
+>  Our pooled summary may be a silent bottleneck."
+
+The CLI flag `--n-summary-tokens K` for K>0 is supported in `model.py` but we've
+**never set it in production training**. With K=2 or K=3, K extra learnable
+"scratch tokens" added to spatial input, processed through self-attention with
+the 14 entities, and **bypass pooling** — temporal transformer gets K vectors
+per turn instead of 1. Documented as a fix for the bottleneck.
+
+**Cost to apply**: NO obs/data change. Model adds K × 384 new learnable
+parameters (initial values of scratch tokens). Resume from current best checkpoint
++ `--n-summary-tokens 3` + `--warmup-iters 12-20` to let new params settle
+before policy updates. NO BC retrain needed. ~25hr PPO continuation.
+
+**B. Move bank embeddings zeroed for team-level moves** (model.py:701-702)
+
+The MoveNet has 4 bank embeddings (BP, accuracy, PP, priority) using `NumericalBank`
+to map integer move-property values to learnable vectors. Active-move path
+(model.py:558) feeds REAL values from `_project_move_flags`. **Team-move path
+(model.py:701-702) feeds `torch.zeros(...)` for ALL FOUR banks.**
+
+What's actually lost (since the 23-dim continuous channel still carries type +
+BP + category + priority for team moves):
+- **Accuracy** (huge — Stone Edge 80% vs Earthquake 100% plays totally different)
+- **PP** (late-game mattering)
+- **Drain/recoil/heal coefficients**
+- **Multihit count**
+- **Move flags** (sound/punch/contact/bite/powder)
+- **Crit ratio**
+
+These features are *only* exposed through the bank/non-compact path. Currently
+the model is blind to them for any move not in our currently-active 4. This is
+a real loss for tactical reasoning ("opp's Pokemon X has Stone Edge, which often
+misses, vs Y has Earthquake, which is reliable").
+
+**Cost to apply**: NO obs shape change. The bank values are deterministic from
+move_id (each move has fixed BP/acc/PP/prio in poke-env's data). Compute them
+inline at model forward time (or in the data loader) and feed to MoveNet's
+existing bank inputs. NO BC retrain needed. Model parameters unchanged in count;
+just feeding non-zero values into already-existing embedding tables. PPO
+continuation needed (model has to relearn how to use the suddenly-non-zero
+banks; ~5-10 iters of mild adaptation expected).
+
+**Combined A + B**: one PPO continuation run, both fixes applied together,
+warmup 12-20 iters to settle the new feature regime. Resume from attempt-11's
+final checkpoint. Total: ~25hr.
+
+### Deferred — not needed (or only if A+B insufficient)
+
+**C. Drop 84-dim padding in MoveNet (split MoveNet by path or dynamic shape)**
+
+The team-move path pads its 23-dim continuous features to 109-dim with zeros
+to share one MoveNet with the active-move path (109 dims). The first
+`Linear(189 → 128)` in MoveNet has 86 input columns that are always zero on
+team paths. **Cost: ~11K dead parameters out of 14M = 0.08% of model.**
+
+Verdict: cosmetic cleanup only. Not capability-limiting. **Skip unless we're
+already touching MoveNet for some other reason.**
+
+**D. Per-move opp tokens in spatial transformer**
+
+Currently each opp Pokemon is ONE token containing 4 concatenated 23-dim
+move encodings. To make each move its own attention token: spatial input grows
+14 → ~38 tokens, attention compute grows ~7× (quadratic), and we'd need:
+- Obs shape changes (BC memmap regen)
+- Spatial transformer reshape
+- BC retrain + PPO retrain
+
+Verdict: real architectural change. **Reserve for "A+B done, ceiling still real."**
+This is the right move IF empirical data shows per-move attention matters more
+than per-Pokemon entity attention. We don't have that data yet.
+
+### What we're doing next (Session 45 plan)
+
+**Two phases:**
+
+1. **Wait for attempt 11 to finish** (~24hr from 2026-05-01 ~01:15 launch).
+   Final snapshot ~sp_0224 becomes the resume point + ladder-submission baseline.
+
+2. **Session 45**: implement A + B as a single combined fix.
+   - Code change in `model.py` for team-move bank population (B)
+   - CLI flag `--n-summary-tokens 3` (A) — already supported, just use it
+   - Resume from attempt-11 final snapshot, warmup 12-20 iters, run 100-200 iters
+   - Compare smart_avg trajectory + per-opp trends to attempt 11 (controlled A/B)
+
+If A+B improves smart_avg ≥3pt past sp_0229's 67.8% baseline (above noise floor),
+we have real evidence that implementation shortcuts were limiting us. If flat,
+that's evidence the ceiling is more fundamental (size, data, or D's per-move
+attention pattern), and the next experiment is D or cloud-scale.
 
 ### KNOWN WEAK POINT: per-update batch size (`--games-per-iter`)
 
