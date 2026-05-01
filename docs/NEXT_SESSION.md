@@ -549,30 +549,96 @@ banks; ~5-10 iters of mild adaptation expected).
 warmup 12-20 iters to settle the new feature regime. Resume from attempt-11's
 final checkpoint. Total: ~25hr.
 
+### Architectural insight: shared parameters generalize understanding across our/opp
+
+Important: PokemonNet and MoveNet have SHARED PARAMETERS across our 6 and
+opp 6 Pokemon (model.py:683-687 — both go through ONE pokemon_net call).
+The same MLP weights process both sides. This means:
+
+- The model's "understanding" of a Pokemon (e.g. "high attack + STAB
+  super-effective move = threat") generalizes from ours to opp by design
+- The model's "understanding" of a move (Earthquake's properties) is the
+  same regardless of who has it
+
+What blocks full generalization is **inconsistent input data across
+contexts**, not the architecture. Active-path moves get full 109-dim
+continuous + real bank values. Team-path moves (both ours and opp's) get
+23-dim compact + ZEROED banks. The same MoveNet sees Earthquake-with-real-
+banks (active) and Earthquake-with-zero-banks (team) as different inputs
+producing different 128-dim outputs. The model is forced to learn TWO
+representations of the same move depending on context.
+
+**B's purpose isn't adding new info — it's restoring architectural
+consistency the design always intended.** The MoveNet bank embedding
+tables exist for a reason; we're just feeding zero where real values
+should go.
+
 ### Deferred — not needed (or only if A+B insufficient)
 
-**C. Drop 84-dim padding in MoveNet (split MoveNet by path or dynamic shape)**
+**C-as-cosmetic-cleanup. Drop the 84-dim padding** (split MoveNet by path or
+dynamic shape).
 
 The team-move path pads its 23-dim continuous features to 109-dim with zeros
 to share one MoveNet with the active-move path (109 dims). The first
 `Linear(189 → 128)` in MoveNet has 86 input columns that are always zero on
 team paths. **Cost: ~11K dead parameters out of 14M = 0.08% of model.**
 
-Verdict: cosmetic cleanup only. Not capability-limiting. **Skip unless we're
-already touching MoveNet for some other reason.**
+Verdict: cosmetic only. Skip.
+
+**B+ (or C-as-feature-expansion). Populate the 86 padding dims with REAL features
+from `_project_move_flags` for team moves.**
+
+After B, team moves still LACK these tactical features (currently only
+exposed via active-path's 107-dim `_project_move_flags`):
+- drain / recoil / heal coefficients (Giga Drain heals; Brave Bird hurts you)
+- multihit count (Scale Shot defeats Substitute/Sash)
+- contact flag (Rocky Helmet / Static / Flame Body / Effect Spore triggers)
+- protect_blocked flag (Feint, etc.)
+- sound flag (pierces Substitute, blocked by Soundproof)
+- punch flag (Iron Fist; Punching Glove)
+- bite flag (Strong Jaw)
+- powder flag (blocked by Grass types / Overcoat / Safety Goggles)
+- crit ratio (Stone Edge etc. crit much more than baseline)
+- secondary effect probabilities (30% paralyze from Body Slam, etc.)
+
+The model can recover some of this via move_id embedding learning, but
+that's making it memorize ~600 moves' properties from training data
+instead of being given them explicitly. Wasteful and incomplete
+generalization.
+
+**B+ extends team-path encoding from 23 → 109 dims by computing
+`_project_move_flags` for all team moves (not just active 4).** This
+populates the 86-dim padding with real features.
+
+Cost: features.py change to compute these per team move; BC memmap regen
+(obs shape changes); BC retrain + PPO retrain.
+
+Verdict: **natural follow-up to A+B if results don't break ceiling.**
+Completes the team/active feature parity that B starts.
 
 **D. Per-move opp tokens in spatial transformer**
 
-Currently each opp Pokemon is ONE token containing 4 concatenated 23-dim
-move encodings. To make each move its own attention token: spatial input grows
-14 → ~38 tokens, attention compute grows ~7× (quadratic), and we'd need:
-- Obs shape changes (BC memmap regen)
-- Spatial transformer reshape
-- BC retrain + PPO retrain
+Currently each opp Pokemon is ONE token containing 4 concatenated move
+encodings. After B (and B+), the model has consistent rich move info inside
+Pokemon tokens. PokemonNet's MLP can encode "this Pokemon with these specific
+moves" patterns into the token, and Pokemon-level spatial attention can
+operate over those. Move-vs-move strategic patterns emerge through
+PokemonNet's MLP **memorizing** them (rather than attention **generalizing**
+them).
 
-Verdict: real architectural change. **Reserve for "A+B done, ceiling still real."**
-This is the right move IF empirical data shows per-move attention matters more
-than per-Pokemon entity attention. We don't have that data yet.
+D would let attention compute things like "Sucker Punch on opp (priority +1,
+only works on attacking targets) vs my setup move (non-attacking)" directly.
+Plausibly handles novel Pokemon-move combos better.
+
+Cost: spatial input grows 14 → ~38 tokens, attention compute ~7× (quadratic),
+implementation complexity, BC + PPO retrain.
+
+Verdict: speculative. **The case for D weakens significantly once we recognize
+the architecture's existing generalization machinery.** With shared MoveNet
+parameters and consistent inputs (B), the model already cross-applies move
+understanding between our/opp Pokemon. D isn't unlocking a new capability;
+it's offering different attention granularity. **Reserve for "A+B+B+ done, ceiling
+still real."**
 
 ### What we're doing next (Session 45 plan)
 
