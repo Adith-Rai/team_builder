@@ -6,19 +6,14 @@ We are building a Pokemon battle AI that competes at an elite level — among
 the strongest human players, the strongest published bots (Metamon's Kakuna,
 SmallRL, Minikazam), and the strongest other engines. V1 scope is singles
 gen 9. Future scope: multi-gen (4+), doubles, triples, 3v3, other formats.
-Doubles/triples will likely need a different model; everything else extends.
 
 Elite Pokemon play is about:
   - Damage prediction (BP × types × items × abilities × screens × weather × boosts)
   - Speed-tier reasoning (item × ability × boost × terrain × Trick Room)
   - Win-condition identification (which of my Pokemon can sweep, against what)
   - Opp set prediction from incomplete info (revealed moves + metagame priors)
-  - Hazard tracking, status timing (toxic counter, sleep counter, future sight)
-  - Item / ability identification ("they moved twice → not Choice")
-  - Probabilistic reasoning (acc/crit/secondary chances, multi-hit)
-  - Long-horizon resource management (PP, one-time-use Tera/Mega/Z/Dynamax)
-  - Substitute / Endeavor / Counter / Belly Drum + Sitrus edge timing
-  - Reading patterns (Sleep Talk vs Roar, defensive sets vs offensive)
+  - Hazard tracking, status timing, item / ability identification
+  - Probabilistic reasoning, long-horizon resource management
 
 Every architectural / training / feature decision should be evaluated against
 "does this help reach elite-level play, or is it premature optimization?"
@@ -29,323 +24,333 @@ than come back later and break working code.
 READ THIS FIRST — IN ORDER, WITH REASONING NOT SKIMMING
 ═══════════════════════════════════════════════════════════════════════════════
 
-Lesson from Session 44 (in NEXT_SESSION.md): "Don't rely on docs alone. Read
-the files." Several initial summary-based claims were wrong. Re-confirm every
-claim against the actual code before acting on it.
+Lesson from Sessions 44 + 47: don't trust the docs alone. Re-confirm every
+load-bearing claim against the actual code before acting on it.
 
-1. **`docs/NEXT_SESSION.md`** — top-to-bottom. Especially the recently-added
-   Session 46 TL;DR. This tells you the live training run state, what
-   landed in Session 46, and where Session 47 picks up.
+1. **`docs/NEXT_SESSION.md`** — top-to-bottom. The Session 47 TL;DR (top of
+   file) tells you what landed in Week 2 and where Week 3 picks up.
+   Critical: read the **"BC vs PPO infrastructure split"** table — it's the
+   single best reference for where each piece of work lives. Don't grep
+   for `battle_server` and assume BC uses it the way PPO does — the table
+   tells you it doesn't.
 
-2. **`docs/REWRITE_DESIGN.md`** — read §1-§9 for the design contract, then
-   carefully read **Postscripts A through G**. The postscripts are where
-   Session 46's actual work lives — significant deviation from the original
-   §7 Week 1 plan. Don't proceed thinking the V1 design is what §3.1 says;
-   that table predates the audit + signal-recovery + structural-enrichment
-   passes.
+2. **`docs/REWRITE_DESIGN.md`** — read §6 (training pipeline) + §6b
+   (heterogeneous opponent support) + §7 Week 3 specifically. Then
+   carefully read **Postscript H** (Session 47, capacity bump). The
+   architecture is now 20M params at d_model=256, d_temporal=512, K=4 —
+   matches Metamon Small's recipe + ~33% bigger.
 
-3. **`docs/STATUS.md`** is long but skimming Sessions 18, 30, 35, 39, 43, 44
-   gives the empirical history (e.g., Session 30 weight analysis showing
-   defensive_eff and type_eff as #1 features by 5-pt margins). Reference,
-   not required reading.
+3. **`pokemon-ai-starter/pokemon-ai/src/model_transformer.py`** — read
+   `TransformerBattlePolicy` end-to-end. You will be calling
+   `forward_sequence(collated, device)` from BC code, and saving / loading
+   `TransformerConfig` from checkpoints. Walk through `forward_sequence`
+   and confirm the keys it expects from the collated dict match what
+   `dataset.collate_seq` produces.
 
-4. **`pokemon-ai-starter/pokemon-ai/src/model_transformer.py`** — this IS
-   the architecture as it stands. Read it top-to-bottom:
-   - Module constants (N_BATTLE_STATE, N_TOKEN_TYPES, _PER_POKEMON_TT, _SL_*,
-     _FL_*, MOVE_FLAG_DIM, etc.) tell you the contract.
-   - `TransformerConfig` is the config surface.
-   - The four parsers (build_damage_chart, build_move_flag_lookup,
-     parse_showdown_items, parse_showdown_abilities) tell you what's in
-     the lookup .pt at training time.
-   - MoveTokenizer / ItemTokenizer / AbilityTokenizer are parallel patterns.
-   - `Tokenizer.forward` is the entry point. Walk through it once with
-     pencil-and-paper to understand what produces each of the 220 tokens.
+4. **`pokemon-ai-starter/pokemon-ai/src/test_policy.py`** — 9 tests.
+   `test_synthetic_ppo_step` is the canonical reference for the
+   forward_sequence + backward + AdamW step that BC will do for real.
+   If your BC plumbing breaks something, this test should catch it.
 
-5. **`pokemon-ai-starter/pokemon-ai/src/test_tokenizer.py`** — 17 tests on
-   real human_v8_100k data. Read each test to understand the contract it
-   asserts. If you change something in Week 2, run these to check for
-   regressions.
+5. **`pokemon-ai-starter/pokemon-ai/src/train_bc.py`** — read top-to-bottom
+   for the legacy code path. Pay attention to:
+   - L394-401: model construction (`config_from_args` + `PokeTransformer`).
+     This is where `--use-transformer` swaps in.
+   - L408-431: optimizer + LR schedule (cosine / constant / psppo).
+   - L441-453: resume path. Has `--lr-restart` for changing LR mid-run.
+   - L249-332: `eval_vs_bots(...)` — uses `BattleAgent`. Won't work for
+     the new arch without `BattleAgentTransformer` (§6b.2). Decide on
+     approach (build it now, defer, or skip-eval-during-BC).
+   - L463: config save (`cfg.to_dict()`). `TransformerConfig` already has
+     `to_dict()` / `from_dict()`.
 
-6. **`pokemon-ai-starter/pokemon-ai/src/model.py`** — the LEGACY MLP arch.
-   `SpatialTransformer` (line 312-430), `TemporalTransformer` (line 437-511),
-   `ActionSlotEncoder` (line 522-571), `PokeTransformer.forward` (line 739-803),
-   `forward_sequence` (line 818-978). You'll mirror the structure but
-   adapt to the 220-token Tokenizer output. **Do not modify model.py.**
-   The §6b guard rail keeps it as the legacy-arch reference.
+6. **`pokemon-ai-starter/pokemon-ai/src/ppo.py:347-371`** — `load_checkpoint`
+   hardcodes `PokeTransformerConfig` + `PokeTransformer`. Both train_bc.py
+   AND train_rl.py call this. Week 3 plumbing must make it dispatch on
+   the checkpoint's `model_config` content (legacy has v8 keys; new has
+   `format_config` and friends).
 
-7. **`pokemon-ai-starter/pokemon-ai/src/dataset.py`** — `MemmapDataset`,
-   `collate_seq`, `unpack_turn_batch`. The collate produces a dict of
-   tensors that `Tokenizer.forward` consumes. The mega-batch path in
-   `forward_sequence` (model.py:818-978) is the BC-training-time fast
-   path you'll mirror.
-
-8. **`pokemon-ai-starter/pokemon-ai/src/features.py`** — for cross-checking.
-   `_encode_pokemon` (line 283-397), `_project_move_flags` (line 1005-1263),
-   `_encode_field` (line 503-650), `_encode_action_slots` (line 1346).
-   **Do not modify features.py.**
+7. **`pokemon-ai-starter/pokemon-ai/src/dataset.py`** — `MemmapDataset` +
+   `collate_seq` — UNCHANGED, used as-is by both architectures. The
+   Tokenizer slices the existing v8 memmap format at training time.
 
 ═══════════════════════════════════════════════════════════════════════════════
-WHAT WEEK 1 + ALL POSTSCRIPTS LEFT YOU
+WHAT WEEK 2 LEFT YOU
 ═══════════════════════════════════════════════════════════════════════════════
 
-State as of commit 3334e97 (run `git log --oneline | head -10` to confirm):
+State as of Session 47 final commit (run `git log --oneline | head -10`):
 
 In `pokemon-ai-starter/pokemon-ai/src/`:
-- `model_transformer.py` — TransformerConfig, MoveTokenizer, ItemTokenizer,
-  AbilityTokenizer, Tokenizer (~1.47M params).
-  Output: dict with `tokens (B, 220, 256)`, `type_ids/poke_slots/move_slots (220,)`.
-- `data/lookup/move_flags_v1.pt` — schema v4. 119-dim move flags + 4-col banks
-  + (20,20) damage chart + (n_items, 8) item features + (n_abilities, 7)
-  ability features. Rebuildable by running `python model_transformer.py`.
-- `verify_move_lookup.py` — 50/50 strict match + 50/50 STAB-only divergence.
-- `test_tokenizer.py` — 17 tests on real human_v8_100k, all passing.
-- `bench_tokenizer.py` — 30 ms median for B=32 turns on RTX 3060 Laptop.
+- `model_transformer.py` — full TransformerBattlePolicy at **20.0M params**
+  (after the Postscript H capacity bump — d_temporal 256→512, K 2→4).
+  Tokenizer (1.0M) + Spatial (4.7M) + Temporal (12.7M) + heads (1.0M) +
+  Summary→Temporal proj (525K). Forward 36.45 ms median for B=32
+  single-turn on RTX 3060 Laptop CUDA fp32. forward_sequence + backward
+  ~25 ms/turn at B=8.
+- `test_policy.py` — 9 tests, all passing.
+- `test_tokenizer.py` — 17 tests, all still passing.
+- `data/lookup/move_flags_v1.pt` — schema v4. Unchanged from Week 1.
 
-Quick sanity before starting:
+Pre-flight before starting Week 3:
   cd pokemon-ai-starter/pokemon-ai/src
-  python verify_move_lookup.py   # 50/50 strict, 50/50 active-path
-  python test_tokenizer.py       # 17/17 pass
-  python bench_tokenizer.py      # ~30 ms median
-
-If any of those fail, STOP and read the recent commits — something drifted.
+  python verify_move_lookup.py    # 50/50 strict + STAB-only
+  python test_tokenizer.py         # 17/17
+  python test_policy.py            # 9/9
+  # If any fail, STOP and read recent commits.
 
 ═══════════════════════════════════════════════════════════════════════════════
-WEEK 2 DELIVERABLE (REWRITE_DESIGN.md §7 Week 2)
+WEEK 3 DELIVERABLE (REWRITE_DESIGN.md §7 Week 3)
 ═══════════════════════════════════════════════════════════════════════════════
 
-A `TransformerBattlePolicy` that runs forward end-to-end on memmap data,
-produces sane action_logits and value scalar, and survives a 1-iter PPO smoke.
+A new-arch BC checkpoint with smart_avg ≥45% on Metamon competitive teams
+(matching legacy v8 BC's mark, ±2pt). Estimated effort: 3-7 days,
+depending on local GPU throughput. Cloud option triggers if local takes
+>5 days.
 
 **The goal under elite-play framing:**
-- Spatial attention should let actor/critic reason compositionally about every
-  attribute. Type × ability × item × move × boost × weather should all be
-  composable via attention paths.
-- Temporal stack is what enables item identification, set prediction, and
-  multi-turn pattern recognition (Sleep Talk vs Roar). Don't undersize it.
-- Action head must distinguish moves from switches, AND it must have enough
-  signal to make elite switch decisions (the #1 ranked feature by Session 30
-  weight analysis was switch defensive_eff).
+- BC convergence proves the new arch CAN learn from human play. If it
+  can't, the architectural fix wasn't decisive — re-evaluate before PPO.
+- The legacy MLP-arch's BC ceiling at 45.1% was attributed to
+  compositional bottleneck (S44 audit). A higher BC mark on the same
+  data is direct evidence the rewrite addressed the bottleneck.
+- Watchpoint: if BC smart_avg looks fine but specific failure modes
+  (item-ID, set prediction, PP-aware play) remain, those are Week-4 PPO
+  problems and Week-6 architecture-decision triggers — don't try to fix
+  them in BC.
 
 ═══════════════════════════════════════════════════════════════════════════════
 SUB-TASKS (in order; each ends in a measurable milestone)
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. **SpatialTransformer**
-   - 6 layers × 8 heads × d_model=256, ff_mult=4, dropout=0.05, pre-norm
-   - Input: Tokenizer's `(B, 220, 256)` + position-ID buffers
-   - Mask: Poke-Mask (state-and-summary tokens can't attend to actor/critic;
-     actor can't see critic and vice versa). The legacy mask is in
-     model.py:372-384 — but the layout is different (220 vs 16), so build
-     it from scratch using the precomputed `type_ids`/`poke_slots` buffers.
-   - Side-mask per design §3.4: tokens with poke_slot ∈ ours-side can be
-     attended freely by everyone; tokens with poke_slot ∈ opp-side... in
-     practice, with the memmap-revealed-only logic, opp tokens for unrevealed
-     attributes are already "unknown" embeddings, so side-mask is mostly
-     defensive consistency. Implement it as a logical AND with the Poke-Mask;
-     unit-test that it doesn't change output beyond Poke-Mask alone (sanity).
-   - Build the mask once as a registered buffer.
-   - Output: `(B, 220, d_model)`. The last 2 indices are the K=2 summary
-     scratch tokens — flatten to `(B, 512)` and project to d_temporal.
+### 1. Plumb `--use-transformer` through `train_bc.py` and `ppo.py`
 
-   **Decision point — elite-play framing:** does the side-mask actually help
-   for V1 singles? Argument for: defensive consistency; matches design intent.
-   Argument against: opp-revealed-only logic already does the work; side-mask
-   is overhead. Default: include it (free, defensive); can disable later.
+**Files to edit:**
 
-2. **TemporalTransformer**
-   - 4 layers × 8 heads × d_model=256, causal, learnable pos embed (200-cap)
-   - Mostly mirror model.py:437-511 but with cfg.d_temporal=256 (not 512)
-   - Variable-length sequences via padding mask
-   - Output: `(B, d_temporal)` — last valid timestep
+(a) `train_bc.py:336-369` — `main()` argparse: add `--use-transformer`.
 
-   **Why this matters for elite play:** opp set prediction, item ID inference,
-   multi-turn move history (for Choice-lock detection, Sleep Talk recognition).
-   The temporal transformer is what enables these. METAMON_LEARNINGS.md flagged
-   the legacy 2-layer 512-dim temporal as undersized; bumping to 4 layers ×
-   256-dim with the K=2 spatial summary feeding 512-dim per-step input is the
-   design's response.
+(b) `train_bc.py:394-401` — model construction. Replace with a factory:
+    ```python
+    if args.use_transformer:
+        from model_transformer import (
+            TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
+        )
+        cfg = TransformerConfig.with_vocab_sizes_from_disk()
+        lookup = load_move_flag_lookup(
+            Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
+        )
+        model = TransformerBattlePolicy(cfg, move_flag_lookup=lookup).to(device)
+    else:
+        cfg = config_from_args(args)
+        model = PokeTransformer(cfg).to(device)
+    ```
+    The downstream `model.forward_sequence(...)` call at the BC training
+    step works unchanged — TransformerBattlePolicy provides it with the
+    same signature.
 
-3. **Action head + value head**
-   - Action head per §5.1: actor_out (d_model) + temporal_ctx (d_temporal) +
-     per-action context (B, 9, d_model) → (B, 9) logits.
-   - Per-action context for moves 0-3: read directly from the spatial
-     output at the our-active Pokemon's 4 move-token positions
-     (sequence indices N_BATTLE_STATE + 0*17 + 13..16, which is 14+13..16 = 27..30).
-   - Per-action context for switches 4-8 (5 switch slots, our bench Pokemon 1-5):
-     pool the 17 attribute tokens of each non-active our Pokemon. Mean-pool
-     is fine to start; can revisit with attention pooling later.
+(c) `train_bc.py:441-453` — resume path. Add a check that the resumed
+    checkpoint's architecture matches `--use-transformer`. State-dict
+    keys are mutually exclusive (legacy has `pokemon_net.*` etc.; new has
+    `tokenizer.*`, `spatial.*`, `temporal.*`); a clean error on mismatch
+    is better than a silent KeyError storm.
 
-   **CRITICAL DECISION POINT — switch defensive_eff / offensive_eff routing.**
-   See REWRITE_DESIGN.md Postscript C3. The deferred plan is to feed the 2
-   per-bench-Pokemon eff dims (from `switch_cont[..., -2:]`) DIRECTLY into the
-   action head's per-action context for switch slots 4-8 — NOT into the spatial
-   token sequence. This matches what the legacy `ActionSlotEncoder` did, and
-   the Session 30 weight analysis (defensive_eff = #1 ranked feature, 23.7
-   weight, 1.7× more important than HP%) was measured in that context. **Do
-   this.** Concretely: the per-action context for switch slot j (j in 0..4)
-   becomes `concat(mean_pool(bench_pokemon_j_tokens), switch_cont[:, j, -2:])`,
-   feed through a small MLP to project to d_model.
+(d) `train_bc.py:463` — config save: works as-is (`cfg.to_dict()`
+    handles both classes; just store an extra `arch: "transformer"|"mlp"`
+    field for the load path to dispatch on).
 
-   - Value head per §5.2: critic_out + temporal_ctx → (B, 51) twohot.
-   - Apply legal mask (model.py:787-789).
+(e) `ppo.py:347-371` — `load_checkpoint`. Make it dispatch:
+    ```python
+    arch = ckpt.get("arch") or _infer_arch(ckpt["model_state_dict"])
+    if arch == "transformer":
+        cfg = TransformerConfig.from_dict(ckpt["model_config"])
+        model = TransformerBattlePolicy(cfg, move_flag_lookup=...).to(device)
+    else:
+        cfg = PokeTransformerConfig.from_dict(ckpt["model_config"])
+        model = PokeTransformer(cfg).to(device)
+    ```
+    `_infer_arch` is a 5-line helper that checks for "tokenizer." prefix
+    in state-dict keys.
 
-4. **`TransformerBattlePolicy` wrapper**
-   - Same `forward(batch, history, history_lens)` interface as
-     `PokeTransformer.forward` (model.py:739-803). This is what train_rl.py
-     and rl_collection.py call.
-   - Output dict: action_logits, value, v_logits, summary, spatial_output —
-     match the legacy schema so downstream code is interface-compatible.
-   - Add `forward_sequence(collated, device)` for BC training (mirror
-     model.py:818-978). The mega-batch trick — flatten all valid (b, t)
-     turns through Tokenizer + spatial in one shot, then loop temporal +
-     heads per-turn — is critical for BC training speed. Don't skip it.
+(f) `eval_vs_bots` (`train_bc.py:249-332`) — see sub-task 2.
 
-5. **Sanity tests** — extend `test_tokenizer.py` (or add `test_policy.py`)
-   - End-to-end forward on 5 episodes: assert action_logits shape (B, 9),
-     value shape (B,), v_logits shape (B, 51), no NaN
-   - legal_mask correctly forces -100.0 on masked actions
-   - forward_sequence on 2 episodes produces (B, T, 9) etc., no NaN
-   - Param count sanity: TransformerBattlePolicy total ≈ 20-30M params (per
-     §4.5 estimate). If wildly off, investigate before PPO smoke
-   - Attention probe (optional but useful): on a sample turn, verify the
-     actor token has nonzero attention weight to the our-active species
-     and the move tokens. If it doesn't, the mask is over-restrictive.
+**Milestone:** `python train_bc.py --use-transformer --memmap-dir
+data/datasets/human_v8_100k --epochs 1 --batch-size 4 --workers 0
+--epochs 1 --eval-games 0` runs ≥10 batches without exception, loss
+finite, grad-norm finite.
 
-6. **PPO 1-iter smoke**
-   - Plumb `--use-transformer` flag in `train_rl.py` (and possibly a small
-     factory file) that swaps `PokeTransformer` for `TransformerBattlePolicy`
-     at construction time. Everything downstream is interface-compatible.
-   - Run: `python train_rl.py --use-transformer --device cuda --servers 9000
-     --n-iters 1 --games-per-iter 4 --max-concurrent 2 --warmup-iters 0
-     --procedural-teams <path>`. Should complete one collection + update
-     without exceptions. Expect bad performance — the model is randomly
-     initialized.
-   - **ALTERNATIVE if (6) gets tangled:** synthetic PPO smoke. Call
-     `forward_sequence` on a real BC batch, compute fake advantages, run one
-     PPO step. Proves the model trains without exploding gradients. Document
-     as "synthetic PPO smoke" if you go this route; real PPO integration
-     can move to Week 3.
+### 2. Decision: BC-time eval vs deferred eval
+
+Three options, ranked:
+
+**(a) Defer BC-time eval to Week 5.** Set `--eval-games 0` for the new
+arch run. Track `val_loss` and `val_acc` for early-stopping. After full
+BC, run `eval_metamon_competitive.py` once on the best checkpoint.
+**Cost: zero new code. Risk: blind during training.**
+
+**(b) Build `BattleAgentTransformer`** (per §6b.2). ~250 lines mirroring
+`battle_agent.py`. Live-play uses `make_features(battle)` from features.py
+(unchanged) — just feeds the resulting dict through the new policy. The
+key wrinkle: `BattleAgent._build_turn_batch(feat)` produces a dict;
+`TransformerBattlePolicy.forward(batch, history)` expects different
+keys (notably `our_pokemon_ids` width 7 with moves baked in vs the
+legacy width 3 + separate `our_pokemon_move_ids`). Tokenizer's
+`_fix_ids` accepts both, so this is straightforward. **Cost: ~half day
+of work + careful test. Benefit: BC-time smart_avg eval, plus
+unblocks §6b.3 direct H2H eval in Week 5.**
+
+**(c) Hack: skip eval during BC, but wire `eval_metamon_competitive.py`
+to be invoked between epochs externally** (cron / shell script). Same
+test power as (b) without writing BattleAgentTransformer. **Cost: small
+shell-side glue. Risk: out-of-band orchestration.**
+
+**Recommended:** start with (a) for the smoke; if smoke is healthy and
+local throughput supports a full run, build (b) before kicking off the
+multi-day full BC. Reason: (b) is needed for Week 5 anyway; doing it
+during Week 3 amortizes the work.
+
+### 3. 1-epoch BC smoke on first 1k episodes
+
+Once plumbing passes a 10-batch run, do a real smoke:
+
+```
+python -u train_bc.py --use-transformer --memmap-dir data/datasets/human_v8_100k \
+  --epochs 1 --batch-size 16 --lr 1e-4 --fp16 --workers 4 --eval-games 0 \
+  --val-ratio 0.05 --run-name v10_smoke 2>&1 | tee logs/v10_smoke.log
+```
+
+Watch for:
+- Loss decreases (train + val) over the epoch.
+- Grad-norm stable (≤ 100; if higher, lower LR or reduce grad-clip from 2.0
+  to 1.0).
+- No NaN at any step.
+- Throughput: turns/sec on the actual hardware. `forward_sequence` at
+  ~25 ms/turn predicts ~40 turns/sec, so an 80k-turn 1k-episode subset
+  runs in ~30 min. If it's much slower, profile (Tokenizer bottleneck?
+  CPU-bound DataLoader?).
+
+If the smoke is healthy, decide local vs cloud for the full run.
+
+### 4. Full BC training: 5-10 epochs on `human_v8_100k`
+
+```
+python -u train_bc.py --use-transformer --memmap-dir data/datasets/human_v8_100k \
+  --epochs 8 --batch-size 16 --lr 1e-4 --fp16 --workers 4 \
+  --eval-games 200 --val-ratio 0.1 --run-name v10_full \
+  --sched cosine --warmup-steps 200 \
+  2>&1 | tee logs/v10_full.log
+```
+
+LR 1e-4 (conservative starting point; legacy used 3e-4 but the bigger
+temporal stack might want a slower LR; if val_loss plateaus early,
+bump). Save every epoch end + best-by-val-loss + best-by-smart_avg.
+
+**Milestone:** smart_avg ≥45% on Metamon competitive (200×4 games min;
+500×4 ideal) sustained for ≥1 epoch.
+
+### 5. Final eval + checkpoint registration
+
+```
+python -u eval_metamon_competitive.py \
+  --checkpoints v10_best=data/models/bc/v10_full/best.pt \
+  --servers 9000 --n-games 500 --concurrency 8 --device cuda \
+  --out-json data/eval/registry/v10_bc_final.json
+```
+
+Append to `data/eval/registry/evals.jsonl` (use the standard tooling).
 
 ═══════════════════════════════════════════════════════════════════════════════
 DECISIONS THAT NEED ELITE-PLAY THINKING
 ═══════════════════════════════════════════════════════════════════════════════
 
-For each, default given but think about it before committing:
+A. **LR for the bigger model.** Legacy used 3e-4; we're at 20M params with
+   a wider temporal stack. Start at 1e-4 with warmup 200; if loss plateaus
+   in the first epoch, bump to 2e-4 or 3e-4 with `--lr-restart`. Don't
+   overcorrect — bigger models often want SMALLER LR.
 
-A. **Switch eff routing** (sub-task 3 above). Default: action head per-action
-   context. The legacy did this and Session 30 validated it empirically. If
-   you're tempted to put it in the spatial tokens, re-read Postscript C3 —
-   the permutation logic between memmap orderings makes that path fragile.
+B. **Batch size + workers + fp16.** Legacy used B=16, workers=4, fp16.
+   Try the same. If VRAM is comfortable (we estimated ~1-1.5 GB at training
+   time with fp16 AMP), bump to B=32 — better throughput utilization.
+   If workers cause stuttering on Windows, drop to 2.
 
-B. **Mean-pool vs attention-pool for switch context.** Mean-pool is the
-   default. Attention-pool with a learnable query is a one-line change but
-   more capacity. For elite switch decisions, attention-pool may matter —
-   but it's also a parameter the model has to learn. Default mean; revisit
-   if BC underfits on switches.
+C. **Loss weighting (action vs value).** Legacy uses 0.5 × value loss.
+   Stays the same for V1. Metamon uses critic_loss_weight=10-12.5 for
+   their offline RL but that's PPO, not BC. Don't change in BC.
 
-C. **Temporal d_model = 256 vs 512.** Design says 256 with the K=2 spatial
-   summary feeding 512-dim per-step. Halves temporal-stack params vs legacy.
-   Per METAMON_LEARNINGS.md, the legacy temporal was UNDER-invested. The
-   tradeoff is: narrow d_temporal but more layers (4 vs 2 in legacy). Default
-   the design's 256/4. If Week 4 PPO shows item-ID or set-prediction failures,
-   bump d_temporal.
+D. **Cloud trigger.** If smoke shows >24 hr/epoch on local, pivot to
+   cloud (CLOUD_DEPLOY.md). $50-150 budget on a single A100 should
+   complete BC in ~12-24 hours.
 
-D. **K=2 summary scratch vs K=4.** Design says 2; Metamon Small uses 4
-   latents × 100 dim = 400-dim summary. Ours is 2 × 256 = 512-dim — already
-   wider. K=2 is the right starting point. Watchpoint: if BC training shows
-   per-turn-summary information bottleneck (loss plateaus while spatial
-   attention is healthy), bump to K=4.
-
-E. **Side-mask vs no side-mask.** See sub-task 1. Default: include it.
-
-F. **Popart on the value head.** Design §5.3 recommends including in V1.
-   Defer to Week 5 per the original roadmap. Don't add it now.
-
-G. **Reward shaping (Week 4 concern).** Sparse `--reward-style terminal`
-   may not push the model to elite-level subtleties (preserved HP, hazards
-   set, win-conditions advanced). Note it as a Week 4 design question;
-   don't change rewards in Week 2.
+E. **Capacity escalation if BC underfits.** If smart_avg <40% after 8
+   epochs, the 20M may still be undersized. Cheapest lever: bump
+   `n_spatial_layers` 6 → 8 (~+1.6M params) or `d_model` 256 → 384
+   (~+7M, more invasive). Don't change before BC results are in —
+   spec-compliance default first.
 
 ═══════════════════════════════════════════════════════════════════════════════
 GUARD RAILS — DO NOT VIOLATE
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. **Do not modify `model.py`, `features.py`, `battle_agent.py`, `vocab.py`,
-   `format_config.py`** beyond minimal additive changes (e.g., a public
-   helper). The legacy MLP path must keep loading — sp_0229 is the H2H
-   baseline for Week 5.
+1. **Do not modify `model.py`, `features.py`, `battle_agent.py`,
+   `vocab.py`, `format_config.py`** beyond minimal additive changes.
+   The legacy path must keep loading — sp_0229 is the H2H baseline
+   for Week 5.
 
 2. **Do not modify the memmap.** Tokenizer slices the existing 104 GB
-   `human_v8_100k` at training time. Memmap regen would cost days.
+   `human_v8_100k` at training time.
 
-3. **Do not change the lookup .pt format casually.** Schema v4 is what's on
-   disk. If you need to add a field, bump the schema version and update the
-   loader's validation.
+3. **Do not change the lookup .pt format casually.** Schema v4 is
+   committed.
 
-4. **Do not add scope.** Week 2 is spatial + temporal + heads + smoke.
-   Week 3 is BC training. Week 4 is PPO. Don't start BC in Week 2.
+4. **Do not start PPO in Week 3.** PPO is Week 4. BC convergence
+   first; PPO from BC second.
 
-5. **Do not skip the synthetic PPO smoke if real PPO is blocked.** A model
-   that forward-passes cleanly but explodes on first backward is a Week 3
-   disaster.
+5. **Do not hand-curate features.** "Derive from true state" is the
+   philosophy.
 
-6. **Do not hand-curate features.** The user's philosophy is "derive from
-   true state." Postscripts C/G adhere to this. If you find yourself writing
-   `if move_id == 472: return 1.5`, stop.
+6. **Do not skip eval.** If you train without
+   `eval_metamon_competitive.py`, you don't know if you converged.
 
 ═══════════════════════════════════════════════════════════════════════════════
 SUCCESS CRITERIA
 ═══════════════════════════════════════════════════════════════════════════════
 
-- `TransformerBattlePolicy.forward(batch)` produces correct-shape outputs,
-  no NaN, on real human_v8_100k data.
-- `forward_sequence` on a multi-turn episode batch produces (B, T, 9) logits,
-  all finite, masked actions get -100.0.
-- Param count in [20M, 30M] range (sanity vs design §4.5).
-- Either real 1-iter PPO smoke completes, OR synthetic PPO smoke proves the
-  model trains without exploding gradients.
-- Forward benchmark for full TransformerBattlePolicy < 80 ms median for
-  B=32 turns on RTX 3060 Laptop. Tokenizer alone is 5 ms; full policy adds
-  attention layers + heads (~50-70 ms expected).
-- All existing test_tokenizer.py tests still pass (17/17).
+- New BC checkpoint at smart_avg ≥45% on Metamon competitive (200×4
+  games min; 500×4 ideal).
+- Loss curves clean: train+val both decreasing for ≥2 epochs before
+  divergence (overfit signal).
+- Existing tests still pass: 17/17 tokenizer + 9/9 policy.
+- BC training time logged. If <5 days local: that's the V1 baseline.
+  If >5 days: cloud-migrated checkpoint is the V1 deliverable.
 
 ═══════════════════════════════════════════════════════════════════════════════
 WHEN YOU'RE DONE
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. Mark Week 2 tasks `[x]` in REWRITE_DESIGN.md §7.
-2. If you encountered any spec-vs-reality divergences, add a Postscript H
-   (or higher) to REWRITE_DESIGN.md describing what changed and why. Do not
-   silently rewrite history.
-3. Update NEXT_SESSION.md TL;DR to reflect Week 2 status (Session 47 done,
-   Session 48 task = Week 3: BC training).
-4. Write `next-prompt.txt` for Session 48, pointing at REWRITE_DESIGN.md
-   §7 Week 3. Carry forward this document's "read first, reason hard" tone.
-5. Commit per-tier: spatial transformer, temporal transformer, heads,
-   policy wrapper, plumbing. Smaller commits = easier to revert if something
-   blows up. Tests in their own commit.
+1. Mark Week 3 tasks `[x]` in REWRITE_DESIGN.md §7.
+2. If you encountered any spec-vs-reality divergences, add a Postscript I
+   (or higher) to REWRITE_DESIGN.md describing what changed and why.
+3. Update NEXT_SESSION.md TL;DR with Session 48 status. Session 49 task =
+   Week 4 (PPO from BC).
+4. Write `next-prompt.txt` for Session 49, pointing at REWRITE_DESIGN.md
+   §7 Week 4. Carry forward this document's "read first, reason hard"
+   tone.
+5. Commit per-tier: train_bc.py plumbing, eval-during-BC decision /
+   `BattleAgentTransformer` if built, smoke results, full BC run results,
+   eval. Smaller commits = easier to revert.
 
 ═══════════════════════════════════════════════════════════════════════════════
 CONTEXT FOR FUTURE SESSIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-- Week 3: BC training to convergence on human_v8_100k. Smart_avg ≥45%
-  (matching legacy v8 BC's mark). Watchpoint: if model underfits specifically
-  on item / ability composition (e.g., always misses Choice-locked plays),
-  text-encoder over Showdown shortDesc is the principled escalation path
-  (Metamon style); don't hand-curate effect dicts.
 - Week 4: PPO from BC. Smart_avg ≥70% target (≥3pt above sp_0229's 67.8%).
   If trajectory mirrors attempt-11 (peak 64-66% then plateau), the
-  architectural fix wasn't decisive — pivot to data scaling, larger model,
-  or test-time adaptation.
+  architectural fix wasn't decisive — pivot to data scaling, larger
+  model, or test-time adaptation.
 - Week 5: long PPO + popart + direct H2H eval vs sp_0229.
-- Week 6: analysis + retrospective + decision on next direction
-  (multi-format, cloud scale, ladder submission).
+- Week 6: analysis + retrospective + decision on next direction.
 
-If Week 2 milestone fails (e.g., model produces NaN, trains unstably,
-benchmark blows past 100 ms/batch), STOP and update REWRITE_DESIGN.md.
-Common Week-2 issues from §8 risk register: tokenizer-spatial integration
-off-by-one (#3), unstable training (#2), forward speed off projection (#12).
+If Week 3 milestone fails (BC <40% after 10 epochs), STOP and update
+REWRITE_DESIGN.md. Common Week-3 risks per §8: tokenizer slicing bug
+(#3), training instability (#2), feature gap discovered late (#4).
 
 ═══════════════════════════════════════════════════════════════════════════════
 FINAL REMINDER
@@ -353,12 +358,6 @@ FINAL REMINDER
 
 Every line of code, every architectural decision, every test you write —
 ask "does this serve the goal of building an elite-level Pokemon battler?"
-
-If a decision is "this is the cleanest abstraction" but the result is the
-model can't reason about a known elite-play skill, the decision is wrong.
-
-If a decision is "this captures the elite-play skill but adds 2 weeks of
-work" and there's a simpler path that gets 90% there, take the simpler path.
 
 Read the docs reasoning, read the code reasoning, write code reasoning.
 The goal is elite Pokemon AI — not pretty code, not the cleanest design,
