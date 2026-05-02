@@ -1,12 +1,13 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-01 (Session 44 finalized — pivoted from "implement A+B" to "skip incremental fixes, design architecture rewrite". Session 45 task: produce REWRITE_DESIGN.md. Current 200-iter PPO run is the final deliverable from MLP-architecture lineage.)**
+**Last updated: 2026-05-01 (Session 45 finalized — REWRITE_DESIGN.md produced. Session 46 task: implement Week 1 of the rewrite (Tokenizer module + integration tests). Current 200-iter PPO run continues to ~02:00 on 2026-05-02 as the final MLP-architecture deliverable.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
 
 Supporting documents:
-- `docs/EXTERNAL_OPPONENTS_PHASE2.md` — **READ THIS** for the protocol-bug postmortem and reproducer
+- `docs/REWRITE_DESIGN.md` — **READ THIS FIRST for Sessions 46+** the architecture rewrite design (pure transformer with attribute-level tokenization)
+- `docs/EXTERNAL_OPPONENTS_PHASE2.md` — protocol-bug postmortem and reproducer
 - `docs/METAMON_LEARNINGS.md` — Session 37 Metamon architecture study + recommendations
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
@@ -14,7 +15,49 @@ Supporting documents:
 
 ---
 
-## Session 44 final status — TL;DR for new readers
+## Session 45 final status — TL;DR for new readers
+
+**Session 45 produced `docs/REWRITE_DESIGN.md` (1027 lines)** — the design
+document for the pure-transformer-with-attribute-tokenization rewrite of
+the model architecture. All 9 required sections present: goals/non-goals,
+high-level diagram, tokenization scheme (212 tokens per turn, 12 Pokemon
+× 17 attribute tokens + 6 battle-state tokens), attention architecture
+(6 spatial layers × 4 temporal layers × d_model=256, K=2 summary scratch
+tokens), action+value heads (preserved), training pipeline (no memmap
+regen needed for V1), heterogeneous opponent support (legacy BattleAgent
+stays alive), 6-week implementation roadmap with explicit decision points,
+12-entry risk register, Metamon comparison.
+
+**Headline design decisions:**
+- ~212 tokens per turn, ONE rich token per move (not sub-decomposed)
+- d_model=256, 6 spatial / 4 temporal layers, 8 heads, K=2 summary scratch
+- ~25M params target (vs current 14M), comparable to Metamon Small (15M)
+- **Memmap unchanged** — tokenizer slices existing 104 GB `human_v8_100k`
+  at training time (saves 1-2 weeks of regen). Move bank values for team
+  moves via `(n_moves, 107)` lookup table built from poke-env at init
+- New code in 3 new files: `model_transformer.py`, `features_transformer.py`,
+  `battle_agent_transformer.py`. Legacy `model.py`/`features.py`/`battle_agent.py`
+  stay untouched for backward compat (sp_0229, sp_2979 etc. still play)
+- Direct head-to-head Elo measurement (new arch vs sp_0229) becomes a
+  first-class eval method via the heterogeneous-opponent infrastructure
+
+**Session 46 task: implement Week 1 of the roadmap** — the Tokenizer
+module + integration tests. See `next-prompt.txt` for detailed
+instructions. Estimated effort: 3-5 days of focused implementation.
+Milestone: tokenizer runs, token shapes match spec, no NaN, forward-pass
+benchmark <50ms/batch on RTX 3060 Laptop.
+
+**Open decision points carried forward to Sessions 46-51:**
+- Optimal K (summary scratch tokens) — start at 2, possibly bump to 4
+- Type-token decomposition (1 vs 2 tokens) — decide in Week 1 unit tests
+- Cloud BC training trigger — Week 3, if local takes >5 days
+- The dispositive Week 4-5 trigger: PPO trajectory mirroring attempt-11
+  (peak 64-66% then plateau) means the architectural fix wasn't decisive
+  → pivot to data scaling / TTA / larger model
+
+---
+
+## Session 44 final status — historical TL;DR (kept for context)
 
 **Session 44 finalized with a pivot: skip A+B (and B+ and D), commit
 directly to architecture rewrite.** The careful analysis in S44 narrowed

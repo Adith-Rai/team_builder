@@ -1,0 +1,1027 @@
+# REWRITE_DESIGN.md — Pure-Transformer Pokemon Battle AI
+
+**Status:** design (Session 45, 2026-05-01). Implementation begins Session 46+.
+**Replaces:** the MLP-encoder architecture in `pokemon-ai-starter/pokemon-ai/src/model.py`
+**Companion docs:**
+- `docs/NEXT_SESSION.md` — S44 architecture audit, the pivot rationale, the live PPO run
+- `docs/METAMON_LEARNINGS.md` — Metamon's published recipes for inspiration
+- `docs/EXTERNAL_OPPONENTS_PHASE2.md` — protocol bugs unrelated to the rewrite, kept fixed
+
+This is a living document. Future implementation sessions update it as reality
+diverges from spec — don't silently drift. Section headers are stable; details
+within sections may shift.
+
+---
+
+## 0. Reading guide
+
+If you're picking this up cold:
+
+1. Read `docs/NEXT_SESSION.md` §"Architecture audit (Session 44 finalization)"
+   first — that's where the *why* lives. This document is the *what*.
+2. Then read this top-to-bottom. Every claim referencing existing code points
+   at `file:line`. If you can't find that line, the file changed since 2026-05-01
+   and the design needs an update.
+3. Don't start coding before §7 (Implementation roadmap). The earlier sections
+   build the picture; the roadmap turns it into discrete tasks.
+
+Verification discipline (carried forward from S44): when you implement against
+this design and reality disagrees, **update the design** before continuing.
+Silent drift is how good designs become bad codebases.
+
+---
+
+## 1. Goals and non-goals
+
+### Goals
+
+- **G1. Address the MLP compositional bottleneck.** `PokemonNet` (model.py:164-240)
+  compresses a combinatorially-explosive input (species × items × abilities ×
+  stat spreads × movesets) into one 256-dim token via a 2-layer MLP. This is
+  the structural ceiling diagnosed in `docs/NEXT_SESSION.md`'s
+  "Architectural insight: MLP encoding is a fundamental compositional
+  bottleneck" section. Every attribute gets its own token instead.
+- **G2. Match or exceed sp_0229's 67.8% smart_avg baseline** on Metamon
+  competitive teams (16-team set, 500 games × 4 bots, ±2.2pt CI). The MLP-arch
+  ceiling sat at 64-66% smart_avg over a 200-iter PPO run; the rewrite must
+  break that decisively (≥3pt sustained over 3+ evals = ≥71%).
+- **G3. Provide a foundation that scales with more data/compute.** The new
+  architecture should benefit from cloud BC training (more replay data,
+  larger model) and longer PPO runs without hitting another structural
+  ceiling at the next scale tier.
+- **G4. Restore the architectural consistency that S44 §"Real shortcuts
+  identified" found broken** — the team-move bank zeros (model.py:701-702),
+  the 86-dim move-cont padding for team moves (model.py:233-234), and the
+  single attention-pooled summary token (model.py:420-426 with
+  `n_summary_tokens=0`). All three are subsumed by per-attribute tokens.
+
+### Non-goals
+
+- **N1. Outperform Metamon's Kakuna (140M params, 18M training trajectories).**
+  Beyond reach without their compute budget. The realistic target is
+  Minikazam (4.7M params, RNN-based) and SmallRL (15M params).
+- **N2. Implement test-time adaptation.** Held in reserve. Listed in
+  `NEXT_SESSION.md` as a paradigm shift for "Session 50+ material."
+- **N3. Foundation-model approach (battle state as text, LLM backbone).**
+  Rejected per S44 — gimmicky inference cost, clunky representation when
+  we already have structured features.
+- **N4. Rewrite the training pipeline (`train_rl.py`, `rl_collection.py`,
+  `external_opponent_manager.py`, the 5 defense layers).** All of those
+  remain. The rewrite changes the *model* and the *obs/feature path*; the
+  PFSP pool, PPO loop, and external-opponent infrastructure stay.
+- **N5. Replace `BattleAgent` (battle_agent.py:23).** New arch lives
+  *alongside* the legacy MLP-arch player, not in place of. See §6b.
+- **N6. Multi-gen support in V1.** Singles gen 9 only. Multi-gen is a
+  natural extension (the tokenizer is gen-agnostic by design) but not
+  in this rewrite's scope.
+
+---
+
+## 2. High-level architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Battle State (per turn)                      │
+│   12 Pokemon × ~17 attributes  +  field  +  transition  +  legal    │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Tokenizer (replaces MLP encoders)                 │
+│  Each attribute → one token (d_model). Type-ID embedding added so    │
+│  attention can disambiguate "this is HP" vs "this is Move 3 BP."     │
+│  Move tokens are rich (BP/acc/PP/prio/flags baked in via small MLP). │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               ↓
+                    ~210 tokens (vs 14 entity tokens today)
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Spatial Transformer                             │
+│  6 layers × 8 heads × d_model=256, with Poke-Mask (kept) +           │
+│  side-mask (decision tokens for player A can't attend tokens marked  │
+│  as private to player B's Pokemon-level info).                       │
+│  K=2 learnable summary scratch tokens collect per-turn output.       │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               ↓
+                    K × d_model summary per turn
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Temporal Transformer                            │
+│  4 layers × 8 heads × d_model=256, causal mask, 200-turn context.    │
+│  Same as model.py:437-511 in spirit; just larger.                    │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│       Action heads (9 logits)  +  Value head (51-bin twohot)        │
+│  Action head consumes per-action tokens (kept from model.py:540-571) │
+│  + actor + temporal_ctx; value head consumes critic + temporal_ctx.  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### What's preserved from the current architecture
+
+- **Temporal transformer with causal mask** (model.py:437-511). Multi-turn
+  attention happens in a separate stack; tokens are not unified across
+  turns. Rationale in §4.
+- **Decision-token convention** (model.py:312-430). The actor and critic
+  are special tokens; Poke-Mask blocks state→decision attention.
+- **Action slot encoder** (model.py:522-571). The 9-action context (4
+  moves + 5 switches) feeds the policy head per-action. Internally the
+  encoder switches from `MoveNet` MLP to per-attribute move tokens, but
+  the *interface* (`(B, 9, d_model)` → policy head) is the same.
+- **Value head structure** (model.py:642-651). Distributional twohot over
+  51 bins, range `[-1.6, 1.6]`. Twohot encoding (model.py:805-816) stays.
+- **PFSP pool, 5 defense layers, training loop.** All non-model
+  infrastructure (rl_collection.py, train_rl.py, external_opponent_manager.py)
+  is unchanged.
+
+### What's replaced
+
+- **`MoveNet` (model.py:124-157), `PokemonNet` (model.py:164-240),
+  `FieldNet` (model.py:247-275), `TransitionNet` (model.py:282-305).**
+  All four are MLPs that compress structured features into one token per
+  entity. They become a single `Tokenizer` module that emits ~17 tokens
+  per Pokemon, ~1-2 tokens for field, ~1 token for transition.
+- **Spatial transformer's 14 entity tokens** (model.py:312-430) → ~204
+  attribute tokens.
+- **Single attention-pooled summary** (model.py:420-426 with K=0) → K=2
+  scratch summary tokens (already supported as a CLI flag in current
+  arch but never used in production; this rewrite makes K≥2 the default
+  rather than an opt-in).
+
+---
+
+## 3. Tokenization scheme — the heart of the design
+
+### 3.1. Token budget
+
+Per turn, per side (ours = full info; opp = revealed-only with learnable
+"unknown" embedding for hidden fields):
+
+**Per Pokemon (17 tokens × 12 Pokemon = 204):**
+
+| # | Token name | Source | Dim | Type ID |
+|---|---|---|---|---|
+| 1 | `species_token` | embedding lookup `n_species=1548` | d_model | 0 |
+| 2 | `item_token` | embedding lookup `n_items=2340`; ID 0 = unknown | d_model | 1 |
+| 3 | `ability_token` | embedding lookup `n_abilities=314`; ID 0 = unknown | d_model | 2 |
+| 4 | `type_token` | small MLP from 2× type embedding (19 types each) | d_model | 3 |
+| 5 | `status_token` | small MLP from status one-hot (7) + volatiles bits (38) + paradox (7) + tera (20) flags | d_model | 4 |
+| 6 | `hp_pct_token` | `NumericalBank(101)` lookup of HP% bucket (0-100) | d_model | 5 |
+| 7 | `boosts_token` | small MLP from 7 boost values (atk/def/spa/spd/spe/acc/eva, range -6..+6) | d_model | 6 |
+| 8 | `stat_hp_token` | `NumericalBank(256)` of base HP stat | d_model | 7 |
+| 9 | `stat_atk_token` | `NumericalBank(256)` of base atk | d_model | 8 |
+| 10 | `stat_def_token` | `NumericalBank(256)` of base def | d_model | 9 |
+| 11 | `stat_spa_token` | `NumericalBank(256)` of base spa | d_model | 10 |
+| 12 | `stat_spd_token` | `NumericalBank(256)` of base spd | d_model | 11 |
+| 13 | `stat_spe_token` | `NumericalBank(256)` of base spe | d_model | 12 |
+| 14 | `move_token[0]` | rich move encoder (see §3.2) | d_model | 13 |
+| 15 | `move_token[1]` | rich move encoder | d_model | 13 |
+| 16 | `move_token[2]` | rich move encoder | d_model | 13 |
+| 17 | `move_token[3]` | rich move encoder | d_model | 13 |
+
+The 4 move tokens share type ID 13; they're distinguished by *position
+within Pokemon* (a separate `slot_id` embedding, see §3.3).
+
+**Battle-state-level (6 tokens):**
+
+| # | Token name | Source | Dim | Type ID |
+|---|---|---|---|---|
+| 1 | `actor_token` | `nn.Parameter` (learnable) | d_model | 14 |
+| 2 | `critic_token` | `nn.Parameter` (learnable) | d_model | 15 |
+| 3 | `field_token` | small MLP from `FIELD_CONT_DIM=52` (features.py:653) + `NumericalBank` of turn/weather_dur/terrain_dur/tr_dur | d_model | 16 |
+| 4 | `transition_token` | small MLP from `TRANSITION_CONT_DIM=51` (features.py:957) + 2× action embed | d_model | 17 |
+| 5 | `summary_token[0]` | `nn.Parameter` (learnable scratch) | d_model | 18 |
+| 6 | `summary_token[1]` | `nn.Parameter` (learnable scratch) | d_model | 18 |
+
+**Total per turn: 210 tokens** (12 × 17 + 6).
+
+### 3.2. The move token (richest non-trivial token)
+
+Each move's token is built from a small MLP — `MoveTokenizer` — that takes
+the same inputs `MoveNet` (model.py:124-157) does today, but keeps them
+*per-token* instead of mixing into a Pokemon-level concat:
+
+**Inputs:**
+- `move_id` embedding (`n_moves=953` × `entity_embed_dim=32`)
+- `bp_bank` (`NumericalBank(256, bank_dim=16)`)
+- `acc_bank` (`NumericalBank(101, bank_dim=16)`)
+- `pp_bank` (`NumericalBank(65, bank_dim_small=8)`)
+- `prio_bank` (`NumericalBank(13, bank_dim_small=8)`)
+- 107-dim continuous feature vector from `_project_move_flags`
+  (features.py:1005-1263), which already contains: drain, recoil, heal,
+  multihit, contact, sound, punch, bite, powder, protect-blocked, crit
+  ratio, secondary effect probabilities, hazards/weather/terrain setup,
+  type one-hot, category one-hot, target one-hot, and 7-status applied
+  one-hot. Verified in §3 of the features.py audit.
+
+**Module:**
+```python
+class MoveTokenizer(nn.Module):
+    # ~190-dim concat → 2-layer MLP → d_model
+    in_dim = 32 + 16 + 16 + 8 + 8 + 107 = 187
+    Linear(187, d_model) → GELU → LayerNorm → Linear(d_model, d_model) → GELU → LayerNorm
+```
+
+**Critical design point — solves S44's "B fix":** the `MoveTokenizer` is
+called for *all* 4 moves on *all* 12 Pokemon (active and team), with the
+same real bank values fed in everywhere. No more `torch.zeros(...)` for
+team moves like model.py:701-702. The bank values are deterministic from
+move_id (each move has fixed BP/acc/PP/prio in poke-env's data), so we
+look them up at tokenization time. Implementation tip: precompute a
+`(n_moves, 4)` lookup table at model init from poke-env's `Move` data
+class; this avoids per-forward dict lookups.
+
+The 107-dim flag vector is also computed for *all* 4 moves (not just
+the active 4), unlike the current code where features.py only fills
+this for the active set and uses 23-dim compact for team moves
+(features.py:431-454, the `_encode_move_compact`). This subsumes both
+S44's "B" fix (banks for team moves) AND the deferred "B+" expansion
+(real flags for team moves), at no additional architectural cost since
+attention scales with token count, not feature dim.
+
+**Per-Pokemon active-vs-team distinction:** the move's tactical context
+(type effectiveness vs current opponent, opponent threat back) varies
+by who's active. Today this is dim 107-108 of the active-move encoding
+only (features.py:1318-1320). In the new arch, we add 2 specialized
+tokens per *active* Pokemon (1 per side):
+
+| Token | When | Computed |
+|---|---|---|
+| `our_active_threat_token` | only for our active | `_compute_type_effectiveness` per move + `_max_opp_threat` over all 4 moves |
+| `opp_active_threat_token` | only for opp active | symmetric |
+
+That's 2 extra tokens (1 per side) per turn. New total: **212 tokens**.
+
+### 3.3. Positional / type / slot disambiguation
+
+The transformer has no inherent notion of "this is Pokemon 3, slot HP"
+vs "this is Pokemon 4, slot HP." Three embeddings combine into the
+input to layer 0:
+
+1. **`type_id_embed[token_type]`** — 19-vocab lookup (types 0-18 above).
+   Tells the model "this is a stat_atk token" vs "this is a move token."
+2. **`pokemon_slot_embed[which_pokemon_0_to_11]`** — 12-vocab lookup.
+   Pokemon 0-5 are ours, 6-11 are opp. Decision tokens (actor, critic,
+   field, transition, summary) get a separate slot embedding (12-15).
+3. **`move_slot_embed[which_move_0_to_3]`** — 4-vocab lookup, applied
+   *only* to move tokens. Distinguishes "this is move slot 0 of this
+   Pokemon" from "move slot 1." Non-move tokens get the zero embedding.
+
+All three are learnable; total ID-embedding overhead: `(19 + 16 + 4) ×
+d_model ≈ 39 × 256 = 10K parameters`. Trivial.
+
+### 3.4. Side disambiguation and information leakage
+
+Token type 12 (Pokemon slot) implicitly encodes side: slots 0-5 are ours,
+6-11 are opp. But we want *attention masking* to also enforce that
+private info stays private:
+
+- For tokens marked "our hidden info" (e.g., our team's full ability,
+  item, exact stats, all 4 moves' raw bank values), the *opponent's*
+  active threat token shouldn't attend to them. We don't enforce this
+  in our model since we ARE one side — but for the symmetry of training
+  data (BC dataset has both sides as samples), we use a **side mask**:
+
+  Side mask construction:
+  - All tokens have a `side_id` (0 = ours, 1 = opp, 2 = neutral/field)
+  - Decision tokens are side 0 (we're always playing as side 0 from our
+    perspective; the BC dataset is normalized to "our perspective" already).
+  - The poke-mask (model.py:372-384) blocks state-to-decision attention.
+    The new side_mask additionally blocks our decision tokens from
+    attending to opp's hidden info — but for opp-revealed info, attend
+    freely. This matches features.py's revealed-only logic for opp:
+    item=0 if not revealed, ability=0 if not revealed, moves use
+    `move_id=0` for unrevealed. So in practice, the opp tokens for
+    unrevealed attributes are already "unknown" embeddings, and side
+    masking adds defensive consistency without changing observed
+    behavior.
+
+The full mask matrix is conceptually:
+
+```
+              actor critic state_us state_opp_revealed state_opp_hidden summary
+actor          ✓     ✗      ✓        ✓                 (none)          ✓
+critic         ✗     ✓      ✓        ✓                 (none)          ✓
+state_us       ✗     ✗      ✓        ✓                 (none)          ✓
+state_opp_rev  ✗     ✗      ✓        ✓                 (none)          ✓
+summary        ✗     ✗      ✓        ✓                 (none)          ✓
+```
+
+The "state_opp_hidden" column is empty by construction — features.py
+yields zero/unknown embeddings for unrevealed opp info, so there are
+no "hidden" tokens in our forward. We don't need an explicit mask;
+the design just ensures we never *create* hidden tokens.
+
+### 3.5. Token count rationale (the alternative considered)
+
+Per the prompt, the big trade-off is: ONE rich move token per move
+(48 move tokens battle-wide) vs SEVERAL sub-tokens per move (move_id,
+move_bp, move_acc as separate tokens, ~192-384 move-related tokens).
+
+**Decision: ONE rich token per move.** Rationale:
+
+- **Compute scaling.** Attention is O(N²). Going from 48 move tokens to
+  192-384 increases total tokens from 210 to ~370-560. Squared cost
+  goes 4-7×. With FlashAttention this is still tractable on a 6 GB GPU
+  (we measured 14M-param current arch at ~7 min/iter; new arch at 25M
+  params and 210 tokens with FA should be ~10-12 min/iter; at 370+
+  tokens it would push to 20-30 min/iter, doubling our wall-clock for
+  the run).
+- **Move attribute redundancy.** A move's properties (BP, acc, type,
+  flags) move together — they don't independently interact with anything
+  in the battle state in a way that benefits from separate attention.
+  Splitting move into 4-8 sub-tokens would mostly waste compute on
+  attention pairs that learn near-zero cross-attention.
+- **Compositional bottleneck only at move level.** The MLP bottleneck
+  diagnosed in S44 was at the *Pokemon* level (everything mashed into
+  one token). Moves were already sub-encoded by `MoveNet` separately
+  (model.py:124-157), so per-move MLP is well-precedented and not the
+  bottleneck. The fix is to surface those move tokens to spatial
+  attention directly, not to further sub-decompose them.
+
+If a future iteration finds movewise compositional gaps (e.g., "the
+model can't compose Stone Edge's accuracy with the user's Compound
+Eyes ability"), we can add sub-token decomposition at that point.
+This rewrite leaves room: `MoveTokenizer` is one module, and replacing
+its emit-1-token logic with emit-N-tokens is a localized change.
+
+---
+
+## 4. Attention architecture
+
+### 4.1. Spatial transformer
+
+- **Layers:** 6 (vs 4 in current model.py:346-347)
+- **Heads:** 8 (vs 4 in current model.py:336-344). 8 heads at d_model=256
+  gives 32d per head, matching common-practice scaling.
+- **d_model:** 256 (vs current `d_spatial=256` per S39 capacity reshape;
+  unchanged at the spatial side).
+- **Feed-forward:** 4× expansion (matches current `ff_mult=4`,
+  model.py:339).
+- **Dropout:** 0.05 (matches Metamon default + current code, model.py:45).
+- **Norm:** pre-norm (matches current `norm_first=True`, model.py:343).
+- **Total tokens at input:** 212 (210 base + 2 active threat tokens).
+- **Mask:** Poke-Mask + side-mask described in §3.4. Same -inf additive
+  mask convention as model.py:372-384.
+- **Output:** `(B, 212, d_model)`.
+
+### 4.2. Summary scratch tokens (collection)
+
+After spatial pass:
+- Decision tokens (actor, critic) are read out at indices [0:2].
+- Summary scratch tokens [last 2 indices] become the per-turn
+  representation fed to the temporal transformer.
+- Two scratch tokens × 256 dim flattened = 512-dim per-turn summary.
+
+This matches Metamon Small's recipe (4 latents × 100 dim = 400-dim
+per-turn summary; we use 2 × 256 = 512 — similar order of magnitude).
+The current arch uses K=0 (single attention pool) — the scratch-token
+path already exists (model.py:401-403, 428-430) and is just enabled
+by setting `n_summary_tokens=2`. The key change is *flatten + project*
+to d_temporal happens to a richer 512-dim input rather than 256-dim.
+
+### 4.3. Temporal transformer
+
+- **Layers:** 4 (vs 2 in current model.py:464). Metamon's recipes use
+  more capacity here (5-8× temporal:spatial in d_model), and
+  METAMON_LEARNINGS.md flags this as a key under-investment in our
+  current arch.
+- **d_temporal:** 256 (down from current 512). The spatial summary is
+  already richer (2 scratch × 256 = 512), so the per-step input to
+  temporal is wider; the temporal stack itself stays narrow. This
+  approximates Metamon's "wide spatial output + narrow temporal" rather
+  than current's "narrow spatial output + wide temporal."
+- **Heads:** 8.
+- **FF:** 4×.
+- **Causal mask:** same as model.py:489-490.
+- **Position embedding:** learnable, 200-position cap (matches current
+  model.py:451). Stays the same.
+- **Padding mask:** for variable-length sequences (matches current
+  model.py:493-495).
+- **Output:** the last valid timestep's d_temporal vector
+  (matches current model.py:504-509).
+
+### 4.4. Why keep temporal *separate* (not unify across turns × tokens)
+
+The prompt explicitly recommends keeping spatial and temporal
+transformers separate:
+
+> "Unified attention over many turns × many tokens explodes compute."
+
+Concretely: 200 turns × 212 tokens = 42,400 tokens in one unified
+attention. That's `42400² ≈ 1.8B pairs` — even FlashAttention can't
+make this fit on a 6 GB GPU. Keeping the 200×512 temporal sequence
+separate reduces it to `200² + 212² ≈ 45K + 45K = 90K pairs` per
+turn, which is fine.
+
+The cost is some lost cross-temporal attribute attention ("our atk
+boost from turn 5 + opp's lowered def from turn 7 + this turn's STAB
+move"). In practice the 2 summary scratch tokens per turn carry enough
+of this signal forward that the explicit cross-temporal attribute
+attention isn't needed — Metamon's models work this way and reach
+71% GXE on gen9OU (Kakuna, in their testing).
+
+### 4.5. Total attention compute estimate
+
+Per turn forward:
+- Spatial: 212 tokens × 6 layers × 8 heads × 32 dim/head + FFN ≈ 25M ops
+- Temporal: 200 turns × 4 layers × 8 heads × 32 dim/head + FFN ≈ 5M ops
+- Action encoder (per-action context for 9 actions): negligible (4M ops)
+- Total: ~35M ops per turn forward.
+
+With FlashAttention 2 at fp16, this should run in ~1.5-2ms per turn
+forward on RTX 3060 Laptop. At 60 turns/battle, ~120ms/battle, ~6
+samples/sec collected. Roughly 2-3× slower than current arch but well
+within the wall-clock budget for a multi-week training run.
+
+For training: BC training over a 100k-replay dataset at batch=64 turns
+should run at ~200-300 turns/sec on the same hardware (memory-bound by
+the 12 Pokemon × 17 tokens reshape). ~10 hours per BC epoch (5M turns
+total). Multi-day BC training for ~5-10 epochs.
+
+---
+
+## 5. Action heads + value head
+
+### 5.1. Action head (preserved with minor changes)
+
+The current `ActionSlotEncoder` (model.py:522-571) consumes 4 active
+moves (with their full `_project_move_flags` 109-dim vectors and real
+bank values) and 5 switch slots, projects each through MoveNet/switch
+MLP, and emits `(B, 9, d_model)` per-action context.
+
+In the rewrite:
+- The 4 active moves are *already* tokenized by `MoveTokenizer` as part
+  of the spatial input (move tokens 14-17 of our active Pokemon).
+  Reading those 4 tokens out of the spatial transformer's output gives
+  the per-action context "for free" — they've already been refined by
+  6 layers of attention against the rest of the battle state.
+- The 5 switch slots (other Pokemon on our team) similarly: their
+  species_token, hp_pct_token, type_token, status_token, etc. have
+  already been computed. We aggregate per-Pokemon: take the 17 tokens
+  for that Pokemon and pool them (mean or attention-pooled with a
+  learnable query) to get a single (B, d_model) vector. 5 such
+  per-Pokemon vectors stack into `(B, 5, d_model)`.
+
+Output: `(B, 9, d_model)` per-action context — same shape as today.
+
+The policy head (model.py:633-637) consumes:
+- actor token output: `(B, d_spatial)` from spatial transformer index 0
+- temporal_ctx: `(B, d_temporal)` from temporal transformer
+- action context: `(B, 9, d_spatial)` per above
+
+Compute: `Linear(2*d_spatial + d_temporal, max(d_spatial, d_temporal))
+→ GELU → Linear(..., 1)`. Reshape to `(B, 9)` logits. Same as today.
+
+Legal mask applied identically (model.py:787-789).
+
+### 5.2. Value head (preserved exactly)
+
+`Linear(d_spatial + d_temporal, max(d_spatial, d_temporal)) → GELU →
+Linear(..., 51)` with twohot encoding (model.py:805-816). No changes.
+
+The critic token output is at spatial transformer index 1, exactly like
+today.
+
+### 5.3. Popart on the value head (small bolt-on, recommended)
+
+Per `METAMON_LEARNINGS.md` and S44 deferred items, Metamon uses popart
+normalization on the value head for value-scale stability across long
+runs. We've never enabled it. This rewrite is the right time to add it
+since we're rebuilding the model anyway.
+
+Popart adds: a learned `(scale, shift)` pair that normalizes the value
+target to unit-ish variance, and the corresponding inverse mapping at
+inference. Implementation: ~30 lines of code, called from PPO update
+in `ppo.py`. **Implement in §7 Week 5+ as a non-blocker but include in
+V1.**
+
+---
+
+## 6. Training pipeline
+
+### 6.1. BC dataset
+
+**KEY DECISION: do not regenerate the memmap.**
+
+The existing memmap at `data/datasets/human_v8_100k/` (104 GB, 5.08M
+records, 199.9K episodes; details from dataset.py audit) already stores
+all the structured features we need:
+
+- `our_pokemon_ids` (B, 6, 7): species, item, ability, 4× move_id
+- `our_pokemon_banks` (B, 6, 10): hp%, level, weight, height, 6× stats
+- `our_pokemon_cont` (B, 6, 285): types(19) + status(7) + boosts(91) +
+  flags(2) + volatiles(38) + paradox(7) + tera(20) + combat(5) +
+  toxic(1) + future_sight(1) + visibility(2) + 4× move_compact(92)
+- `our_pokemon_mcont` (B, 6, 4, 23): per-Pokemon per-move compact
+  features (type one-hot + BP + category + priority)
+- ... and the symmetric opp fields, plus field/transition/active-move/
+  switch/legal/action/result.
+
+The new tokenizer can be implemented as **slicing operations + small
+MLPs at training time** that consume these structured tensors. Concrete
+plan:
+
+| Token | Built from | Memmap fields |
+|---|---|---|
+| `species_token` | embedding lookup | `our_pokemon_ids[:, :, :, 0]` |
+| `item_token` | embedding lookup | `our_pokemon_ids[:, :, :, 1]` |
+| `ability_token` | embedding lookup | `our_pokemon_ids[:, :, :, 2]` |
+| `type_token` | MLP from 2 type embeds | slice `our_pokemon_cont[:, :, :, 0:19]` (the type multi-hot; recover top-2 indices) |
+| `status_token` | MLP | slice `our_pokemon_cont[:, :, :, 19:26]` (status) + `:, :, :, 119:157]` (volatiles) + `:, :, :, 157:164]` (paradox) + `:, :, :, 164:184]` (tera) |
+| `hp_pct_token` | NumericalBank | `our_pokemon_banks[:, :, :, 0]` |
+| `boosts_token` | MLP from 7 boost values | slice `our_pokemon_cont[:, :, :, 26:117]` (the 91-dim 7×13 one-hot; recover boost values via argmax-and-rescale) |
+| 6× `stat_token` | NumericalBank | `our_pokemon_banks[:, :, :, 4:10]` |
+| `move_token[i]` | rich MoveTokenizer | `our_pokemon_ids[:, :, :, 3+i]` (move_id) + `our_pokemon_mcont[:, :, :, i, :]` (23-dim) + lookup of bp/acc/pp/prio from move_id (deterministic) + computed 107-dim `_project_move_flags` |
+
+The only piece that requires the *full* 107-dim move flag vector for
+team moves (not just active) is the new `MoveTokenizer`. Two options:
+
+**Option A (preferred for V1): compute flags at training time from move_id.**
+poke-env's `Move` data class (already used by features.py) has all the
+flag info; the 107-dim projection is a deterministic function of
+move_id alone (independent of battle state, except for type
+effectiveness which is *not* needed for team moves — that's only for
+active). Implement as a `(n_moves, 107)` lookup table built once at
+model init from poke-env's move data, then indexed by move_id. **Cost:
+zero per-forward overhead beyond a tensor index. Memmap unchanged.**
+
+**Option B (later, if A's lookup table feels brittle): regenerate
+memmap with explicit per-move 109-dim feature vectors stored.** Adds
+~6 × 4 × 109 × 4 bytes = ~10 KB per turn, scales the 104 GB memmap to
+~115 GB. Days of regeneration time. Defer unless A's lookup turns out
+to miss some battle-state-dependent info.
+
+Going with Option A. **Memmap: unchanged. BC training data: 100k
+human replays, already there.**
+
+### 6.2. BC training
+
+- **Loss:** unchanged from train_bc.py:30-119. Cross-entropy over
+  legal actions + 0.5× value loss (categorical cross-entropy via
+  twohot encoding).
+- **Batch size:** start at 32 (current default; train_bc.py defaults
+  vary). Tune based on GPU memory. The new arch is ~25M params (rough
+  estimate, see §4.5 capacity calculation; refine after Week 1
+  forward-pass validation), vs current 14M. Memory budget on RTX 3060
+  Laptop should support batch ≥ 32.
+- **Optimizer:** AdamW, same as today (train_bc.py:408-409).
+- **LR:** 3e-4 for BC (same as current per train_bc.py defaults).
+  Warmup 200 steps, cosine decay over the run.
+- **Epochs to convergence:** unknown until we run it. Current MLP arch
+  converged at epoch 2 on `human_v8_100k` (smart_avg 45.1% per S39).
+  New arch with more parameters and richer attention may need 5-10
+  epochs to converge. Plan for ~3-5 days of BC training before PPO.
+- **Mixed precision:** fp16 (train_bc.py supports `--fp16`).
+- **AMP:** keep summary attention in fp32 (matches current
+  model.py:421-426 with `torch.amp.autocast("cuda", enabled=False)`).
+
+### 6.3. PPO continuation
+
+Identical to current pipeline. The model class swap is the only change
+to `train_rl.py`:
+- `--init-from <new_arch_bc_checkpoint>.pt` instead of the v9 BC.
+- All 5 defense layers (forfeit filter, queue restart, dispatch
+  watchdog, auto-respawn, pool curation) work unchanged.
+- `--external-adapters external_adapters_curated.yaml` — same external
+  pool.
+- PFSP, EMA win rate tracking, adaptive entropy, early stop — all
+  unchanged.
+
+### 6.4. Training teams (PROJECT-WIDE STANDARD)
+
+ALL training MUST use procedurally-generated teams from Smogon usage
+stats with `--random-team-pct 0.05`:
+
+```
+--procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04
+--random-team-pct 0.05
+```
+
+This is enforced by `train_rl.py`'s pre-flight guard (which raises if
+`--procedural-teams` is missing). The 70-team pool is **not** for
+training (caused thousands of iters of overfitting in S35-S38 history).
+Metamon competitive teams are eval-only.
+
+### 6.5. Eval methodology (PROJECT-WIDE STANDARD)
+
+ALL evals MUST use Metamon competitive teams via `--eval-team-set
+metamon-competitive`. The 70-team pool's 51-pt smart_avg spread (TEAM_AX
+81.5% vs TEAM_AR 30.5% per S43 retrospective) makes per-checkpoint
+comparisons noisy enough that eval signals can't be distinguished from
+team-draw variance. The Metamon competitive 16-team set has tight
+variance and ladder-validated provenance.
+
+**Eval-time team source ≠ training-time team source.** Mixing them
+contaminates results. Keep separate.
+
+### 6.6. Smart_avg target and significance threshold
+
+- **Baseline:** sp_0229 = 67.8% smart_avg on Metamon competitive.
+- **Same-policy noise floor:** ±2.2pt at 500 games × 4 bots (per S44
+  measurement bumped from S43's 200×4 ±3.6pt).
+- **Significance bar:** ≥3pt above baseline = ≥70.8% smart_avg
+  sustained over 3+ consecutive evals = real improvement.
+- **Failure threshold:** ≥3pt below baseline = ≤64.8% sustained over 2+
+  consecutive evals = stop and re-investigate.
+
+These match the current PPO run's success/failure criteria
+(NEXT_SESSION.md "What to watch for"). We're carrying the same
+measurement discipline forward.
+
+---
+
+## 6b. Heterogeneous opponent support — keep the legacy player alive
+
+### 6b.1. Constraint
+
+The new architecture and the existing MLP architecture must coexist as
+poke-env Players that can play battles against each other through
+`battle_server.js`. Both implement the poke-env `Player` interface;
+neither shares internal state. The WebSocket protocol is the only
+contract.
+
+### 6b.2. Implementation
+
+**Keep `battle_agent.py:23` (`class BattleAgent(Player)`) as-is.** Do
+not delete, refactor, or renamerefactor for the duration of the rewrite.
+It's the legacy player loader — it knows how to load
+`PokeTransformerConfig` checkpoints, run the v9 obs pipeline (via
+features.py:make_features), and play battles. It also has the
+dim-expansion checkpoint-loading logic at battle_agent.py:53-71 that
+handles pre-S39 checkpoints (sp_2979 era) by zero-padding new feature
+columns.
+
+`battle_agent.py` also depends on:
+- `model.py` (PokeTransformer, PokeTransformerConfig)
+- `features.py` (make_features, MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM)
+- `vocab.py` (no changes needed)
+
+**None of these dependencies change.** model.py and features.py are
+both kept around (they're used by BattleAgent's checkpoint loader).
+The new arch's model/features live in *new modules*, not as edits to
+the existing ones. Specifically:
+
+- **New file `model_transformer.py`** — contains `TransformerBattlePolicy`,
+  `TransformerConfig`, `MoveTokenizer`, `Tokenizer`, etc. ~600-800
+  lines (similar to current model.py at 1033 lines, smaller because
+  much of model.py is the obsolete MLP encoders).
+- **New file `features_transformer.py`** — contains
+  `make_features_transformer(battle)`, the per-token feature extractor.
+  Initially this is mostly a thin wrapper around the existing
+  `features.py:make_features` (since the memmap is unchanged) plus the
+  per-token tensor reshaping, ~300-500 lines.
+- **New file `battle_agent_transformer.py`** — contains
+  `class BattleAgentTransformer(Player)`. Mirror of battle_agent.py
+  but uses the new model + new feature extractor. ~250 lines (similar
+  to existing battle_agent.py at ~150-200 lines).
+
+**The new files import from the new model/features modules; legacy
+files keep their existing imports. No circular dependencies, no
+shared mutable state.** The only shared module is `vocab.py` (vocab
+sizes are constant across architectures).
+
+### 6b.3. Heterogeneous opponent use cases unlocked
+
+1. **Direct head-to-head Elo measurement.** Spawn
+   `BattleAgent('sp_0229.pt')` and `BattleAgentTransformer('new_ckpt.pt')`
+   in the same battle pair. Run 200+ games. Get a direct measurement
+   of "did the rewrite beat the MLP-arch champion?" without needing a
+   proxy metric. (S44 didn't have this option clean; doing this
+   first-class avoids future awkwardness.)
+
+2. **Optional legacy opponents in PFSP pool during PPO of the new
+   arch.** In `external_adapters_curated.yaml`, add entries like:
+   ```yaml
+   - name: legacy-sp_0229
+     adapter: legacy_self_play
+     checkpoint: data/models/.../sp_0229.pt
+     weight: 0.3
+   ```
+   `external_opponent_manager.py` already supports heterogeneous
+   opponent types (mcts, foulplay subprocess, metamon subprocess,
+   self-play); adding a `legacy_self_play` type is incremental — same
+   in-process Player path as `SelfPlayOpponent` (rl_player.py:267-282)
+   but instantiates `BattleAgent(sp_0229.pt)` instead of using the
+   trainer's current model.
+
+3. **Backward-compatible eval.** Any future analysis of MLP-arch
+   lineage (Elo trajectories, per-team analysis, ladder rerating)
+   stays possible. Old checkpoints don't go to the dust bin.
+
+### 6b.4. Cost
+
+~600-800 lines of legacy code (battle_agent.py + model.py +
+features.py-the-MLP-parts) maintained as read-only "vendor in our own
+repo." Acceptable. Pure additive complexity. The trade-off is
+clear-eyed: we don't do this and we lose the ability to measure new
+arch vs old arch directly, which is the strongest signal we'll get.
+
+### 6b.5. Guard rail in the implementation roadmap
+
+> **DO NOT delete or substantially refactor `battle_agent.py`,
+> `model.py`, `features.py` during the rewrite.** New arch lives
+> alongside, not in place of. If you find yourself touching these for
+> any reason other than adding `BatleAgentTransformer` to the
+> `external_opponent_manager.py` adapter table, stop and reconsider.
+
+---
+
+## 7. Implementation roadmap
+
+Six weeks of focused work. Each week ends with a measurable milestone;
+if the milestone slips, that's the trigger to update the design.
+
+### Week 1: Tokenizer module + integration tests
+
+**Deliverable:** `model_transformer.py` exports `Tokenizer` that
+consumes the existing memmap batch format and emits a `(B, 212,
+d_model)` tensor + a slot/type ID tensor for positional embeddings.
+
+**Tasks:**
+- [ ] Create `model_transformer.py` skeleton: `TransformerConfig`,
+  `Tokenizer`, `MoveTokenizer` modules.
+- [ ] Implement `MoveTokenizer` per §3.2.
+- [ ] Implement `Tokenizer` that unpacks the memmap's per-Pokemon tensors
+  into per-attribute tokens per §6.1.
+- [ ] Build the `(n_moves, 107)` flag lookup table from poke-env Move
+  data. Confirm it matches `_project_move_flags` (features.py:1005-1263)
+  on a sample of 50 moves.
+- [ ] Write unit tests: `test_tokenizer.py` with 5 sample battles
+  (loaded from existing memmap), assert token count = 212, no NaNs,
+  type_id embeddings line up with the spec table.
+- [ ] Forward-pass benchmark: time `Tokenizer + dummy spatial` on a
+  single batch of 32 turns. Should be <50ms on RTX 3060 Laptop.
+
+**Milestone:** Tokenizer runs. Token shapes match spec. No silent NaN.
+
+### Week 2: Spatial + temporal stack, replace model architecture
+
+**Deliverable:** `TransformerBattlePolicy` runs forward end-to-end,
+produces sane action_logits and value scalar on dummy memmap data.
+PPO integration test.
+
+**Tasks:**
+- [ ] Implement `SpatialTransformer` (6L, 8H, d_model=256, K=2 scratch
+  tokens, Poke-Mask + side-mask).
+- [ ] Implement `TemporalTransformer` (4L, 8H, d_model=256, causal,
+  pos embeddings).
+- [ ] Implement action head (per §5.1) and value head (per §5.2,
+  identical to current).
+- [ ] Implement `TransformerBattlePolicy.forward(batch, history)`:
+  same interface as `PokeTransformer.forward` (model.py:739-803), so
+  it slots into existing collection/training code.
+- [ ] Implement `TransformerBattlePolicy.forward_sequence(collated,
+  device)` for BC training (mirror of model.py:818-978).
+- [ ] Sanity check: load a sample BC batch, forward through new model,
+  assert logits shape = (B, T, 9), value shape = (B, T), no NaN,
+  legal-action masking works.
+- [ ] PPO 1-iter smoke: `train_rl.py --init-from <random-init>.pt
+  --use-transformer --n-iters 1 --games-per-iter 4 --max-concurrent 2`.
+  Assert it produces a valid checkpoint, no exceptions, no Layer 1
+  forfeit triggers.
+
+**Milestone:** New model integrates with existing PPO loop. 1-iter
+smoke passes.
+
+### Week 3: BC training to BC convergence
+
+**Deliverable:** New-arch BC checkpoint at smart_avg comparable to
+existing v8 BC's 45.1% (matched within ±2pt).
+
+**Tasks:**
+- [ ] Add `--use-transformer` flag to `train_bc.py` that swaps
+  `PokeTransformer` → `TransformerBattlePolicy` and uses the new
+  collate path.
+- [ ] Run BC smoke: 1 epoch on first 1k episodes. Verify loss decreases,
+  no NaN, gradient norm sane. If slow, profile and optimize.
+- [ ] Run full BC: 5-10 epochs on `human_v8_100k`. Monitor val_loss,
+  val_acc, periodic smart_avg eval (every epoch end).
+- [ ] Pick best epoch by smart_avg (Metamon competitive, 200×4 games).
+  Record as `bc_v10_<timestamp>/best.pt`.
+
+**Milestone:** New arch BC reaches ≥45% smart_avg. If <40%, debug; if
+50%+, that's a positive surprise and we proceed with extra confidence.
+
+**Cloud option:** if local BC training takes >5 days at full epoch
+count (likely on RTX 3060 Laptop), trigger cloud BC training (see
+CLOUD_DEPLOY.md). Probable cost: $50-150 for BC convergence on a
+single A100.
+
+### Week 4: PPO from BC, eval methodology validated
+
+**Deliverable:** First new-arch PPO checkpoint that beats 67.8% smart_avg
+on Metamon competitive.
+
+**Tasks:**
+- [ ] Launch PPO from new BC checkpoint with the same recipe as the
+  attempt-11 run (NEXT_SESSION.md section "Resume the run if you
+  killed it"). Adjust `--init-from` and add `--use-transformer`. Pool
+  composition: same curated YAML.
+- [ ] Run 50 iters with frequent eval (`--eval-interval 5`). Monitor
+  smart_avg trajectory. Compare to MLP arch's iter 0-50 trajectory
+  from attempt 11 (will have to look this up in the run log).
+- [ ] Mid-run sanity checks: per-iter pool size sane, KL drift below
+  0.04, entropy in [0.6, 0.85], no Layer 1/2/3/4/5 fires beyond cold
+  start.
+
+**Milestone:** Iter ≥30 hits ≥70% smart_avg sustained over 2+ evals.
+If the trajectory looks like attempt-11 (peak 64-66% then plateau),
+that's a clear signal the architectural fix wasn't decisive — proceed
+to deeper analysis (see Week 6).
+
+### Week 5: Long PPO run + popart + final eval
+
+**Deliverable:** Final new-arch checkpoint. Smart_avg comparison vs
+sp_0229 baseline. Direct head-to-head Elo measurement via the new
+heterogeneous-opponent infrastructure (§6b.3.1).
+
+**Tasks:**
+- [ ] Implement popart on the value head per §5.3. Add as a flag
+  (`--popart`) that defaults to True for new arch.
+- [ ] Resume PPO from Week 4 best, run another 100-150 iters with
+  popart on. Monitor for value-scale stability gain (the diagnostic is
+  whether avg KL stays tighter and whether smart_avg trajectory has
+  fewer dips).
+- [ ] At final iter or every 20 iters, run direct H2H eval:
+  `BattleAgentTransformer(new.pt)` vs `BattleAgent(sp_0229.pt)` 200
+  games. Goal: ≥55% WR (clearly better than the 50% noise floor).
+
+**Milestone:** Final checkpoint at ≥71% smart_avg sustained over 3+
+evals AND ≥55% WR vs sp_0229 in direct H2H. If both hit, the rewrite
+delivered.
+
+### Week 6: Analysis, retrospective, documentation
+
+**Deliverable:** Updated NEXT_SESSION.md. Per-opp analysis of new arch
+vs MLP arch. Decision on whether to scale up further (cloud, larger
+model) or call the rewrite done.
+
+**Tasks:**
+- [ ] Run `_analyze_run_log.py` on the long PPO run. Per-opp W/L
+  trajectory: where did new arch gain over MLP arch? where did it
+  plateau?
+- [ ] Compare attribute-level token activations on a sample of 20
+  battles (use forward hooks). Sanity-check: are token-type embeddings
+  distinct? Do unusual sets activate "novel" attention patterns vs
+  common sets activate familiar ones?
+- [ ] Update REWRITE_DESIGN.md (this doc) with all reality-vs-spec
+  divergences encountered during implementation. Don't edit history;
+  add postscript sections explaining what changed and why.
+- [ ] Update NEXT_SESSION.md with the new arch's status, baseline
+  smart_avg, and recommended next directions (more BC data? larger
+  model? test-time adaptation?).
+
+**Milestone:** Project state updated. Next direction chosen.
+
+### Decision points / off-ramps
+
+| Week | Trigger | Action |
+|---|---|---|
+| 1 | Tokenizer benchmarks >100ms/batch | Profile, optimize, possibly defer K=2 → K=4; otherwise simplify token count |
+| 2 | New model fails to forward / produces NaN | Debug; if architectural issue, reconsider d_model / layer count |
+| 3 | BC <40% smart_avg after 10 epochs | Investigate: tokenizer bug? MLP collapse on novel attribute combos? Possibly fall back to smaller token count and retest |
+| 3 | BC training takes >5 days local | Trigger cloud migration |
+| 4 | PPO trajectory mirrors attempt-11 (peak 64-66% then plateau) | New arch isn't the fix. Pivot to data scaling (more BC replays, multi-gen) OR test-time adaptation OR larger model. The rewrite is then a building block, not the answer. |
+| 5 | Final smart_avg <70% | Same as Week 4: data/scale/TTA pivot |
+| 5 | Final smart_avg ≥75% | Big win. Plan a ladder submission run + larger model + more BC data |
+| 6 | Direct H2H WR <50% vs sp_0229 | Strange: smart_avg up but H2H down? Likely a Metamon-competitive teams effect; investigate |
+
+---
+
+## 8. Risk register
+
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|---|
+| 1 | BC training too slow on local 6 GB GPU (new arch ~25M params, 212 tokens, 5M turn dataset) | medium | medium | Cloud option budgeted (Week 3). Can also reduce `n_summary_tokens` from 2 to 1, drop temporal layers from 4 to 3, or batch-size down |
+| 2 | New arch trains unstably (NaN, exploding gradients, exploding KL) | medium | high | LR sweep (Week 2-3), grad clip 2.0, layer norm everywhere, fp16 AMP with master fp32 weights for sensitive ops |
+| 3 | Tokenizer slicing logic has a subtle off-by-one or wrong-side-of-mask bug | medium | high | Unit tests in Week 1, integration tests in Week 2. Compare token-by-token output to a reference implementation that uses for-loops instead of vectorized slicing |
+| 4 | Memmap-with-no-regen approach hits a feature gap (some new attribute we want isn't sliceable from existing fields) | low | medium | Fall back to Option B: regen with explicit per-token features. ~2-3 days additional cost in Week 1 |
+| 5 | Eval methodology drift (Metamon competitive teams change, or some new bot replaces an existing eval bot) | low | medium | Pin the Metamon competitive set version to git commit hash. Bots are SimpleHeuristics, SmartDamage, Tactical, Strategic — all in-tree |
+| 6 | Heterogeneous opponent infrastructure (BattleAgent vs BattleAgentTransformer in the same battle) has a protocol incompatibility | low | medium | Test in Week 5 with `diag_cross_venv.py` style sanity check before PPO uses it. The existing battle_server already handles 4 separate Player types; one more shouldn't break it |
+| 7 | New arch overfits to the BC dataset and doesn't generalize ("memorizes the 100k human replays") | low | high | Same risk as MLP arch had; smart_avg eval on Metamon competitive teams is the early warning. Dropout 0.05, weight decay matching current |
+| 8 | New arch wins at smart_avg but loses on PokeAgent ladder (different distribution of opponents) | medium | low | Ladder submission is post-Week 6. Acceptable risk; the smart_avg measurement is the project-wide standard |
+| 9 | Compute budget overrun: cloud BC + cloud PPO + Storage > $300 | medium | low | Cap individual run cost at $200; if cloud BC alone exceeds that, reduce model size before scaling further |
+| 10 | Scope creep: implementing test-time adaptation / multi-gen / larger model in the rewrite session | medium | high | Hard guard: this design is V1. New scope = new design doc, post-Week 6 |
+| 11 | The architectural rewrite turns out to be insufficient (the ceiling really IS data scale, not architecture) | medium | high | This is the central uncertainty. Week 4-5 evals are the dispositive test. If we hit this, the rewrite is still a building block; pivot to data scaling |
+| 12 | Compute estimates in §4.5 are wrong, and the real model is 3-5× slower than projected | medium | medium | Profile in Week 2 forward benchmarks. Adjust K, layers, d_model accordingly |
+
+---
+
+## 9. Reference comparison to Metamon
+
+Per `metamon_ref/metamon/rl/metamon_to_amago.py:534-589`, Metamon's
+production tokenizer is `MetamonPerceiverTstepEncoder`. Their config for
+Minikazam (4.7M params): 5 latent tokens × 64 d_model = 320-dim per-turn
+output. For Small (15M params): 4 scratch × 100 = 400-dim. For Large
+(140M params): 11 scratch × 160 = 1760-dim.
+
+Their tokenization differs from ours in **two structural ways**:
+
+1. **Text + numerical multimodal input.** Metamon's per-turn input is
+   ~87 text tokens (words like "charizard", "leftovers", "blaze",
+   "fire", "flying") + 3-6 numerical tokens (HP%, level, stats). The
+   structure is *implicit in word ordering* — the model learns that
+   the 5th word is the species, the 6th is the item, etc. They use a
+   single 2541-token vocabulary covering gens 1-9.
+
+2. **Perceiver cross-attention to compress.** The 90-93 input tokens
+   cross-attend to K learnable latent tokens (5 for Minikazam, 11 for
+   Large), then those latents self-attend. Output = K × d_model
+   flattened.
+
+**Our design differs**:
+
+- **Explicit per-attribute tokens** (~212 of them) instead of implicit
+  word-positional structure. We have more inductive bias (the model
+  starts knowing "this is a stat token" via type_id_embed) at the cost
+  of less flexibility for multi-gen extension.
+- **Direct self-attention** instead of Perceiver cross-attention. We
+  have ~212 input tokens, not 90 — but with FlashAttention, this is
+  still tractable on consumer GPUs at d_model=256.
+
+**What we adopt:**
+- **Multi-summary scratch tokens** (K=2, like Minikazam's 5 latents).
+  Replaces our current single attention-pooled summary
+  (model.py:420-426), which METAMON_LEARNINGS.md flagged as a silent
+  bottleneck.
+- **Higher temporal-to-spatial ratio.** Metamon: 5-8:1 in d_model
+  (small=5×100 spatial → 512 temporal hidden). Ours rewrite: 2:1 in
+  per-turn output (2×256=512 spatial output → 256 temporal d_model),
+  with 4 temporal layers vs 2. Closer to Metamon's recipe than current.
+- **Popart on value head.** Metamon Small/Large/Kakuna all use it.
+  We've never enabled it. Including in V1.
+- **Dropout 0.05.** Already matches current.
+
+**What we adapt (different from Metamon):**
+- **Token count higher.** 212 vs Metamon's ~93. We trade compute for
+  explicit compositional structure, betting that attention over
+  attribute-level tokens generalizes better to novel sets than text
+  ordering does.
+- **Move tokens NOT split into sub-tokens.** Metamon doesn't have
+  separate move-bp / move-acc tokens; they encode move text + bundled
+  numerical features together. We similarly bundle (rich move token).
+  But we do it explicitly via `MoveTokenizer` MLP, not by text-position
+  in the input sequence. The explicit-vs-implicit distinction is the
+  main divergence.
+- **Spatial / temporal split kept.** Metamon Small/Large use a single
+  trajectory transformer over (turns × latents) flattened. We keep
+  spatial and temporal separate (§4.4) because at our token count
+  unifying would explode compute.
+
+**What we differ on (deliberately):**
+- **Single-format singles gen 9 only in V1.** Metamon's tokenizer is
+  multi-gen (gens 1-9). Ours is gen-9-only because we don't need
+  multi-gen support yet (per §1 N6) and the gen-specific tokenization
+  is more compact.
+- **Our PFSP pool, our defense layers.** Metamon's training infra is
+  AMAGO-based (different framework, different eval methodology).
+  We keep ours — they work, and migrating to theirs is a separate
+  project (not a rewrite of the model).
+
+**Param target:**
+- Minikazam at 4.7M: too small for our purposes; their RNN temporal is
+  efficient but ours is transformer.
+- Small at 15M: comparable to current (14M). Reasonable target for V1.
+- Large at 140M: requires cloud, requires more BC data than we have.
+  Future work.
+
+Our V1 target: ~25M params (rough estimate, see §4.5; refine after
+Week 1 forward-pass validation). Slightly larger than Small to
+compensate for our lack of their 18M-trajectory dataset (we have ~5M).
+
+---
+
+## 10. Open questions / things deliberately left unresolved
+
+- **Optimal K (summary scratch tokens).** Going from current K=0 to K=2
+  is a clear improvement; K=4 (Metamon Small) might be better. Decide
+  in Week 2 forward benchmarks based on what fits in compute budget.
+- **Type-token decomposition.** §3.1 has 1 type token per Pokemon
+  (compressing both types via small MLP from 2 type embeddings). Could
+  alternatively be 2 separate tokens (type1, type2). Trade-off:
+  consolidation saves 12 tokens (=12×12 attention pairs); separation
+  enables attention to compose "Fire/Flying weakness to Stealth Rock"
+  more directly. Decide in Week 1 unit tests.
+- **Move-flag projection table size.** The `(n_moves, 107)` lookup is
+  ~400 KB in fp32. If we want per-format generalization later, we'll
+  need to either (a) regenerate per-format, (b) store sparse per-format
+  diffs. V1: gen-9-only, ignore. Multi-gen extension is post-V1.
+- **Whether to publish a `transformer_v1` BC dataset.** If memmap stays
+  unchanged (Option A in §6.1), we don't need to. If we go to Option
+  B (explicit per-token memmap regen), the new dataset is ~115 GB and
+  worth tagging/versioning.
+- **Whether to rerun full ladder eval on new arch.** PokeAgent ladder
+  submission is mentioned in NEXT_SESSION.md as a post-Week 6 option.
+  Cost: account management + days of ladder games + monitoring.
+  Diagnostic value: validated public Elo. Decide after Week 5 results.
+
+---
+
+## 11. Document changelog
+
+- **2026-05-01 (Session 45):** initial design. Covers V1 of the rewrite,
+  spans Sessions 46-51 of implementation effort.
+
+Future updates as implementation reveals divergences. Add a postscript
+section per change; do not silently rewrite history.
