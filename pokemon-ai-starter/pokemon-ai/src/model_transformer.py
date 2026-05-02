@@ -103,26 +103,81 @@ assert _SL_MOVE_COMPACT[1] == POKEMON_CONT_DIM, (
 
 
 # =============================
+# Slice offsets in the FIELD_CONT_DIM=52 field cont vector.
+# Verified against features.py:_encode_field (lines 618-649). Layout:
+#   weather one-hot (5) + terrain one-hot (5) + trick_room (1)
+#   + our hazards (4: SR, spikes/3, tspikes/2, web) + opp hazards (4)
+#   + our screens (6: 3 × {presence, dur}) + opp screens (6)
+#   + tailwind (2: us, opp)
+#   + mechanics (17: tera/mega/z/dmax availability + used + dmax_turns
+#       + trapped + force_switch + opp_revealed_frac)
+#   + alive (2: our/6, opp/6)
+# =============================
+_FL_WEATHER_OH    = (0,    5)    # weather one-hot
+_FL_TERRAIN_OH    = (5,    10)   # terrain one-hot
+_FL_TRICK_ROOM    = (10,   11)
+_FL_OUR_HAZARDS   = (11,   15)   # SR / spikes / tspikes / web
+_FL_OPP_HAZARDS   = (15,   19)
+_FL_OUR_SCREENS   = (19,   25)   # 3 screens × (presence, dur)
+_FL_OPP_SCREENS   = (25,   31)
+_FL_TAILWIND      = (31,   33)   # us, opp
+_FL_MECHANICS     = (33,   50)   # 17 dims of one-time-use resources + flags
+_FL_ALIVE         = (50,   52)   # our_alive/6, opp_alive/6
+
+assert _FL_ALIVE[1] == FIELD_CONT_DIM, (
+    f"field layout end {_FL_ALIVE[1]} != FIELD_CONT_DIM {FIELD_CONT_DIM}; "
+    "features.py changed _encode_field — update _FL_* offsets here"
+)
+
+
+# =============================
 # Token type / slot / position constants
 # =============================
 N_PER_POKEMON  = 17
-N_BATTLE_STATE = 6     # actor, critic, field, transition, 2 active threats
+# Battle-state tokens (sequence indices 0..N_BATTLE_STATE-1):
+#  0  actor (learnable)
+#  1  critic (learnable)
+#  2  transition (last-turn events MLP)
+#  3  our active threat (per-move type-eff vs opp + threat back, MLP)
+#  4  opp active threat (computed from damage chart + lookup, MLP)
+#  5  weather  (Postscript E field-token split)
+#  6  terrain
+#  7  our hazards
+#  8  opp hazards
+#  9  our screens
+# 10  opp screens
+# 11  speed-field (tailwind + trick room)
+# 12  mechanics (tera/mega/z/dmax availability + trapped/force_switch/opp_revealed_frac)
+# 13  progression (turn + alive counts)
+N_BATTLE_STATE = 14
 N_SUMMARY      = 2     # K=2 summary scratch tokens (per §3.2 / §4.2)
 N_THREAT_SIDES = 2     # our + opp active-threat tokens
 MAX_TYPES_PER_POKEMON = 2
 
-# Token type IDs — one per row in §3.1 tables, plus the threat-token type.
+# Token type IDs — one per row in §3.1 tables + threat-token + Postscript E
+# field-token split.
 TT_SPECIES, TT_ITEM, TT_ABILITY, TT_TYPE, TT_STATUS = 0, 1, 2, 3, 4
 TT_HP_PCT, TT_BOOSTS = 5, 6
 TT_STAT_HP, TT_STAT_ATK, TT_STAT_DEF, TT_STAT_SPA, TT_STAT_SPD, TT_STAT_SPE = 7, 8, 9, 10, 11, 12
 TT_MOVE       = 13   # all 4 move tokens share this; move_slot_embed disambiguates
 TT_ACTOR      = 14
 TT_CRITIC     = 15
-TT_FIELD      = 16
-TT_TRANSITION = 17
-TT_SUMMARY    = 18   # both K=2 scratch tokens
-TT_THREAT     = 19   # our + opp active-threat tokens
-N_TOKEN_TYPES = 20
+TT_TRANSITION = 16
+TT_SUMMARY    = 17   # both K=2 scratch tokens
+TT_THREAT     = 18   # our + opp active-threat tokens
+# Field-token split (Postscript E): the legacy single TT_FIELD becomes 9
+# thematic tokens. This lets attention specialize — e.g., opp_screens_token
+# can attend to our sweeper's stats independently of weather state.
+TT_WEATHER     = 19
+TT_TERRAIN     = 20
+TT_OUR_HAZARDS = 21
+TT_OPP_HAZARDS = 22
+TT_OUR_SCREENS = 23
+TT_OPP_SCREENS = 24
+TT_SPEED_FIELD = 25  # tailwind us/opp + trick room (speed-tier modifiers)
+TT_MECHANICS   = 26  # one-time-use resources: tera/mega/z/dmax + trapped/force_switch/opp_revealed
+TT_PROGRESSION = 27  # turn count + alive counts (game-progression info)
+N_TOKEN_TYPES = 28
 
 # Per-Pokemon: where each of the 17 token types maps in the 17-token block.
 _PER_POKEMON_TT = (
@@ -137,11 +192,19 @@ assert len(_PER_POKEMON_TT) == N_PER_POKEMON
 #   0..team_size-1     : our Pokemon slots
 #   team_size..2*team_size-1 : opp Pokemon slots
 #   followed by named battle-state slots:
-PS_SLOT_DECISION   = 0   # actor / critic — relative to "battle-state slot base"
-PS_SLOT_FIELD      = 1
-PS_SLOT_TRANSITION = 2
-PS_SLOT_SUMMARY    = 3
-N_BATTLE_STATE_SLOTS = 4
+PS_SLOT_DECISION       = 0   # actor / critic — relative to "battle-state slot base"
+PS_SLOT_TRANSITION     = 1
+PS_SLOT_WEATHER        = 2
+PS_SLOT_TERRAIN        = 3
+PS_SLOT_OUR_HAZARDS    = 4
+PS_SLOT_OPP_HAZARDS    = 5
+PS_SLOT_OUR_SCREENS    = 6
+PS_SLOT_OPP_SCREENS    = 7
+PS_SLOT_SPEED_FIELD    = 8
+PS_SLOT_MECHANICS      = 9
+PS_SLOT_PROGRESSION    = 10
+PS_SLOT_SUMMARY        = 11
+N_BATTLE_STATE_SLOTS = 12
 
 
 def n_pokemon(fmt: FormatConfig) -> int:
@@ -633,13 +696,35 @@ class Tokenizer(nn.Module):
         self.stat_bank = NumericalBank(256, cfg.bank_dim)
         self.bank_proj = nn.Linear(cfg.bank_dim, d)
 
-        # ---- Field token: 4 banks (turn / weather_dur / terrain_dur / tr_dur) + cont ----
+        # ---- Field tokens (Postscript E split): 9 thematic tokens replacing 1.
+        # Each thematic MLP takes a narrow slice of `field_cont` plus relevant
+        # banks. Lets attention specialize per theme.
         self.turn_bank        = NumericalBank(201, cfg.bank_dim)
         self.weather_dur_bank = NumericalBank(9,   cfg.bank_dim_small)
         self.terrain_dur_bank = NumericalBank(6,   cfg.bank_dim_small)
         self.tr_dur_bank      = NumericalBank(6,   cfg.bank_dim_small)
-        field_in = cfg.bank_dim + 3 * cfg.bank_dim_small + FIELD_CONT_DIM
-        self.field_mlp = _mlp_1_layer(field_in, d)
+
+        weather_in   = (_FL_WEATHER_OH[1] - _FL_WEATHER_OH[0]) + cfg.bank_dim_small
+        terrain_in   = (_FL_TERRAIN_OH[1] - _FL_TERRAIN_OH[0]) + cfg.bank_dim_small
+        our_haz_in   = (_FL_OUR_HAZARDS[1] - _FL_OUR_HAZARDS[0])
+        opp_haz_in   = (_FL_OPP_HAZARDS[1] - _FL_OPP_HAZARDS[0])
+        our_scr_in   = (_FL_OUR_SCREENS[1] - _FL_OUR_SCREENS[0])
+        opp_scr_in   = (_FL_OPP_SCREENS[1] - _FL_OPP_SCREENS[0])
+        # Speed-field token: tailwind (2) + trick_room (1) + tr_dur bank
+        speed_field_in = (_FL_TAILWIND[1] - _FL_TAILWIND[0]) + (_FL_TRICK_ROOM[1] - _FL_TRICK_ROOM[0]) + cfg.bank_dim_small
+        mech_in      = (_FL_MECHANICS[1] - _FL_MECHANICS[0])
+        # Progression token: alive_us / alive_opp (2) + turn bank
+        prog_in      = (_FL_ALIVE[1] - _FL_ALIVE[0]) + cfg.bank_dim
+
+        self.weather_mlp     = _mlp_1_layer(weather_in,     d)
+        self.terrain_mlp     = _mlp_1_layer(terrain_in,     d)
+        self.our_hazards_mlp = _mlp_1_layer(our_haz_in,     d)
+        self.opp_hazards_mlp = _mlp_1_layer(opp_haz_in,     d)
+        self.our_screens_mlp = _mlp_1_layer(our_scr_in,     d)
+        self.opp_screens_mlp = _mlp_1_layer(opp_scr_in,     d)
+        self.speed_field_mlp = _mlp_1_layer(speed_field_in, d)
+        self.mechanics_mlp   = _mlp_1_layer(mech_in,        d)
+        self.progression_mlp = _mlp_1_layer(prog_in,        d)
 
         # ---- Transition token: shared embedding for moves + species (legacy convention) ----
         self.action_embed = nn.Embedding(max(cfg.n_moves, cfg.n_species) + 1, cfg.entity_embed_dim)
@@ -724,25 +809,46 @@ class Tokenizer(nn.Module):
         Layout matches the forward()'s assembly order — keep them in lock-step."""
         team = fmt.team_size
         bs_base = 2 * team   # battle-state slot IDs start after both sides' Pokemon slots
-        slot_decision = bs_base + PS_SLOT_DECISION
-        slot_field    = bs_base + PS_SLOT_FIELD
-        slot_trans    = bs_base + PS_SLOT_TRANSITION
-        slot_summary  = bs_base + PS_SLOT_SUMMARY
+        def bs(slot_offset: int) -> int:
+            return bs_base + slot_offset
 
         tt: list[int] = []
         ps: list[int] = []
         ms: list[int] = []
 
-        # 0,1: actor + critic
-        tt.extend([TT_ACTOR, TT_CRITIC]); ps.extend([slot_decision] * 2); ms.extend([0, 0])
-        # 2: field
-        tt.append(TT_FIELD);      ps.append(slot_field);    ms.append(0)
-        # 3: transition
-        tt.append(TT_TRANSITION); ps.append(slot_trans);    ms.append(0)
-        # 4: our active threat — pinned to our active Pokemon slot 0
-        tt.append(TT_THREAT);     ps.append(0);             ms.append(0)
-        # 5: opp active threat — pinned to opp active Pokemon slot (= team_size)
-        tt.append(TT_THREAT);     ps.append(team);          ms.append(0)
+        # Sequence indices 0..N_BATTLE_STATE-1 (must match forward()'s
+        # assembly order). 14 battle-state tokens after the field-token split.
+        # 0, 1: actor + critic
+        tt.extend([TT_ACTOR, TT_CRITIC])
+        ps.extend([bs(PS_SLOT_DECISION)] * 2)
+        ms.extend([0, 0])
+        # 2: transition
+        tt.append(TT_TRANSITION)
+        ps.append(bs(PS_SLOT_TRANSITION))
+        ms.append(0)
+        # 3: our active threat — pinned to our active Pokemon slot 0
+        tt.append(TT_THREAT)
+        ps.append(0)
+        ms.append(0)
+        # 4: opp active threat — pinned to opp active Pokemon slot (= team_size)
+        tt.append(TT_THREAT)
+        ps.append(team)
+        ms.append(0)
+        # 5..13: 9 thematic field tokens (Postscript E split)
+        for t_id, p_slot in [
+            (TT_WEATHER,     PS_SLOT_WEATHER),
+            (TT_TERRAIN,     PS_SLOT_TERRAIN),
+            (TT_OUR_HAZARDS, PS_SLOT_OUR_HAZARDS),
+            (TT_OPP_HAZARDS, PS_SLOT_OPP_HAZARDS),
+            (TT_OUR_SCREENS, PS_SLOT_OUR_SCREENS),
+            (TT_OPP_SCREENS, PS_SLOT_OPP_SCREENS),
+            (TT_SPEED_FIELD, PS_SLOT_SPEED_FIELD),
+            (TT_MECHANICS,   PS_SLOT_MECHANICS),
+            (TT_PROGRESSION, PS_SLOT_PROGRESSION),
+        ]:
+            tt.append(t_id)
+            ps.append(bs(p_slot))
+            ms.append(0)
 
         # 6 .. 6 + 2*team*N_PER_POKEMON: per-Pokemon attribute blocks
         for p in range(2 * team):
@@ -757,7 +863,7 @@ class Tokenizer(nn.Module):
 
         # K summary scratch tokens (last)
         tt.extend([TT_SUMMARY] * N_SUMMARY)
-        ps.extend([slot_summary] * N_SUMMARY)
+        ps.extend([bs(PS_SLOT_SUMMARY)] * N_SUMMARY)
         ms.extend([0] * N_SUMMARY)
 
         expected = total_tokens(fmt)
@@ -884,19 +990,51 @@ class Tokenizer(nn.Module):
 
     # ---- Battle-state encoders ----
 
-    def _encode_field(
+    def _encode_field_tokens(
         self,
         field_banks: Dict[str, torch.Tensor],
-        field_cont: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([
-            self.turn_bank       (field_banks["turn"]),
-            self.weather_dur_bank(field_banks["weather_dur"]),
-            self.terrain_dur_bank(field_banks["terrain_dur"]),
-            self.tr_dur_bank     (field_banks["tr_dur"]),
-            field_cont,
-        ], dim=-1)
-        return self.field_mlp(x)
+        field_cont: torch.Tensor,        # (B, FIELD_CONT_DIM)
+    ) -> Dict[str, torch.Tensor]:
+        """Postscript E: produce 9 thematic field tokens, each (B, d_model)."""
+        weather_dur_e = self.weather_dur_bank(field_banks["weather_dur"])
+        terrain_dur_e = self.terrain_dur_bank(field_banks["terrain_dur"])
+        tr_dur_e      = self.tr_dur_bank     (field_banks["tr_dur"])
+        turn_e        = self.turn_bank       (field_banks["turn"])
+
+        weather_t = self.weather_mlp(torch.cat([
+            field_cont[..., _FL_WEATHER_OH[0]:_FL_WEATHER_OH[1]],
+            weather_dur_e,
+        ], dim=-1))
+        terrain_t = self.terrain_mlp(torch.cat([
+            field_cont[..., _FL_TERRAIN_OH[0]:_FL_TERRAIN_OH[1]],
+            terrain_dur_e,
+        ], dim=-1))
+        our_haz_t = self.our_hazards_mlp(field_cont[..., _FL_OUR_HAZARDS[0]:_FL_OUR_HAZARDS[1]])
+        opp_haz_t = self.opp_hazards_mlp(field_cont[..., _FL_OPP_HAZARDS[0]:_FL_OPP_HAZARDS[1]])
+        our_scr_t = self.our_screens_mlp(field_cont[..., _FL_OUR_SCREENS[0]:_FL_OUR_SCREENS[1]])
+        opp_scr_t = self.opp_screens_mlp(field_cont[..., _FL_OPP_SCREENS[0]:_FL_OPP_SCREENS[1]])
+        speed_field_t = self.speed_field_mlp(torch.cat([
+            field_cont[..., _FL_TAILWIND[0]:_FL_TAILWIND[1]],
+            field_cont[..., _FL_TRICK_ROOM[0]:_FL_TRICK_ROOM[1]],
+            tr_dur_e,
+        ], dim=-1))
+        mech_t = self.mechanics_mlp(field_cont[..., _FL_MECHANICS[0]:_FL_MECHANICS[1]])
+        prog_t = self.progression_mlp(torch.cat([
+            field_cont[..., _FL_ALIVE[0]:_FL_ALIVE[1]],
+            turn_e,
+        ], dim=-1))
+
+        return {
+            "weather":     weather_t,
+            "terrain":     terrain_t,
+            "our_hazards": our_haz_t,
+            "opp_hazards": opp_haz_t,
+            "our_screens": our_scr_t,
+            "opp_screens": opp_scr_t,
+            "speed_field": speed_field_t,
+            "mechanics":   mech_t,
+            "progression": prog_t,
+        }
 
     def _encode_transition(
         self,
@@ -1022,24 +1160,34 @@ class Tokenizer(nn.Module):
 
         actor_t  = self.actor_token .unsqueeze(0).expand(B, d).unsqueeze(1)
         critic_t = self.critic_token.unsqueeze(0).expand(B, d).unsqueeze(1)
-        field_t  = self._encode_field(batch["field_banks"], batch["field_cont"]).unsqueeze(1)
         trans_t  = self._encode_transition(batch["transition_ids"], batch["transition_cont"]).unsqueeze(1)
 
         our_threat_t = self._encode_our_threat(batch["active_move_cont"]).unsqueeze(1)
-        # Postscript C: opp threat computed from lookup + damage chart (was a
-        # zero-init learnable parameter pre-cleanup). Slot 0 of each side is
-        # the active Pokemon by construction (features.py:_encode_team).
+        # Postscript C: opp threat computed from lookup + damage chart.
         opp_active_move_ids = opp_ids[:, 0, 3:7]                                 # (B, n_moves)
         our_active_cont     = batch["our_pokemon_cont"][:, 0, :]                  # (B, POKEMON_CONT_DIM)
         opp_threat_t = self._encode_opp_threat(
             opp_active_move_ids, our_active_cont,
         ).unsqueeze(1)
 
+        # Postscript E: 9 thematic field tokens.
+        f = self._encode_field_tokens(batch["field_banks"], batch["field_cont"])
+        field_seq = torch.stack([
+            f["weather"], f["terrain"],
+            f["our_hazards"], f["opp_hazards"],
+            f["our_screens"], f["opp_screens"],
+            f["speed_field"], f["mechanics"], f["progression"],
+        ], dim=1)                                                                 # (B, 9, d)
+
         scratch = self.summary_scratch.unsqueeze(0).expand(B, N_SUMMARY, d)
 
+        # Order MUST match _build_position_ids: actor, critic, transition,
+        # our_threat, opp_threat, 9 field tokens, then per-Pokemon block, then
+        # summary scratch.
         seq = torch.cat([
-            actor_t, critic_t, field_t, trans_t,
+            actor_t, critic_t, trans_t,
             our_threat_t, opp_threat_t,
+            field_seq,
             all_poke,
             scratch,
         ], dim=1)

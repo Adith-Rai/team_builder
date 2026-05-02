@@ -27,7 +27,7 @@ from dataset import MemmapDataset, collate_seq, unpack_turn_batch
 from format_config import FormatConfig, FORMAT_SINGLES
 from model_transformer import (
     Tokenizer, TransformerConfig, load_move_flag_lookup,
-    N_TOKENS, N_TOKEN_TYPES, TT_MOVE,
+    N_TOKENS, N_TOKEN_TYPES, N_BATTLE_STATE, TT_MOVE,
     MAX_TYPES_PER_POKEMON, _SL_TYPES, _PER_POKEMON_TT, _FIRST_MOVE_OFFSET,
 )
 
@@ -103,8 +103,9 @@ def test_unknown_opp_moves():
         out = tok(batch)
     _assert_finite(out["tokens"], "tokens")
     # Sanity: position-IDs match expected layout for opp Pokemon 0 move 0.
-    # Layout: 6 battle-state + 6 our × 17 + opp 0 starts at 108. Move 0 = +13.
-    OPP_0_MOVE_0_IDX = 6 + 6 * 17 + _FIRST_MOVE_OFFSET
+    # Layout: N_BATTLE_STATE + 6 our × 17 + opp 0 starts at N_BATTLE_STATE + 102.
+    # Move 0 = +13 within the per-Pokemon block.
+    OPP_0_MOVE_0_IDX = N_BATTLE_STATE + 6 * 17 + _FIRST_MOVE_OFFSET
     assert tok.type_ids[OPP_0_MOVE_0_IDX].item() == TT_MOVE
     assert tok.move_slots[OPP_0_MOVE_0_IDX].item() == 1   # move slot 0 → vocab 1 (0 reserved)
     print(f"  opp_0_move_0 position-IDs OK (idx={OPP_0_MOVE_0_IDX})")
@@ -139,8 +140,10 @@ def test_pokemon_slot_disambiguation():
     with torch.no_grad():
         out2 = tok(batch)["tokens"]
     tok.species_embed.weight.data.copy_(saved)
-    # Compare species token of our slot 0 vs slot 1 (indices 6 + 0*17 = 6 and 6 + 17 = 23).
-    slot_diff = (out2[0, 6] - out2[0, 23]).abs().max().item()
+    # Species tokens for our slot 0 vs slot 1 (offset 0 within each per-Pokemon block).
+    species_p0 = N_BATTLE_STATE + 0 * 17
+    species_p1 = N_BATTLE_STATE + 1 * 17
+    slot_diff = (out2[0, species_p0] - out2[0, species_p1]).abs().max().item()
     print(f"  with species_embed zeroed, slot-only diff = {slot_diff:.4f}")
     assert slot_diff > 1e-3, "pokemon_slot_embed doesn't disambiguate"
     print("  OK")
@@ -225,8 +228,11 @@ def test_grad_flow_opp_threat():
     collated = _load_sample_batch(2)
     batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
     out = tok(batch)
-    # Random projection of the opp_threat token (idx 5) — non-uniform upstream
-    OPP_THREAT_IDX = 5
+    # Random projection of the opp_threat token (post-Postscript-E layout puts
+    # it at sequence index 4: actor=0, critic=1, transition=2, our_threat=3,
+    # opp_threat=4) — non-uniform upstream gradient avoids the LayerNorm
+    # constant-component-projection nullity.
+    OPP_THREAT_IDX = 4
     proj = torch.randn(out["tokens"].shape[-1])
     loss = (out["tokens"][:, OPP_THREAT_IDX] * proj).sum()
     loss.backward()
@@ -249,11 +255,16 @@ def test_opp_threat_uses_chart():
         tok.damage_chart.zero_()
         out_chart_zero = tok(batch)["tokens"]
         tok.damage_chart.copy_(saved)
-    # Opp threat token is at sequence index 5 (0=actor, 1=critic, 2=field,
-    # 3=transition, 4=our_threat, 5=opp_threat).
-    diff_opp_threat = (out_normal[:, 5] - out_chart_zero[:, 5]).abs().max().item()
-    diff_other = (out_normal[:, [0, 1, 2, 3, 4]] - out_chart_zero[:, [0, 1, 2, 3, 4]]).abs().max().item()
-    print(f"  diff at opp_threat token (idx 5): {diff_opp_threat:.4f}")
+    # Post-Postscript-E layout: opp_threat is at sequence index 4
+    # (0=actor, 1=critic, 2=transition, 3=our_threat, 4=opp_threat). The 9
+    # field tokens after that are pure functions of field_cont/banks, so they
+    # also stay invariant under chart perturbations.
+    OPP_THREAT_IDX = 4
+    other_battle_state = list(range(N_BATTLE_STATE))
+    other_battle_state.remove(OPP_THREAT_IDX)
+    diff_opp_threat = (out_normal[:, OPP_THREAT_IDX] - out_chart_zero[:, OPP_THREAT_IDX]).abs().max().item()
+    diff_other = (out_normal[:, other_battle_state] - out_chart_zero[:, other_battle_state]).abs().max().item()
+    print(f"  diff at opp_threat token (idx {OPP_THREAT_IDX}): {diff_opp_threat:.4f}")
     print(f"  diff at other battle-state tokens: {diff_other:.2e}")
     assert diff_opp_threat > 1e-3, "opp threat doesn't depend on damage chart"
     assert diff_other < 1e-4, "chart perturbation leaked beyond opp_threat token"
@@ -309,7 +320,7 @@ def test_active_flag_override_recovers_dynamic_dims():
 
     # Active move tokens of our slot 0 are at sequence indices [6+13, 6+14, 6+15, 6+16].
     from model_transformer import _FIRST_MOVE_OFFSET
-    move_idx = list(range(6 + _FIRST_MOVE_OFFSET, 6 + _FIRST_MOVE_OFFSET + 4))
+    move_idx = list(range(N_BATTLE_STATE + _FIRST_MOVE_OFFSET, N_BATTLE_STATE + _FIRST_MOVE_OFFSET + 4))
     diff_active = (out_with_real[:, move_idx] - out_no_real_flags[:, move_idx]).abs().max().item()
     print(f"  diff at our active 4 move tokens with vs without flag override: {diff_active:.4f}")
     assert diff_active > 1e-3, "flag override didn't change active-move tokens"
@@ -332,8 +343,8 @@ def test_active_real_banks_override():
         out_real = tok(batch_lookup)["tokens"]
 
     # Slot-0 active 4 moves are at our-slot-0 attribute positions
-    # 6 battle-state + 0*17 + 13..17 = 19..22.
-    move_token_indices = list(range(6 + _FIRST_MOVE_OFFSET, 6 + _FIRST_MOVE_OFFSET + 4))
+    # N_BATTLE_STATE + 0*17 + (move offset 13..16) within the per-Pokemon block.
+    move_token_indices = list(range(N_BATTLE_STATE + _FIRST_MOVE_OFFSET, N_BATTLE_STATE + _FIRST_MOVE_OFFSET + 4))
     diff_active_slot = (out_lookup[:, move_token_indices] - out_real[:, move_token_indices]).abs().max().item()
     # Other tokens should be unaffected (we only override slot-0 of our side).
     other_idx = [i for i in range(N_TOKENS) if i not in move_token_indices]
@@ -359,10 +370,10 @@ def test_restored_signals_reach_status_token():
     tok = _make_tokenizer(seed=0).eval()
     collated = _load_sample_batch(2)
     batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
-    # status_token of our slot 0: idx 6 + 0*17 + 4 (per _PER_POKEMON_TT layout) = 10.
-    STATUS_IDX = 6 + 4
-    SPECIES_IDX = 6 + 0    # species_token of our slot 0 — should NOT change
-    HP_IDX = 6 + 5         # hp_token of our slot 0 — should NOT change
+    # status_token of our slot 0: N_BATTLE_STATE + 0*17 + 4 (status offset in _PER_POKEMON_TT).
+    STATUS_IDX  = N_BATTLE_STATE + 4
+    SPECIES_IDX = N_BATTLE_STATE + 0   # species_token of our slot 0 — should NOT change
+    HP_IDX      = N_BATTLE_STATE + 5   # hp_token of our slot 0 — should NOT change
 
     slices_to_test = [
         ("active",        _SL_ACTIVE_FLAG),
@@ -401,8 +412,8 @@ def test_physical_banks_reach_status_token():
     tok = _make_tokenizer(seed=0).eval()
     collated = _load_sample_batch(2)
     batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
-    STATUS_IDX = 6 + 4
-    HP_IDX = 6 + 5
+    STATUS_IDX = N_BATTLE_STATE + 4
+    HP_IDX     = N_BATTLE_STATE + 5
     with torch.no_grad():
         out_baseline = tok(batch)["tokens"]
     for name, col in [("level", 1), ("weight", 2), ("height", 3)]:
@@ -419,6 +430,92 @@ def test_physical_banks_reach_status_token():
         assert d_status > 1e-4, f"perturbing {name} didn't reach status_token"
         assert d_hp < 1e-5, f"{name} leaked into hp_token"
     print("  OK")
+
+
+def test_field_split_isolation():
+    """Postscript E: each thematic field slice should affect only its own
+    field token, not the others. Validates the split's attention-isolation
+    benefit at the input level.
+    """
+    print("\n== test 13: field-split slices reach only their own thematic tokens ==")
+    from model_transformer import (
+        _FL_WEATHER_OH, _FL_TERRAIN_OH, _FL_TRICK_ROOM,
+        _FL_OUR_HAZARDS, _FL_OPP_HAZARDS,
+        _FL_OUR_SCREENS, _FL_OPP_SCREENS,
+        _FL_TAILWIND, _FL_MECHANICS, _FL_ALIVE,
+    )
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+
+    # Field-token sequence indices (post-Postscript-E layout):
+    # 0=actor, 1=critic, 2=transition, 3=our_threat, 4=opp_threat,
+    # 5=weather, 6=terrain, 7=our_haz, 8=opp_haz,
+    # 9=our_screens, 10=opp_screens, 11=speed_field, 12=mechanics, 13=progression
+    FIELD_TOKEN = {
+        "weather":      5,
+        "terrain":      6,
+        "our_hazards":  7,
+        "opp_hazards":  8,
+        "our_screens":  9,
+        "opp_screens": 10,
+        "speed_field": 11,
+        "mechanics":   12,
+        "progression": 13,
+    }
+
+    SLICE_TO_TOKEN = [
+        # (slice, expected-token-name, perturbation amount)
+        (_FL_WEATHER_OH,  "weather",      0.5),
+        (_FL_TERRAIN_OH,  "terrain",      0.5),
+        (_FL_OUR_HAZARDS, "our_hazards",  0.3),
+        (_FL_OPP_HAZARDS, "opp_hazards",  0.3),
+        (_FL_OUR_SCREENS, "our_screens",  0.3),
+        (_FL_OPP_SCREENS, "opp_screens",  0.3),
+        (_FL_MECHANICS,   "mechanics",    0.3),
+        (_FL_ALIVE,       "progression",  0.3),
+        # speed_field consumes 3 different slices (tailwind + trick_room)
+        # so it shows up under both perturbation paths
+    ]
+
+    with torch.no_grad():
+        out_baseline = tok(batch)["tokens"]
+
+    for sl, expected_token_name, delta in SLICE_TO_TOKEN:
+        a, b = sl
+        perturbed = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        fc = perturbed["field_cont"].clone()
+        fc[..., a:b] += delta
+        perturbed["field_cont"] = fc
+        with torch.no_grad():
+            out_p = tok(perturbed)["tokens"]
+        d_per_token = (out_p[:, :N_BATTLE_STATE] - out_baseline[:, :N_BATTLE_STATE]).abs().max(dim=-1).values
+        target_idx = FIELD_TOKEN[expected_token_name]
+        d_target = d_per_token[:, target_idx].max().item()
+        # Other field tokens (excluding the target) should be unchanged.
+        other_field_idx = [v for k, v in FIELD_TOKEN.items() if k != expected_token_name]
+        d_others = d_per_token[:, other_field_idx].max().item()
+        print(f"  slice {sl} -> {expected_token_name:12s}: target diff={d_target:.3f}  others={d_others:.2e}")
+        assert d_target > 1e-3, f"perturbing {sl} didn't reach {expected_token_name}_token"
+        assert d_others < 1e-4, f"slice {sl} leaked beyond {expected_token_name}_token"
+
+    # speed_field consumes both _FL_TAILWIND and _FL_TRICK_ROOM. Verify both
+    # routes hit the speed_field token only.
+    for sl_name, sl in [("tailwind", _FL_TAILWIND), ("trick_room", _FL_TRICK_ROOM)]:
+        a, b = sl
+        perturbed = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        fc = perturbed["field_cont"].clone()
+        fc[..., a:b] += 0.5
+        perturbed["field_cont"] = fc
+        with torch.no_grad():
+            out_p = tok(perturbed)["tokens"]
+        d_per_token = (out_p[:, :N_BATTLE_STATE] - out_baseline[:, :N_BATTLE_STATE]).abs().max(dim=-1).values
+        d_speed = d_per_token[:, FIELD_TOKEN["speed_field"]].max().item()
+        d_others = d_per_token[:, [v for k, v in FIELD_TOKEN.items() if k != "speed_field"]].max().item()
+        print(f"  slice {sl} ({sl_name:10s}) -> speed_field: target diff={d_speed:.3f}  others={d_others:.2e}")
+        assert d_speed > 1e-3, f"perturbing {sl_name} didn't reach speed_field_token"
+        assert d_others < 1e-4, f"{sl_name} leaked beyond speed_field_token"
+    print("  OK (each field slice reaches only its thematic token)")
 
 
 def test_doubles_rejected():
@@ -451,5 +548,6 @@ if __name__ == "__main__":
     test_active_real_banks_override()
     test_restored_signals_reach_status_token()
     test_physical_banks_reach_status_token()
+    test_field_split_isolation()
     test_doubles_rejected()
-    print("\n=== all 14 tests passed ===")
+    print("\n=== all 15 tests passed ===")
