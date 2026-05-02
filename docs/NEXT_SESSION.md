@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-02 (Session 47 complete — Week 2 of the rewrite shipped: SpatialTransformer + TemporalTransformer + ActionHead + ValueHead + TransformerBattlePolicy wrapper + forward_sequence mega-batch path + synthetic PPO smoke. 9/9 policy tests pass, 17/17 tokenizer tests still pass. After a capacity-allocation review against METAMON_LEARNINGS.md + REWRITE_DESIGN.md §9, bumped d_temporal 256→512 and K 2→4 to match Metamon Small's recipe. Total params **19.99M** (was 9.5M; lifts T:S ratio 1.0×→2.0×, lands ~33% above Metamon Small's 15M as the design §9 intended). Full-policy B=32 forward: 36.45 ms median on RTX 3060 Laptop CUDA (only +0.75 ms over the 9.5M version because temporal at T=1 is trivial). See REWRITE_DESIGN.md Postscript H for the data + math. Session 48 task: Week 3 — BC training to convergence on `human_v8_100k` (target ≥45% smart_avg). See `next-prompt.txt`.)**
+**Last updated: 2026-05-02 (Session 48 — Week 3 plumbing landed. `--use-transformer` flag plumbed through `train_bc.py` (factory + arch-tagged checkpoints + resume guard) and `ppo.py::load_checkpoint` (arch dispatch with state-dict-key inference fallback for legacy ckpts). Plumbing smoke (CPU B=4, 40 batches): loss 1.66→1.61 clean, no NaN, 19,994,924 params confirmed. CUDA fp16 throughput bench (`bench_bc_step.py`) found a memory cliff at B=8 on the 6 GB RTX 3060 — per-turn 5 ms → 145 ms once peak crosses ~5 GB. **B=4 is the chosen local operating point**: 6-11 ms/turn fp16, peak ≤2.74 GB, loss decreasing cleanly across 8 consecutive batches. Throughput projection: ~9.7 hr/epoch local → 5 epochs ≈ 2 days, 10 epochs ≈ 4 days (right at the cloud-trigger boundary). All 17/17 tokenizer + 9/9 policy tests still pass. See REWRITE_DESIGN.md Postscript I for the cliff data + decision rationale. Session 49 task: launch the full 5-epoch BC at B=4 fp16 (`--workers 2 --eval-games 0 --val-ratio 0.05 --use-transformer`), monitor val_loss for early stopping, run `eval_metamon_competitive.py` post-epoch on each saved checkpoint. See `next-prompt.txt`.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -12,6 +12,76 @@ Supporting documents:
 - `docs/RESEARCH.md` — architecture research, published system comparisons, experiment order
 - `docs/STATUS.md` — full historical narrative if deep context needed (long, usually skippable)
 - `docs/CLOUD_DEPLOY.md` — cloud migration plan
+
+---
+
+## Session 48 final status — TL;DR for new readers
+
+**Session 48 plumbed Week 3 sub-task 1** (REWRITE_DESIGN.md §7 Week 3,
+Postscript I): `--use-transformer` flag end-to-end through `train_bc.py`
+and `ppo.py::load_checkpoint`. Both arches now coexist behind a single
+flag; saved checkpoints are arch-tagged so resume can't silently load
+the wrong class.
+
+**Files changed (committed at `1f3ec01`):**
+- `pokemon-ai-starter/pokemon-ai/src/train_bc.py` — `+66/-10` lines.
+  Adds `--use-transformer` argparse, factory branch (legacy MLP vs
+  `TransformerBattlePolicy`), resume-arch guard with state-dict-key
+  inference for legacy ckpts (no `arch` field), forces `--eval-games 0`
+  with notice when transformer is on (option (a) per §6b: defer
+  `BattleAgentTransformer` to Week 5), `arch` field added to all save
+  paths (`epoch_NNN.pt`, `step_NNN.pt`, `best.pt`, `mid_step*`,
+  `_eval_temp.pt`, `config.json`).
+- `pokemon-ai-starter/pokemon-ai/src/ppo.py` — `+32/-1` lines.
+  `load_checkpoint` reads `ckpt["arch"]` (or infers from state-dict keys)
+  and dispatches between `PokeTransformer` (legacy + dim-expansion
+  preserved) and `TransformerBattlePolicy` (no expansion needed).
+  `save_checkpoint` adds `arch` automatically by detecting cfg class.
+  Same `(model, cfg, ckpt)` return signature — `train_rl.py` doesn't
+  need to change.
+- `pokemon-ai-starter/pokemon-ai/src/bench_bc_step.py` — new file (~110
+  lines). Standalone bench: pre-loads N batches, runs N consecutive
+  forward_sequence + backward + AdamW.step(), reports per-turn ms +
+  peak GPU memory. Used to find the B=8 cliff. Committable for future
+  throughput regression testing.
+
+**Plumbing smoke (CPU B=4, 40 batches, killed manually):**
+- 19,994,924 params confirmed at training start.
+- Loss decreasing: 1.66 (batch 20) → 1.61 (batch 40), accuracy ~0.32.
+- No NaN, no Inf. Print + flush working. Scheduler + AdamW running.
+
+**CUDA fp16 throughput bench (`bench_bc_step.py`):**
+
+| B | dt (ms) by batch | per-turn | peak_mem | verdict |
+|---|------------------|----------|----------|---------|
+| 8 | 1263, 753, 1092, **37557, 40762** | 6.6 → **145** ms | 3.5 → **5.12 GB** | cliff |
+| 4 | 855, 700, 502, 480, 730, 636, 1084, 1057 | 6-11 ms | 1.5 → 2.74 GB | stable |
+
+The 6 GB RTX 3060 Laptop hits a memory cliff at ~5 GB peak: cuda
+allocator fragmentation + spillover synchronization once the cache
+nears the device ceiling. Not OOM (max 5.12/6.14), but a **30× per-turn
+slowdown** that sticks for the rest of the run. B=4 stays comfortably
+below the cliff with 8/8 batches healthy and loss decreasing.
+
+**Throughput projection (B=4 fp16 local):**
+- Per-turn: ~7 ms median.
+- Per-epoch: 7 ms × 5M turns ≈ **9.7 hr/epoch**.
+- 5 epochs (legacy convergence point): ~50 hr ≈ **2.1 days**.
+- 10 epochs: ~100 hr ≈ **4.2 days**. Right at the 5-day cloud-trigger.
+
+**Verification (post-Session-48):**
+- 17/17 `test_tokenizer.py` tests still pass.
+- 9/9 `test_policy.py` tests still pass.
+- 50/50 strict + STAB-only `verify_move_lookup.py` still passes.
+- Plumbing smoke: 40 batches CPU clean, B=4 CUDA bench stable.
+
+**Session 49 task = continue Week 3 of the roadmap**: launch the full
+5-epoch BC training at B=4 fp16 locally (or pivot to cloud per
+CLOUD_DEPLOY.md if early throughput is worse than projected). Monitor
+val_loss + grad-norm. Run `eval_metamon_competitive.py` on each saved
+epoch checkpoint to track smart_avg. Target: ≥45% smart_avg sustained
+for ≥1 epoch (matches legacy v8 BC's S39 mark of 45.1%).
+See `next-prompt.txt` for the runbook.
 
 ---
 
@@ -117,8 +187,9 @@ caused real bugs, so the table is canonical.
   live play (used by `BattleAgent` during eval and by RL collection).
 - `vocab.py`, `format_config.py`, `dataset.py` (BC only — PPO collects in memory).
 - `ppo.py::load_checkpoint / save_checkpoint` — both use these for I/O.
-  Note: `load_checkpoint` currently hardcodes `PokeTransformer`. Week 3
-  plumbing must make it model-class-aware.
+  Session 48 made these arch-aware: `load_checkpoint` reads `ckpt["arch"]`
+  (or infers from state-dict key prefixes for legacy ckpts) and dispatches;
+  `save_checkpoint` tags by cfg class.
 - `eval_metamon_competitive.py` — standalone eval, both architectures
   use it via the `BattleAgent` / `BattleAgentTransformer` wrapper.
 - `battle_server.js` — Node.js Showdown emulator on port 9000. BC eval

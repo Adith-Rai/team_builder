@@ -1116,6 +1116,17 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
   divergences (param count 9.5M vs 20-30M estimate, side-mask skipped,
   per-action context permutation by species/move-id matching, real-PPO
   smoke deferred to Week 3 in favor of synthetic-PPO).
+- **2026-05-02 (Session 48):** Week 3 plumbing landed.
+  `train_bc.py:--use-transformer` factory + arch-tagged checkpoints +
+  arch dispatch in `ppo.py::load_checkpoint`. Plumbing smoke (CPU B=4,
+  40 batches): loss 1.66 → 1.61, no NaN, 19,994,924 params confirmed.
+  CUDA fp16 throughput bench (`bench_bc_step.py`) found a memory cliff
+  at B=8 on the 6 GB RTX 3060: per-turn jumps from 5 ms → 145 ms once
+  peak memory crosses ~5 GB (batch 3 of 5 spike). B=4 is stable —
+  per-turn 6-11 ms fp16, peak ≤2.74 GB across 8 batches, loss decreasing
+  cleanly. Postscript I documents the cliff + chosen operating point.
+  Throughput: ~9.7 hr/epoch local fp16 → 5 epochs ≈ 2 days; 10 epochs
+  ≈ 4 days. Right at the cloud-trigger boundary.
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
@@ -1984,3 +1995,127 @@ worth it for V1.
   (~25 ms per valid turn).
 - Synthetic PPO step: pi_loss=-0.13, v_loss=3.94, total grad-norm 3.24,
   246 params updated by AdamW step.
+
+---
+
+## Postscript I — Session 48 Week 3 plumbing + B=8 memory cliff
+
+Triggered by completing Week 3 sub-task 1 (the `--use-transformer` flag
+plumbed end-to-end through `train_bc.py` and `ppo.py::load_checkpoint`)
+and running the first throughput bench against the 20M model.
+
+### I1. Plumbing changes
+
+- `train_bc.py`:
+  - `--use-transformer` flag (default off — legacy MLP unchanged).
+  - When on: factory builds `TransformerBattlePolicy(TransformerConfig.with_vocab_sizes_from_disk(),
+    move_flag_lookup=load_move_flag_lookup(...))`. Forces `--eval-games 0`
+    with a printed notice (option (a) per next-prompt.txt: defer
+    `BattleAgentTransformer` to Week 5).
+  - Resume guard: if `--resume <ckpt>` and ckpt's `arch` field disagrees
+    with the run's `--use-transformer` flag, raise a clear `SystemExit`
+    instead of letting `load_state_dict` produce a KeyError storm. Old
+    checkpoints without an `arch` field are inferred from state-dict key
+    prefixes (`tokenizer.`, `spatial.`, etc. → transformer; everything
+    else → mlp).
+  - All saved checkpoints (`epoch_NNN.pt`, `step_NNN.pt`, `best.pt`,
+    `mid_step*`, `_eval_temp.pt`) get an `arch: "transformer" | "mlp"`
+    field. `config.json` gets the same field for human-readable inspection.
+- `ppo.py::load_checkpoint`:
+  - Reads `ckpt["arch"]` (falling back to state-dict-key inference) and
+    dispatches between `PokeTransformer` (legacy + dim-expansion logic
+    preserved) and `TransformerBattlePolicy` (no dim-expansion needed —
+    transformer ckpts can't predate the spec). Same `(model, cfg, ckpt)`
+    return signature.
+  - `save_checkpoint` adds the `arch` field automatically by detecting
+    `cfg`'s class name. Callers (`train_rl.py`) don't need to change.
+
+### I2. Plumbing smoke (CPU B=4)
+
+Forty batches on CPU before manual termination. Validated:
+- 19,994,924 params confirmed at training start.
+- Loss decreasing: 1.66 (batch 20) → 1.61 (batch 40), accuracy ~0.32.
+- No NaN, no Inf, scheduler + AdamW running cleanly.
+- Print path uses `flush=True`; reports every 20 batches.
+
+### I3. Throughput bench: the B=8 memory cliff
+
+`bench_bc_step.py` (added) measures per-batch wall-clock for the BC step
+(forward_sequence + loss + backward + AdamW) on 5-8 pre-loaded real
+batches. Standalone — no DataLoader/workers — to isolate model-side
+throughput from data pipeline.
+
+**B=8 fp16 CUDA results (5 batches):**
+
+| Batch | Valid turns | dt (ms) | per-turn (ms) | peak_mem (GB) |
+|-------|-------------|---------|---------------|---------------|
+| 0     | 190         | 1263    | 6.6           | 3.50          |
+| 1     | 146         | 753     | 5.2           | 3.50          |
+| 2     | 222         | 1092    | 4.9           | 4.28          |
+| 3     | 258         | **37557**| **145.6**    | **5.12**      |
+| 4     | 248         | 40762   | 164.4         | 5.12          |
+
+Batches 0-2 are healthy at 5-7 ms/turn fp16. **Batch 3 spikes 30× when
+peak memory crosses ~5 GB**, and stays slow afterward. The cliff is
+not OOM (we top out at 5.12 / 6.14 GB) but a thrash: cuda allocator
+fragmentation + spillover synchronization once the cache nears the
+device ceiling.
+
+The dominant memory consumer in `forward_sequence` is the spatial pass
+mega-batch over `N_valid` turns × 220 tokens × d_model=256 with 6
+layer's worth of activations, plus the `(B, T, 220, 256)` fp32
+`spatial_grid` allocated as workspace. At B=8 with avg_T=26 and
+occasional T=66 episodes, N_valid hits 250+ and memory peaks above the
+cliff.
+
+**B=4 fp16 CUDA results (8 batches):** all stable at 6-11 ms/turn,
+peak memory 1.5 → 2.74 GB. No spikes. Loss decreasing across batches
+(pi: 1.74 → 1.71 ; v: 1.94 → 0.42).
+
+### I4. Decision: B=4 is the local operating point
+
+- Per-turn: ~7 ms fp16 median (call it 7-10 ms with margin).
+- Epoch wall-clock: 7 ms × 5M turns ≈ 9.7 hr → call it ~10 hr/epoch.
+- 5 epochs ≈ 50 hr ≈ 2.1 days. 10 epochs ≈ 100 hr ≈ 4.2 days.
+- Cloud-trigger threshold (REWRITE_DESIGN.md §7 Week 3): >5 days local.
+  Local at B=4 is right at the boundary — if there's any extra slowdown
+  (Windows sleep, thermals, validation overhead, eval fires), cross it.
+
+**Recommendation for Session 49**: launch a 5-epoch BC at B=4 fp16
+locally, with `--workers 2 --eval-games 0 --val-ratio 0.05`, monitoring
+val_loss for early-stopping after epoch 2-3 (legacy converged at epoch 2
+for smart_avg 45.1%). If after 24 hr the wall-clock projects past 5
+days, kill and migrate to cloud per CLOUD_DEPLOY.md.
+
+### I5. Why not lower T_max instead of lowering B?
+
+Could clamp episodes to T ≤ 100 in the dataset, which reduces grid
+sizes and N_valid spike. But:
+- Episodes with T > 100 are rare (avg_T ≈ 26, max in spot-checks 66-200).
+- Truncating loses long-game training signal — exactly what BC needs
+  to learn endgame play, hazard tracking, set prediction.
+- B=4 already fits comfortably without truncation.
+Stick with B=4 for V1.
+
+### I6. Headroom if B=4 throughput is unacceptable
+
+- **Cloud A100 40 GB**: 7× memory headroom → B=32 trivially fits, ~10×
+  faster per epoch (per Postscript H estimate). 5 epochs in ~12 hr cloud
+  vs 50 hr local. ~$50-150 budget per CLOUD_DEPLOY.md.
+- **Truncate `forward_sequence` to chunks**: process B in mini-batches
+  of 2 episodes at a time inside the function, accumulating gradients.
+  ~2× memory savings, but adds Python overhead and complicates BC's
+  backward pass. Not worth it unless cloud is unavailable.
+- **Drop fp32 `spatial_grid`**: cast to fp16 with `torch.zeros(...,
+  dtype=torch.float16)`. Saves ~half the workspace memory but risks
+  precision loss on the action_head context input. Worth testing if
+  time pressure forces it.
+
+### I7. Verification status post-Session-48
+
+- All 17/17 tokenizer + 9/9 policy + 50/50 lookup tests still pass.
+- Plumbing smoke: 40 batches CPU clean. CUDA bench: B=4 stable, B=8 cliff.
+- Both checkpoints (legacy MLP + transformer) load round-trip via the
+  new `load_checkpoint` dispatch (legacy verified by existing PPO ckpts;
+  transformer verified manually via plumbing smoke save → torch.load).
+- `bench_bc_step.py` committed for future profiling.
