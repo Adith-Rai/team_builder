@@ -54,12 +54,22 @@ _log = logging.getLogger("pokemon_ai")
 # =============================
 # Lookup schema
 # =============================
-# Bumped when the (n_moves, 107) contract changes (e.g., features.py adds a
-# move-flag dim, gen support shifts). Saved into the .pt file; loader rejects
-# mismatches loudly.
-LOOKUP_SCHEMA_VERSION = 1
+# Bumped when the (n_moves, 107) contract or accompanying chart changes.
+# Saved into the .pt file; loader rejects mismatches loudly.
+#   v1 (Session 46 initial): flags + banks + valid + meta
+#   v2 (Session 46 signal-recovery): + (N_TYPES+1, N_TYPES+1) damage_chart for opp threat
+LOOKUP_SCHEMA_VERSION = 2
 MOVE_FLAG_DIM = 107          # dim of `_project_move_flags(move)["continuous"]`
 MOVE_BANK_FIELDS = ("bp_int", "acc_int", "pp_int", "priority_int")  # column order
+
+# In the 107-dim flag vector, the type one-hot lives at this slice (indices
+# 81..99 — see features.py:_project_move_flags lines 1257-1262, the order of
+# elements appended to the `continuous` list).
+_MOVE_TYPE_ONEHOT_SLICE = (81, 81 + 19)
+assert _MOVE_TYPE_ONEHOT_SLICE[1] - _MOVE_TYPE_ONEHOT_SLICE[0] == N_TYPES, (
+    "_MOVE_TYPE_ONEHOT_SLICE width must equal N_TYPES; if features.py reordered "
+    "the continuous fields, recompute the slice from a fresh _project_move_flags call."
+)
 
 
 # =============================
@@ -275,6 +285,43 @@ def _features_project_move_flags(move):
     return _project_move_flags(move)
 
 
+def build_damage_chart(gen: int = 9) -> torch.Tensor:
+    """Build a (N_TYPES+1, N_TYPES+1) damage chart from poke-env's GenData.
+
+    Layout: `chart[attacker, defender]` = single-type effectiveness multiplier.
+    The trailing row+col (index N_TYPES) is the "absent" type slot used when a
+    Pokemon has only one type — multiplier 1.0 for any pairing (no-op factor
+    in the t1*t2 product).
+
+    Index mapping matches features.py's `_TYPES` list (NORMAL=0, ..., ???=18).
+    Used for opp-side threat computation: `eff = chart[move_t, our_t1] * chart[move_t, our_t2]`.
+
+    Saved into the lookup .pt; built from the same gen as the move flags.
+    """
+    from poke_env.battle import PokemonType
+    from poke_env.data import GenData
+
+    chart_dict = GenData.from_gen(gen).type_chart   # {defender_str: {attacker_str: mult}}
+    n = N_TYPES + 1
+    out = torch.ones(n, n, dtype=torch.float32)     # default 1.0 (covers ??? + absent)
+
+    # features.py:_TYPES drives our index ↔ string mapping (line 80-84).
+    # Rebuild the same list here to avoid re-importing a private constant.
+    type_names = ["NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", "FIGHTING",
+                  "POISON", "GROUND", "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST",
+                  "DRAGON", "DARK", "STEEL", "FAIRY", "???"]
+    assert len(type_names) == N_TYPES, "type_names must match features.py:_TYPES order"
+
+    for atk_idx, atk_name in enumerate(type_names):
+        for def_idx, def_name in enumerate(type_names):
+            # poke-env chart is keyed [defender][attacker]. ??? is not in the chart;
+            # leave both rows/cols as 1.0 (the default).
+            mult = chart_dict.get(def_name, {}).get(atk_name)
+            if mult is not None:
+                out[atk_idx, def_idx] = float(mult)
+    return out
+
+
 def build_move_flag_lookup(
     n_moves: int,
     gen: int = 9,
@@ -283,7 +330,8 @@ def build_move_flag_lookup(
     """Build the (n_moves, 107) flag table + (n_moves, 4) bank table from poke-env.
 
     Returns a dict suitable for save_move_flag_lookup. Row 0 is reserved for
-    pad/unknown and is left zero.
+    pad/unknown and is left zero. v2 also embeds a (N_TYPES+1, N_TYPES+1)
+    damage chart for opp-threat computation.
     """
     from vocab import Vocab
     from poke_env.battle import Move
@@ -325,16 +373,44 @@ def build_move_flag_lookup(
     if verbose:
         _log.info("[lookup] built %d / %d moves; %d failed to instantiate",
                   n_built, n_moves - 1, n_failed)
+
+    chart = build_damage_chart(gen)
+    if verbose:
+        _log.info("[lookup] damage chart built: shape=%s, sample fire->water=%.1f, "
+                  "ghost->normal=%.1f", tuple(chart.shape),
+                  chart[1, 2].item(), chart[13, 0].item())
+
+    # Sanity: verify a few well-known move types are correctly recoverable from
+    # the lookup's type-onehot slice — catches a features.py reorder of the
+    # 107-dim continuous fields.
+    if verbose and n_built > 0:
+        v = Vocab.load()
+        for known_move, expected_type_idx in [
+            ("earthquake", 8),    # GROUND
+            ("flamethrower", 1),  # FIRE
+            ("psychic", 10),      # PSYCHIC
+        ]:
+            mid = v.move(known_move)
+            if mid > 0 and bool(valid[mid].item()):
+                t_oh = flags[mid, _MOVE_TYPE_ONEHOT_SLICE[0]:_MOVE_TYPE_ONEHOT_SLICE[1]]
+                got = int(t_oh.argmax().item())
+                assert got == expected_type_idx, (
+                    f"_MOVE_TYPE_ONEHOT_SLICE seems wrong: {known_move!r} mapped to "
+                    f"type idx {got}, expected {expected_type_idx}. features.py reordered."
+                )
+
     return {
         "flags": flags,
         "banks": banks,
         "valid": valid,
+        "damage_chart": chart,
         "meta": {
             "schema_version": LOOKUP_SCHEMA_VERSION,
             "gen": int(gen),
             "vocab_n_moves": int(n_moves),
             "move_flag_dim": MOVE_FLAG_DIM,
             "bank_fields": list(MOVE_BANK_FIELDS),
+            "type_onehot_slice": list(_MOVE_TYPE_ONEHOT_SLICE),
         },
     }
 
@@ -373,6 +449,17 @@ def load_move_flag_lookup(path: Path, expected_n_moves: Optional[int] = None) ->
         raise RuntimeError(
             f"Lookup at {path} has n_moves={lookup_n}, but TransformerConfig "
             f"has n_moves={expected_n_moves}. Vocabs are out of sync — rebuild."
+        )
+    # v2 schema requirements
+    if "damage_chart" not in blob:
+        raise RuntimeError(
+            f"Lookup at {path} missing damage_chart (schema v2). Rebuild."
+        )
+    expected_chart_shape = (N_TYPES + 1, N_TYPES + 1)
+    if tuple(blob["damage_chart"].shape) != expected_chart_shape:
+        raise RuntimeError(
+            f"damage_chart shape {tuple(blob['damage_chart'].shape)} != "
+            f"{expected_chart_shape}"
         )
     return blob
 
@@ -497,16 +584,45 @@ class Tokenizer(nn.Module):
         self.type_embed = nn.Embedding(fmt.n_types + 1, cfg.entity_embed_dim)
         self.type_mlp = _mlp_1_layer(MAX_TYPES_PER_POKEMON * cfg.entity_embed_dim, d)
 
-        # ---- Status token ----
-        # status(7) + volatile(38) + paradox(7) + tera(20). Derived from slice
-        # widths so a features.py change is caught at construction, not runtime.
-        status_in = (
+        # ---- Per-Pokemon misc-state token (kept name `status_token` for API
+        # stability; it now carries all per-Pokemon scalar/flag state).
+        # Restored signals per Postscript C — Session 30 weight analysis showed
+        # several of these are top-ranked features that the model can't learn
+        # implicitly. Inputs:
+        #   - status one-hot               (_SL_STATUS, 7)
+        #   - volatile flags               (_SL_VOLATILE, 38)
+        #   - paradox encoding             (_SL_PARADOX, 7)
+        #   - tera flags                   (_SL_TERA, 20)
+        #   - active flag                  (1)            -- WAS DROPPED, restored
+        #   - fainted flag                 (1)            -- WAS DROPPED, restored
+        #   - combat state                 (5)            -- WAS DROPPED, restored
+        #   - toxic-escalation counter     (1)            -- WAS DROPPED, restored
+        #   - future_sight pending         (1)            -- WAS DROPPED, restored
+        #   - visibility (ability/item)    (2)            -- WAS DROPPED, restored
+        #   - level / weight / height bank embeds (3 × bank_dim_small)
+        # See REWRITE_DESIGN.md Postscript C for rationale.
+        status_cont_dims = (
             (_SL_STATUS[1]   - _SL_STATUS[0])
             + (_SL_VOLATILE[1] - _SL_VOLATILE[0])
             + (_SL_PARADOX[1]  - _SL_PARADOX[0])
             + (_SL_TERA[1]     - _SL_TERA[0])
+            + 1                                    # active flag
+            + 1                                    # fainted flag
+            + (_SL_COMBAT[1]   - _SL_COMBAT[0])    # combat (5)
+            + 1                                    # toxic
+            + 1                                    # future_sight
+            + (_SL_VISIBILITY[1] - _SL_VISIBILITY[0])  # visibility (2)
         )
+        # Bank embeds for level/weight/height appended at forward time.
+        status_in = status_cont_dims + 3 * cfg.bank_dim_small
         self.status_mlp = _mlp_1_layer(status_in, d)
+
+        # Per-Pokemon physical banks (NumericalBank ranges from features.py:
+        # level 1..100 -> 100 buckets; weight kg/5 clamped 0..200 -> 201;
+        # height m*2 clamped 0..40 -> 41).
+        self.level_bank  = NumericalBank(100, cfg.bank_dim_small)
+        self.weight_bank = NumericalBank(201, cfg.bank_dim_small)
+        self.height_bank = NumericalBank(41,  cfg.bank_dim_small)
 
         # ---- Boosts token (7 stats × 13 buckets one-hot) ----
         boosts_in = _SL_BOOSTS[1] - _SL_BOOSTS[0]
@@ -530,18 +646,23 @@ class Tokenizer(nn.Module):
         trans_in = 2 * cfg.entity_embed_dim + TRANSITION_CONT_DIM
         self.trans_mlp = _mlp_1_layer(trans_in, d)
 
-        # ---- Threat tokens ----
+        # ---- Threat tokens (Postscript C: opp side computed, not zero param) ----
         # Our side: features.py appends 2 active-only dims per move
         # (type_eff_vs_opp, opp_threat_back) to MOVE_SLOT_CONT_DIM = 109.
         # We pull those 2 dims for each of fmt.n_moves moves -> 2*n_moves-dim input.
-        threat_in = fmt.n_moves * 2
         assert MOVE_SLOT_CONT_DIM == MOVE_FLAG_DIM + 2, (
             f"MOVE_SLOT_CONT_DIM ({MOVE_SLOT_CONT_DIM}) should equal "
             f"MOVE_FLAG_DIM ({MOVE_FLAG_DIM}) + 2 active-only dims; "
             "features.py changed and the threat token wiring needs review."
         )
-        self.threat_mlp = _mlp_1_layer(threat_in, d)
-        self.opp_threat_unknown = nn.Parameter(torch.zeros(d))
+        our_threat_in = fmt.n_moves * 2
+        self.our_threat_mlp = _mlp_1_layer(our_threat_in, d)
+
+        # Opp side: we don't have features.py-precomputed threats in the memmap
+        # (no opp-active-move table). Compute at forward time from the lookup's
+        # type one-hot + the damage chart. Input is fmt.n_moves dims (one
+        # effectiveness multiplier per opp move vs our active).
+        self.opp_threat_mlp = _mlp_1_layer(fmt.n_moves, d)
 
         # ---- Battle-state learnable tokens ----
         self.actor_token   = nn.Parameter(torch.randn(d) * cfg.init_std)
@@ -553,13 +674,15 @@ class Tokenizer(nn.Module):
         self.pokemon_slot_embed  = nn.Embedding(n_pokemon_slot_vocab(fmt),       d)
         self.move_slot_embed     = nn.Embedding(fmt.n_moves + 1,                 d)  # +1 for non-move (idx 0)
 
-        # ---- Move flag + bank lookup ----
+        # ---- Move flag + bank + damage-chart lookup ----
         if move_flag_lookup is None:
             flags = torch.zeros(cfg.n_moves, MOVE_FLAG_DIM, dtype=torch.float32)
             mbanks = torch.zeros(cfg.n_moves, len(MOVE_BANK_FIELDS), dtype=torch.int32)
+            chart = torch.ones(N_TYPES + 1, N_TYPES + 1, dtype=torch.float32)
         else:
             flags = move_flag_lookup["flags"].float()
             mbanks = move_flag_lookup["banks"].int()
+            chart = move_flag_lookup["damage_chart"].float()
             if flags.shape != (cfg.n_moves, MOVE_FLAG_DIM):
                 raise RuntimeError(
                     f"Lookup flags shape {tuple(flags.shape)} != "
@@ -570,8 +693,14 @@ class Tokenizer(nn.Module):
                     f"Lookup banks shape {tuple(mbanks.shape)} != "
                     f"({cfg.n_moves}, {len(MOVE_BANK_FIELDS)})"
                 )
+            if chart.shape != (N_TYPES + 1, N_TYPES + 1):
+                raise RuntimeError(
+                    f"Lookup damage_chart shape {tuple(chart.shape)} != "
+                    f"({N_TYPES + 1}, {N_TYPES + 1})"
+                )
         self.register_buffer("move_flags_lookup", flags)
         self.register_buffer("move_banks_lookup", mbanks)
+        self.register_buffer("damage_chart", chart)
 
         # ---- Precomputed position-ID buffers ----
         type_ids, poke_slots, move_slots = self._build_position_ids(fmt)
@@ -674,12 +803,24 @@ class Tokenizer(nn.Module):
         type_e = self.type_embed(topi).flatten(-2, -1)                           # (B, T, k*e)
         type_tok = self.type_mlp(type_e)
 
-        # Status token (status + volatile + paradox + tera)
+        # Status token — Postscript C: all per-Pokemon misc state lives here.
+        # Cont slices for status/volatile/paradox/tera + scalar flags
+        # (active/fainted/combat/toxic/future_sight/visibility) +
+        # bank embeds for level/weight/height.
         status_cont = torch.cat([
             cont[..., _SL_STATUS[0]:_SL_STATUS[1]],
             cont[..., _SL_VOLATILE[0]:_SL_VOLATILE[1]],
             cont[..., _SL_PARADOX[0]:_SL_PARADOX[1]],
             cont[..., _SL_TERA[0]:_SL_TERA[1]],
+            cont[..., _SL_ACTIVE_FLAG[0]:_SL_ACTIVE_FLAG[1]],
+            cont[..., _SL_FAINTED[0]:_SL_FAINTED[1]],
+            cont[..., _SL_COMBAT[0]:_SL_COMBAT[1]],
+            cont[..., _SL_TOXIC[0]:_SL_TOXIC[1]],
+            cont[..., _SL_FUTURESIGHT[0]:_SL_FUTURESIGHT[1]],
+            cont[..., _SL_VISIBILITY[0]:_SL_VISIBILITY[1]],
+            self.level_bank (banks[..., 1]),
+            self.weight_bank(banks[..., 2]),
+            self.height_bank(banks[..., 3]),
         ], dim=-1)
         status_tok = self.status_mlp(status_cont)
 
@@ -752,7 +893,66 @@ class Tokenizer(nn.Module):
         """`active_move_cont`: (B, n_moves, MOVE_SLOT_CONT_DIM). The trailing 2
         dims are `type_eff_vs_opp` and `opp_threat_back` (features.py:1362-1363)."""
         eff_threat = active_move_cont[..., -2:]                                  # (B, n_moves, 2)
-        return self.threat_mlp(eff_threat.flatten(-2, -1))
+        return self.our_threat_mlp(eff_threat.flatten(-2, -1))
+
+    def _encode_opp_threat(
+        self,
+        opp_active_move_ids: torch.Tensor,        # (B, n_moves) long — opp slot 0's 4 moves
+        our_active_cont: torch.Tensor,            # (B, POKEMON_CONT_DIM) — our slot 0's cont
+    ) -> torch.Tensor:
+        """Compute opp's max-effectiveness threat per move vs our active.
+
+        Mirrors features.py:_compute_type_effectiveness on a per-move basis,
+        but driven entirely by tensor ops on the lookup + damage chart so it
+        works at training time when no live Battle object exists.
+
+        Returns (B, d_model) — fed via `opp_threat_mlp`. Empty/unknown opp
+        moves (move_id=0) contribute the chart's pad-row -> all-1.0 -> mult
+        capped to 0.25 in the normalized range; functionally a "neutral" prior.
+        """
+        # 1) Opp move types from lookup's type-onehot slice.
+        # opp_move_flags shape: (B, n_moves, MOVE_FLAG_DIM)
+        opp_move_flags = self.move_flags_lookup[opp_active_move_ids]
+        type_oh_slice = self.move_flags_lookup.new_zeros(0)  # silence linters
+        a, b = _MOVE_TYPE_ONEHOT_SLICE
+        opp_move_type = opp_move_flags[..., a:b].argmax(dim=-1)                  # (B, n_moves) long
+
+        # 2) Our active types from cont multi-hot, sorted canonical (mirrors
+        # the type-token logic). For an empty/typeless slot, both indices map
+        # to N_TYPES (the chart's "absent" row, multiplier 1.0).
+        types_oh = our_active_cont[..., _SL_TYPES[0]:_SL_TYPES[1]]               # (B, n_types)
+        topv, topi = types_oh.topk(MAX_TYPES_PER_POKEMON, dim=-1)
+        absent = torch.full_like(topi, self.cfg.format_config.n_types)
+        topi = torch.where(topv > 0, topi, absent)
+        topi, _ = topi.sort(dim=-1)
+        our_t1 = topi[..., 0:1]                                                  # (B, 1)
+        our_t2 = topi[..., 1:2]                                                  # (B, 1)
+
+        # 3) Multiplier per opp move via chart[atk_type, def_type]. Defender is
+        # our active's t1/t2 — multiply for combined typing.
+        # damage_chart: (N_TYPES+1, N_TYPES+1). Index [opp_move_type, our_t*].
+        chart = self.damage_chart                                                # (n+1, n+1)
+        # Gather: chart row by opp_move_type → shape (B, n_moves, n+1).
+        rows = chart[opp_move_type]                                              # (B, n_moves, n+1)
+        # Pick our_t1 and our_t2 columns. Expand for gather.
+        our_t1_exp = our_t1.unsqueeze(-1).expand(-1, opp_move_type.shape[-1], 1) # (B, n_moves, 1)
+        our_t2_exp = our_t2.unsqueeze(-1).expand(-1, opp_move_type.shape[-1], 1)
+        mult1 = rows.gather(-1, our_t1_exp).squeeze(-1)                          # (B, n_moves)
+        mult2 = rows.gather(-1, our_t2_exp).squeeze(-1)
+        mult  = mult1 * mult2                                                    # (B, n_moves)
+
+        # 4) Normalize to [0, 1] like features.py:_compute_type_effectiveness
+        # (mult/4.0, capped 0..1). Floor at 0.01 except for true-immune (0)
+        # so FP16 doesn't lose the immune signal — matches features.py:1297.
+        norm = (mult.clamp(0.0, 4.0) / 4.0)                                       # (B, n_moves)
+        norm = torch.where(mult > 0, norm.clamp(min=0.01), norm)
+
+        # 5) Mask unknown opp moves (move_id=0) to neutral (0.25 = 1.0 mult / 4).
+        # This mirrors features.py's "0.25 default when move type unknown."
+        unknown = (opp_active_move_ids == 0).float()
+        norm = norm * (1 - unknown) + 0.25 * unknown
+
+        return self.opp_threat_mlp(norm)
 
     # ---- forward ----
 
@@ -797,7 +997,14 @@ class Tokenizer(nn.Module):
         trans_t  = self._encode_transition(batch["transition_ids"], batch["transition_cont"]).unsqueeze(1)
 
         our_threat_t = self._encode_our_threat(batch["active_move_cont"]).unsqueeze(1)
-        opp_threat_t = self.opp_threat_unknown.unsqueeze(0).expand(B, d).unsqueeze(1)
+        # Postscript C: opp threat computed from lookup + damage chart (was a
+        # zero-init learnable parameter pre-cleanup). Slot 0 of each side is
+        # the active Pokemon by construction (features.py:_encode_team).
+        opp_active_move_ids = opp_ids[:, 0, 3:7]                                 # (B, n_moves)
+        our_active_cont     = batch["our_pokemon_cont"][:, 0, :]                  # (B, POKEMON_CONT_DIM)
+        opp_threat_t = self._encode_opp_threat(
+            opp_active_move_ids, our_active_cont,
+        ).unsqueeze(1)
 
         scratch = self.summary_scratch.unsqueeze(0).expand(B, N_SUMMARY, d)
 

@@ -1053,6 +1053,14 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
   gradient_checkpoint plumbed, logging instead of print, lookup version
   check), and tier-G recovery of the active-move real-banks signal that
   the V1 design had collapsed into the lookup.
+- **2026-05-01 (Session 46, signal-recovery):** Second audit asked
+  "is everything derived from source-of-truth?" Answer was no — the
+  §3.1 token tables omitted several memmap-recorded signals
+  (active/fainted/combat/toxic/future_sight/visibility/level/weight/
+  height) and the opp threat token was a zero-init parameter.
+  Postscript C documents the restoration with empirical references
+  (Session 30 weight analysis: defensive_eff and type_eff are the
+  #1 ranked features by 5-pt margins).
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
@@ -1258,7 +1266,7 @@ stays as the default, and the override is a single tensor index op.
 - Sub-token move decomposition (§3.5 of design) — defer
 - Test-time adaptation (§N2) — defer
 
-### B8. Verification status post-cleanup
+### B8. Verification status post-cleanup (snapshot before Postscript C)
 
 - Lookup rebuild: 952/952 valid moves in 953-vocab. Atomic write OK.
 - Verifier: 50/50 strict match + 50/50 active-path with only-STAB-
@@ -1271,3 +1279,210 @@ stays as the default, and the override is a single tensor index op.
   noise — no perf regression from added abstractions).
 - Param count unchanged at 1,420,680 — refactor introduced no new
   parameters.
+
+---
+
+## Postscript C — Session 46 signal-recovery pass
+
+Triggered by: "is everything derived from the recorded obs vector and
+poke-env, or are we making assumptions, simplifications, omissions?"
+Audit found significant signal omissions vs both the legacy MLP arch
+and the memmap. The original §3.1 token tables specified 17
+per-Pokemon attribute tokens and a `status_token` from "status +
+volatiles + paradox + tera flags." Several memmap-recorded fields
+weren't allocated to any token. This section restores them.
+
+### C1. Empirical evidence from the docs
+
+The agent dive into STATUS.md / V8_PLAN.md / Session 30 notes
+returned hard numbers, not speculation:
+
+- **`defensive_eff` (switch_cont) ranks #1 in switch-decision weight
+  analysis at 23.7 — 1.7× more important than HP%.** Adding it
+  produced **+5 win-rate points** in Session 30 (47% → 52%).
+- **Type effectiveness in active_move_cont ranks #1 overall at weight
+  34.2 — 5.2× more important than Base Power.** The team explicitly
+  tried "let the model learn it from entity embeddings"; it didn't
+  work. The hard fix was to compute it explicitly.
+- **Item embedding is 25× oversaturated** (800 items, H_ITEM=64 dims):
+  Choice Scarf and Leftovers hash to nearly identical embeddings.
+  Visibility flags (`item_known`, `ability_known`) are the partial
+  mitigation that distinguishes "no item" from "we don't know yet."
+- combat / toxic / future_sight were added in the Session 18 audit as
+  "decision-relevant by next action" — non-trivial battle state with
+  no other proxy (e.g., a Pokemon charging Solar Beam looks identical
+  to a Pokemon in a no-op turn unless `preparing` is exposed).
+
+V8_PLAN.md early on argued "ps-ppo learns this; remove pre-computed
+features." Session 30's empirical results overruled that. We defer
+to the empirical outcome.
+
+### C2. What was restored
+
+**Per-Pokemon `status_token` widened.** Same token name (API stable),
+new inputs:
+
+| Field | Slice | Prev | Now |
+|---|---|---|---|
+| status one-hot | cont[19:26] | ✓ | ✓ |
+| volatile flags | cont[119:157] | ✓ | ✓ |
+| paradox encoding | cont[157:164] | ✓ | ✓ |
+| tera flags | cont[164:184] | ✓ | ✓ |
+| **active flag** | cont[117:118] | dropped | ✓ |
+| **fainted flag** | cont[118:119] | dropped | ✓ |
+| **combat state (5 dims)** | cont[184:189] | dropped | ✓ |
+| **toxic counter** | cont[189:190] | dropped | ✓ |
+| **future_sight pending** | cont[190:191] | dropped | ✓ |
+| **visibility (2 dims)** | cont[191:193] | dropped | ✓ |
+| **level bank embed** | banks[1] via `NumericalBank(100, 8)` | dropped | ✓ |
+| **weight bank embed** | banks[2] via `NumericalBank(201, 8)` | dropped | ✓ |
+| **height bank embed** | banks[3] via `NumericalBank(41, 8)` | dropped | ✓ |
+
+`status_mlp` first Linear: `83 → 256` cont dims + `24` bank-embed dims
+= `107 → 256`. ~9K added params here.
+
+**Battle-state opp threat is computed, not a zero parameter.**
+Previously `opp_threat_unknown` was a single learnable d_model vector
+(zero-init), which gave the opp threat token no input signal — the
+model had to learn what "opp threat" means from absolutely nothing.
+Now:
+
+- The lookup `.pt` file embeds an `(N_TYPES+1, N_TYPES+1)` damage
+  chart from `poke_env.data.GenData(gen).type_chart`. Schema bumped
+  to v2; loader rejects v1 / missing-chart files.
+- `Tokenizer._encode_opp_threat` extracts opp-active's 4 move types
+  from the lookup (type one-hot lives at flag dims 81-99), looks up
+  effectiveness against our active's two types (sorted canonical), and
+  feeds the 4-dim multiplier vector through `opp_threat_mlp`. Same
+  normalization (mult/4.0, floor 0.01) as `features.py:_compute_type_effectiveness`.
+- Mirrors `our_threat_mlp` in spirit, but with 4-dim input (one
+  multiplier per opp move) vs 8-dim input (4 our moves × {type_eff,
+  opp_threat_back}). Asymmetric because the memmap doesn't carry
+  opp-active-move continuous; the chart-driven version is the best we
+  can do without expanding the memmap.
+
+### C3. What was deferred (with rationale)
+
+**Switch defensive_eff / offensive_eff (switch_cont last 2 dims) for
+the 5 bench Pokemon — DEFERRED to Week 2 action head.** Reasons:
+
+1. They're per-action-target signals, not per-Pokemon state. The
+   legacy `ActionSlotEncoder` (model.py:522-571) consumed them
+   directly when building the per-action context for switch slots
+   4-8. That's where they belong architecturally.
+2. Attaching them to the per-Pokemon `status_token` requires
+   permutation logic to match memmap orderings: `switch_cont` is in
+   poke-env's `available_switches` order; `our_pokemon_cont`'s bench
+   is alphabetical-by-species. They don't align without a join on
+   species_id, costing ~40 lines of permutation code per forward.
+3. The signal is **preserved**, just routed correctly. Week 2's
+   action head will pass `switch_cont[..., -2:]` directly into the
+   per-action context for the 5 switch slots.
+
+If Week 2 finds the action-head path insufficient (e.g., the value
+head also needs the signal in the spatial transformer, not just the
+policy head), revisit by adding a "switch_eval_token" per bench
+Pokemon with the 2 eff dims as input.
+
+### C4. What's NOT restored (and why)
+
+- **Active move 107-dim flag vector** for active moves. We use the
+  lookup uniformly. Lost: `current_pp` (recovered via Tier-G banks
+  override), `disabled` (rare), `stab` (recoverable via attention to
+  type_token). Acceptable.
+- **Per-move `_compute_type_effectiveness` for non-active moves
+  (team moves' active-only dims).** Memmap doesn't carry these; the
+  legacy MLP arch zeroed them too. No regression.
+- **Switch_cont's 19+1+7+1 dims that duplicate `our_pokemon_cont`.**
+  Genuinely redundant — same Pokemon's types/hp/status/weight already
+  in the per-Pokemon block.
+
+### C5. Real shortcuts I'm taking (flagged for the user)
+
+- **`status_token` is now an everything-bag** (~107-dim input).
+  Functionally correct, but in attention probing later "what does the
+  status token represent?" will be muddled. Alternative: split into
+  3-4 narrower tokens (status, condition_flags, physical_meta,
+  visibility) at the cost of +30 tokens per turn. I picked one wide
+  token for V1; flag this for revisit if attention diagnostics get
+  confusing.
+- **`opp_threat_mlp` input is 4 dims (one mult per opp move).**
+  `our_threat_mlp` input is 8 dims (4 moves × 2). Different shapes,
+  different MLPs. Not a problem in the model, but worth noting that
+  opp threat is structurally lower-rank than our threat — the model
+  can attend to other tokens for the missing direction.
+- **`opp_threat` mask for unknown moves uses 0.25 ("neutral") as the
+  default.** This matches `features.py:_compute_type_effectiveness`'s
+  no-info fallback. Real value: the model can't distinguish
+  "unrevealed move would be 1.0× effective" from "unrevealed move
+  could be 4× effective." Acceptable for V1; if Week 4 PPO struggles
+  on early-turn opp-threat assessment, add a per-opp-move "is this
+  revealed?" bit.
+
+### C6. What the model now sees (vs legacy MLP arch)
+
+Going through every memmap field:
+
+| Field | Legacy uses it? | New tokenizer uses it? |
+|---|---|---|
+| `our_pokemon_ids[species/item/ability/4×move_id]` | ✓ | ✓ (3 entity tokens + 4 move tokens) |
+| `our_pokemon_banks[hp_pct]` | ✓ | ✓ (`hp_pct_token`) |
+| `our_pokemon_banks[level/weight/height]` | ✓ | ✓ (status_token bank embeds) |
+| `our_pokemon_banks[6 stats]` | ✓ | ✓ (6 stat tokens) |
+| `our_pokemon_cont[types]` | ✓ | ✓ (`type_token`) |
+| `our_pokemon_cont[status/volatile/paradox/tera]` | ✓ | ✓ (`status_token`) |
+| `our_pokemon_cont[boosts]` | ✓ | ✓ (`boosts_token`) |
+| `our_pokemon_cont[active flag]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[fainted flag]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[combat state]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[toxic counter]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[future_sight]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[visibility]` | ✓ | ✓ (status_token, restored) |
+| `our_pokemon_cont[4× move_compact]` | ✓ | replaced by lookup (richer) |
+| `our_pokemon_mcont[4×23]` | ✓ | replaced by lookup (richer) |
+| `field_banks[4]` | ✓ | ✓ (`field_token`) |
+| `field_cont[52]` | ✓ | ✓ (`field_token`) |
+| `trans_ids[2]` | ✓ | ✓ (`transition_token`) |
+| `trans_cont[51]` | ✓ | ✓ (`transition_token`) |
+| `active_move_ids[4]` | ✓ | ✓ (move tokens at our active slot 0) |
+| `active_move_banks[4×4]` | ✓ | ✓ (Tier G override on slot 0) |
+| `active_move_cont[4×109]` | ✓ | partial — last 2 dims for `our_threat_token`; first 107 use lookup |
+| `switch_ids[5]` / `switch_cont[5×30]` | ✓ | **DEFERRED to Week 2 action head**: 19+1+7+1 redundant; defensive/offensive_eff (last 2) are per-action-target signal that goes in the action context, not the spatial token sequence |
+| `legal_mask[9]` | ✓ (action head) | ✓ (action head, Week 2) |
+
+Symmetric audit for opp side:
+- All `opp_pokemon_*` fields used the same way.
+- Opp active threat now computed (Postscript C2) instead of being a
+  zero-init parameter.
+
+Everything in the memmap is now reaching the model except the 5×switch
+deferred items, all of which are routed into the action head in
+Week 2 — not lost, just architecturally placed where the legacy code
+also placed them.
+
+### C7. Verification status post-Postscript-C
+
+- Lookup .pt v2: 952/952 valid moves, damage chart shape (20, 20),
+  spot-checks Fire→Water=0.5, Ghost→Normal=0.0.
+- `verify_move_lookup.py`: 50/50 strict match + 50/50 active-path
+  STAB-only divergence. Schema v2 validation in load.
+- `test_tokenizer.py`: 13/13 tests pass on real `human_v8_100k`. New
+  tests: `test_opp_threat_uses_chart` (perturbing chart changes
+  opp_threat token only), `test_restored_signals_reach_status_token`
+  (each restored cont-slice perturbs status_token without leaking),
+  `test_physical_banks_reach_status_token` (level/weight/height bank
+  embeds reach status_token).
+- Bench: tokenizer 4.29 ms median (was 3.61), tokenizer + dummy
+  spatial 29.06 ms median (was 27.60). +1.5 ms from wider status MLP
+  + opp threat computation; well under 50 ms budget.
+- Param count: 1,433,912 (was 1,420,680). +13,232 params from level/
+  weight/height banks, wider status_mlp, opp_threat_mlp.
+
+### C8. How a future contributor verifies "no signal lost"
+
+Run `python test_tokenizer.py`. Tests 11 + 12 perturb each restored
+slice and assert it reaches `status_token`. Test 8b perturbs the
+damage chart and asserts only `opp_threat_token` changes. If a future
+edit accidentally drops a slice from `status_cont` cat, the
+corresponding test 11/12 sub-test fails immediately with the slice
+name in the error message.

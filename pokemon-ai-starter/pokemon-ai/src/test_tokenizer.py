@@ -207,21 +207,56 @@ def test_init_stats():
 
 
 def test_grad_flow_opp_threat():
-    print("\n== test 8: gradient flows through opp_threat_unknown ==")
+    print("\n== test 8: gradient flows through computed opp threat path ==")
     tok = _make_tokenizer(seed=0).train()
-    # Make sure the param requires grad and starts at zero.
-    p = tok.opp_threat_unknown
-    assert p.requires_grad
-    assert (p == 0).all()
+    # Postscript C: opp threat is now computed from damage chart + lookup, not
+    # a learnable zero param. Verify gradient reaches the opp_threat_mlp's first
+    # Linear (the layer that consumes the computed effectiveness signal).
+    #
+    # IMPORTANT: every per-attribute MLP ends in a LayerNorm. Using
+    # `loss = tokens.sum()` produces a uniform upstream gradient, which
+    # LayerNorm projects out (constant-component nulled). The Linear weight
+    # then sees zero upstream gradient — a degenerate test artifact, NOT a
+    # disconnection. In real training the heads produce non-uniform upstream
+    # gradients and this never happens. We probe with a random projection.
+    torch.manual_seed(0)
+    target_param = tok.opp_threat_mlp[0].weight
+    assert target_param.requires_grad
     collated = _load_sample_batch(2)
     batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
     out = tok(batch)
-    loss = out["tokens"].sum()
+    # Random projection of the opp_threat token (idx 5) — non-uniform upstream
+    OPP_THREAT_IDX = 5
+    proj = torch.randn(out["tokens"].shape[-1])
+    loss = (out["tokens"][:, OPP_THREAT_IDX] * proj).sum()
     loss.backward()
-    assert p.grad is not None, "opp_threat_unknown got no gradient"
-    g = p.grad.abs().sum().item()
-    print(f"  |grad| sum on opp_threat_unknown = {g:.3f}")
-    assert g > 0, "gradient is exactly zero — param disconnected from forward graph"
+    assert target_param.grad is not None, "opp_threat_mlp got no gradient"
+    g = target_param.grad.abs().sum().item()
+    print(f"  |grad| sum on opp_threat_mlp[0].weight (random projection): {g:.3f}")
+    assert g > 0, "gradient is zero -- opp threat path disconnected from forward graph"
+    print("  OK")
+
+
+def test_opp_threat_uses_chart():
+    print("\n== test 8b: opp threat changes when damage chart is perturbed ==")
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+    with torch.no_grad():
+        out_normal = tok(batch)["tokens"]
+        # Perturb the chart: zero everything (all moves "immune" against everyone)
+        saved = tok.damage_chart.clone()
+        tok.damage_chart.zero_()
+        out_chart_zero = tok(batch)["tokens"]
+        tok.damage_chart.copy_(saved)
+    # Opp threat token is at sequence index 5 (0=actor, 1=critic, 2=field,
+    # 3=transition, 4=our_threat, 5=opp_threat).
+    diff_opp_threat = (out_normal[:, 5] - out_chart_zero[:, 5]).abs().max().item()
+    diff_other = (out_normal[:, [0, 1, 2, 3, 4]] - out_chart_zero[:, [0, 1, 2, 3, 4]]).abs().max().item()
+    print(f"  diff at opp_threat token (idx 5): {diff_opp_threat:.4f}")
+    print(f"  diff at other battle-state tokens: {diff_other:.2e}")
+    assert diff_opp_threat > 1e-3, "opp threat doesn't depend on damage chart"
+    assert diff_other < 1e-4, "chart perturbation leaked beyond opp_threat token"
     print("  OK")
 
 
@@ -254,6 +289,82 @@ def test_active_real_banks_override():
     print("  OK (slot-0 active moves change; rest unchanged)")
 
 
+def test_restored_signals_reach_status_token():
+    """Postscript C: verify each restored cont-slice signal flows into the
+    status_token. Perturb the slice; status token should change; other tokens
+    not. Catches accidental drop / bad slicing.
+    """
+    print("\n== test 11: each restored signal perturbs the status token ==")
+    from features import POKEMON_CONT_DIM
+    from model_transformer import (
+        _SL_ACTIVE_FLAG, _SL_FAINTED, _SL_COMBAT, _SL_TOXIC,
+        _SL_FUTURESIGHT, _SL_VISIBILITY,
+    )
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+    # status_token of our slot 0: idx 6 + 0*17 + 4 (per _PER_POKEMON_TT layout) = 10.
+    STATUS_IDX = 6 + 4
+    SPECIES_IDX = 6 + 0    # species_token of our slot 0 — should NOT change
+    HP_IDX = 6 + 5         # hp_token of our slot 0 — should NOT change
+
+    slices_to_test = [
+        ("active",        _SL_ACTIVE_FLAG),
+        ("fainted",       _SL_FAINTED),
+        ("combat",        _SL_COMBAT),
+        ("toxic",         _SL_TOXIC),
+        ("future_sight",  _SL_FUTURESIGHT),
+        ("visibility",    _SL_VISIBILITY),
+    ]
+    with torch.no_grad():
+        out_baseline = tok(batch)["tokens"]
+    for name, (a, b) in slices_to_test:
+        # Perturb that slice by adding 1.0 across the cont
+        perturbed = {k: (v.clone() if torch.is_tensor(v) else v)
+                     for k, v in batch.items()}
+        cont = perturbed["our_pokemon_cont"].clone()
+        cont[:, 0, a:b] += 1.0
+        perturbed["our_pokemon_cont"] = cont
+        with torch.no_grad():
+            out_p = tok(perturbed)["tokens"]
+        d_status  = (out_p[:, STATUS_IDX]  - out_baseline[:, STATUS_IDX]).abs().max().item()
+        d_species = (out_p[:, SPECIES_IDX] - out_baseline[:, SPECIES_IDX]).abs().max().item()
+        d_hp      = (out_p[:, HP_IDX]      - out_baseline[:, HP_IDX]).abs().max().item()
+        print(f"  {name:13s}: status delta={d_status:.4f}  species={d_species:.2e}  hp={d_hp:.2e}")
+        assert d_status > 1e-4, f"perturbing {name} didn't reach status_token"
+        # Species and HP should be unaffected
+        assert d_species < 1e-5, f"{name} leaked into species_token"
+        assert d_hp < 1e-5, f"{name} leaked into hp_token"
+    print("  OK (each restored signal reaches status_token, doesn't leak)")
+
+
+def test_physical_banks_reach_status_token():
+    """Postscript C: level/weight/height are wired through NumericalBanks into
+    the status_token. Perturbing the bank input should change status."""
+    print("\n== test 12: level/weight/height bank embeds flow into status_token ==")
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+    STATUS_IDX = 6 + 4
+    HP_IDX = 6 + 5
+    with torch.no_grad():
+        out_baseline = tok(batch)["tokens"]
+    for name, col in [("level", 1), ("weight", 2), ("height", 3)]:
+        perturbed = {k: (v.clone() if torch.is_tensor(v) else v)
+                     for k, v in batch.items()}
+        bk = perturbed["our_pokemon_banks"].clone()
+        bk[:, 0, col] = (bk[:, 0, col] + 1) % 40   # bump within range
+        perturbed["our_pokemon_banks"] = bk
+        with torch.no_grad():
+            out_p = tok(perturbed)["tokens"]
+        d_status = (out_p[:, STATUS_IDX] - out_baseline[:, STATUS_IDX]).abs().max().item()
+        d_hp     = (out_p[:, HP_IDX]     - out_baseline[:, HP_IDX]).abs().max().item()
+        print(f"  {name:6s}: status delta={d_status:.4f}  hp delta={d_hp:.2e}")
+        assert d_status > 1e-4, f"perturbing {name} didn't reach status_token"
+        assert d_hp < 1e-5, f"{name} leaked into hp_token"
+    print("  OK")
+
+
 def test_doubles_rejected():
     print("\n== test 10: doubles format raises NotImplementedError ==")
     fmt_doubles = FormatConfig(
@@ -279,6 +390,9 @@ if __name__ == "__main__":
     test_type_ordering_is_canonical()
     test_init_stats()
     test_grad_flow_opp_threat()
+    test_opp_threat_uses_chart()
     test_active_real_banks_override()
+    test_restored_signals_reach_status_token()
+    test_physical_banks_reach_status_token()
     test_doubles_rejected()
-    print("\n=== all 10 tests passed ===")
+    print("\n=== all 13 tests passed ===")
