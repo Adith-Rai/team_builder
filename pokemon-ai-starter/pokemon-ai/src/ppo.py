@@ -344,15 +344,41 @@ def _cancel_listener(player):
 # Checkpoint I/O
 # =============================
 
+def _infer_arch_from_state_dict(state: dict) -> str:
+    """Pick 'transformer' vs 'mlp' from state-dict key prefixes. Used when a
+    legacy checkpoint (no `arch` field) is loaded — defaults to 'mlp'."""
+    transformer_prefixes = ("tokenizer.", "spatial.", "temporal.", "switch_encoder.",
+                            "action_head.", "value_head.", "summary_to_temporal.")
+    return "transformer" if any(k.startswith(transformer_prefixes) for k in state.keys()) else "mlp"
+
+
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    state = ckpt["model_state_dict"]
+    arch = ckpt.get("arch") or _infer_arch_from_state_dict(state)
+
+    if arch == "transformer":
+        # New arch (REWRITE_DESIGN.md, Session 47+). No dim-expansion path —
+        # these checkpoints can't predate the spec.
+        from model_transformer import (
+            TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
+        )
+        from pathlib import Path as _Path
+        cfg = TransformerConfig.from_dict(ckpt.get("model_config", {}))
+        lookup = load_move_flag_lookup(
+            _Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
+        )
+        model = TransformerBattlePolicy(cfg, move_flag_lookup=lookup).to(device)
+        model.load_state_dict(state, strict=True)
+        return model, cfg, ckpt
+
+    # Legacy MLP arch.
     cfg = PokeTransformerConfig.from_dict(ckpt.get("model_config", {}))
     model = PokeTransformer(cfg).to(device)
 
     # Handle dim expansion for type effectiveness features (zero-init new columns)
     # move_net.mlp.0.weight: 187 -> 189 (+2: type_eff, opp_threat)
     # switch_mlp.0.weight: 60 -> 62 (+2: defensive/offensive effectiveness)
-    state = ckpt["model_state_dict"]
     _expand_targets = ["move_net.mlp.0.weight", "switch_mlp.0.weight"]
     for key in list(state.keys()):
         if any(key.endswith(t) for t in _expand_targets):
@@ -372,7 +398,11 @@ def load_checkpoint(path: str, device: torch.device):
 
 
 def save_checkpoint(path, model, cfg, optimizer, iteration, metrics=None):
+    # Architecture tag — read by load_checkpoint to dispatch to the right class.
+    # Detect from cfg type so callers don't have to pass an extra argument.
+    arch = "transformer" if type(cfg).__name__ == "TransformerConfig" else "mlp"
     ckpt = {
+        "arch": arch,
         "model_state_dict": model.state_dict(),
         "model_config": cfg.to_dict(),
         "optimizer_state_dict": optimizer.state_dict(),

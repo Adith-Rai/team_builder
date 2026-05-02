@@ -27,6 +27,15 @@ from dataset import MemmapDataset, collate_seq, unpack_turn_batch
 from model import PokeTransformer, PokeTransformerConfig, add_model_args, config_from_args
 
 
+def _state_dict_is_transformer(state: dict) -> bool:
+    """Infer arch from state-dict keys. New arch has 'tokenizer.' / 'spatial.' /
+    'temporal.' top-level prefixes; legacy MLP has 'pokemon_net.' / 'spatial_xform.'
+    / 'temporal_xform.' etc. Used for resume-path validation."""
+    return any(k.startswith(("tokenizer.", "spatial.", "temporal.", "switch_encoder.",
+                              "action_head.", "value_head.", "summary_to_temporal."))
+               for k in state.keys())
+
+
 def masked_policy_ce(logits: torch.Tensor, actions: torch.Tensor,
                      legal: torch.Tensor, label_smoothing: float = 0.0) -> torch.Tensor:
     """Cross-entropy loss over legal actions.
@@ -365,6 +374,11 @@ def main():
                         help="Enable mixed precision training (AMP) for ~2x speedup on CUDA")
     parser.add_argument("--server", type=str, default="ws://127.0.0.1:9000/showdown/websocket",
                         help="Battle server URL for bot eval")
+    parser.add_argument("--use-transformer", action="store_true",
+                        help="Use the new TransformerBattlePolicy (model_transformer.py) "
+                             "instead of the legacy MLP-arch PokeTransformer. "
+                             "REWRITE_DESIGN.md §7 Week 3. Forces eval-games=0 (no live "
+                             "BattleAgent for the new arch yet — defer to Week 5).")
     add_model_args(parser)
     args = parser.parse_args()
 
@@ -391,14 +405,34 @@ def main():
                             prefetch_factor=(2 if nw > 0 else None))
 
     # Model
-    cfg = config_from_args(args)
-    model = PokeTransformer(cfg).to(device)
-    print(f"Model: {model.count_parameters():,} params")
-    # Print effective (resolved) dims so reshape runs are obvious in logs.
-    print(f"Config: d_spatial={model.d_spatial}, d_temporal={model.d_temporal}, "
-          f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
-          f"heads={cfg.n_heads}, n_summary_tokens={cfg.n_summary_tokens}, "
-          f"dropout={cfg.dropout}")
+    arch = "transformer" if args.use_transformer else "mlp"
+    if args.use_transformer:
+        from model_transformer import (
+            TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
+        )
+        cfg = TransformerConfig.with_vocab_sizes_from_disk()
+        lookup = load_move_flag_lookup(
+            Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
+        )
+        model = TransformerBattlePolicy(cfg, move_flag_lookup=lookup).to(device)
+        print(f"Model: {model.count_parameters():,} params (transformer arch)")
+        print(f"Config: d_model={cfg.d_model}, d_temporal={cfg.d_temporal}, "
+              f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
+              f"heads={cfg.n_heads}, K={cfg.n_summary_tokens}, dropout={cfg.dropout}")
+        if args.eval_games > 0:
+            print(f"  [INFO] Forcing --eval-games 0: BattleAgentTransformer not built "
+                  f"yet (Week 5). Run eval_metamon_competitive.py manually post-epoch "
+                  f"if needed.", flush=True)
+            args.eval_games = 0
+    else:
+        cfg = config_from_args(args)
+        model = PokeTransformer(cfg).to(device)
+        print(f"Model: {model.count_parameters():,} params (legacy MLP arch)")
+        # Print effective (resolved) dims so reshape runs are obvious in logs.
+        print(f"Config: d_spatial={model.d_spatial}, d_temporal={model.d_temporal}, "
+              f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
+              f"heads={cfg.n_heads}, n_summary_tokens={cfg.n_summary_tokens}, "
+              f"dropout={cfg.dropout}")
     # Echo training hyperparams to log — prevents silent-config debugging pain.
     print(f"Train: lr={args.lr}, wd={args.weight_decay}, grad_clip={args.grad_clip}, "
           f"label_smoothing={args.label_smoothing}, batch_size={args.batch_size}, "
@@ -438,6 +472,17 @@ def main():
     # Resume
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Architecture-mismatch guard: a legacy ckpt loaded into transformer (or
+        # vice-versa) would otherwise unleash a KeyError storm with no clear cause.
+        ckpt_arch = ckpt.get("arch")
+        if ckpt_arch is None:
+            ckpt_arch = "transformer" if _state_dict_is_transformer(ckpt["model_state_dict"]) else "mlp"
+        if ckpt_arch != arch:
+            raise SystemExit(
+                f"Resume arch mismatch: checkpoint is '{ckpt_arch}' but training run "
+                f"is '{arch}'. Either rerun with --use-transformer={'on' if ckpt_arch=='transformer' else 'off'} "
+                f"or pick a matching checkpoint."
+            )
         model.load_state_dict(ckpt["model_state_dict"])
         if args.lr_restart:
             print(f"LR restart: loaded weights only, fresh optimizer + scheduler")
@@ -460,7 +505,7 @@ def main():
 
     # Save config
     with open(str(out_dir / "config.json"), "w") as f:
-        json.dump({"model_config": cfg.to_dict(), "args": vars(args)}, f, indent=2)
+        json.dump({"arch": arch, "model_config": cfg.to_dict(), "args": vars(args)}, f, indent=2)
 
     # Mixed precision (AMP)
     scaler = torch.cuda.amp.GradScaler() if args.fp16 and device.type == "cuda" else None
@@ -478,6 +523,7 @@ def main():
     def _save_checkpoint(n_batches: int, current_step: int):
         ae = _current_actual_epoch[0]
         ckpt = {
+            "arch": arch,
             "epoch": -1,  # mid-epoch
             "global_step": current_step,
             "model_state_dict": model.state_dict(),
@@ -522,6 +568,7 @@ def main():
             # Save temp checkpoint for eval
             temp_ckpt_path = str(out_dir / "_eval_temp.pt")
             torch.save({
+                "arch": arch,
                 "model_state_dict": model.state_dict(),
                 "model_config": cfg.to_dict(),
             }, temp_ckpt_path)
@@ -548,6 +595,7 @@ def main():
 
         # Save checkpoint
         ckpt = {
+            "arch": arch,
             "epoch": actual_epoch,
             "global_step": global_step,
             "model_state_dict": model.state_dict(),
