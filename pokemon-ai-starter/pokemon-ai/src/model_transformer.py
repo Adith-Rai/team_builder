@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 import logging
+import re
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -63,7 +64,11 @@ _log = logging.getLogger("pokemon_ai")
 #       _project_move_flags drops (slicing/bullet/bypasssub/pulse/charge/
 #       futuremove/ignore_defensive/use_target_offensive/thaws_target/
 #       reflectable/gravity/sleep_usable).
-LOOKUP_SCHEMA_VERSION = 3
+#   v4 (Session 46, Postscript G): adds (n_items, ITEM_FEAT_DIM) and
+#       (n_abilities, ABILITY_FEAT_DIM) feature lookups parsed from
+#       Showdown's items.ts / abilities.ts. Pure structural extraction;
+#       no curation. ItemTokenizer/AbilityTokenizer consume these.
+LOOKUP_SCHEMA_VERSION = 4
 MOVE_FLAG_DIM_BASE = 107     # the slice from `_project_move_flags(move)["continuous"]`
 MOVE_FLAG_EXTRA = (
     "slicing",                  # Sharpness ability boosts these
@@ -81,6 +86,25 @@ MOVE_FLAG_EXTRA = (
 )
 MOVE_FLAG_DIM = MOVE_FLAG_DIM_BASE + len(MOVE_FLAG_EXTRA)   # 119
 MOVE_BANK_FIELDS = ("bp_int", "acc_int", "pp_int", "priority_int")  # column order
+
+# Postscript G — structural feature dims for items and abilities. Columns
+# are documented in `parse_showdown_items` / `parse_showdown_abilities`.
+ITEM_FEAT_FIELDS = (
+    "is_berry", "is_gem", "is_pokeball", "is_mega_stone", "is_z_crystal",
+    "ignore_klutz", "fling_bp_norm", "natural_gift_bp_norm",
+)
+ITEM_FEAT_DIM = len(ITEM_FEAT_FIELDS)
+
+ABILITY_FEAT_FIELDS = (
+    "breakable",          # Mold Breaker / Teravolt etc. bypass these
+    "cantsuppress",       # Gastro Acid / Skill Swap can't suppress
+    "notrace",            # Trace can't copy
+    "notransform",        # Transform/Imposter can't copy
+    "no_skill_swap",      # Skill Swap can't move (some abilities)
+    "is_permanent",       # isPermanent: true (As One, etc.)
+    "suppress_weather",   # Air Lock, Cloud Nine
+)
+ABILITY_FEAT_DIM = len(ABILITY_FEAT_FIELDS)
 
 # In the 107-dim flag vector, the type one-hot lives at this slice (indices
 # 81..99 — see features.py:_project_move_flags lines 1257-1262, the order of
@@ -389,6 +413,139 @@ def _extra_move_flags(move) -> list:
     ]
 
 
+# =============================
+# Showdown items.ts / abilities.ts parsers (Postscript G)
+# =============================
+# Pure mechanical extraction of structural fields. No effect-logic curation —
+# the actual effect callbacks are JS functions we don't try to interpret.
+
+_SHOWDOWN_DATA_DIR = Path(__file__).parent.parent.parent / "showdown-reference" / "data"
+
+
+def _split_top_level_blocks(text: str) -> Dict[str, str]:
+    """Split a Showdown TS data file into {top-level-id: block-text} pairs.
+
+    Items / abilities are tab-indented top-level keys followed by `{...}`. We
+    find the matching closing brace by depth-counting.
+    """
+    out: Dict[str, str] = {}
+    pattern = re.compile(r"^\t(\w+):\s*\{", re.MULTILINE)
+    for m in pattern.finditer(text):
+        key = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(text) and depth > 0:
+            c = text[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            i += 1
+        out[key] = text[start:i - 1]
+    return out
+
+
+def parse_showdown_items(items_ts: Optional[Path] = None) -> Dict[str, Dict[str, float]]:
+    """Parse Showdown's items.ts into {item_id: {feature_name: value}}.
+
+    Extracted features (per ITEM_FEAT_FIELDS, in order):
+      is_berry / is_gem / is_pokeball: top-level bool literals
+      is_mega_stone: derived from `megaStone:` field present
+      is_z_crystal: derived from `zMove:` or `zMoveType:` field present
+      ignore_klutz: bool literal
+      fling_bp_norm: fling.basePower / 130 (max ~130)
+      natural_gift_bp_norm: naturalGift.basePower / 100 (max 100)
+    """
+    p = items_ts or (_SHOWDOWN_DATA_DIR / "items.ts")
+    text = p.read_text(encoding="utf-8")
+    out = {}
+    for item_id, block in _split_top_level_blocks(text).items():
+        out[item_id] = {
+            "is_berry":     1.0 if re.search(r"\bisBerry:\s*true",     block) else 0.0,
+            "is_gem":       1.0 if re.search(r"\bisGem:\s*true",       block) else 0.0,
+            "is_pokeball":  1.0 if re.search(r"\bisPokeball:\s*true",  block) else 0.0,
+            "is_mega_stone": 1.0 if re.search(r"\bmegaStone:\s*\{",     block) else 0.0,
+            "is_z_crystal":  1.0 if (re.search(r"\bzMove:\s*\{",        block)
+                                     or re.search(r'\bzMoveType:\s*"', block)) else 0.0,
+            "ignore_klutz": 1.0 if re.search(r"\bignoreKlutz:\s*true", block) else 0.0,
+            "fling_bp_norm":        0.0,
+            "natural_gift_bp_norm": 0.0,
+        }
+        m = re.search(r"\bfling:\s*\{[^}]*\bbasePower:\s*(\d+)", block, re.DOTALL)
+        if m:
+            out[item_id]["fling_bp_norm"] = min(1.0, int(m.group(1)) / 130.0)
+        m = re.search(r"\bnaturalGift:\s*\{[^}]*\bbasePower:\s*(\d+)", block, re.DOTALL)
+        if m:
+            out[item_id]["natural_gift_bp_norm"] = min(1.0, int(m.group(1)) / 100.0)
+    return out
+
+
+def parse_showdown_abilities(abilities_ts: Optional[Path] = None) -> Dict[str, Dict[str, float]]:
+    """Parse Showdown's abilities.ts into {ability_id: {feature_name: value}}.
+
+    Extracted features (per ABILITY_FEAT_FIELDS):
+      breakable / cantsuppress / notrace / notransform / no_skill_swap:
+        bits inside the `flags: { ... }` object (presence of `flagname: 1`).
+      is_permanent: top-level `isPermanent: true`
+      suppress_weather: top-level `suppressWeather: true`
+    """
+    p = abilities_ts or (_SHOWDOWN_DATA_DIR / "abilities.ts")
+    text = p.read_text(encoding="utf-8")
+    out = {}
+    for ability_id, block in _split_top_level_blocks(text).items():
+        # Pull the flags inner object so we don't false-match field names that
+        # appear in callback bodies elsewhere in the block.
+        flags_block = ""
+        m = re.search(r"\bflags:\s*\{([^}]*)\}", block, re.DOTALL)
+        if m:
+            flags_block = m.group(1)
+        out[ability_id] = {
+            "breakable":         1.0 if re.search(r"\bbreakable:\s*1",         flags_block) else 0.0,
+            "cantsuppress":      1.0 if re.search(r"\bcantsuppress:\s*1",      flags_block) else 0.0,
+            "notrace":           1.0 if re.search(r"\bnotrace:\s*1",           flags_block) else 0.0,
+            "notransform":       1.0 if re.search(r"\bnotransform:\s*1",       flags_block) else 0.0,
+            "no_skill_swap":     1.0 if re.search(r"\bnoskillswap:\s*1",       flags_block) else 0.0,
+            "is_permanent":      1.0 if re.search(r"\bisPermanent:\s*true",    block) else 0.0,
+            "suppress_weather":  1.0 if re.search(r"\bsuppressWeather:\s*true", block) else 0.0,
+        }
+    return out
+
+
+def build_item_features(n_items: int, vocab) -> torch.Tensor:
+    """Build (n_items, ITEM_FEAT_DIM) tensor indexed by Vocab item_id."""
+    parsed = parse_showdown_items()
+    out = torch.zeros(n_items, ITEM_FEAT_DIM, dtype=torch.float32)
+    id_to_name = vocab.id_to_name_map("item")
+    for iid in range(1, n_items):
+        name = id_to_name.get(iid)
+        if name is None:
+            continue
+        feats = parsed.get(name)
+        if feats is None:
+            continue
+        for ci, fname in enumerate(ITEM_FEAT_FIELDS):
+            out[iid, ci] = feats[fname]
+    return out
+
+
+def build_ability_features(n_abilities: int, vocab) -> torch.Tensor:
+    """Build (n_abilities, ABILITY_FEAT_DIM) tensor indexed by Vocab ability_id."""
+    parsed = parse_showdown_abilities()
+    out = torch.zeros(n_abilities, ABILITY_FEAT_DIM, dtype=torch.float32)
+    id_to_name = vocab.id_to_name_map("ability")
+    for aid in range(1, n_abilities):
+        name = id_to_name.get(aid)
+        if name is None:
+            continue
+        feats = parsed.get(name)
+        if feats is None:
+            continue
+        for ci, fname in enumerate(ABILITY_FEAT_FIELDS):
+            out[aid, ci] = feats[fname]
+    return out
+
+
 def build_damage_chart(gen: int = 9) -> torch.Tensor:
     """Build a (N_TYPES+1, N_TYPES+1) damage chart from poke-env's GenData.
 
@@ -431,11 +588,11 @@ def build_move_flag_lookup(
     gen: int = 9,
     verbose: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    """Build the (n_moves, 107) flag table + (n_moves, 4) bank table from poke-env.
+    """Build the lookup .pt blob: move flags + banks + damage chart + item /
+    ability feature tables. Row 0 of each table is reserved for pad/unknown
+    and stays zero.
 
-    Returns a dict suitable for save_move_flag_lookup. Row 0 is reserved for
-    pad/unknown and is left zero. v2 also embeds a (N_TYPES+1, N_TYPES+1)
-    damage chart for opp-threat computation.
+    Returns a dict suitable for save_move_flag_lookup. Schema v4.
     """
     from vocab import Vocab
     from poke_env.battle import Move
@@ -508,17 +665,36 @@ def build_move_flag_lookup(
                     f"type idx {got}, expected {expected_type_idx}. features.py reordered."
                 )
 
+    # Postscript G: parse Showdown items.ts / abilities.ts.
+    item_features = build_item_features(v.n_items, v)
+    ability_features = build_ability_features(v.n_abilities, v)
+    if verbose:
+        n_item_set    = int((item_features.sum(dim=-1) > 0).sum().item())
+        n_ability_set = int((ability_features.sum(dim=-1) > 0).sum().item())
+        _log.info("[lookup] parsed Showdown items.ts: %d / %d items have at least one structural flag set",
+                  n_item_set, v.n_items - 1)
+        _log.info("[lookup] parsed Showdown abilities.ts: %d / %d abilities have at least one structural flag set",
+                  n_ability_set, v.n_abilities - 1)
+
     return {
         "flags": flags,
         "banks": banks,
         "valid": valid,
         "damage_chart": chart,
+        "item_features": item_features,
+        "ability_features": ability_features,
         "meta": {
             "schema_version": LOOKUP_SCHEMA_VERSION,
             "gen": int(gen),
             "vocab_n_moves": int(n_moves),
+            "vocab_n_items": int(v.n_items),
+            "vocab_n_abilities": int(v.n_abilities),
             "move_flag_dim": MOVE_FLAG_DIM,
+            "item_feat_dim": ITEM_FEAT_DIM,
+            "ability_feat_dim": ABILITY_FEAT_DIM,
             "bank_fields": list(MOVE_BANK_FIELDS),
+            "item_feat_fields": list(ITEM_FEAT_FIELDS),
+            "ability_feat_fields": list(ABILITY_FEAT_FIELDS),
             "type_onehot_slice": list(_MOVE_TYPE_ONEHOT_SLICE),
         },
     }
@@ -570,6 +746,22 @@ def load_move_flag_lookup(path: Path, expected_n_moves: Optional[int] = None) ->
             f"damage_chart shape {tuple(blob['damage_chart'].shape)} != "
             f"{expected_chart_shape}"
         )
+    # v4 schema requirements
+    for k in ("item_features", "ability_features"):
+        if k not in blob:
+            raise RuntimeError(
+                f"Lookup at {path} missing {k} (schema v4). Rebuild."
+            )
+    if meta.get("item_feat_dim") != ITEM_FEAT_DIM:
+        raise RuntimeError(
+            f"Lookup item_feat_dim={meta.get('item_feat_dim')!r} != code {ITEM_FEAT_DIM}. "
+            "Rebuild lookup with current code."
+        )
+    if meta.get("ability_feat_dim") != ABILITY_FEAT_DIM:
+        raise RuntimeError(
+            f"Lookup ability_feat_dim={meta.get('ability_feat_dim')!r} != code {ABILITY_FEAT_DIM}. "
+            "Rebuild lookup with current code."
+        )
     return blob
 
 
@@ -612,6 +804,49 @@ def _mlp_1_layer(in_dim: int, d: int) -> nn.Sequential:
 # =============================
 # MoveTokenizer
 # =============================
+
+class ItemTokenizer(nn.Module):
+    """Per-Pokemon item token: id_embed + structural features -> d_model.
+
+    Postscript G: parallel to MoveTokenizer in spirit. The id embedding
+    learns item effects from gameplay outcomes; the structural features
+    (is_berry/is_gem/is_pokeball/is_mega_stone/is_z_crystal/ignore_klutz/
+    fling_bp_norm/natural_gift_bp_norm) are pure structural extraction
+    from Showdown items.ts — no curation, derived from true state.
+    """
+
+    def __init__(self, cfg: TransformerConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.id_embed = nn.Embedding(cfg.n_items, cfg.entity_embed_dim)
+        in_dim = cfg.entity_embed_dim + ITEM_FEAT_DIM
+        self.mlp = _mlp_2_layer(in_dim, cfg.d_model)
+        init_module_(self, std=cfg.init_std)
+
+    def forward(self, item_id: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        e = self.id_embed(item_id)
+        x = torch.cat([e, features], dim=-1)
+        return self.mlp(x)
+
+
+class AbilityTokenizer(nn.Module):
+    """Per-Pokemon ability token: id_embed + structural features -> d_model.
+    Mirrors ItemTokenizer; structural features parsed from Showdown abilities.ts.
+    """
+
+    def __init__(self, cfg: TransformerConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.id_embed = nn.Embedding(cfg.n_abilities, cfg.entity_embed_dim)
+        in_dim = cfg.entity_embed_dim + ABILITY_FEAT_DIM
+        self.mlp = _mlp_2_layer(in_dim, cfg.d_model)
+        init_module_(self, std=cfg.init_std)
+
+    def forward(self, ability_id: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        e = self.id_embed(ability_id)
+        x = torch.cat([e, features], dim=-1)
+        return self.mlp(x)
+
 
 class MoveTokenizer(nn.Module):
     """Per move (active or team): id + 4 banks + 107-dim flags -> d_model token."""
@@ -681,10 +916,14 @@ class Tokenizer(nn.Module):
         # ---- Move sub-tokenizer ----
         self.move_tokenizer = MoveTokenizer(cfg)
 
-        # ---- 3 entity tokens: species / item / ability ----
-        self.species_embed = nn.Embedding(cfg.n_species,   d)
-        self.item_embed    = nn.Embedding(cfg.n_items,     d)
-        self.ability_embed = nn.Embedding(cfg.n_abilities, d)
+        # ---- Entity tokens ----
+        # species: id-only embedding (no Showdown structural fields are
+        # competitive-relevant — types/stats/abilities are already separate tokens)
+        self.species_embed = nn.Embedding(cfg.n_species, d)
+        # item / ability: id_embed + structural features (Postscript G).
+        # Embedding learns effects from gameplay; features give a head start.
+        self.item_tokenizer    = ItemTokenizer(cfg)
+        self.ability_tokenizer = AbilityTokenizer(cfg)
 
         # ---- Type token (MAX_TYPES_PER_POKEMON type embeds, sorted) ----
         # +1 vocab slot for "no second type" (used when a Pokemon has only one
@@ -807,15 +1046,19 @@ class Tokenizer(nn.Module):
         self.pokemon_slot_embed  = nn.Embedding(n_pokemon_slot_vocab(fmt),       d)
         self.move_slot_embed     = nn.Embedding(fmt.n_moves + 1,                 d)  # +1 for non-move (idx 0)
 
-        # ---- Move flag + bank + damage-chart lookup ----
+        # ---- Move + item + ability + chart lookups ----
         if move_flag_lookup is None:
             flags = torch.zeros(cfg.n_moves, MOVE_FLAG_DIM, dtype=torch.float32)
             mbanks = torch.zeros(cfg.n_moves, len(MOVE_BANK_FIELDS), dtype=torch.int32)
             chart = torch.ones(N_TYPES + 1, N_TYPES + 1, dtype=torch.float32)
+            item_feats = torch.zeros(cfg.n_items, ITEM_FEAT_DIM, dtype=torch.float32)
+            ability_feats = torch.zeros(cfg.n_abilities, ABILITY_FEAT_DIM, dtype=torch.float32)
         else:
             flags = move_flag_lookup["flags"].float()
             mbanks = move_flag_lookup["banks"].int()
             chart = move_flag_lookup["damage_chart"].float()
+            item_feats = move_flag_lookup["item_features"].float()
+            ability_feats = move_flag_lookup["ability_features"].float()
             if flags.shape != (cfg.n_moves, MOVE_FLAG_DIM):
                 raise RuntimeError(
                     f"Lookup flags shape {tuple(flags.shape)} != "
@@ -831,9 +1074,21 @@ class Tokenizer(nn.Module):
                     f"Lookup damage_chart shape {tuple(chart.shape)} != "
                     f"({N_TYPES + 1}, {N_TYPES + 1})"
                 )
-        self.register_buffer("move_flags_lookup", flags)
-        self.register_buffer("move_banks_lookup", mbanks)
-        self.register_buffer("damage_chart", chart)
+            if item_feats.shape != (cfg.n_items, ITEM_FEAT_DIM):
+                raise RuntimeError(
+                    f"Lookup item_features shape {tuple(item_feats.shape)} != "
+                    f"({cfg.n_items}, {ITEM_FEAT_DIM})"
+                )
+            if ability_feats.shape != (cfg.n_abilities, ABILITY_FEAT_DIM):
+                raise RuntimeError(
+                    f"Lookup ability_features shape {tuple(ability_feats.shape)} != "
+                    f"({cfg.n_abilities}, {ABILITY_FEAT_DIM})"
+                )
+        self.register_buffer("move_flags_lookup",     flags)
+        self.register_buffer("move_banks_lookup",     mbanks)
+        self.register_buffer("damage_chart",          chart)
+        self.register_buffer("item_features_lookup",  item_feats)
+        self.register_buffer("ability_features_lookup", ability_feats)
 
         # ---- Precomputed position-ID buffers ----
         type_ids, poke_slots, move_slots = self._build_position_ids(fmt)
@@ -955,10 +1210,14 @@ class Tokenizer(nn.Module):
         team_size = ids.shape[1]
         d = self.cfg.d_model
 
-        # 3 entity tokens
+        # 3 entity tokens. species: id-only; item/ability: id + structural flags.
         species_tok = self.species_embed(ids[..., 0])
-        item_tok    = self.item_embed   (ids[..., 1])
-        ability_tok = self.ability_embed(ids[..., 2])
+        item_id     = ids[..., 1]
+        ability_id  = ids[..., 2]
+        item_feats    = self.item_features_lookup   [item_id]      # (B, T, ITEM_FEAT_DIM)
+        ability_feats = self.ability_features_lookup[ability_id]
+        item_tok    = self.item_tokenizer   (item_id,    item_feats)
+        ability_tok = self.ability_tokenizer(ability_id, ability_feats)
 
         # Type token: top-2 indices from the multi-hot, sorted ascending so the
         # MLP sees a deterministic order regardless of topk tie-breaking.

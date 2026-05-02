@@ -476,6 +476,83 @@ def test_extra_move_flags_in_lookup():
     print(f"  OK ({n_checked}/{len(expected)} known move-flag pairs verified)")
 
 
+def test_item_ability_features_in_lookup():
+    """Postscript G: item/ability structural feature dicts parsed from
+    Showdown's items.ts / abilities.ts. Spot-check known entries."""
+    print("\n== test 15: Postscript G item + ability structural features ==")
+    from model_transformer import (
+        load_move_flag_lookup, ITEM_FEAT_FIELDS, ABILITY_FEAT_FIELDS,
+    )
+    from vocab import Vocab
+    from pathlib import Path
+    blob = load_move_flag_lookup(Path(LOOKUP_PATH))
+    item_feats = blob["item_features"]
+    ability_feats = blob["ability_features"]
+    v = Vocab.load()
+
+    # Known items with specific flags set
+    item_idx = {f: i for i, f in enumerate(ITEM_FEAT_FIELDS)}
+    item_checks = [
+        ("sitrusberry",     "is_berry"),
+        ("rockygem",        "is_gem"),
+        ("garchompite",     "is_mega_stone"),
+        ("normaliumz",      "is_z_crystal"),
+        ("abilityshield",   "ignore_klutz"),
+    ]
+    n_item_checked = 0
+    for name, flag in item_checks:
+        iid = v.item(name)
+        if iid == 0:
+            print(f"  item {name!r}: not in vocab (skipped)")
+            continue
+        idx = item_idx[flag]
+        val = float(item_feats[iid, idx].item())
+        print(f"  item {name:15s} flag {flag!r} = {val:.1f}")
+        assert val == 1.0, f"expected item {name} to have {flag} set"
+        n_item_checked += 1
+    print(f"  items: {n_item_checked}/{len(item_checks)} canonical pairs verified")
+
+    # Known abilities with specific flags
+    ab_idx = {f: i for i, f in enumerate(ABILITY_FEAT_FIELDS)}
+    ability_checks = [
+        ("aromaveil",       "breakable"),         # Showdown-tagged breakable
+        ("armortail",       "breakable"),         # Showdown-tagged breakable
+        ("airlock",         "suppress_weather"),  # ignores weather (Air Lock)
+        ("cloudnine",       "suppress_weather"),  # ignores weather (Cloud Nine)
+    ]
+    n_ab_checked = 0
+    for name, flag in ability_checks:
+        aid = v.ability(name)
+        if aid == 0:
+            print(f"  ability {name!r}: not in vocab (skipped)")
+            continue
+        idx = ab_idx[flag]
+        val = float(ability_feats[aid, idx].item())
+        print(f"  ability {name:15s} flag {flag!r} = {val:.1f}")
+        assert val == 1.0, f"expected ability {name} to have {flag} set"
+        n_ab_checked += 1
+    print(f"  abilities: {n_ab_checked}/{len(ability_checks)} canonical pairs verified")
+
+    # Verify item_token / ability_token are gradient-connected and respond
+    # to feature perturbation.
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+    with torch.no_grad():
+        out_baseline = tok(batch)["tokens"]
+        # Zero the item features lookup; item tokens should change.
+        saved = tok.item_features_lookup.clone()
+        tok.item_features_lookup.zero_()
+        out_zero = tok(batch)["tokens"]
+        tok.item_features_lookup.copy_(saved)
+    # Our slot 0's item token at sequence index N_BATTLE_STATE + 1
+    item_tok_idx = N_BATTLE_STATE + 1
+    diff_item = (out_baseline[:, item_tok_idx] - out_zero[:, item_tok_idx]).abs().max().item()
+    print(f"  zeroing item_features_lookup: item_token diff = {diff_item:.3f}")
+    assert diff_item > 1e-3, "item_features don't reach item_token"
+    print("  OK")
+
+
 def test_field_split_isolation():
     """Postscript E: each thematic field slice should affect only its own
     field token, not the others. Validates the split's attention-isolation
@@ -593,6 +670,7 @@ if __name__ == "__main__":
     test_restored_signals_reach_status_token()
     test_physical_banks_reach_status_token()
     test_extra_move_flags_in_lookup()
+    test_item_ability_features_in_lookup()
     test_field_split_isolation()
     test_doubles_rejected()
-    print("\n=== all 16 tests passed ===")
+    print("\n=== all 17 tests passed ===")

@@ -1070,6 +1070,23 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
   adds an `active_real_flags` override path mirroring Tier G's banks
   override, restoring real per-turn PP/disabled/STAB for the moves
   the model is choosing among.
+- **2026-05-02 (Session 46, structural enrichment pass):** Fourth
+  audit asked "what about hazards/weather/screens/move effects/
+  items/abilities — anything else we're missing?" With user's "no
+  hand-curation, derive from true state" philosophy:
+  - Postscript E: split `field_token` into 9 thematic tokens
+    (weather/terrain/our_haz/opp_haz/our_scr/opp_scr/speed_field/
+    mechanics/progression). N_TOKENS 212 → 220.
+  - Postscript F: enrich move flag lookup 107 → 119 dim with 12
+    structurally-derivable flags poke-env exposes that
+    `_project_move_flags` drops (slicing/bullet/bypasssub/pulse/
+    charge/futuremove/ignore_defensive/use_target_offensive/
+    thaws_target/reflectable/gravity/sleep_usable). Schema v3.
+  - Postscript G: parse Showdown items.ts / abilities.ts at
+    lookup-build time. Add `(n_items, 8)` and `(n_abilities, 7)`
+    structural feature tables. New `ItemTokenizer` /
+    `AbilityTokenizer` (id_embed + features → MLP → d_model),
+    parallel to MoveTokenizer. Schema v4.
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
@@ -1602,3 +1619,197 @@ weak item learning. Not a Week 1 task; YAGNI for now.
   against opp (e.g., model fails to recognize opp's Choice-locked
   state), revisit by deriving disabled from transition events
   (turn-by-turn Choice lock detection in features.py).
+
+---
+
+## Postscript E — field-token split into 9 thematic tokens
+
+**Triggered by:** "for elite play this matters — sun + Solar Power
+composes; opp screens halve our damage; tailwind alters speed tier; with
+everything mashed into one MLP token, attention can't specialize."
+
+The legacy / V1-pre-refactor code had ONE `field_token` from a single MLP
+over all 52 cont dims + 4 banks. That collapsed all field state into
+one attention slot. Replaced with 9 thematic tokens:
+
+| Token | Source dims | Why split |
+|---|---|---|
+| `weather`     | weather one-hot (5) + dur bank | Weather sets up Sand Force / Solar Power / Slush Rush / Swift Swim / Sand Rush — each composes with specific abilities. Attention path needs to be its own. |
+| `terrain`     | terrain one-hot (5) + dur bank | Same: Surge Surfer + Electric Terrain, Quark Drive + Electric Terrain, Grassy Terrain healing, Misty Terrain status block |
+| `our_hazards` | SR / spikes (1-3) / tspikes (1-2) / web (4 dims) | The legacy `defensive_eff` signal is fundamentally about "does this Pokemon survive entry to opp's hazards" — needs its own attention path |
+| `opp_hazards` | symmetric (4) | hazards I just set up; matters for "should I push for SR + Spikes vs swap to attacking" |
+| `our_screens` | reflect / ls / av × {presence, dur} = 6 | Screens I have up: opp damage halved. Composes with my walls' bulk |
+| `opp_screens` | symmetric (6) | Screens opp has: my damage halved. Composes with my sweeper's offense |
+| `speed_field` | tailwind us/opp + trick room + tr_dur (3 + bank) | Speed-tier modifiers — flips outspeed calculations |
+| `mechanics`   | can_tera/mega/z/dmax + used_* + dmax_turns + trapped + force_switch + opp_revealed_frac (17) | One-time-use resources + battle-state flags |
+| `progression` | alive_us/alive_opp + turn bank | Game-progression — endgame counting, win-condition timing |
+
+**Bookkeeping:**
+- `N_BATTLE_STATE: 6 → 14`
+- `N_TOKENS: 212 → 220` (+8 tokens, +3.7% attention compute at the
+  spatial transformer; well under any meaningful budget)
+- `N_TOKEN_TYPES: 20 → 28` (one per thematic token + threat/decision/etc.)
+- `N_BATTLE_STATE_SLOTS: 4 → 12`
+
+**Test 13 (`test_field_split_isolation`):** perturbing each cont slice
+shows bit-perfect isolation — every other thematic token's output is
+0.00e+00 different. The architectural separation is enforced at the
+input level.
+
+**Bench:** 30.04 ms median for B=32 turns (was 27.13 pre-split). +3 ms
+from the added MLPs and tokens. Well under 50 ms budget.
+
+---
+
+## Postscript F — move flag lookup enrichment (107 → 119 dim)
+
+**Triggered by:** "the model has to memorize 'this is Body Press, uses
+Defense' from move_id alone; that's exactly the brittleness the rewrite
+was supposed to fix."
+
+`features.py:_project_move_flags` extracts 107 dims, dropping ~12
+structurally-derivable flags poke-env's `Move` object exposes directly.
+Adding them as a *Postscript-F* extension to the lookup, NOT modifying
+features.py (guard-railed). Layout: `[0:107]` from `_project_move_flags`
+(bit-exact); `[107:119]` from `_extra_move_flags(move)`.
+
+| Flag | Source | Used by ability/move |
+|---|---|---|
+| `slicing` | `m.flags["slicing"]` | Sharpness boost |
+| `bullet` | `m.flags["bullet"]` | Bulletproof immunity |
+| `bypasssub` | `m.flags["bypasssub"]` | Sound + others bypass Sub |
+| `pulse` | `m.flags["pulse"]` | Mega Launcher boost |
+| `charge` | `m.flags["charge"]` | 2-turn moves (Solar Beam, Fly, ...) |
+| `futuremove` | `m.flags["futuremove"]` | Future Sight, Doom Desire |
+| `ignore_defensive` | `m.ignore_defensive` | Body Press / Foul Play category |
+| `use_target_offensive` | `m.use_target_offensive` | Foul Play |
+| `thaws_target` | `m.thaws_target` | Scald-style anti-freeze |
+| `reflectable` | `m.flags["reflectable"]` | Magic Bounce target |
+| `gravity` | `m.flags["gravity"]` | gravity-suppressed |
+| `sleep_usable` | `m.sleep_usable` | Sleep Talk, Snore |
+
+`MOVE_FLAG_DIM_BASE = 107`, `MOVE_FLAG_DIM = 119`. Schema bumped to v3.
+
+**Active-move flag override path:** still reads
+`active_move_cont[..., :MOVE_FLAG_DIM_BASE]` from the memmap (per-turn
+ground truth on dims 9/10/12). The 12 extras are move-static and stay
+from the lookup. No memmap shape change required.
+
+**Test 14 (`test_extra_move_flags_in_lookup`):** 11/11 canonical
+move-flag pairs verified — psychocut→slicing, eggbomb→bullet,
+boomburst→bypasssub, aurasphere→pulse, solarbeam→charge,
+futuresight→futuremove, foulplay→use_target_offensive,
+scald→thaws_target, toxic→reflectable, bounce→gravity,
+sleeptalk→sleep_usable.
+
+---
+
+## Postscript G — item + ability structural feature lookups
+
+**Triggered by:** "items are tokenized — won't they be learned?" + "is
+there a reason we can't tokenize items?" — the answer is "yes, with
+sufficient capacity / data, embeddings learn effects" (256-dim is way
+past legacy's 32/64-dim oversaturation), but giving the model a small
+head start with structurally-derivable features is principled and
+free, IF we don't hand-curate.
+
+**Approach:** parse Showdown's `items.ts` and `abilities.ts` at
+lookup-build time. Pure regex/pattern-based extraction of structurally-
+present fields. NO interpretation of effect callbacks (those are JS
+functions, untouchable as code without writing a JS interpreter, which
+would be hand-curation by another name).
+
+### G1. Item features (8 dim per item)
+
+Parsed from items.ts `_split_top_level_blocks`:
+
+| Field | Source pattern | Examples |
+|---|---|---|
+| `is_berry` | `isBerry: true` | Sitrus Berry, Lum Berry, Salac Berry |
+| `is_gem` | `isGem: true` | Normal Gem, Fire Gem (gen 5/6) |
+| `is_pokeball` | `isPokeball: true` | (battle-irrelevant; included for completeness) |
+| `is_mega_stone` | `megaStone: { ... }` present | Garchompite, Charizardite Y |
+| `is_z_crystal` | `zMove:` or `zMoveType:` present | Normalium Z, Firium Z |
+| `ignore_klutz` | `ignoreKlutz: true` | Ability Shield |
+| `fling_bp_norm` | `fling.basePower / 130` | Iron Ball (130), Hard Stone (100) |
+| `natural_gift_bp_norm` | `naturalGift.basePower / 100` | berries used with Natural Gift |
+
+Build result: 515 / 2339 items have at least one flag set (the rest
+are battle-irrelevant or have only callback effects — Choice
+Band/Specs/Scarf, Life Orb, Leftovers fall into the "callback only"
+bucket and rely on the embedding learning their effects).
+
+### G2. Ability features (7 dim per ability)
+
+Parsed from abilities.ts:
+
+| Field | Source pattern | Examples |
+|---|---|---|
+| `breakable` | `flags: { breakable: 1 }` | Aroma Veil, Armor Tail, Sturdy, Battle Armor |
+| `cantsuppress` | `flags: { cantsuppress: 1 }` | Multitype, Stance Change |
+| `notrace` | `flags: { notrace: 1 }` | Forecast, Flower Gift, Imposter |
+| `notransform` | `flags: { notransform: 1 }` | Disguise, Battle Bond |
+| `no_skill_swap` | `flags: { noskillswap: 1 }` | Wonder Guard, Multitype |
+| `is_permanent` | `isPermanent: true` (top-level) | As One (Glastrier/Spectrier) |
+| `suppress_weather` | `suppressWeather: true` | Air Lock, Cloud Nine |
+
+Build result: 116 / 313 abilities have at least one flag set.
+
+### G3. Tokenizer integration
+
+- `ItemTokenizer`: `id_embed (entity_embed_dim=32) + ITEM_FEAT_DIM=8`
+  → 2-layer MLP → `d_model`. Replaces direct `item_embed(item_id)` in
+  `_encode_pokemon_block`.
+- `AbilityTokenizer`: same pattern, `id_embed + ABILITY_FEAT_DIM=7` →
+  MLP → `d_model`.
+- `MoveTokenizer` already follows this pattern (id + banks + 119-dim
+  flags → MLP → d_model). The two new tokenizers are deliberate
+  parallels.
+
+### G4. What this gives the model
+
+For Sitrus Berry: the embedding starts knowing "this is a berry,"
+which composes via attention with `cont[..., _SL_VOLATILE]` (the
+volatiles slice in the per-Pokemon block, which includes the
+`STOCKPILE`/`SUBSTITUTE`/etc. flags) and the HP bank. The "consumed
+when below 50%" effect still has to be learned, but the categorical
+"this is berry-shaped" prior is given.
+
+For Air Lock: ability_token starts knowing "suppress_weather=1," which
+the model can compose with the weather_token's value to predict that
+weather effects don't fire. Faster convergence than learning purely
+from outcomes.
+
+For Choice Band: NO structural feature gives "1.5× phys atk" — that's
+in the JS callback. The id embedding still has to learn this. With
+256-dim and 5M training samples this is well within learnable range
+(see Postscript A on items being learnable). The structural features
+are a head start, not the main mechanism.
+
+### G5. Schema bump and lookup file
+
+`LOOKUP_SCHEMA_VERSION: 3 → 4`. The .pt blob now has:
+- `flags` (n_moves, 119)
+- `banks` (n_moves, 4)
+- `valid` (n_moves,)
+- `damage_chart` (N_TYPES+1, N_TYPES+1)
+- `item_features` (n_items, 8)               — NEW v4
+- `ability_features` (n_abilities, 7)         — NEW v4
+- `meta` dict with all schema fields
+
+Loader rejects v3 files with a "rebuild" error.
+
+### G6. Verification status
+
+- `verify_move_lookup.py`: 50/50 strict + 50/50 STAB-only-divergence.
+- `test_tokenizer.py`: 17/17 pass. New test 15:
+  - 4/5 canonical item-flag pairs verified (sitrusberry/garchompite/
+    normaliumz/abilityshield; rockygem absent from gen-9 vocab — ok)
+  - 4/4 canonical ability-flag pairs verified (aromaveil/armortail
+    breakable; airlock/cloudnine suppress_weather)
+  - Gradient-flow check: zeroing `item_features_lookup` changes the
+    item_token output by 1.78 (nontrivial; structural features
+    reach the token).
+- Bench: 30.46 ms median for B=32 (was 30.04). +0.4 ms; within noise.
+- Param count: 1,447,224 → ~1,470,000 (+~25K from the two new
+  tokenizers' first Linears).
