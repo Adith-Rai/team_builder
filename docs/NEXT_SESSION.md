@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-02 (Session 48 — Week 3 plumbing landed. `--use-transformer` flag plumbed through `train_bc.py` (factory + arch-tagged checkpoints + resume guard) and `ppo.py::load_checkpoint` (arch dispatch with state-dict-key inference fallback for legacy ckpts). Plumbing smoke (CPU B=4, 40 batches): loss 1.66→1.61 clean, no NaN, 19,994,924 params confirmed. CUDA fp16 throughput bench (`bench_bc_step.py`) found a memory cliff at B=8 on the 6 GB RTX 3060 — per-turn 5 ms → 145 ms once peak crosses ~5 GB. **B=4 is the chosen local operating point**: 6-11 ms/turn fp16, peak ≤2.74 GB, loss decreasing cleanly across 8 consecutive batches. Throughput projection: ~9.7 hr/epoch local → 5 epochs ≈ 2 days, 10 epochs ≈ 4 days (right at the cloud-trigger boundary). All 17/17 tokenizer + 9/9 policy tests still pass. See REWRITE_DESIGN.md Postscript I for the cliff data + decision rationale. Session 49 task: launch the full 5-epoch BC at B=4 fp16 (`--workers 2 --eval-games 0 --val-ratio 0.05 --use-transformer`), monitor val_loss for early stopping, run `eval_metamon_competitive.py` post-epoch on each saved checkpoint. See `next-prompt.txt`.)**
+**Last updated: 2026-05-02 (Session 48 — Week 3 plumbing + eval pipeline shipped. Three commits: (1) `1f3ec01` `--use-transformer` plumbed through `train_bc.py` + `ppo.py::load_checkpoint`; (2) `a6e6b33` `bench_bc_step.py` + Postscript I documenting the B=8 memory cliff at 5 GB peak on the 6 GB RTX 3060 (per-turn 5 ms → 145 ms) and choice of B=4 as local operating point; (3) `5f04380` `BattleAgentTransformer` (mirror of legacy `BattleAgent` for the new arch) + arch dispatch in `eval_metamon_competitive.py`, smoke-validated end-to-end (20 random-init games in 15 s). Plumbing smoke (CPU B=4, 40 batches): loss 1.66→1.61 clean, no NaN, 19,994,924 params confirmed. CUDA fp16 bench at B=4: 6-11 ms/turn, peak ≤2.74 GB, 8/8 batches stable. Throughput projection: ~9.7 hr/epoch local → 5 epochs ≈ 2 days, 10 epochs ≈ 4 days (right at the cloud-trigger boundary). All 17/17 tokenizer + 9/9 policy tests still pass. Session 49 task: launch the full 5-epoch BC at B=4 fp16 (`--workers 2 --eval-games 0 --val-ratio 0.05 --use-transformer`), run `eval_metamon_competitive.py` post-epoch on each saved checkpoint. Eval pipeline is wired and validated. See `next-prompt.txt`.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -44,6 +44,20 @@ the wrong class.
   forward_sequence + backward + AdamW.step(), reports per-turn ms +
   peak GPU memory. Used to find the B=8 cliff. Committable for future
   throughput regression testing.
+- `pokemon-ai-starter/pokemon-ai/src/battle_agent_transformer.py` — new
+  file (~165 lines, commit `5f04380`). Mirror of `battle_agent.py` for
+  the new arch (REWRITE_DESIGN.md §6b.2). Same Player interface, same
+  `make_features` / `build_turn_batch` / `action_to_order` flow, same
+  per-battle history buffer. Loads `TransformerConfig` +
+  `TransformerBattlePolicy` + `move_flag_lookup`. Refuses non-transformer
+  ckpts loudly. Exports `is_transformer_checkpoint(ckpt)` as the
+  dispatch oracle.
+- `pokemon-ai-starter/pokemon-ai/src/eval_metamon_competitive.py` —
+  `+2 lines`. `eval_ckpt_vs_bot` picks `BattleAgentTransformer` vs
+  `BattleAgent` per `is_transformer_checkpoint(cached)`. Smoke: 20 games
+  on a random-init transformer ckpt at concurrency 2, 15 s wall-clock,
+  smart_avg 0.0% (random net vs smart bots — expected). All 4 matchups
+  load + complete without exception.
 
 **Plumbing smoke (CPU B=4, 40 batches, killed manually):**
 - 19,994,924 params confirmed at training start.

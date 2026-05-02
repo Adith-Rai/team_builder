@@ -47,14 +47,21 @@ are easy to hide behind "should fit"; benchmarks beat estimates.
    batch size, fp16 mode). One-shot diagnostic; doesn't run the full pipeline.
 
 5. **`pokemon-ai-starter/pokemon-ai/src/eval_metamon_competitive.py`** —
-   the standalone eval. You'll invoke this between epochs (or after the
-   full run) on each saved checkpoint. Its `--checkpoints v10=...`
-   convention writes per-checkpoint smart_avg to a json registry.
+   the standalone eval, Session-48-arch-aware. Dispatches between
+   `BattleAgent` (legacy mlp) and `BattleAgentTransformer` (new arch)
+   per `ckpt["arch"]`. `--checkpoints label=path` syntax; writes per-bot
+   wr + smart_avg to JSON. Smoke-validated end-to-end against a
+   random-init transformer ckpt (Session 48 final commit `5f04380`).
 
-6. **`pokemon-ai-starter/pokemon-ai/src/ppo.py:347-409`** — Session 48's
-   arch-dispatch `load_checkpoint`. Used by `eval_metamon_competitive.py`
-   to load both arches. Sanity check: a v10 BC checkpoint should load and
-   run an eval game without error.
+6. **`pokemon-ai-starter/pokemon-ai/src/battle_agent_transformer.py`** —
+   inference player for new-arch ckpts (mirror of `battle_agent.py`).
+   Same Player interface, same `make_features` / `build_turn_batch` /
+   `action_to_order` flow. `is_transformer_checkpoint()` helper is the
+   dispatch oracle for any custom eval scripts you write.
+
+7. **`pokemon-ai-starter/pokemon-ai/src/ppo.py:347-409`** — Session 48's
+   arch-dispatch `load_checkpoint`. Used by `train_rl.py` (Week 4) to
+   resume + by analysis tools.
 
 ═══════════════════════════════════════════════════════════════════════════════
 PRE-FLIGHT (do this before anything else)
@@ -66,6 +73,25 @@ PRE-FLIGHT (do this before anything else)
   python test_policy.py            # 9/9
   python bench_bc_step.py --batch-size 4 --n-batches 5 --device cuda --fp16
     # expect ≤15 ms/turn, peak_mem ≤3 GB, all 5 batches stable
+
+  # Verify eval round-trip on a fresh random ckpt (sanity, ~30s):
+  python -c "
+import torch
+from pathlib import Path
+from model_transformer import TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup
+cfg = TransformerConfig.with_vocab_sizes_from_disk()
+lookup = load_move_flag_lookup(Path('data/lookup/move_flags_v1.pt'), expected_n_moves=cfg.n_moves)
+m = TransformerBattlePolicy(cfg, move_flag_lookup=lookup)
+torch.save({'arch':'transformer','model_state_dict':m.state_dict(),'model_config':cfg.to_dict()},
+           'data/models/bc/_smoke_random.pt')
+"
+  # In another terminal start the battle_server:
+  #   $TOOLS\node-v20.18.1-win-x64\node.exe battle_server.js --port 9000
+  python -u eval_metamon_competitive.py \
+    --checkpoints sm=data/models/bc/_smoke_random.pt \
+    --servers 9000 --n-games 5 --concurrency 2 --device cuda \
+    --out-json data/eval/_smoke.json
+    # expect: smart_avg ~0% (random net), 4 matchups complete, no exception
 
 If any fail, STOP. Run `git log --oneline | head -10` and figure out what's
 recently changed before proceeding.
@@ -146,28 +172,25 @@ Notes:
 
 ### 3. Per-epoch eval via `eval_metamon_competitive.py`
 
-After each epoch saves (`epoch_NNN.pt`), in a separate terminal:
+`BattleAgentTransformer` (`battle_agent_transformer.py`) shipped at the
+end of Session 48 — `eval_metamon_competitive.py` now dispatches by
+`ckpt["arch"]`. Smoke verified: 20 games on a random-init transformer
+ckpt complete in 15 s. After each epoch saves (`epoch_NNN.pt`), in a
+separate terminal:
 
   cd pokemon-ai-starter/pokemon-ai/src
   python -u eval_metamon_competitive.py \
     --checkpoints v10_e1=data/models/bc/v10_full/epoch_001.pt \
-    --servers 9000 --n-games 200 --concurrency 4 --device cuda \
+    --servers 9000 --n-games 200 --concurrency 8 --device cuda \
     --out-json data/eval/registry/v10_bc_epoch001.json
 
-Note: `eval_metamon_competitive.py` calls `ppo.load_checkpoint`, which
-Session 48 made arch-aware — but that path also instantiates a
-`BattleAgent`, which can't load transformer ckpts. **Verify this first**
-by running the eval on a saved BC checkpoint. Two outcomes:
-- Eval works: great, run after every epoch.
-- Eval errors with "no BattleAgentTransformer": stop and either
-  (a) build BattleAgentTransformer per REWRITE_DESIGN.md §6b.2 (~250
-       lines, ~half day) — better, sets up Week 5, OR
-  (b) defer eval to end-of-run; rely on val_loss to choose the best
-      checkpoint, then run eval once.
+Expected wall-clock: ~16-20 min per checkpoint (4 matchups × ~4-5 min
+each at concurrency 8). Append the smart_avg result to
+`data/eval/registry/evals.jsonl` once you have it.
 
-I recommend (a) — eval-during-training is the only way to catch a
-plateau early enough to act. Building it now also unblocks Week 5
-direct H2H eval vs sp_0229.
+If a real BC checkpoint fails to load: `is_transformer_checkpoint(ckpt)`
+in `battle_agent_transformer.py` is the dispatch oracle — verify it
+reports `True` for the saved ckpt.
 
 ### 4. Final eval + checkpoint registration
 
