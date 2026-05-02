@@ -732,28 +732,49 @@ arch vs old arch directly, which is the strongest signal we'll get.
 Six weeks of focused work. Each week ends with a measurable milestone;
 if the milestone slips, that's the trigger to update the design.
 
-### Week 1: Tokenizer module + integration tests
+### Week 1: Tokenizer module + integration tests — DONE (Session 46)
 
 **Deliverable:** `model_transformer.py` exports `Tokenizer` that
 consumes the existing memmap batch format and emits a `(B, 212,
 d_model)` tensor + a slot/type ID tensor for positional embeddings.
 
 **Tasks:**
-- [ ] Create `model_transformer.py` skeleton: `TransformerConfig`,
+- [x] Create `model_transformer.py` skeleton: `TransformerConfig`,
   `Tokenizer`, `MoveTokenizer` modules.
-- [ ] Implement `MoveTokenizer` per §3.2.
-- [ ] Implement `Tokenizer` that unpacks the memmap's per-Pokemon tensors
+- [x] Implement `MoveTokenizer` per §3.2.
+- [x] Implement `Tokenizer` that unpacks the memmap's per-Pokemon tensors
   into per-attribute tokens per §6.1.
-- [ ] Build the `(n_moves, 107)` flag lookup table from poke-env Move
+- [x] Build the `(n_moves, 107)` flag lookup table from poke-env Move
   data. Confirm it matches `_project_move_flags` (features.py:1005-1263)
   on a sample of 50 moves.
-- [ ] Write unit tests: `test_tokenizer.py` with 5 sample battles
+- [x] Write unit tests: `test_tokenizer.py` with 5 sample battles
   (loaded from existing memmap), assert token count = 212, no NaNs,
   type_id embeddings line up with the spec table.
-- [ ] Forward-pass benchmark: time `Tokenizer + dummy spatial` on a
+- [x] Forward-pass benchmark: time `Tokenizer + dummy spatial` on a
   single batch of 32 turns. Should be <50ms on RTX 3060 Laptop.
 
 **Milestone:** Tokenizer runs. Token shapes match spec. No silent NaN.
+
+**Session 46 results:**
+- 952/952 valid moves built into `data/lookup/move_flags_v1.pt` (move_id 0
+  reserved for pad/unknown). 50/50 sampled moves pass strict re-call exact
+  match against `_project_move_flags(move)`. Active-path call with
+  `poke_types=(move.type,)` diverges only at the documented STAB index — no
+  unexpected battle-state-dependent components.
+- Tokenizer on RTX 3060 Laptop, B=32 turns: **3.42 ms median for tokenizer
+  alone, 28.36 ms median for tokenizer + dummy 6-layer spatial transformer**.
+  Well under the 50 ms budget; ~0.89 ms/turn end-to-end.
+- 5/5 unit tests pass on real `human_v8_100k` memmap data: shape =
+  (B, 212, 256), no NaN/inf, all 20 token types present, multi-turn forward
+  works, opp Pokemon with unrevealed move_id=0 produces finite output, type_id
+  embeddings demonstrably contribute (zeroing them changes output by
+  max |Δ|=3.85), pokemon_slot_embed disambiguates same-attribute tokens
+  across slots.
+- New files: `model_transformer.py` (1.42M params for Tokenizer +
+  MoveTokenizer), `verify_move_lookup.py`, `test_tokenizer.py`,
+  `bench_tokenizer.py`. Lookup at `data/lookup/move_flags_v1.pt`
+  (~840 KB on disk). Total Week 1 footprint stays inside the legacy-untouched
+  guard rail (no edits to `model.py` / `features.py` / `battle_agent.py`).
 
 ### Week 2: Spatial + temporal stack, replace model architecture
 
@@ -1022,6 +1043,64 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
 
 - **2026-05-01 (Session 45):** initial design. Covers V1 of the rewrite,
   spans Sessions 46-51 of implementation effort.
+- **2026-05-01 (Session 46):** Week 1 complete. See §7 Week 1 results
+  block for measurements. Postscript notes below.
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
+
+---
+
+## Postscript A — Session 46 Week 1 implementation notes
+
+These items deviated mildly from §3 / §6.1 during implementation. None
+require a redesign; they're carried forward into Week 2 work.
+
+1. **All 4 move tokens (active + team) use the same `(n_moves, 107)`
+   flag lookup AND the same `(n_moves, 4)` bank lookup.** This is
+   explicit in §3.2 ("same real bank values fed in everywhere") but
+   deserves restating. Concretely, the active 4 moves *no longer
+   surface* current_pp, disabled, or STAB to the model via the move
+   token — those are now uniformly the lookup's no-battle-state values
+   (max pp, not disabled, no STAB). The model can still recover STAB
+   via attention between move_token and the active Pokemon's
+   type_token; current_pp / disabled signals are lost in V1. If Week
+   3 BC convergence stalls and ablation suggests current_pp matters,
+   add a per-active "pp_remaining_token" of 4 dims fed from
+   `active_move_banks` (cheap, +4 tokens).
+
+2. **Opp active-threat token is a learnable "unknown" parameter,
+   not a symmetric MLP from opp's active-move flags.** Reason: the
+   memmap doesn't carry an opp-active-move feature table. Our side
+   uses the 2 trailing dims of `active_move_cont` (type_eff +
+   opp_threat, the 109-dim active-only encoding). For symmetric
+   training-data parity per §3.4, V1 just provides a learnable token
+   for the opp slot — the model can attend to opp's exposed moves and
+   types directly, so no information is lost; only the explicit
+   pre-computed threat scalars are unavailable. Acceptable for V1.
+
+3. **Type token uses ONE token, not 2 (open question §10 resolved).**
+   Picked single-token aggregation via 2 type embeds → MLP → d_model.
+   Saves 12 attention pairs per turn vs splitting; no measurable
+   downside in unit tests. Re-examine if Week 3 BC underfits on
+   dual-typing-dependent matchups.
+
+4. **Position-ID layout is stored as buffers, not regenerated per
+   forward.** Tokenizer.\_build\_position\_ids runs once at module
+   init; all 212 positions get static type_id, pokemon_slot_id,
+   move_slot_id tensors. The forward just adds three embedding lookups.
+   Trivial, but explicit so Week 2's spatial / mask code doesn't try
+   to recompute them.
+
+5. **Lookup verification is stricter than spec.** §7 said "matches to
+   within fp32 noise"; the actual verification at
+   `verify_move_lookup.py` asserts bit-exact match (max |Δ| ≤ 1e-6) on
+   the 105 battle-state-INDEPENDENT dims, plus only-STAB-differs on
+   the active-path call. Documented: cont[12]=stab, cont[9]=current_pp,
+   cont[10]=disabled are the three battle-state-dependent components
+   not in the lookup.
+
+6. **Imported `NumericalBank` from `model.py` rather than duplicating.**
+   The §6b guard rail says don't *modify* `model.py`; importing a small
+   utility is fine (no shared state, no upgrade risk). If Week 2 / 5
+   ever needs to delete `model.py`, this is the only outbound dep.

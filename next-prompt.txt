@@ -1,183 +1,200 @@
-Read docs/NEXT_SESSION.md (top section, S45 status) AND docs/REWRITE_DESIGN.md
-(top-to-bottom) before doing anything. The design doc is the contract you're
-implementing against — every claim in it should be verifiable from current code,
-and every code change you make should match the spec.
+Read docs/NEXT_SESSION.md (top section, S46 status) AND docs/REWRITE_DESIGN.md
+§7 Week 2 (and Postscript A — Session 46 notes — at the bottom) before doing
+anything. Week 1 (Tokenizer) landed on 2026-05-01 in Session 46; the design is
+locked. If you find spec-vs-reality divergences during implementation, UPDATE
+REWRITE_DESIGN.md (add another postscript section, do not rewrite history).
 
-Your goal: complete Week 1 of the implementation roadmap (REWRITE_DESIGN.md §7) —
-the Tokenizer module + integration tests.
-
-This is an IMPLEMENTATION session, not design. The design is locked. If you find
-spec-vs-reality divergences during implementation, UPDATE REWRITE_DESIGN.md (add a
-postscript section explaining what changed and why) — don't silently drift.
+Your goal: complete Week 2 of the implementation roadmap (REWRITE_DESIGN.md §7).
 
 ═══════════════════════════════════════════════════════════════════════════════
-WEEK 1 DELIVERABLE (from REWRITE_DESIGN.md §7)
+WHAT WEEK 1 LEFT YOU (verify before starting)
 ═══════════════════════════════════════════════════════════════════════════════
 
-`pokemon-ai-starter/pokemon-ai/src/model_transformer.py` exports `Tokenizer` that
-consumes the existing memmap batch format (see dataset.py:167-285 for shape
-contract) and emits a `(B, 212, d_model)` tensor + slot/type ID tensors for
-positional embeddings.
+Files in pokemon-ai-starter/pokemon-ai/src/:
+- `model_transformer.py` — TransformerConfig, MoveTokenizer, Tokenizer.
+  Tokenizer.forward(batch) returns {tokens: (B, 212, d_model),
+  type_ids/poke_slots/move_slots: (212,)}. Use the position-ID buffers
+  rather than recomputing.
+- `data/lookup/move_flags_v1.pt` — (n_moves=953, 107) flag table +
+  (n_moves, 4) bank table. Loaded via `load_move_flag_lookup`. Built once,
+  do not regenerate unless you change the 107-dim contract.
+- `test_tokenizer.py`, `verify_move_lookup.py`, `bench_tokenizer.py` —
+  reference for how the Tokenizer is exercised.
+
+Quick re-verification step before diving in (~3 min):
+  cd pokemon-ai-starter/pokemon-ai/src
+  python test_tokenizer.py     # all 5 tests pass
+  python bench_tokenizer.py    # ~28 ms median on RTX 3060 Laptop
+
+═══════════════════════════════════════════════════════════════════════════════
+WEEK 2 DELIVERABLE (from REWRITE_DESIGN.md §7)
+═══════════════════════════════════════════════════════════════════════════════
+
+`TransformerBattlePolicy` runs forward end-to-end, produces sane
+action_logits and value scalar on memmap data. PPO 1-iter smoke passes.
 
 Sub-tasks (in order):
 
-1. **Create `model_transformer.py` skeleton.**
-   - `TransformerConfig` dataclass mirroring `PokeTransformerConfig` (model.py:33)
-     but with new defaults per REWRITE_DESIGN.md §4: d_model=256, n_spatial=6,
-     n_temporal=4, n_heads=8, n_summary_tokens=2, dropout=0.05, ff_mult=4.
-   - Stub `Tokenizer`, `MoveTokenizer` modules. Don't implement the bodies yet;
-     just get the imports + class signatures landing.
-   - Add to `model_transformer.py` (NOT model.py — leave that untouched per §6b).
+1. **SpatialTransformer in `model_transformer.py`.**
+   - 6 layers × 8 heads × d_model=256, ff_mult=4, dropout=0.05, pre-norm.
+   - Input: the Tokenizer output (B, 212, d_model) + the position-ID buffers.
+   - Mask: Poke-Mask + side-mask per REWRITE_DESIGN.md §3.4 / §4.1. The legacy
+     impl is at model.py:312-430; the layout is different (212 tokens vs 16),
+     so build a NEW mask from scratch using the position-ID buffers.
+     Concretely:
+       - Decision tokens are TT_ACTOR (0) and TT_CRITIC (1), at sequence
+         indices 0 and 1 by construction.
+       - state-and-summary tokens cannot attend to actor/critic.
+       - actor cannot see critic and vice versa.
+       - Side mask: tokens with poke_slot ∈ {0..5} are "ours", {6..11} are
+         "opp", {12..15} are battle-state/neutral. The hidden-vs-revealed
+         distinction in §3.4 is moot (memmap already zeroes unrevealed opp
+         info), so side mask is mostly defensive — implement it but unit-test
+         that it doesn't change output beyond the Poke-Mask alone (sanity).
+     Make the mask a registered buffer; build it once in __init__.
+   - Output: (B, 212, d_model). The summary scratch tokens (last 2 indices)
+     are the per-turn summary; flatten + project to d_temporal.
 
-2. **Implement `MoveTokenizer` per REWRITE_DESIGN.md §3.2.**
-   - Inputs: move_id, bp/acc/pp/prio bank lookups, 107-dim flag vector.
-   - Module: 187-dim concat → 2-layer MLP → d_model.
-   - Test: instantiate, run a (B=4, n_moves=4) forward, assert output shape
-     `(B, n_moves, d_model)`, no NaN.
+2. **TemporalTransformer.**
+   - 4 layers × 8 heads × d_model=256, causal mask, learnable pos embed
+     (200-position cap). Mostly mirror the legacy class at model.py:437-511
+     but with cfg.d_temporal=256 (not 512). Variable-length sequences via
+     padding mask.
+   - Input: (B, T, d_temporal) per-turn summaries.
+   - Output: (B, d_temporal) — the last valid timestep.
 
-3. **Build the `(n_moves, 107)` flag lookup table.**
-   - For each move_id 0..n_moves-1, run `_project_move_flags(move)`
-     (features.py:1005-1263) and store the 107-dim "continuous" output.
-   - Save to disk as `data/lookup/move_flags_v1.pt` (or similar). Build script
-     in `model_transformer.py` or a separate `build_move_flag_lookup.py`.
-   - **Critical verification step:** sample 50 moves at random; for each, build
-     a fake battle with that move on the active Pokemon, run features.py's
-     active path (features.py:_encode_action_slots ~line 1346), and assert the
-     107-dim output matches the lookup table to within fp32 noise. If it
-     doesn't match, the lookup is wrong — the 107-dim flags may have
-     battle-state-dependent components we missed. (See REWRITE_DESIGN.md §6.1
-     "Option A vs Option B" — if Option A fails, fall back to B.)
+3. **Action head + value head (mostly preserved).**
+   - Action head per §5.1: actor_out (d_model) + temporal_ctx (d_temporal)
+     + per-action context (B, 9, d_model) → (B, 9) logits. Per-action
+     context: 4 active moves come straight from the spatial output (their
+     token positions are the our-active Pokemon's 4 move slots). 5 switch
+     slots: pool the 17 tokens of each non-active our Pokemon (start with
+     mean pool; revisit if BC underfits).
+   - Value head per §5.2: critic_out + temporal_ctx → (B, 51) twohot.
+   - Apply legal mask exactly like model.py:787-789.
 
-4. **Implement `Tokenizer` per REWRITE_DESIGN.md §3.1 + §6.1.**
-   - Consumes the memmap batch dict (the same shape `_encode_entities` consumes
-     today, model.py:668-720). Outputs `(B, 212, d_model)` + slot/type IDs.
-   - For each of the 17 token types per Pokemon, slice the appropriate fields
-     from the existing memmap tensors. Use the dim breakdowns in the
-     features.py audit (in REWRITE_DESIGN.md §3.1 / §6.1 table):
-       - species_token: embedding lookup of `our_pokemon_ids[..., 0]`
-       - item_token: embedding lookup of `our_pokemon_ids[..., 1]`
-       - ability_token: embedding lookup of `our_pokemon_ids[..., 2]`
-       - type_token: small MLP from 2× type embeds (recover via top-2 of
-         `our_pokemon_cont[..., 0:19]`)
-       - status_token: small MLP from sliced flags (status + volatiles +
-         paradox + tera; see features.py audit dim breakdown)
-       - hp_pct_token: NumericalBank(101) of `our_pokemon_banks[..., 0]`
-       - boosts_token: small MLP from `our_pokemon_cont[..., 26:117]` 7×13 one-hot
-       - 6× stat_token: NumericalBank(256) of `our_pokemon_banks[..., 4:10]`
-       - 4× move_token: MoveTokenizer with move_id from
-         `our_pokemon_ids[..., 3+i]`, bp/acc/pp/prio from lookup table indexed
-         by move_id, 107-dim flags from the lookup table.
-   - Plus 6 battle-state tokens: actor (learnable), critic (learnable), field
-     (MLP from 52-dim cont + 4 banks), transition (MLP from 51-dim cont + 2
-     action embeds), 2× summary scratch (learnable).
-   - Plus 2 active threat tokens (REWRITE_DESIGN.md §3.2 last paragraph; bumps
-     total to 212).
-   - Add type_id and pokemon_slot_id and move_slot_id positional embeddings
-     (§3.3). Sum into token embeddings before returning.
+4. **`TransformerBattlePolicy` wrapper.**
+   - Same forward(batch, history, history_lens) interface as
+     `PokeTransformer.forward` (model.py:739-803), so train_rl.py /
+     rl_collection.py / battle_agent_transformer.py can swap it in.
+   - Output dict keys: action_logits, value, v_logits, summary (for
+     temporal buffer), spatial_output. Match the legacy schema.
+   - Add forward_sequence(collated, device) for BC training (mirror
+     model.py:818-978). Big win: batch all valid (b, t) turns through
+     spatial+tokenizer in one go.
 
-5. **Write unit tests in `test_tokenizer.py`.**
-   - Load 5 sample turns from `data/datasets/human_v8_100k/` via
-     `MemmapDataset` (dataset.py:22-164).
-   - For each, assert:
-     - Output shape: `(B, 212, d_model)` exactly
-     - No NaN, no inf
-     - type_id embeddings: pull a few specific tokens (e.g., the species_token
-       for our Pokemon 3) and verify it has the type_id embedding for type 0
-       added (sanity check the sum)
-     - Move tokens for opp Pokemon use move_id=0 ("unknown") for unrevealed
-       moves (check via the memmap's `opp_pokemon_ids[..., 3:7]` having zeros)
-   - Run with: `cd pokemon-ai-starter/pokemon-ai/src && python -m pytest
-     test_tokenizer.py -v`. Or just plain python if pytest isn't set up.
+5. **Sanity tests.**
+   - Extend `test_tokenizer.py` (or add `test_policy.py`) with:
+     - End-to-end forward on 5 episodes — assert action_logits shape
+       (B, 9), value shape (B,), v_logits shape (B, 51), no NaN.
+     - legal_mask correctly forces -100.0 on masked actions.
+     - forward_sequence on 2 episodes produces (B, T, 9) etc., no NaN.
+     - Param count sanity: TransformerBattlePolicy total params should
+       be ~25M ± 5M per §4.5 estimate. If wildly off, investigate before
+       PPO smoke.
 
-6. **Forward-pass benchmark.**
-   - On RTX 3060 Laptop, time `Tokenizer + dummy_spatial(212, d_model=256)` on
-     a batch of 32 turns. Run 10 iterations after warmup, report median.
-   - Target: <50ms median. If >100ms, profile and optimize. Common culprits
-     are torch.cat in a loop (use torch.stack), or the (n_moves, 107) lookup
-     building inside forward (should be cached at module init).
+6. **PPO 1-iter smoke (§7 Week 2 last task).**
+   - This requires plumbing in `train_rl.py` / `rl_collection.py` /
+     `battle_agent.py` to be able to construct a TransformerBattlePolicy
+     instead of a PokeTransformer. The MINIMAL plumbing is a flag like
+     `--use-transformer` that swaps the model class at construction time
+     (everything downstream is interface-compatible).
+     The §6b guard rail says don't modify model.py / features.py /
+     battle_agent.py. So:
+       a. Add `--use-transformer` to train_rl.py CLI.
+       b. Add a model factory function in train_rl.py (or a small new
+          file `policy_factory.py`) that picks PokeTransformer or
+          TransformerBattlePolicy based on the flag.
+       c. For BC init: skip — Week 2 just needs random-init PPO smoke.
+          For init-from arg: support either checkpoint format; Week 2
+          uses random init.
+       d. Run: `python train_rl.py --use-transformer --device cuda
+          --servers 9000 --n-iters 1 --games-per-iter 4 --max-concurrent 2
+          --warmup-iters 0 --procedural-teams <path>`. Should complete
+          one collection + update without exceptions.
+   - ALTERNATIVE if (6) gets too tangled: stub the PPO smoke with a
+     simulated batch (no battle server) — call forward_sequence on a
+     real BC batch, compute fake advantages, run one PPO step. This
+     proves the model trains without exploding. Document as "synthetic
+     PPO smoke" if you go this route. The real PPO integration can move
+     to Week 3.
 
 ═══════════════════════════════════════════════════════════════════════════════
-WEEK 1 SUCCESS CRITERIA
+WEEK 2 SUCCESS CRITERIA
 ═══════════════════════════════════════════════════════════════════════════════
 
-- `model_transformer.py` exists, imports cleanly
-- `Tokenizer.forward(batch)` produces correct-shape output on real memmap data
-- `(n_moves, 107)` lookup table validated against features.py for 50 moves
-- 5/5 unit tests pass on sample memmap data
-- Forward benchmark <50ms median for B=32 turns
-
-If ANY of these fail, stop and debug before moving on. Don't push forward into
-Week 2 (spatial+temporal stack) with a broken tokenizer.
+- TransformerBattlePolicy.forward(batch) produces correct-shape outputs,
+  no NaN, on real memmap data.
+- forward_sequence on a multi-turn episode batch produces (B, T, 9)
+  logits, all finite, masked actions get -100.0.
+- Param count in the 20-30M range (sanity vs §4.5).
+- Either: real 1-iter PPO smoke completes (preferred), OR synthetic PPO
+  smoke proves model trains without exploding gradients.
+- Forward benchmark for full TransformerBattlePolicy < 80 ms median for
+  B=32 turns on RTX 3060 Laptop (Week 1 measured 28 ms for the
+  tokenizer+dummy spatial; full policy with temporal+heads should add
+  ~30-40 ms).
 
 ═══════════════════════════════════════════════════════════════════════════════
 GUARD RAILS — DO NOT VIOLATE
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. **DO NOT modify `model.py`, `features.py`, or `battle_agent.py`.** They are
-   the legacy MLP-arch path and must keep working for sp_0229/sp_0114/sp_2979
-   to load and play battles. (See REWRITE_DESIGN.md §6b.)
+1. **DO NOT modify `model.py`, `features.py`, or `battle_agent.py`**
+   beyond the absolute minimum needed for the `--use-transformer` flag
+   plumbing (which goes in `train_rl.py` / a new factory file, not in
+   the legacy files).
 
-2. **DO NOT modify the memmap.** The Tokenizer slices the existing 104 GB
-   `human_v8_100k` memmap at training time. Memmap regen would cost days; this
-   design avoids it explicitly. (See REWRITE_DESIGN.md §6.1.)
+2. **DO NOT modify the memmap.** Same as Week 1.
 
-3. **DO NOT touch `train_rl.py`, `rl_collection.py`, `external_opponent_manager.py`,
-   `rl_player.py`.** Those are training infrastructure and Layer 1-5 defenses.
-   They stay verbatim.
+3. **DO NOT touch `rl_collection.py`, `external_opponent_manager.py`,
+   `rl_player.py`** beyond what's necessary for model swap (likely
+   nothing, since they're model-agnostic).
 
-4. **DO NOT add scope.** Week 1 is just the Tokenizer. Don't write the spatial
-   transformer, don't start the BC training script, don't touch heads. Those
-   are Weeks 2-3.
+4. **DO NOT add scope.** Week 2 is just spatial + temporal + heads +
+   smoke. Don't start BC training (that's Week 3), don't write the new
+   battle_agent_transformer.py (that's Week 5/6 for H2H eval).
 
-5. **DO NOT skip the lookup-vs-features.py verification.** If the 107-dim flag
-   table is wrong, every move token in the model will be wrong, and BC will
-   silently train to garbage. The verification is the firewall.
+5. **DO NOT skip the synthetic PPO smoke if real PPO is blocked.** A
+   model that forward-passes cleanly but explodes on first backward is
+   a Week 3 disaster. Either path — real or synthetic — must verify
+   training stability.
 
 ═══════════════════════════════════════════════════════════════════════════════
-LIVE PPO RUN STATUS (DO NOT TOUCH)
+LIVE PPO RUN STATUS (DONE)
 ═══════════════════════════════════════════════════════════════════════════════
 
-The attempt-11 PPO run was scheduled to finish ~02:00 on 2026-05-02. Check the
-log to see if it's still running:
-
-  tail -n 5 /c/Users/raiad/OneDrive/Desktop/team_builder/logs/external/training_curated.log
-
-If still running, leave it alone. The final snapshot is the "best-of-MLP-arch"
-deliverable per NEXT_SESSION.md. If you accidentally kill it (e.g., by changing
-GPU-relevant code), you'll have to resume per NEXT_SESSION.md "Resume the run
-if you killed it" recipe.
-
-The Tokenizer development work happens entirely on CPU (or trivial GPU usage for
-unit tests). It shouldn't conflict.
+The 200-iter MLP-arch PPO run completed at 21:48 on 2026-05-01. Final at
+`data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/final.pt`. This
+is the "best-of-MLP-arch" deliverable. The new arch will eventually run
+direct H2H against snapshots from this run for the §6b.3.1 measurement
+(Week 5).
 
 ═══════════════════════════════════════════════════════════════════════════════
 WHEN YOU'RE DONE
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. Mark Week 1 tasks complete in REWRITE_DESIGN.md §7 (replace `[ ]` with `[x]`).
+1. Mark Week 2 tasks `[x]` in REWRITE_DESIGN.md §7.
 2. If you encountered any spec-vs-reality divergences during implementation,
-   add a postscript section to REWRITE_DESIGN.md describing what changed.
-3. Update NEXT_SESSION.md TL;DR to reflect Week 1 status (Session 46 done,
-   Session 47 task = Week 2: spatial + temporal stack + replace model
-   architecture).
-4. Write `next-prompt.txt` for Session 47, pointing at REWRITE_DESIGN.md §7
-   Week 2.
+   add another postscript section to REWRITE_DESIGN.md ("Postscript B —
+   Session 47 Week 2 implementation notes") describing what changed.
+3. Update NEXT_SESSION.md TL;DR to reflect Week 2 status (Session 47 done,
+   Session 48 task = Week 3: BC training).
+4. Write `next-prompt.txt` for Session 48, pointing at REWRITE_DESIGN.md
+   §7 Week 3.
 5. Commit: REWRITE_DESIGN.md updates + NEXT_SESSION.md updates + the new
-   `model_transformer.py` + `test_tokenizer.py` + `data/lookup/move_flags_v1.pt`
-   (or wherever the lookup table ended up).
+   spatial/temporal/policy code in `model_transformer.py` + new tests + any
+   factory/plumbing changes.
 
 ═══════════════════════════════════════════════════════════════════════════════
-CONTEXT FOR FUTURE SESSIONS (47+) THAT WILL CONTINUE THE IMPLEMENTATION
+CONTEXT FOR FUTURE SESSIONS (48+) THAT WILL CONTINUE THE IMPLEMENTATION
 ═══════════════════════════════════════════════════════════════════════════════
 
-The Week 1 milestone is the foundation; Weeks 2-6 build on top:
-- Week 2: spatial + temporal transformer + heads. Forward pass end-to-end.
-- Week 3: BC training to convergence on `human_v8_100k`. Smart_avg ≥45% target.
+- Week 3: BC training to convergence on `human_v8_100k`. Smart_avg ≥45%.
 - Week 4: PPO from BC. Smart_avg ≥70% target (≥3pt above sp_0229's 67.8%).
 - Week 5: long PPO + popart + direct H2H eval vs sp_0229.
 - Week 6: analysis + retrospective + decision on next direction.
 
-If Week 1 milestone fails (e.g., lookup table doesn't match features.py at the
-required precision), STOP and update REWRITE_DESIGN.md to plan Option B (memmap
-regen with explicit per-token features). Don't silently keep going with a broken
-foundation.
+If Week 2 milestone fails (e.g., model produces NaN or trains unstably),
+STOP and update REWRITE_DESIGN.md. Common Week-2 issues from §8 risk
+register: tokenizer slicing off-by-one (#3), unstable training (#2),
+forward speed off projection (#12).

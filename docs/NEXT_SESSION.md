@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-01 (Session 45 finalized — REWRITE_DESIGN.md produced. Session 46 task: implement Week 1 of the rewrite (Tokenizer module + integration tests). Current 200-iter PPO run continues to ~02:00 on 2026-05-02 as the final MLP-architecture deliverable.)**
+**Last updated: 2026-05-01 (Session 46 finalized — Week 1 of the rewrite landed: Tokenizer + MoveTokenizer + (n_moves, 107) lookup. 5/5 unit tests pass on `human_v8_100k`; benchmark 28 ms / B=32 turns on RTX 3060 Laptop, well under the 50 ms budget. The 200-iter MLP PPO run completed; final.pt at `data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/`. Session 47 task: Week 2 — spatial + temporal stack + heads + 1-iter PPO smoke. See `next-prompt.txt`.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -15,7 +15,57 @@ Supporting documents:
 
 ---
 
-## Session 45 final status — TL;DR for new readers
+## Session 46 final status — TL;DR for new readers
+
+**Session 46 implemented Week 1 of the rewrite** (REWRITE_DESIGN.md §7).
+New files in `pokemon-ai-starter/pokemon-ai/src/`:
+
+- `model_transformer.py` — `TransformerConfig`, `MoveTokenizer`,
+  `Tokenizer`, plus `build_move_flag_lookup` / `save_move_flag_lookup`.
+  1.42M params for the Tokenizer alone (move tokenizer 152K). Imports
+  `NumericalBank` from `model.py` (read-only — legacy MLP arch is
+  untouched per §6b guard rail).
+- `verify_move_lookup.py` — sample 50 moves from the lookup vs
+  `_project_move_flags`. 50/50 strict exact match; active-path call
+  diverges only at the documented STAB index (cont[12]).
+- `test_tokenizer.py` — 5 integration tests on real `human_v8_100k`
+  data: shape (B, 212, 256), no NaN/inf, 20 token types present,
+  multi-turn forward, opp unrevealed-moves OK, type_id and
+  pokemon_slot embeddings demonstrably contribute.
+- `bench_tokenizer.py` — RTX 3060 Laptop benchmark: tokenizer alone
+  3.42 ms median for B=32, tokenizer + dummy 6-layer spatial 28.36 ms
+  median. Per-turn ~0.89 ms.
+- `data/lookup/move_flags_v1.pt` — built from poke-env Move(name, gen=9)
+  for 952/952 named moves, ~840 KB.
+
+**Critical implementation choices (postscript A in REWRITE_DESIGN.md):**
+- All 4 move tokens (active + team) use the lookup, not active-only
+  banks. Model loses current_pp / disabled / STAB signal in the move
+  token; it can still recover STAB via attention to type_token. Watch
+  for BC underfitting on PP-aware play in Week 3.
+- Opp active-threat token is a learnable "unknown" parameter (memmap
+  doesn't store opp's active-move continuous). Our side uses the
+  trailing 2 dims of `active_move_cont`.
+- Type token: single MLP from 2 type embeds (resolves §10 open question).
+- Position IDs (type_id, pokemon_slot, move_slot) are precomputed in
+  buffers — Week 2 spatial code shouldn't recompute them.
+
+**The 200-iter MLP PPO run completed at 21:48 on 2026-05-01.** Final
+checkpoint `data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/final.pt`.
+This is the "best-of-MLP-arch" deliverable per the S44 plan; new arch
+will eventually run direct H2H against snapshots from this run for the
+§6b.3.1 measurement.
+
+**Session 47 task = Week 2 of the roadmap** (REWRITE_DESIGN.md §7
+Week 2): SpatialTransformer (6L, 8H, d_model=256, K=2 scratch tokens,
+Poke-Mask + side-mask) + TemporalTransformer (4L, 8H, d_model=256,
+causal) + action head + value head, all stitched together as
+`TransformerBattlePolicy`. Then 1-iter PPO smoke. ETA 3-5 days.
+See `next-prompt.txt` for sub-tasks.
+
+---
+
+## Session 45 final status — TL;DR for new readers (kept for context)
 
 **Session 45 produced `docs/REWRITE_DESIGN.md` (1027 lines)** — the design
 document for the pure-transformer-with-attribute-tokenization rewrite of
