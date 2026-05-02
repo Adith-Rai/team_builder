@@ -58,8 +58,28 @@ _log = logging.getLogger("pokemon_ai")
 # Saved into the .pt file; loader rejects mismatches loudly.
 #   v1 (Session 46 initial): flags + banks + valid + meta
 #   v2 (Session 46 signal-recovery): + (N_TYPES+1, N_TYPES+1) damage_chart for opp threat
-LOOKUP_SCHEMA_VERSION = 2
-MOVE_FLAG_DIM = 107          # dim of `_project_move_flags(move)["continuous"]`
+#   v3 (Session 46 extra flags, Postscript F): MOVE_FLAG_DIM bumped from 107
+#       to 119 by appending 12 structural flags poke-env exposes that
+#       _project_move_flags drops (slicing/bullet/bypasssub/pulse/charge/
+#       futuremove/ignore_defensive/use_target_offensive/thaws_target/
+#       reflectable/gravity/sleep_usable).
+LOOKUP_SCHEMA_VERSION = 3
+MOVE_FLAG_DIM_BASE = 107     # the slice from `_project_move_flags(move)["continuous"]`
+MOVE_FLAG_EXTRA = (
+    "slicing",                  # Sharpness ability boosts these
+    "bullet",                   # Bulletproof ability immunes these
+    "bypasssub",                # Sound + others bypass Substitute
+    "pulse",                    # Mega Launcher boosts these
+    "charge",                   # 2-turn moves (Solar Beam, Fly, Dive, ...)
+    "futuremove",               # Future Sight, Doom Desire — delayed damage
+    "ignore_defensive",         # uses target's offensive stat (Foul Play)
+    "use_target_offensive",     # alias path for Foul Play
+    "thaws_target",             # Flame Wheel-style anti-freeze
+    "reflectable",              # Magic Bounce target
+    "gravity",                  # gravity-suppressed (Bounce, Fly, ...)
+    "sleep_usable",             # Sleep Talk, Snore — usable while asleep
+)
+MOVE_FLAG_DIM = MOVE_FLAG_DIM_BASE + len(MOVE_FLAG_EXTRA)   # 119
 MOVE_BANK_FIELDS = ("bp_int", "acc_int", "pp_int", "priority_int")  # column order
 
 # In the 107-dim flag vector, the type one-hot lives at this slice (indices
@@ -348,6 +368,27 @@ def _features_project_move_flags(move):
     return _project_move_flags(move)
 
 
+def _extra_move_flags(move) -> list:
+    """Postscript F: structural flags `_project_move_flags` drops. Pure
+    extraction from poke-env Move attributes / m.flags set — no curation.
+    Order MUST match MOVE_FLAG_EXTRA tuple."""
+    flags = getattr(move, "flags", None) or set()
+    return [
+        1.0 if "slicing"               in flags else 0.0,
+        1.0 if "bullet"                in flags else 0.0,
+        1.0 if "bypasssub"             in flags else 0.0,
+        1.0 if "pulse"                 in flags else 0.0,
+        1.0 if "charge"                in flags else 0.0,
+        1.0 if "futuremove"            in flags else 0.0,
+        1.0 if bool(getattr(move, "ignore_defensive", False))     else 0.0,
+        1.0 if bool(getattr(move, "use_target_offensive", False)) else 0.0,
+        1.0 if bool(getattr(move, "thaws_target", False))         else 0.0,
+        1.0 if "reflectable"           in flags else 0.0,
+        1.0 if "gravity"               in flags else 0.0,
+        1.0 if bool(getattr(move, "sleep_usable", False))         else 0.0,
+    ]
+
+
 def build_damage_chart(gen: int = 9) -> torch.Tensor:
     """Build a (N_TYPES+1, N_TYPES+1) damage chart from poke-env's GenData.
 
@@ -423,11 +464,16 @@ def build_move_flag_lookup(
             continue
 
         cont = d.get("continuous", [])
-        if len(cont) != MOVE_FLAG_DIM:
+        if len(cont) != MOVE_FLAG_DIM_BASE:
             _log.warning("[lookup] move_id=%d name=%r: cont dim %d != %d",
-                         mid, name, len(cont), MOVE_FLAG_DIM)
+                         mid, name, len(cont), MOVE_FLAG_DIM_BASE)
             continue
-        flags[mid] = torch.tensor(cont, dtype=torch.float32)
+        # Concatenate base 107 dim from features.py with the 12 extra structural
+        # flags poke-env exposes directly (Postscript F).
+        flags[mid, :MOVE_FLAG_DIM_BASE] = torch.tensor(cont, dtype=torch.float32)
+        flags[mid, MOVE_FLAG_DIM_BASE:] = torch.tensor(
+            _extra_move_flags(move), dtype=torch.float32,
+        )
         for ci, field_name in enumerate(MOVE_BANK_FIELDS):
             banks[mid, ci] = int(d.get(field_name, 0))
         valid[mid] = True
@@ -735,10 +781,12 @@ class Tokenizer(nn.Module):
         # Our side: features.py appends 2 active-only dims per move
         # (type_eff_vs_opp, opp_threat_back) to MOVE_SLOT_CONT_DIM = 109.
         # We pull those 2 dims for each of fmt.n_moves moves -> 2*n_moves-dim input.
-        assert MOVE_SLOT_CONT_DIM == MOVE_FLAG_DIM + 2, (
+        assert MOVE_SLOT_CONT_DIM == MOVE_FLAG_DIM_BASE + 2, (
             f"MOVE_SLOT_CONT_DIM ({MOVE_SLOT_CONT_DIM}) should equal "
-            f"MOVE_FLAG_DIM ({MOVE_FLAG_DIM}) + 2 active-only dims; "
-            "features.py changed and the threat token wiring needs review."
+            f"MOVE_FLAG_DIM_BASE ({MOVE_FLAG_DIM_BASE}) + 2 active-only dims; "
+            "features.py changed and the threat token wiring needs review. "
+            f"(MOVE_FLAG_DIM={MOVE_FLAG_DIM} is the lookup width including "
+            "the Postscript F structural extras.)"
         )
         our_threat_in = fmt.n_moves * 2
         self.our_threat_mlp = _mlp_1_layer(our_threat_in, d)
@@ -967,13 +1015,15 @@ class Tokenizer(nn.Module):
             mb = mb.clone()
             mb[:, 0, :, :] = real
         if active_real_flags is not None:
-            # Replace slot-0 107-dim flags with the per-turn version. Static dims
-            # match the lookup; the 3 dynamic dims (cont[9] current_pp/64,
-            # cont[10] disabled, cont[12] stab) get their real values back.
-            assert active_real_flags.shape[-1] == MOVE_FLAG_DIM, \
-                f"active_real_flags last dim {active_real_flags.shape[-1]} != {MOVE_FLAG_DIM}"
+            # Replace slot-0 first-107-dim flags (the `_project_move_flags` slice)
+            # with the per-turn version. Static dims match the lookup; the 3
+            # dynamic dims (cont[9] current_pp/64, cont[10] disabled, cont[12]
+            # stab) get their real values back. The 12 extra structural flags
+            # at [MOVE_FLAG_DIM_BASE:] are move-static and stay from the lookup.
+            assert active_real_flags.shape[-1] == MOVE_FLAG_DIM_BASE, \
+                f"active_real_flags last dim {active_real_flags.shape[-1]} != {MOVE_FLAG_DIM_BASE}"
             flags = flags.clone()
-            flags[:, 0, :, :] = active_real_flags
+            flags[:, 0, :, :MOVE_FLAG_DIM_BASE] = active_real_flags
 
         bp_v, acc_v, pp_v, prio_v = mb[..., 0], mb[..., 1], mb[..., 2], mb[..., 3]
         move_toks = self.move_tokenizer(move_ids, bp_v, acc_v, pp_v, prio_v, flags)
@@ -1138,13 +1188,16 @@ class Tokenizer(nn.Module):
         opp_ids = self._fix_ids(batch, "opp")
 
         active_real_banks = batch.get("active_move_banks")    # may be None
-        # Postscript D: also override the 107-dim flags for our active 4 moves
-        # with per-turn ground truth (recovers current_pp/disabled/STAB that
-        # the lookup leaves stale). The trailing 2 dims of `active_move_cont`
-        # are the active-only threat scalars; the first 107 dims are exactly
-        # the same shape as the lookup but with battle-state-correct values.
+        # Postscript D: override slot-0's first 107 flag dims with per-turn
+        # ground truth from `active_move_cont[..., :MOVE_FLAG_DIM_BASE]`. The
+        # trailing 2 dims of `active_move_cont` are the active-only threat
+        # scalars (consumed elsewhere); the first 107 dims match the
+        # `_project_move_flags` shape with battle-state-correct values for
+        # current_pp / disabled / STAB. The 12 extra structural flags at
+        # MOVE_FLAG_DIM_BASE:MOVE_FLAG_DIM aren't in active_move_cont and stay
+        # from the lookup (they're move-static anyway).
         amc = batch.get("active_move_cont")
-        active_real_flags = amc[..., :MOVE_FLAG_DIM] if amc is not None else None
+        active_real_flags = amc[..., :MOVE_FLAG_DIM_BASE] if amc is not None else None
 
         our_block = self._encode_pokemon_block(
             our_ids, batch["our_pokemon_banks"], batch["our_pokemon_cont"],

@@ -23,8 +23,8 @@ from poke_env.battle import Move
 from features import _project_move_flags
 from vocab import Vocab
 from model_transformer import (
-    load_move_flag_lookup, MOVE_FLAG_DIM, MOVE_BANK_FIELDS,
-    LOOKUP_SCHEMA_VERSION,
+    load_move_flag_lookup, MOVE_FLAG_DIM, MOVE_FLAG_DIM_BASE, MOVE_BANK_FIELDS,
+    MOVE_FLAG_EXTRA, LOOKUP_SCHEMA_VERSION, _extra_move_flags,
 )
 
 
@@ -79,12 +79,18 @@ def main():
             failures.append((mid, name, f"Move() failed: {e}"))
             continue
 
-        # 1) Strict re-call without poke_types (matches lookup's build path).
+        # 1) Strict re-call: first 107 dims must match _project_move_flags;
+        # last 12 must match _extra_move_flags (Postscript F).
         d_re = _project_move_flags(move)
         re_cont = torch.tensor(d_re["continuous"], dtype=torch.float32)
-        diff = (re_cont - flags[mid]).abs().max().item()
-        if diff > 1e-6:
-            failures.append((mid, name, f"strict diff {diff:.2e} > 1e-6"))
+        diff_base = (re_cont - flags[mid, :MOVE_FLAG_DIM_BASE]).abs().max().item()
+        if diff_base > 1e-6:
+            failures.append((mid, name, f"strict diff (first 107) {diff_base:.2e} > 1e-6"))
+            continue
+        re_extra = torch.tensor(_extra_move_flags(move), dtype=torch.float32)
+        diff_extra = (re_extra - flags[mid, MOVE_FLAG_DIM_BASE:]).abs().max().item()
+        if diff_extra > 1e-6:
+            failures.append((mid, name, f"strict diff (extras 107:119) {diff_extra:.2e} > 1e-6"))
             continue
         # Bank ints in column order from MOVE_BANK_FIELDS.
         re_banks = [int(d_re.get(k, 0)) for k in MOVE_BANK_FIELDS]
@@ -95,15 +101,16 @@ def main():
         n_pass_strict += 1
 
         # 2) Active-path simulation: pass poke_types=(move.type,) so STAB=True.
-        # Then ONLY index 12 (stab) should differ from the lookup. We don't
-        # simulate disabled / current_pp here because they require a real
-        # battle context; they're documented as static-in-lookup.
+        # Then ONLY index 12 (stab) of the FIRST 107 dims should differ from
+        # the lookup. The 12 extras (107..118) are move-static and must be
+        # bit-exact regardless. We don't simulate disabled / current_pp here
+        # because they require a real battle context.
         try:
             move2 = Move(name, gen=gen)
             d_active = _project_move_flags(move2, poke_types=(move2.type,))
             active_cont = torch.tensor(d_active["continuous"], dtype=torch.float32)
-            assert active_cont.shape == (MOVE_FLAG_DIM,), active_cont.shape
-            diff_per_dim = (active_cont - flags[mid]).abs()
+            assert active_cont.shape == (MOVE_FLAG_DIM_BASE,), active_cont.shape
+            diff_per_dim = (active_cont - flags[mid, :MOVE_FLAG_DIM_BASE]).abs()
             differing = (diff_per_dim > 1e-6).nonzero(as_tuple=True)[0].tolist()
             allowed = {EXPECTED_DIVERGENCES["stab"]}
             unexpected = set(differing) - allowed

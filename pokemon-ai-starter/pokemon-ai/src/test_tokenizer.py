@@ -432,6 +432,50 @@ def test_physical_banks_reach_status_token():
     print("  OK")
 
 
+def test_extra_move_flags_in_lookup():
+    """Postscript F: verify the 12 structural flags poke-env exposes are in
+    the lookup at indices [MOVE_FLAG_DIM_BASE:MOVE_FLAG_DIM] for known moves
+    where the flag should be set.
+    """
+    print("\n== test 14: Postscript F structural flags in lookup ==")
+    from model_transformer import (
+        load_move_flag_lookup, MOVE_FLAG_DIM_BASE, MOVE_FLAG_EXTRA,
+    )
+    from vocab import Vocab
+    from pathlib import Path
+    blob = load_move_flag_lookup(Path(LOOKUP_PATH))
+    flags = blob["flags"]
+    v = Vocab.load()
+
+    # Sanity: each known move type that uses each flag should have it set in lookup.
+    expected = [
+        ("psychocut",   "slicing"),         # Sharpness slicing flag
+        ("eggbomb",     "bullet"),          # Bulletproof bullet flag
+        ("boomburst",   "bypasssub"),       # sound move bypasses Sub
+        ("aurasphere",  "pulse"),           # Mega Launcher pulse flag
+        ("solarbeam",   "charge"),          # 2-turn move
+        ("futuresight", "futuremove"),      # delayed damage
+        ("foulplay",    "use_target_offensive"),  # uses target's atk
+        ("scald",       "thaws_target"),    # thaws frozen target (note: Flame Wheel uses thawsUser, not thawsTarget — different mechanism)
+        ("toxic",       "reflectable"),     # Magic Bounce target
+        ("bounce",      "gravity"),         # gravity-suppressed
+        ("sleeptalk",   "sleep_usable"),    # sleep talk obviously
+    ]
+    flag_idx = {name: MOVE_FLAG_DIM_BASE + i for i, name in enumerate(MOVE_FLAG_EXTRA)}
+    n_checked = 0
+    for move_name, flag_name in expected:
+        mid = v.move(move_name)
+        if mid == 0:
+            print(f"  {move_name:14s}: not in vocab (skipped)")
+            continue
+        idx = flag_idx[flag_name]
+        val = float(flags[mid, idx].item())
+        print(f"  {move_name:14s} flag '{flag_name}' (lookup dim {idx}) = {val:.1f}")
+        assert val == 1.0, f"expected {move_name} to have flag {flag_name} set"
+        n_checked += 1
+    print(f"  OK ({n_checked}/{len(expected)} known move-flag pairs verified)")
+
+
 def test_field_split_isolation():
     """Postscript E: each thematic field slice should affect only its own
     field token, not the others. Validates the split's attention-isolation
@@ -548,6 +592,7 @@ if __name__ == "__main__":
     test_active_real_banks_override()
     test_restored_signals_reach_status_token()
     test_physical_banks_reach_status_token()
+    test_extra_move_flags_in_lookup()
     test_field_split_isolation()
     test_doubles_rejected()
-    print("\n=== all 15 tests passed ===")
+    print("\n=== all 16 tests passed ===")
