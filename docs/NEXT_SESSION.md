@@ -1,6 +1,6 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-01 (Session 46 finalized — Week 1 of the rewrite landed: Tokenizer + MoveTokenizer + (n_moves, 107) lookup. 5/5 unit tests pass on `human_v8_100k`; benchmark 28 ms / B=32 turns on RTX 3060 Laptop, well under the 50 ms budget. The 200-iter MLP PPO run completed; final.pt at `data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/`. Session 47 task: Week 2 — spatial + temporal stack + heads + 1-iter PPO smoke. See `next-prompt.txt`.)**
+**Last updated: 2026-05-02 (Session 46 fully finalized after 4 audit passes — Tokenizer + 3 sub-tokenizers (Move/Item/Ability), 220 tokens / turn, lookup schema v4 with damage chart + structural item/ability features. 17/17 tests pass on real `human_v8_100k`; benchmark 30 ms / B=32 turns. Postscripts A-G in REWRITE_DESIGN.md document every deviation from §3.1 with empirical references. Session 47 task: Week 2 — spatial + temporal stack + heads + 1-iter PPO smoke. See `next-prompt.txt` — it tells the next session to read docs + code with reasoning before proceeding, and to make every decision with elite-play as the focus.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
 read this top-to-bottom and you should have full context to execute every pending task.
@@ -16,6 +16,74 @@ Supporting documents:
 ---
 
 ## Session 46 final status — TL;DR for new readers
+
+**Session 46 went through 4 audit passes after the initial Week 1
+implementation.** Each pass uncovered real signal/architecture gaps and
+fixed them while still inside the refactor window. Net result: a
+significantly richer Tokenizer than the original §3.1 design.
+
+**Reading order for Session 47+ (don't skim):**
+1. The Postscripts (A-G) in `docs/REWRITE_DESIGN.md` — these document
+   what's actually in the code, not what §3.1 says.
+2. The actual `model_transformer.py` source — read top-to-bottom.
+3. `test_tokenizer.py` — 17 tests that pin down the contract.
+
+**The four audit passes (commits in order):**
+- `be36415` — Week 1 baseline: Tokenizer + MoveTokenizer + 107-dim lookup.
+- `77e20f7` — Cleanup: type-sort bug fix, weight init, FormatConfig
+  threading, lookup schema versioning. Postscript B.
+- `b4b8004` — Signal recovery: restored active/fainted/combat/toxic/
+  future_sight/visibility/level/weight/height to status_token; opp threat
+  computed from damage chart instead of zero parameter. Postscript C.
+- `3114d10` — Active-move flag override: real PP/disabled/STAB recovered
+  for our 4 active moves (closing the regression vs legacy). Postscript D.
+- `dec76c0` — Field-token split into 9 thematic tokens (weather/terrain/
+  our_haz/opp_haz/our_screens/opp_screens/speed_field/mechanics/progression).
+  Postscript E.
+- `f55576d` — Move-flag enrichment 107 → 119 dim with 12 structural flags
+  (slicing/bullet/bypasssub/pulse/charge/futuremove/ignore_defensive/
+  use_target_offensive/thaws_target/reflectable/gravity/sleep_usable).
+  Postscript F.
+- `3334e97` — ItemTokenizer + AbilityTokenizer with structural feature
+  dicts parsed from Showdown items.ts / abilities.ts. Postscript G.
+
+**The architecture as it stands (Session 47 starting state):**
+- 220 tokens per turn:
+  - 14 battle-state tokens (actor/critic + transition + 2 active threats
+    + 9 thematic field tokens)
+  - 12 Pokemon × 17 attribute tokens = 204
+  - 2 summary scratch
+- d_model = 256, ~1.47M params for the Tokenizer alone
+- Lookup schema v4: 119-dim move flags, 4-col banks, (20,20) damage chart,
+  (n_items, 8) structural feats, (n_abilities, 7) structural feats
+- Bench: 30 ms median for B=32 turns. Tokenizer alone: ~5 ms.
+- 17/17 tests pass. Verifier 50/50 strict + 50/50 STAB-only divergence.
+
+**The user's philosophy (carried forward):** derive features from true
+state — Showdown data + poke-env structural attributes + the recorded
+memmap. NO hand-curation. If items/abilities aren't sufficiently learned
+from id_embed + structural feats + 5M training samples, the principled
+escalation is text-encoder over Showdown shortDesc (Metamon style), not
+hand-curated effect dicts.
+
+**Switch defensive_eff/offensive_eff (the #1 ranked feature by Session
+30 weight analysis) is currently DEFERRED to the Week 2 action head**,
+where the legacy ActionSlotEncoder also placed it. If you're starting
+Week 2: this signal lives in `switch_cont[..., -2:]` (last 2 dims of
+the 30-dim switch_cont per bench Pokemon). Feed it directly into the
+per-action context for switch slots 4-8. Postscript C3 explains why
+this is better than per-Pokemon spatial-token attachment.
+
+**Session 47 task = Week 2 of the roadmap**: Spatial transformer (6L,
+8H, K=2, Poke-Mask + side-mask) + Temporal transformer (4L, 8H,
+d_temporal=256, causal) + Action head + Value head + 1-iter PPO smoke.
+ETA 3-5 days. See `next-prompt.txt` for orienting context — it tells
+the new session to read docs + code with reasoning, and to evaluate
+every decision against the elite-play goal.
+
+---
+
+## Session 46 mid-state status — TL;DR (kept for context)
 
 **Session 46 implemented Week 1 of the rewrite** (REWRITE_DESIGN.md §7).
 New files in `pokemon-ai-starter/pokemon-ai/src/`:
