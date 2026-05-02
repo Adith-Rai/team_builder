@@ -58,6 +58,31 @@ class Vocab:
     def ability(self, name: Optional[str]) -> int:
         return self._ability.get(_to_id_str(name), 0)
 
+    # ---- reverse lookups (id -> name) ----
+
+    _KIND_ATTRS = {
+        "species": "_species",
+        "move": "_move",
+        "item": "_item",
+        "ability": "_ability",
+    }
+
+    def id_to_name_map(self, kind: str) -> Dict[int, str]:
+        """Reverse map {int_id -> name_str} for the named vocabulary.
+
+        kind in {"species", "move", "item", "ability"}. Pad index 0 is omitted
+        (it's reserved for unknown/empty and has no canonical name).
+        """
+        attr = self._KIND_ATTRS.get(kind)
+        if attr is None:
+            raise KeyError(f"unknown vocab kind {kind!r}; expected one of {sorted(self._KIND_ATTRS)}")
+        forward: Dict[str, int] = getattr(self, attr)
+        return {idx: name for name, idx in forward.items()}
+
+    def id_to_name(self, kind: str, idx: int) -> Optional[str]:
+        """One-shot reverse lookup; None if the id is unknown / pad."""
+        return self.id_to_name_map(kind).get(int(idx))
+
     # ---- sizes (including pad=0) ----
 
     @property

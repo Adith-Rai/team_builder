@@ -1044,7 +1044,15 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
 - **2026-05-01 (Session 45):** initial design. Covers V1 of the rewrite,
   spans Sessions 46-51 of implementation effort.
 - **2026-05-01 (Session 46):** Week 1 complete. See §7 Week 1 results
-  block for measurements. Postscript notes below.
+  block for measurements. Postscript A below.
+- **2026-05-01 (Session 46, late):** Self-audit pass — Postscript B
+  below covers tier-A bugs fixed (type ordering, weight init), tier-B
+  format-extensibility hooks (FormatConfig threading, vocab-driven defaults,
+  lookup schema versioning), tier-C hardcoding cleanup, tier-D robustness
+  lessons brought in from the legacy painful-fixes record (atomic write,
+  gradient_checkpoint plumbed, logging instead of print, lookup version
+  check), and tier-G recovery of the active-move real-banks signal that
+  the V1 design had collapsed into the lookup.
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
@@ -1101,6 +1109,165 @@ require a redesign; they're carried forward into Week 2 work.
    not in the lookup.
 
 6. **Imported `NumericalBank` from `model.py` rather than duplicating.**
-   The §6b guard rail says don't *modify* `model.py`; importing a small
-   utility is fine (no shared state, no upgrade risk). If Week 2 / 5
-   ever needs to delete `model.py`, this is the only outbound dep.
+   ~~The §6b guard rail says don't *modify* `model.py`; importing a small
+   utility is fine~~. **Reverted in Postscript B**: now duplicated inline
+   in `model_transformer.py` so we have zero outbound deps on the legacy
+   module.
+
+---
+
+## Postscript B — Session 46 self-audit cleanup
+
+Triggered by an explicit "what shortcuts / hardcoding / quirks?" review.
+Items below are improvements *to Week 1 code as committed in be36415*; the
+spec contract is unchanged (still ~212 tokens, still d_model=256, still
+the lookup table approach).
+
+### B1. Bug fixes (correctness)
+
+**Type-token ordering canonicalized.** `_encode_pokemon_block` previously
+did `topk(2)` on the type multi-hot to recover the two types. For 2-type
+Pokemon, `topk` tie-breaking was implementation-dependent — Water/Ice
+could come back as `(2, 5)` or `(5, 2)`, and the type MLP saw two
+different inputs for the same Pokemon. Now: `topi.sort(dim=-1)` after
+the absent-type fill, deterministic by index. Test 6 in
+`test_tokenizer.py` asserts identical type tokens across slots with
+identical types.
+
+**Weight init matches legacy.** `init_module_(self, std=cfg.init_std=0.02)`
+applied to MoveTokenizer + Tokenizer at construction; mirrors
+`PokeTransformer._init_weights` (model.py:655-666). Sanity check (test 7):
+9 Linear + 19 Embedding weights all have std within `[0.4×, 1.6×]× 0.02`.
+Pre-fix max-|delta| from zeroing type_id was 3.85; post-fix is 0.085 —
+activation magnitudes are now well-controlled at init.
+
+### B2. Format extensibility (multi-format goal)
+
+Even though V1 is gen-9 singles only, the project goal is "all formats,
+all gens 4+" (NEXT_SESSION.md). Cheap hooks added now to avoid retrofit
+later:
+
+- `TransformerConfig.format_config: FormatConfig` field with default
+  `FORMAT_SINGLES`. All shape decisions (Pokemon count, Pokemon-slot
+  vocab, type count, move count per Pokemon, threat-MLP fan-in) derive
+  from `cfg.format_config`. `total_tokens(fmt)` and
+  `n_pokemon_slot_vocab(fmt)` are pure functions of the format.
+- **`Tokenizer.__init__` raises `NotImplementedError` for `n_active != 1`.**
+  We're not pretending doubles works; we're failing loudly with a pointer
+  to §1 N6. Test 10 asserts this.
+- `TransformerConfig.with_vocab_sizes_from_disk()` constructor pulls
+  `n_species/n_moves/n_items/n_abilities` from `Vocab.load()` so a vocab
+  regen flows through automatically. Old defaults are still on the field
+  (so checkpoint loading via `from_dict` continues to work).
+- `Vocab.id_to_name(kind, id)` and `id_to_name_map(kind)` added as public
+  helpers — no more `v._move` private-attribute access in lookup builder.
+
+### B3. Hardcoding cleanup
+
+- Slice offsets `_SL_*` are now derived from `N_TYPES`, `N_STATUS`,
+  `N_VOLATILE`, `N_PARADOX`, and the explicit boosts/tera widths.
+  Asserts at module load that the layout sums to `POKEMON_CONT_DIM`
+  exactly — a features.py change that bumps any slice will fail at
+  import, not silently shift offsets.
+- `boosts_mlp` in_dim derived from `_SL_BOOSTS[1] - _SL_BOOSTS[0]`,
+  `status_mlp` in_dim from the status/volatile/paradox/tera slice
+  widths. The brittle `assert in_dim == 187 / 72` literals are gone.
+- `threat_mlp` in_dim is `fmt.n_moves * 2`. The assertion that
+  `MOVE_SLOT_CONT_DIM == MOVE_FLAG_DIM + 2` documents the contract
+  with features.py.
+- Battle-state Pokemon-slot IDs (`PS_SLOT_DECISION`, `PS_SLOT_FIELD`,
+  `PS_SLOT_TRANSITION`, `PS_SLOT_SUMMARY`) are named, indexed off the
+  per-format `2 * team_size` base.
+- `Tokenizer.count_parameters()` added (matches legacy convenience).
+- `_mlp_2_layer` / `_mlp_1_layer` factor the MLP-with-norm pattern that
+  was repeated 5+ times.
+
+### B4. Robustness lessons from legacy painful-fixes
+
+The legacy MLP arch accumulated stability fixes over many iterations
+(atomic-checkpoint write Session 35, AMP attention Session 35, etc.).
+Most live in the *training pipeline* and are preserved by §N4. The ones
+that apply to the Tokenizer:
+
+- **Atomic lookup save:** `save_move_flag_lookup` now writes to `.tmp`
+  then `.replace()`. Mirrors the Session 35 atomic-checkpoint fix.
+- **`gradient_checkpoint: bool = False`** field plumbed in
+  `TransformerConfig` so Week 2 spatial/temporal stack can opt in
+  without a config schema change.
+- **`logging.getLogger("pokemon_ai")`** replaces `print` in the lookup
+  builder, matching the convention used by `dataset.py`,
+  `train_rl.py`, etc. Verbose CLI usage gets a default StreamHandler;
+  library callers control verbosity through normal logging config.
+- **Lookup schema versioning:** the `.pt` file now embeds a `meta` dict
+  with `schema_version`, `gen`, `vocab_n_moves`, `move_flag_dim`,
+  `bank_fields`. `load_move_flag_lookup` rejects mismatches loudly
+  (raises with rebuild instructions). `expected_n_moves` parameter
+  catches vocab/lookup desync — if `Vocab.load().n_moves` != lookup's
+  `n_moves`, training won't silently mis-tokenize moves with new IDs.
+
+### B5. Brittleness fixes
+
+- `_features_project_move_flags` shim isolates the one private import
+  from features.py to a single line. If features.py renames the
+  function, only this shim breaks (loud import failure at lookup-build
+  time, not a silent training-time desync).
+- `NumericalBank` inlined into `model_transformer.py`. Zero outbound
+  deps on legacy `model.py`. Reverses Postscript A item 6.
+
+### B6. Tier G — active-move real banks (recovers signal that V1 design lost)
+
+**Spec deviation, not bug fix.** REWRITE_DESIGN.md §3.2 said
+"`MoveTokenizer` is called for *all* 4 moves on *all* 12 Pokemon ...
+with the same real bank values fed in everywhere." Strict reading:
+active moves use the lookup, like team moves. That collapses
+`current_pp`, `disabled`, and STAB into the lookup's no-battle-state
+defaults — losing real signal the legacy MLP arch captured via
+`active_move_banks` (model.py:780).
+
+**B6 walks that back, partially.** The Tokenizer's `forward` now
+optionally consumes `batch["active_move_banks"]` (already provided by
+`dataset.unpack_turn_batch` line 336). When present, slot-0's 4 move
+banks on our side are overridden with those real per-turn values
+(current_pp / acc / etc.). The 107-dim flag vector still uses the
+lookup uniformly — battle-state-dependent flag dims (#9 current_pp,
+#10 disabled, #12 stab) remain frozen. So:
+
+- Active moves on our side: REAL banks, lookup flags
+- Team moves on our side: lookup banks, lookup flags
+- All opp moves: lookup banks, lookup flags
+
+Test 9 in `test_tokenizer.py` asserts the override changes only the 4
+active-move tokens (slot 0 of our side) and leaves the other 208
+tokens bit-identical.
+
+This is asymmetric (only OUR active gets real banks) but correct: the
+memmap reflects what we know. The model's value head can now reason
+about "I'm at low PP on my best move; I should pivot before running
+dry" — the legacy MLP arch had that signal; the strict V1 design
+silently dropped it. We don't pay any compute cost; the lookup path
+stays as the default, and the override is a single tensor index op.
+
+### B7. What's still deferred (no change)
+
+- Doubles / triples token layout — needs design (§1 N6)
+- Multi-gen lookup structure — single-gen is V1
+- `current_pp` / `disabled` / `stab` in the *flag* vector for active
+  moves — deferred; 107-dim still lookup-only. If Week 3 BC underfits
+  on PP-aware play, revisit by overriding flags[active] from
+  `active_move_cont[..., :MOVE_FLAG_DIM]`.
+- Sub-token move decomposition (§3.5 of design) — defer
+- Test-time adaptation (§N2) — defer
+
+### B8. Verification status post-cleanup
+
+- Lookup rebuild: 952/952 valid moves in 953-vocab. Atomic write OK.
+- Verifier: 50/50 strict match + 50/50 active-path with only-STAB-
+  divergence — same as before B1-B7.
+- 10/10 test_tokenizer.py tests pass on real `human_v8_100k` data.
+  New tests (6, 7, 8, 9, 10) cover the B1, B1-init, B6, and B2
+  rejection paths.
+- Benchmark RTX 3060 Laptop, B=32 turns: tokenizer 3.61 ms,
+  tokenizer+dummy spatial 27.60 ms (was 28.36 ms pre-cleanup, within
+  noise — no perf regression from added abstractions).
+- Param count unchanged at 1,420,680 — refactor introduced no new
+  parameters.

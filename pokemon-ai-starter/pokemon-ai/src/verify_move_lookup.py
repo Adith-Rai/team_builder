@@ -4,16 +4,12 @@
 #  the active Pokemon, run features.py's active path, and assert the 107-dim
 #  output matches the lookup table to within fp32 noise."
 #
-# Approach: re-instantiate poke_env.battle.Move(name, gen=9) for 50 random move
-# IDs and re-run features.py:_project_move_flags(move). The lookup must match
-# bit-for-bit on the 105 battle-state-INDEPENDENT dims, and may diverge ONLY on
-# documented battle-state-dependent dims (STAB, current_pp, disabled). We
-# enumerate those and confirm the divergence is only on those expected positions.
-#
-# We also do an "active-path" call that mimics features.py:_encode_action_slots
-# by passing poke_types=(move.type,) so STAB=True. The lookup builds with
-# poke_types=None (STAB=False), so we expect a difference at exactly the STAB
-# index — no other index should differ.
+# Approach: re-instantiate poke_env.battle.Move(name, gen=lookup_meta["gen"])
+# for 50 random move IDs and re-run features.py:_project_move_flags(move). The
+# lookup must match bit-for-bit on the battle-state-INDEPENDENT dims, and may
+# diverge ONLY on documented battle-state-dependent dims (STAB, current_pp,
+# disabled). We enumerate those and confirm the divergence is only on those
+# expected positions.
 #
 # Run: cd pokemon-ai-starter/pokemon-ai/src && python verify_move_lookup.py
 
@@ -26,7 +22,10 @@ from poke_env.battle import Move
 
 from features import _project_move_flags
 from vocab import Vocab
-from model_transformer import load_move_flag_lookup
+from model_transformer import (
+    load_move_flag_lookup, MOVE_FLAG_DIM, MOVE_BANK_FIELDS,
+    LOOKUP_SCHEMA_VERSION,
+)
 
 
 # Indices in the 107-dim continuous vector that depend on battle state.
@@ -44,17 +43,24 @@ EXPECTED_DIVERGENCES = {
 
 def main():
     print("Loading lookup table...")
-    lookup = load_move_flag_lookup(Path("data/lookup/move_flags_v1.pt"))
-    flags = lookup["flags"]      # (n_moves, 107)
-    banks = lookup["banks"]      # (n_moves, 4)
-    valid = lookup["valid"]      # (n_moves,)
-    n_moves = flags.shape[0]
-    print(f"  shape: {flags.shape}, banks: {banks.shape}, valid moves: {int(valid.sum().item())}")
+    blob = load_move_flag_lookup(Path("data/lookup/move_flags_v1.pt"))
+    flags = blob["flags"]
+    banks = blob["banks"]
+    valid = blob["valid"]
+    meta = blob.get("meta", {})
+    print(f"  schema_version={meta.get('schema_version')}  gen={meta.get('gen')}  "
+          f"vocab_n_moves={meta.get('vocab_n_moves')}  flag_dim={meta.get('move_flag_dim')}")
+    assert meta.get("schema_version") == LOOKUP_SCHEMA_VERSION
+    assert meta.get("move_flag_dim") == MOVE_FLAG_DIM
+    assert list(meta.get("bank_fields", [])) == list(MOVE_BANK_FIELDS)
+    print(f"  shape: {tuple(flags.shape)}  banks: {tuple(banks.shape)}  "
+          f"valid moves: {int(valid.sum().item())}")
 
     print("Loading vocab...")
     v = Vocab.load()
-    id_to_name = {idx: name for name, idx in v._move.items()}
+    id_to_name = v.id_to_name_map("move")
 
+    n_moves = flags.shape[0]
     valid_ids = [i for i in range(n_moves) if bool(valid[i].item()) and i in id_to_name]
     rng = random.Random(0)
     sample = rng.sample(valid_ids, k=min(50, len(valid_ids)))
@@ -64,10 +70,11 @@ def main():
     n_pass_with_known_divergence = 0
     failures = []
 
+    gen = int(meta.get("gen", 9))
     for mid in sample:
         name = id_to_name[mid]
         try:
-            move = Move(name, gen=9)
+            move = Move(name, gen=gen)
         except Exception as e:
             failures.append((mid, name, f"Move() failed: {e}"))
             continue
@@ -79,27 +86,23 @@ def main():
         if diff > 1e-6:
             failures.append((mid, name, f"strict diff {diff:.2e} > 1e-6"))
             continue
-        # Also assert bank ints match
-        if not (banks[mid, 0] == d_re["bp_int"]
-                and banks[mid, 1] == d_re["acc_int"]
-                and banks[mid, 2] == d_re["pp_int"]
-                and banks[mid, 3] == d_re["priority_int"]):
+        # Bank ints in column order from MOVE_BANK_FIELDS.
+        re_banks = [int(d_re.get(k, 0)) for k in MOVE_BANK_FIELDS]
+        if banks[mid].tolist() != re_banks:
             failures.append((mid, name,
-                f"bank mismatch lookup={banks[mid].tolist()} re={[d_re[k] for k in ['bp_int','acc_int','pp_int','priority_int']]}"))
+                f"bank mismatch lookup={banks[mid].tolist()} re={re_banks}"))
             continue
         n_pass_strict += 1
 
         # 2) Active-path simulation: pass poke_types=(move.type,) so STAB=True.
-        # Then ONLY index 12 (stab) should differ from the lookup. (Plus the 2
-        # active-only dims at indices [107, 108] which the active path appends
-        # in _encode_action_slots — those aren't part of the 107-dim lookup.)
-        # We don't simulate disabled / current_pp here because they require a
-        # real battle context; they're documented as static-in-lookup.
+        # Then ONLY index 12 (stab) should differ from the lookup. We don't
+        # simulate disabled / current_pp here because they require a real
+        # battle context; they're documented as static-in-lookup.
         try:
-            move2 = Move(name, gen=9)  # fresh instance (pp counters etc.)
+            move2 = Move(name, gen=gen)
             d_active = _project_move_flags(move2, poke_types=(move2.type,))
             active_cont = torch.tensor(d_active["continuous"], dtype=torch.float32)
-            assert active_cont.shape == (107,), active_cont.shape
+            assert active_cont.shape == (MOVE_FLAG_DIM,), active_cont.shape
             diff_per_dim = (active_cont - flags[mid]).abs()
             differing = (diff_per_dim > 1e-6).nonzero(as_tuple=True)[0].tolist()
             allowed = {EXPECTED_DIVERGENCES["stab"]}
@@ -109,9 +112,6 @@ def main():
                     f"active-path divergence at unexpected indices {sorted(unexpected)} "
                     f"(differing dims = {differing})"))
                 continue
-            # If STAB index was indeed flipped (since move.type is in poke_types),
-            # it's expected; if NOT flipped (no STAB-able move type), the lookup
-            # already had STAB=0 and active-path also yields 0 — also fine.
             n_pass_with_known_divergence += 1
         except Exception as e:
             failures.append((mid, name, f"active-path call failed: {e}"))
