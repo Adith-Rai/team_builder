@@ -186,7 +186,11 @@ def main():
     p.add_argument("--servers", default="9000",
                    help="Comma-separated battle_server ports (we use 1 per matchup, sequential).")
     p.add_argument("--n-games", type=int, default=200)
-    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--concurrency", type=int, default=100,
+                   help="poke-env max_concurrent_battles (both sides). vs-smart-bot "
+                        "eval is CPU-bound on the bot side; GPU sees serialized forwards. "
+                        "100 is healthy at 20M params. Bump to 200 if no slack measured. "
+                        "Drop to 70 on smaller VRAM if forward queue saturates.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out-json", default="data/eval/metamon_competitive_eval.json")
     p.add_argument("--team-dir", default=str(METAMON_COMPETITIVE_DIR),

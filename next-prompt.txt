@@ -181,11 +181,21 @@ separate terminal:
   cd pokemon-ai-starter/pokemon-ai/src
   python -u eval_metamon_competitive.py \
     --checkpoints v10_e1=data/models/bc/v10_full/epoch_001.pt \
-    --servers 9000 --n-games 200 --concurrency 8 --device cuda \
+    --servers 9000 --n-games 200 --concurrency 100 --device cuda \
     --out-json data/eval/registry/v10_bc_epoch001.json
 
-Expected wall-clock: ~16-20 min per checkpoint (4 matchups × ~4-5 min
-each at concurrency 8). Append the smart_avg result to
+**Concurrency note:** the script's argparse default is 8, but vs-smart-bot
+eval can run far higher because the bots are CPU-bound and a single
+BattleAgent serves all websockets through one GPU stream (forwards queue,
+no parallel CUDA contention). Project history (NEXT_SESSION.md L2346,
+ladder runs) used `--concurrency 70-200`. **Default to 100 for transformer
+ckpts** — bigger model means each forward is ~36 ms (B=32 equiv), and at
+200-way poke-env concurrency the 20M model can starve. 100 is a safe
+ceiling. Bump to 200 if you measure slack at 100. Don't run eval while
+the BC training process holds 5.96 GB of GPU.
+
+Expected wall-clock: ~3-5 min per checkpoint at concurrency 100 (4 matchups
+in series × ~50-75 s each). Append the smart_avg result to
 `data/eval/registry/evals.jsonl` once you have it.
 
 If a real BC checkpoint fails to load: `is_transformer_checkpoint(ckpt)`
