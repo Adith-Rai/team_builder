@@ -41,6 +41,7 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 
 from policy_smartbots import SmartDamagePlayer, TacticalPlayer, StrategicPlayer
 from battle_agent import BattleAgent
+from battle_agent_transformer import BattleAgentTransformer, is_transformer_checkpoint
 
 
 METAMON_COMPETITIVE_DIR = Path(
@@ -107,7 +108,9 @@ async def eval_ckpt_vs_bot(ckpt_label, ckpt_path, cached, device,
                             opp_cls, opp_name, n_games, concurrency, server, tb):
     """Play n_games for one checkpoint vs one heuristic bot, sampling teams
     from `tb` on each side. Returns (wins, losses, ties, wr_pct)."""
-    p1 = BattleAgent(
+    # Arch dispatch: pick the right BattleAgent class for this ckpt.
+    AgentClass = BattleAgentTransformer if is_transformer_checkpoint(cached) else BattleAgent
+    p1 = AgentClass(
         ckpt_path, device=device, _cached_ckpt=cached,
         account_configuration=AccountConfiguration.generate(f"E{ckpt_label[:6]}", rand=True),
         battle_format="gen9ou",
