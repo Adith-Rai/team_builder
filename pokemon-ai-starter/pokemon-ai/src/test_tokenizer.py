@@ -260,6 +260,62 @@ def test_opp_threat_uses_chart():
     print("  OK")
 
 
+def test_active_flag_override_recovers_dynamic_dims():
+    """Postscript D: active 4 moves' 107-dim flags should reflect REAL per-turn
+    PP / disabled / STAB, not the lookup's static defaults."""
+    print("\n== test 9b: active-move flag override recovers PP/disabled/STAB ==")
+    tok = _make_tokenizer(seed=0).eval()
+    collated = _load_sample_batch(2)
+    batch = unpack_turn_batch(collated, t=0, device=torch.device("cpu"))
+
+    # The dynamic indices in the 107-dim flag (per features.py:_project_move_flags)
+    DYN = {"current_pp": 9, "disabled": 10, "stab": 12}
+
+    # Read the memmap's active_move_cont (ground truth at t=0 for our 4 active moves).
+    amc = batch["active_move_cont"]                        # (B, 4, 109)
+    real_flags = amc[..., :128 - 21]                       # take 107 dims via shape; safer: amc[..., :MOVE_FLAG_DIM]
+    from model_transformer import MOVE_FLAG_DIM
+    real_flags = amc[..., :MOVE_FLAG_DIM]                  # (B, 4, 107)
+
+    # Look up the flags the model would use WITHOUT override (i.e. lookup-only).
+    move_ids = batch["our_pokemon_move_ids"][:, 0, :]      # (B, 4) — our active's 4 move ids
+    lookup_flags = tok.move_flags_lookup[move_ids]         # (B, 4, 107)
+
+    # For at least one of the 3 dynamic dims, real and lookup should differ on
+    # at least one move (otherwise the test wouldn't actually exercise the fix).
+    any_diff = False
+    for name, idx in DYN.items():
+        d = (real_flags[..., idx] - lookup_flags[..., idx]).abs().sum().item()
+        print(f"  dim {idx} ({name}): cumulative diff between real and lookup = {d:.4f}")
+        if d > 1e-4:
+            any_diff = True
+    assert any_diff, ("memmap and lookup happen to agree on all 3 dynamic dims for "
+                      "the sampled episodes — pick different episodes or enrich the test fixture")
+
+    # Now verify the model uses real_flags, not lookup_flags. We reach into
+    # _encode_pokemon_block via the forward — in particular the active 4 move
+    # tokens of our slot 0 should change if we strip the active_real_flags path.
+    with torch.no_grad():
+        out_with_real = tok(batch)["tokens"]
+        # Strip both active_move_cont AND active_move_banks to fall back to lookup
+        b_no_real = {k: v for k, v in batch.items()
+                     if k not in ("active_move_cont", "active_move_banks")}
+        # active_move_cont is required by forward; supply zeros so threat path runs.
+        # We only want to disable the FLAG override here, but threat path consumes
+        # the trailing 2 dims, so swap in zeros to keep shape but null the override.
+        b_no_real["active_move_cont"] = torch.zeros_like(batch["active_move_cont"])
+        b_no_real["active_move_banks"] = batch["active_move_banks"]   # keep banks override
+        out_no_real_flags = tok(b_no_real)["tokens"]
+
+    # Active move tokens of our slot 0 are at sequence indices [6+13, 6+14, 6+15, 6+16].
+    from model_transformer import _FIRST_MOVE_OFFSET
+    move_idx = list(range(6 + _FIRST_MOVE_OFFSET, 6 + _FIRST_MOVE_OFFSET + 4))
+    diff_active = (out_with_real[:, move_idx] - out_no_real_flags[:, move_idx]).abs().max().item()
+    print(f"  diff at our active 4 move tokens with vs without flag override: {diff_active:.4f}")
+    assert diff_active > 1e-3, "flag override didn't change active-move tokens"
+    print("  OK")
+
+
 def test_active_real_banks_override():
     print("\n== test 9: active_move_banks override changes slot-0 token (Postscript B) ==")
     tok = _make_tokenizer(seed=0).eval()
@@ -391,8 +447,9 @@ if __name__ == "__main__":
     test_init_stats()
     test_grad_flow_opp_threat()
     test_opp_threat_uses_chart()
+    test_active_flag_override_recovers_dynamic_dims()
     test_active_real_banks_override()
     test_restored_signals_reach_status_token()
     test_physical_banks_reach_status_token()
     test_doubles_rejected()
-    print("\n=== all 13 tests passed ===")
+    print("\n=== all 14 tests passed ===")

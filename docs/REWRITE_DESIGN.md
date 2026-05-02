@@ -1061,6 +1061,15 @@ compensate for our lack of their 18M-trajectory dataset (we have ~5M).
   Postscript C documents the restoration with empirical references
   (Session 30 weight analysis: defensive_eff and type_eff are the
   #1 ranked features by 5-pt margins).
+- **2026-05-01 (Session 46, active-move flag fix):** Third audit asked
+  "the PP thing shows wrong info — what about acc?" Re-reading
+  `_project_move_flags` confirmed: accuracy is static (no fix needed),
+  but `current_pp` (dim 9), `disabled` (dim 10), and `stab` (dim 12)
+  are dynamic. For OUR active 4 moves these are silently overridden
+  by the lookup's static defaults, regressing vs legacy. Postscript D
+  adds an `active_real_flags` override path mirroring Tier G's banks
+  override, restoring real per-turn PP/disabled/STAB for the moves
+  the model is choosing among.
 
 Future updates as implementation reveals divergences. Add a postscript
 section per change; do not silently rewrite history.
@@ -1486,3 +1495,110 @@ damage chart and asserts only `opp_threat_token` changes. If a future
 edit accidentally drops a slice from `status_cont` cat, the
 corresponding test 11/12 sub-test fails immediately with the slice
 name in the error message.
+
+---
+
+## Postscript D — Session 46 active-move flag override
+
+Triggered by: "isn't the PP thing also a big thing — it shows wrong
+info? what about acc and stuff?" + "read the A/B/B+/C/D thread."
+
+### D1. The exact problem
+
+The 107-dim move-flag vector from `_project_move_flags` (features.py:
+1005-1263) has three battle-state-dependent dims, classified by
+re-reading the function:
+
+| Dim | Field | Source | Static? |
+|---|---|---|---|
+| 0 | bp01 | `m.base_power / 250` | Static ✓ |
+| 1 | acc01 | `m.accuracy` (1.0 if always-hit) | **Static** ✓ — accuracy boosts/drops live on the *Pokemon's* boost stat, not the move |
+| 2 | prio_n | `m.priority / 3` | Static ✓ |
+| 3-8 | drain/recoil/heal/multihit/flinch/crit_ratio | move properties | Static ✓ |
+| **9** | **`current_pp/64`** | `m.current_pp` | **DYNAMIC** — varies per turn |
+| **10** | **`disabled`** | `m.disabled` | **DYNAMIC** — Disable / Encore / Choice-lock |
+| 11 | recharge | `m.recharge` | Static ✓ |
+| **12** | **`stab`** | depends on `poke_types` arg | **DYNAMIC** — flips on STAB-able moves vs Pokemon's types |
+| 13-106 | all the boolean / one-hot flags | move properties | Static ✓ |
+
+So `accuracy` does NOT change at runtime — that one is fine in the
+lookup. The three actually-dynamic dims are 9 / 10 / 12.
+
+Previously (Postscript A item 1, then re-confirmed in Postscript B):
+"all 4 move tokens (active + team) use the lookup uniformly." For
+team and opp moves this is **strictly better** than the legacy MLP
+arch (which zeroed those dims entirely). For OUR ACTIVE 4 MOVES this
+is a **silent regression**: the legacy arch had real per-turn PP /
+disabled / STAB via the `active_move_cont` memmap path; we threw that
+away.
+
+### D2. The A/B/B+ thread context
+
+The whole point of the A/B/B+/D-and-rewrite design (NEXT_SESSION.md
+L689-870) was: *the model should see real per-move features for every
+move, not zeros.* Specifically B+ argued for "extend team-path
+encoding from 23 → 109 dims." We did better than B+ for team moves
+(lookup carries the static 104 of 107 dims, beating zeros). We did
+worse than legacy for active moves (lookup overrides real per-turn
+values with static defaults on 3 dims). Net result before this fix:
+team improved, active regressed. This fix addresses the active
+regression.
+
+### D3. The fix
+
+`_encode_pokemon_block` accepts a new optional `active_real_flags:
+(B, n_moves, MOVE_FLAG_DIM)` argument. When provided, slot-0's 107-dim
+flags are overridden with the real per-turn vector. The Tokenizer's
+`forward()` slices `active_move_cont[..., :MOVE_FLAG_DIM]` (the
+memmap stores the same 109-dim that features.py's active path
+produces, with first 107 dims being the same shape as the lookup
+but with battle-state-correct values; the trailing 2 dims are the
+threat scalars we already use).
+
+For our 4 active moves: real PP, real disabled, real STAB. For team
+moves and opp moves: lookup unchanged (no battle-state info available
+in the memmap for those positions anyway).
+
+### D4. On items being learnable (the user's pushback)
+
+The Session 30 docs noted "Choice Scarf = Leftovers to the model" but
+the embedding was 64-dim against ~800 items (~12.5× oversaturation).
+Our config has `d_model=256` for entity tokens (3.1× oversaturation),
+4× more capacity per item. Combined with 5M training samples and
+transformer attention composing item_token with stat / type / ability
+tokens, items are within learnable range. This is consistent with the
+legacy MLP arch reaching 67.8% smart_avg with 32-dim item embeds —
+i.e., even at 73× oversaturation the model captured *something*.
+Pre-baking item-effect feature dicts (Choice/Orb/immunity flags etc.)
+is **deferred** to a possible Week 3 follow-up if BC ablation shows
+weak item learning. Not a Week 1 task; YAGNI for now.
+
+### D5. Verification
+
+- Test 9b in `test_tokenizer.py`: `test_active_flag_override_recovers_dynamic_dims`.
+  - Loads 2 sample episodes at t=0; reads `active_move_cont[..., :107]`
+    vs `move_flags_lookup[move_ids]` for our 4 active moves.
+  - At t=0, dim 9 (current_pp) and dim 10 (disabled) happen to agree
+    (full PP, nothing disabled). Dim 12 (STAB) cumulative diff = 4.0
+    (STAB flipped on at least 4 active moves across 2 episodes —
+    exactly what we'd expect for STAB-able move/Pokemon pairings).
+  - Move-token output diff = 5.28 across the 4 active moves with vs
+    without the override path enabled.
+- Test 9 (`test_active_real_banks_override`) still passes — the banks
+  override is independent of the flag override.
+- Bench: 27.13 ms median for B=32 turns (was 29.06 pre-fix; within
+  noise, no perf regression).
+
+### D6. What this still doesn't recover
+
+- **Team-move PP**: no per-turn PP for our team's 5 bench Pokemon. The
+  memmap doesn't carry it (only active_move_cont covers our 4 active).
+  Acceptable: knowing "Wish PP at 2/16" on a Pokemon you're not using
+  this turn is third-order info; legacy didn't have it either.
+- **Opp-move PP / disabled / STAB**: same — memmap doesn't carry an
+  opp-active-move-cont table. Lookup-only for opp.
+- **`current_pp` and `disabled` flag dims for opp moves** stay at the
+  lookup defaults forever. If Week 4 PPO struggles on PP-aware play
+  against opp (e.g., model fails to recognize opp's Choice-locked
+  state), revisit by deriving disabled from transition events
+  (turn-by-turn Choice lock detection in features.py).

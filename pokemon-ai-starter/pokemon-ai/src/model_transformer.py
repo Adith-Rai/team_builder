@@ -776,13 +776,27 @@ class Tokenizer(nn.Module):
         banks: torch.Tensor,                                       # (B, T_size, 10)
         cont: torch.Tensor,                                        # (B, T_size, POKEMON_CONT_DIM)
         active_real_banks: Optional[Dict[str, torch.Tensor]] = None,
+        active_real_flags: Optional[torch.Tensor] = None,           # (B, n_moves, MOVE_FLAG_DIM)
     ) -> torch.Tensor:
         """Returns (B, T_size, N_PER_POKEMON, d_model).
 
+        Per-Pokemon block: 17 attribute tokens (3 entity + type + status +
+        hp + boosts + 6 stats + 4 moves).
+
         `active_real_banks` (our side only): override slot 0's move banks with
         real per-turn values from the memmap's `active_move_banks`. Recovers
-        the current_pp / disabled signal lost when team moves use the lookup
-        (Postscript B). Pass None for opp side.
+        current_pp / acc / etc. that the lookup uses static defaults for
+        (Postscript B).
+
+        `active_real_flags` (our side only): override slot 0's 107-dim move
+        flag vector with `active_move_cont[..., :MOVE_FLAG_DIM]`. The memmap
+        stores the *real per-turn* values for the 3 dynamic dims (cont[9]
+        current_pp, cont[10] disabled, cont[12] stab — STAB depends on the
+        user's types). Without this override the model would see stale info
+        on those 3 dims for the 4 moves it's about to choose between, which
+        is the exact failure mode the A/B/B+ thread (NEXT_SESSION.md L689-870)
+        identified for team moves and that we accidentally re-introduced for
+        active moves when collapsing to the lookup. Pass None for opp side.
         """
         team_size = ids.shape[1]
         d = self.cfg.d_model
@@ -834,20 +848,27 @@ class Tokenizer(nn.Module):
         stats_e = self.stat_bank(banks[..., 4:10])                               # (B, T, 6, bank_dim)
         stat_toks = self.bank_proj(stats_e)                                      # (B, T, 6, d)
 
-        # 4 move tokens via lookup (+ optional real-banks override on slot 0)
+        # 4 move tokens via lookup (+ optional real-banks/flags overrides on slot 0).
         move_ids = ids[..., 3:7]                                                 # (B, T, 4)
         flags = self.move_flags_lookup[move_ids]                                 # (B, T, 4, 107)
         mb = self.move_banks_lookup[move_ids].long()                             # (B, T, 4, 4)
 
         if active_real_banks is not None:
-            # active_real_banks: {bp/acc/pp/prio: (B, n_moves) long}.
-            # Replace slot-0 move banks with the trainer's per-turn observed values
-            # (Postscript B — restores current_pp / disabled signal for our active).
+            # Replace slot-0 move banks with the trainer's per-turn observed values.
             real = torch.stack([
                 active_real_banks[k] for k in ("bp", "acc", "pp", "prio")
             ], dim=-1).long()                                                    # (B, n_moves, 4)
             mb = mb.clone()
             mb[:, 0, :, :] = real
+        if active_real_flags is not None:
+            # Replace slot-0 107-dim flags with the per-turn version. Static dims
+            # match the lookup; the 3 dynamic dims (cont[9] current_pp/64,
+            # cont[10] disabled, cont[12] stab) get their real values back.
+            assert active_real_flags.shape[-1] == MOVE_FLAG_DIM, \
+                f"active_real_flags last dim {active_real_flags.shape[-1]} != {MOVE_FLAG_DIM}"
+            flags = flags.clone()
+            flags[:, 0, :, :] = active_real_flags
+
         bp_v, acc_v, pp_v, prio_v = mb[..., 0], mb[..., 1], mb[..., 2], mb[..., 3]
         move_toks = self.move_tokenizer(move_ids, bp_v, acc_v, pp_v, prio_v, flags)
 
@@ -979,10 +1000,18 @@ class Tokenizer(nn.Module):
         opp_ids = self._fix_ids(batch, "opp")
 
         active_real_banks = batch.get("active_move_banks")    # may be None
+        # Postscript D: also override the 107-dim flags for our active 4 moves
+        # with per-turn ground truth (recovers current_pp/disabled/STAB that
+        # the lookup leaves stale). The trailing 2 dims of `active_move_cont`
+        # are the active-only threat scalars; the first 107 dims are exactly
+        # the same shape as the lookup but with battle-state-correct values.
+        amc = batch.get("active_move_cont")
+        active_real_flags = amc[..., :MOVE_FLAG_DIM] if amc is not None else None
 
         our_block = self._encode_pokemon_block(
             our_ids, batch["our_pokemon_banks"], batch["our_pokemon_cont"],
             active_real_banks=active_real_banks,
+            active_real_flags=active_real_flags,
         )
         opp_block = self._encode_pokemon_block(
             opp_ids, batch["opp_pokemon_banks"], batch["opp_pokemon_cont"],
