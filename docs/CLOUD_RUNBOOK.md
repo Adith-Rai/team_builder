@@ -504,21 +504,205 @@ Per-epoch loss/acc trajectory we've validated:
 
 ---
 
-## 11. PPO on cloud (Week 4, untested)
+## 11. PPO on cloud (Week 4 — scaling guide + bottleneck audit)
 
-This is the next deliverable but **not validated yet**. Differences from BC:
+This is the next deliverable. The doc here is **concrete recipes for scaling
+PPO collection on cloud**, not a "we'll figure it out later" placeholder.
 
-- Needs **Node.js** + `battle_server.js` running on port 9000 inside the pod
-- Needs **foul_play_venv** (separate Python env, vendored from `foul_play` repo)
-- Needs **metamon_venv** (separate Python env, from `metamon_ref` clone)
-- ~5-7 GB GPU + several GB host RAM for subprocess opponents
+### What changed since the original PPO scaling notes (S35-era)
 
-The cloud advantages are larger here than for BC:
-- Linux's `expandable_segments` allocator works (Windows doesn't support it)
-- `fork()` for DataLoader/subprocess workers (vs Windows spawn overhead)
-- No platform-specific websocket race conditions we hit at 6+ slots locally
+The original docs assumed self-play-only training where `--max-concurrent
+200` worked because both sides are GPU forwards (no CPU-bound subprocess).
+S43-S44 introduced mixed-pool training (FP + MM + mcts + sp) which forced
+us to drop to `--max-concurrent 6` because foul_play and metamon
+subprocesses choke at 3-6 concurrent challenges each. **That C=6 is a
+subprocess-side cap, not a GPU-side or training-side cap.** Cloud breaks
+that cap by giving us enough cores to run 4-8× more subprocess instances.
 
-A `cloud_setup_ppo.sh` should be built when Week 4 starts. For now, just BC.
+### What PPO needs that BC doesn't
+
+| Component | Why | How |
+|-----------|-----|-----|
+| **Node.js + battle_server.js** | Showdown emulator on port 9000 | Install Node 20, run `battle_server.js` per port |
+| **foul_play_venv** | Foul Play subprocess opponents (separate Python env, vendored) | `python -m venv foul_play_venv`; pip install foul_play repo |
+| **metamon_venv** | Metamon Minikazam/SmallRL/Kakuna subprocesses (poke-env 0.8.3 fork) | `python -m venv metamon_venv`; pip install metamon's vendored poke-env |
+| **mcts in-process** | Poke-engine MCTS (no subprocess, scales with GPU) | `pip install poke-engine` (already in BC requirements.txt) |
+| **External adapter YAML** | Pool composition spec | `external_adapters_curated.yaml` exists |
+| **Procedural team generator** | Smogon usage stats for proc-gen teams | `raw_data/pokemon_usage/` (need to upload to R2) |
+
+### Bottleneck breakdown (validated locally Session 43-44)
+
+Per PPO iter at `--games-per-iter 200 --max-concurrent 6 --servers 9000,9000,9000,9000`:
+
+```
+Iter time: ~22 min total
+├── ~70%  waiting for opponent subprocesses (FP MCTS, MM forward, mcts compute)
+├── ~25%  poke-env choreography (websocket framing, queue management)
+└── ~5%   actual GPU work (forward + PPO update)
+```
+
+**GPU utilization during collect: 10-30%.** The GPU is mostly idle.
+This is the architectural improvement opportunity for V2 (inference
+batching + async actor-learner). For V1, the win is just running more
+subprocesses on cloud's much-bigger CPU pool.
+
+### Levers ranked by ROI
+
+| Phase | Lever | ROI | Cost |
+|-------|-------|-----|------|
+| **1** | Cloud's 32-128 cores → run **4-8 FP + 4-8 MM subprocesses** instead of 1 each | ~3× faster collect | 1-2 hr setup |
+| **1** | `--servers 9000,9001,...,9007` (try **6-8 slots**; Linux likely doesn't hit Windows-only bugs A/B from `EXTERNAL_OPPONENTS_PHASE2.md`) | ~1.5-2× faster collect | flag change |
+| **1** | Self-play-heavier pool composition (sp scales freely with GPU) | Free with config tweak | edit YAML |
+| **2** | Wire `inference_batcher.py` into the main collect loop (currently only used in MP-path); batches forwards across all in-flight battles | ~1.5-2× more, **GPU goes to 95%+ util** | ~half day rewrite |
+| **3** | Async actor-learner (AMAGO/IMPALA pattern): N actor pods collecting, 1 GPU pod learning | 3-10× more, scalable to compute budget | 1-2 weeks rewrite — defer to V2 |
+
+**Combined Phase 1 estimate: PPO iter time drops from ~22 min → 5-8 min.**
+A 200-iter run that took ~74 hr local would finish in **~17-27 hr cloud
+≈ $25-40**.
+
+### Phase 1 setup script (to be written when Week 4 starts)
+
+`cloud_setup_ppo.sh` should:
+
+```bash
+# 1. Install Node 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+
+# 2. Set up foul_play_venv
+cd /workspace
+git clone https://github.com/<foul_play_repo> foul_play_ref
+python3 -m venv foul_play_venv
+source foul_play_venv/bin/activate
+pip install -r foul_play_ref/requirements.txt
+deactivate
+
+# 3. Set up metamon_venv (uses Metamon's vendored poke-env 0.8.3)
+python3 -m venv metamon_venv
+source metamon_venv/bin/activate
+cd /workspace/team_builder/metamon_ref   # already cloned via git
+pip install -e .
+cd /workspace
+deactivate
+
+# 4. Sync procedural team generator data from R2
+aws s3 sync --endpoint-url $S3_ENDPOINT_URL --profile r2 \
+  s3://team-builder-data/raw_data/pokemon_usage/ \
+  /workspace/raw_data/pokemon_usage/
+
+# 5. Spawn battle_servers
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+for port in 9000 9001 9002 9003 9004 9005; do
+  nohup node battle_server.js --port $port > /workspace/bs_$port.log 2>&1 &
+done
+sleep 5
+# verify all 6 are listening
+for port in 9000 9001 9002 9003 9004 9005; do
+  netstat -tln | grep :$port || echo "WARN: port $port not listening"
+done
+```
+
+Then before launching PPO training:
+
+```bash
+# Cloud-PPO YAML adapter config (more subprocesses, more parallelism)
+cat > pokemon-ai-starter/pokemon-ai/src/external_adapters_cloud.yaml <<'EOF'
+opponents:
+  - {name: sp,             adapter: self_play,    weight: 0.40}
+  - {name: mcts-fast,      adapter: mcts,         weight: 0.15, params: {time_ms: 100}}
+  - {name: foulplay-100ms, adapter: foulplay,     weight: 0.10, params: {time_ms: 100}, n_instances: 6}
+  - {name: foulplay-300ms, adapter: foulplay,     weight: 0.05, params: {time_ms: 300}, n_instances: 4}
+  - {name: metamon-mini,   adapter: metamon,      weight: 0.10, params: {model: Minikazam}, n_instances: 4}
+  - {name: metamon-small,  adapter: metamon,      weight: 0.10, params: {model: SmallRL},   n_instances: 4}
+  - {name: metamon-med,    adapter: metamon,      weight: 0.05, params: {model: MediumRL},  n_instances: 2}
+  - {name: legacy-sp_0229, adapter: legacy_self_play, weight: 0.05, params: {checkpoint: data/models/rl_v9/_init_sp_0229/snapshot_0229.pt}}
+EOF
+```
+
+Note: `n_instances` would need to be added to `external_opponent_manager.py`
+(it currently spawns 1 per opponent). That's a small enhancement, not
+a rewrite.
+
+### PPO launch command (Phase 1, on cloud)
+
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+
+# Activate the modern poke-env env (the BC env is already active)
+nohup python -u train_rl.py \
+  --use-transformer \
+  --init-from data/models/bc/v10_cloud_gen9/best.pt \
+  --device cuda \
+  --servers 9000,9001,9002,9003,9004,9005 \
+  --fp16 --pipeline \
+  --games-per-iter 200 --max-concurrent 16 \
+  --n-iters 200 --warmup-iters 0 \
+  --reward-style terminal --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --adaptive-entropy --adaptive-entropy-high 0.85 --adaptive-entropy-min 0.005 \
+  --early-stop --early-stop-patience 3 \
+  --eval-interval 20 --eval-games 200 --eval-team-set metamon-competitive \
+  --target-kl 0.02 \
+  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --external-adapters external_adapters_cloud.yaml \
+  --pool-anchors data/models/rl_v9/_init_sp_0229/snapshot_0229.pt \
+  --pool-max-current-run 4 \
+  --out-dir data/models/rl_v10_cloud \
+  --win-rate-mode ema --lr 3e-5 \
+  > /workspace/v10_ppo_cloud.log 2>&1 &
+```
+
+Key changes from local PPO:
+- `--use-transformer` (we'll need to plumb this through train_rl.py if not yet — Session 48 plumbing covered train_bc but train_rl uses ppo.py::load_checkpoint which is now arch-aware)
+- `--init-from` points at our cloud BC's `best.pt` (now already validated H2H-stronger than sp_0229)
+- `--max-concurrent 16` (vs local 6) — cloud cores can run more concurrent FP/MM
+- `--servers 9000,9001,9002,9003,9004,9005` (6 slots vs local 4)
+- Pool YAML uses `n_instances: 4-6` per external opponent
+
+### What we'll learn quickly on cloud
+
+1. **Does Linux fix the 4-slot ceiling?** First iter at 6 slots tells us. If yes → another 1.5× speedup essentially free.
+
+2. **Does FP/MM `accept_serve` survive at higher concurrency on Linux?** Their poke-env-based queue management may behave better with Linux's better network stack. If it does → can push `--max-concurrent` even higher.
+
+3. **What's the actual GPU utilization?** If still <50% at Phase 1 max settings, Phase 2 (inference batching) is high ROI. If >70%, Phase 1 was enough.
+
+### What references can teach us (now that we know the problem)
+
+**Metamon (AMAGO):** uses `parallel_actors=8, parallel_envs_per_actor=N`.
+That's IMPALA-style: 8 separate actor processes, each running multiple
+poke-env battles. Central learner consumes a trajectory queue async.
+**This is the V2 architecture.** Don't build it now.
+
+**ps-ppo:** 256 parallel envs in their PPO. Easier because Random Battles
+are short and stateless model. Their `--num-envs 256` directly maps to
+our `--max-concurrent 256` if we had no external subprocesses.
+
+**VGC-Bench:** PPO with many parallel envs, similar to ps-ppo. Stateless
+core (5M params) + shorter games + simpler format = trivially scales.
+
+**Common pattern across all three:** **decouple actors from learners**.
+The learner waits on a trajectory queue; actors fill it independently.
+We currently have a single-process collect-then-update loop. That's the
+V2 architectural change that makes scaling unbounded.
+
+### Honest cost estimate for Week 4
+
+Phase 1 only (recommended for V1):
+- PPO setup script: ~half day
+- 1-iter smoke: 5-10 min, ~$0.30
+- 200-iter run: 17-27 hr at $1.50/hr = **$25-40**
+- Eval rounds during the run + final: $5-10
+- **Total Week 4 cost: ~$30-50**
+
+If Phase 2 is added (inference batcher into main loop):
+- ~Half day rewrite + smoke
+- 200-iter run faster: 12-18 hr = $18-27
+- **Total ~$30-50** (same, just faster)
+
+If Phase 3 (full async actor-learner):
+- 1-2 weeks dev work — DEFER.
+
+---
 
 ---
 
