@@ -13,9 +13,14 @@ validation.
 2. Run sync_to_s3.sh from your laptop (overnight, ~24 hr at residential upload)
 3. Spin up A100 RunPod pod, run cloud_setup.sh (~10 min)
 4. Run sync_from_s3.sh on the pod (~5-10 min)
-5. Launch train_bc.py with --compile --batch-size 48 --workers 8 (~3-6 hr to converge)
-6. scp best.pt back, rsync metrics, kill pod
+5. Run cloud_smoke.sh — 50-batch validation (~$0.50, ~5 min)
+6. Launch train_bc.py with --compile --batch-size 48 --workers 8 (~3-6 hr to converge)
+7. scp best.pt back, kill pod
 ```
+
+**No RunPod network volume needed.** Each run: spin up pod with ephemeral
+NVMe, sync from S3 (5-10 min), train, scp results, terminate. Cheaper
+than $20/mo network volume and simpler.
 
 ## What lives where
 
@@ -48,16 +53,7 @@ validation.
 3. Pick the region: same region as RunPod = free egress. Different region =
    $0.02/GB egress (so $2/full-sync; not catastrophic but adds up).
 
-### C. Network volume on RunPod
-
-1. RunPod dashboard → Storage → Create network volume.
-2. Pick the same region as your S3 bucket.
-3. Size: 200 GB (room for gen-9 plus future gens 6-8). ~$20/month.
-4. Name it `team-builder-data` or similar.
-5. This volume can be attached to multiple pods — you upload data once,
-   reuse across runs.
-
-### D. Local AWS credentials
+### C. Local AWS credentials
 
 ```
 aws configure
@@ -83,7 +79,8 @@ Verify when done: `aws s3 ls s3://team-builder-data/datasets/human_v8_100k/`
 RunPod dashboard → Deploy:
 - Template: **PyTorch 2.x** (pre-baked CUDA 12.1, Python 3.11)
 - GPU: **A100 40GB** (Secure Cloud preferred for stability)
-- Disk: 100 GB ephemeral container disk + your network volume mounted at `/workspace`
+- Container disk: **150 GB** ephemeral (room for repo + 104 GB memmap + ckpts).
+  No network volume needed — we sync S3 → ephemeral disk per run.
 - Start.
 
 You'll get an SSH command like:
@@ -116,7 +113,24 @@ bash pokemon-ai-starter/pokemon-ai/scripts/sync_from_s3.sh
 
 Takes 5-10 min for 104 GB at A100-pod's network speed.
 
-### 5. Launch BC training
+### 5. Run smoke test (~$0.50, 5 min)
+
+```
+cd /workspace/team_builder
+bash pokemon-ai-starter/pokemon-ai/scripts/cloud_smoke.sh
+```
+
+50 batches at the cloud config (B=48, fp16, compile, workers=8). Validates:
+- torch.compile completes without errors
+- B=48 fp16 fits without OOM
+- workers=8 doesn't deadlock
+- Loss decreases
+- Throughput in 2-5 ms/turn range
+
+If green, proceed. If anything fails, debug before committing GPU time
+to a multi-hour run.
+
+### 6. Launch BC training
 
 ```
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
@@ -209,10 +223,14 @@ with `--resume <latest>.pt`.
 |------|------|
 | RunPod A100 Secure (4 hr at $1.69) | $7 |
 | RunPod A100 Secure (8 hr conservative) | $14 |
-| S3 storage (1 month, 200 GB) | $4.60 |
-| RunPod network volume (1 month, 200 GB) | $20 |
+| Smoke test (~5 min A100) | $0.50 |
+| S3 storage (1 month, 104 GB) | $2.40 |
 | S3 sync (same region) | $0 egress |
-| **Total per run, conservative** | **~$30-40** |
+| **Total per run, conservative** | **~$10-15 + $2.40/mo storage** |
 
-Multi-gen later: ~4× compute (more data) plus storage of additional gens.
-Ballpark: $100-150 for a multi-gen converging run, fitting your budget.
+If you delete S3 data after multi-gen is done, you only pay storage for
+the months you keep it. ~$5-10 total storage cost for a typical
+research-phase project.
+
+Multi-gen later: ~4× compute ($40-60) plus storage of additional gens
+(~$10/mo). Ballpark $50-100 total for a multi-gen converging run.
