@@ -46,7 +46,18 @@ echo
 echo "[setup] installing Python deps (assuming PyTorch is pre-baked)..."
 cd "$REPO_DIR/pokemon-ai-starter/pokemon-ai"
 pip install --no-cache-dir -r requirements.txt --no-deps
-pip install --no-cache-dir einops gin-config orjson pyarrow PyYAML
+pip install --no-cache-dir einops gin-config orjson pyarrow PyYAML awscli
+
+# --- 2b. R2 / S3 credentials ---
+# If r2_env.local.sh is present, source it. Otherwise expect AWS_ACCESS_KEY_ID
+# / AWS_SECRET_ACCESS_KEY / S3_ENDPOINT_URL / S3_BUCKET to be set externally.
+SCRIPT_DIR="$REPO_DIR/pokemon-ai-starter/pokemon-ai/scripts"
+if [ -f "$SCRIPT_DIR/r2_env.local.sh" ]; then
+  echo "[setup] sourcing R2 env from r2_env.local.sh"
+  source "$SCRIPT_DIR/r2_env.local.sh"
+else
+  echo "[setup] WARN: no r2_env.local.sh — set AWS_ACCESS_KEY_ID/SECRET/S3_ENDPOINT_URL manually"
+fi
 
 # --- 3. Sanity: GPU + CUDA ---
 echo

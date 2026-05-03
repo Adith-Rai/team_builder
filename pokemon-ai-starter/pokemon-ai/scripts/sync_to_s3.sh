@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Auto-source r2_env.local.sh if it exists next to this script — convenience.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/r2_env.local.sh" ] && source "$SCRIPT_DIR/r2_env.local.sh"
+
 S3_BUCKET="${S3_BUCKET:-team-builder-data}"
 S3_PREFIX="${S3_PREFIX:-datasets/human_v8_100k}"
 LOCAL_DIR="${LOCAL_DIR:-pokemon-ai-starter/pokemon-ai/src/data/datasets/human_v8_100k}"

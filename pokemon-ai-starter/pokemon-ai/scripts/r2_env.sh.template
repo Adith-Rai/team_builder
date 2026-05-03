@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# r2_env.sh — copy this to r2_env.local.sh, fill in your keys, then source it.
+#
+# Usage:
+#   cp r2_env.sh.template r2_env.local.sh
+#   # edit r2_env.local.sh, fill in the 5 values below
+#   chmod 600 r2_env.local.sh    # restrict permissions on the secrets
+#   source r2_env.local.sh       # in any shell where you want to use sync scripts
+#
+# After sourcing, sync_to_s3.sh / sync_from_s3.sh / aws CLI all work without
+# additional flags.
+#
+# r2_env.local.sh is gitignored (see .gitignore: *.local.sh entry).
+
+# --- Cloudflare R2 credentials ---
+# Get these from https://dash.cloudflare.com -> R2 -> Manage R2 API Tokens
+export AWS_ACCESS_KEY_ID="<your-r2-access-key-id>"
+export AWS_SECRET_ACCESS_KEY="<your-r2-secret-access-key>"
+export AWS_DEFAULT_REGION="auto"            # R2 ignores; CLI requires a value
+
+# --- R2 endpoint + bucket ---
+# Account ID is on the R2 dashboard top-right.
+export S3_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
+export S3_BUCKET="team-builder-data"
+export S3_PREFIX="datasets/human_v8_100k"   # or whatever subdir; default fine
+
+echo "[r2_env] active: bucket=$S3_BUCKET endpoint=$S3_ENDPOINT_URL"

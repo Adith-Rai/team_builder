@@ -63,6 +63,8 @@ node_modules/
 # Env / secrets
 .env
 *.env
+*.local.sh
+*.creds
 
 # Jupyter
 .ipynb_checkpoints/
