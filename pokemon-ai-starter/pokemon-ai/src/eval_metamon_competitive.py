@@ -44,9 +44,34 @@ from battle_agent import BattleAgent
 from battle_agent_transformer import BattleAgentTransformer, is_transformer_checkpoint
 
 
-METAMON_COMPETITIVE_DIR = Path(
-    "C:/Users/raiad/OneDrive/Desktop/team_builder/metamon_cache/teams/competitive/gen9ou"
-)
+def _default_metamon_teams_dir() -> Path:
+    """Resolve the metamon competitive team dir.
+
+    Resolution order (first existing wins):
+      1. $METAMON_TEAMS_DIR env var
+      2. <repo_root>/metamon_cache/teams/competitive/gen9ou
+      3. /workspace/metamon_cache/teams/competitive/gen9ou (RunPod default)
+      4. The Windows-development hardcoded path (legacy, last resort)
+    Raises if none exist.
+    """
+    env = os.environ.get("METAMON_TEAMS_DIR")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve()
+    # src/eval_metamon_competitive.py -> walk up to repo root (4 levels)
+    repo_root = here.parents[3]   # src -> pokemon-ai -> pokemon-ai-starter -> team_builder
+    candidates = [
+        repo_root / "metamon_cache" / "teams" / "competitive" / "gen9ou",
+        Path("/workspace/metamon_cache/teams/competitive/gen9ou"),
+        Path("C:/Users/raiad/OneDrive/Desktop/team_builder/metamon_cache/teams/competitive/gen9ou"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]   # default that will fail loudly with a useful path
+
+
+METAMON_COMPETITIVE_DIR = _default_metamon_teams_dir()
 
 
 class MetamonCompetitiveTeambuilder(Teambuilder):

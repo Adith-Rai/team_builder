@@ -21,6 +21,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+# Throughput knobs (mirror legacy/bc_train.py:56 + 1899; missing in the rewrite).
+# TF32 matmul precision: ~2-4x faster fp32 matmul on Ampere (RTX 30xx) with
+# imperceptible precision loss; helps even under fp16 AMP since some ops
+# fall back to fp32. cuDNN benchmark: autotune best kernel per input shape;
+# +10-30% on transformer-heavy workloads with stable shapes.
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+
 import asyncio
 
 from dataset import MemmapDataset, collate_seq, unpack_turn_batch
@@ -378,7 +386,19 @@ def main():
                         help="Use the new TransformerBattlePolicy (model_transformer.py) "
                              "instead of the legacy MLP-arch PokeTransformer. "
                              "REWRITE_DESIGN.md §7 Week 3. Forces eval-games=0 (no live "
-                             "BattleAgent for the new arch yet — defer to Week 5).")
+                             "BattleAgent for the new arch yet — defer to Week 5). "
+                             "The --gradient-checkpoint flag from add_model_args also "
+                             "applies (saves ~50% peak activation memory; needed on "
+                             "6 GB VRAM at B>=4 to survive worst-case T_max=200 draws).")
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap spatial + temporal transformers in torch.compile() "
+                             "for 10-25%% speedup on Linux/A100. Adds ~30-60s warmup at "
+                             "first batch. Granular compile (not whole model) because "
+                             "forward_sequence has Python loops Inductor can't trace.")
+    parser.add_argument("--early-stop-patience", type=int, default=0,
+                        help="If >0, stop training after N consecutive epochs with no "
+                             "val_loss improvement. Metamon default is 2. Set 0 to "
+                             "disable (legacy behavior).")
     add_model_args(parser)
     args = parser.parse_args()
 
@@ -411,6 +431,8 @@ def main():
             TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
         )
         cfg = TransformerConfig.with_vocab_sizes_from_disk()
+        if args.gradient_checkpoint:
+            cfg.gradient_checkpoint = True
         lookup = load_move_flag_lookup(
             Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
         )
@@ -418,7 +440,16 @@ def main():
         print(f"Model: {model.count_parameters():,} params (transformer arch)")
         print(f"Config: d_model={cfg.d_model}, d_temporal={cfg.d_temporal}, "
               f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
-              f"heads={cfg.n_heads}, K={cfg.n_summary_tokens}, dropout={cfg.dropout}")
+              f"heads={cfg.n_heads}, K={cfg.n_summary_tokens}, dropout={cfg.dropout}, "
+              f"gradient_checkpoint={cfg.gradient_checkpoint}")
+        if args.compile:
+            # Granular compile: only the heavy attention stacks (static shapes,
+            # no Python control flow). forward_sequence's outer (b, t) loop stays
+            # in eager mode — Inductor can't trace through arbitrary Python loops.
+            # Mirrors Metamon's @torch.compile pattern in metamon_to_amago.py:521,579.
+            print("  [compile] wrapping spatial + temporal transformers in torch.compile()")
+            model.spatial = torch.compile(model.spatial)
+            model.temporal = torch.compile(model.temporal)
         if args.eval_games > 0:
             print(f"  [INFO] Forcing --eval-games 0: BattleAgentTransformer not built "
                   f"yet (Week 5). Run eval_metamon_competitive.py manually post-epoch "
@@ -468,6 +499,7 @@ def main():
     global_step = 0
     best_val_loss = float("inf")
     best_smart_avg = 0.0
+    epochs_since_best = 0  # for --early-stop-patience
 
     # Resume
     if args.resume:
@@ -611,21 +643,35 @@ def main():
             "best_smart_avg": best_smart_avg,
         }
 
-        # Save best by bot win rate (the metric that matters)
+        # Save best by bot win rate (the metric that matters), or val_loss if eval disabled.
+        improved = False
         if smart_avg > best_smart_avg:
             best_smart_avg = smart_avg
             ckpt["best_smart_avg"] = best_smart_avg
             torch.save(ckpt, str(out_dir / "best.pt"))
             print(f"  -> New best smart_avg={smart_avg:.1f}%, saved best.pt")
+            improved = True
         elif args.eval_games == 0 and val_loss < best_val_loss:
-            # Fallback to val_loss if bot eval is disabled
             best_val_loss = val_loss
             ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, str(out_dir / "best.pt"))
             print(f"  -> New best val_loss={val_loss:.4f}, saved best.pt (no bot eval)")
+            improved = True
 
         torch.save(ckpt, str(out_dir / f"epoch_{actual_epoch:03d}.pt"))
         torch.save(ckpt, str(out_dir / f"step_{global_step}.pt"))
+
+        # Early stopping (Metamon-style): exit if --early-stop-patience epochs
+        # pass without an improvement. Off when patience=0.
+        if args.early_stop_patience > 0:
+            if improved:
+                epochs_since_best = 0
+            else:
+                epochs_since_best += 1
+                print(f"  [early-stop] {epochs_since_best}/{args.early_stop_patience} epochs without improvement", flush=True)
+                if epochs_since_best >= args.early_stop_patience:
+                    print(f"  [early-stop] patience exhausted; stopping at epoch {actual_epoch}.", flush=True)
+                    break
 
     print(f"\nTraining complete. Best smart_avg={best_smart_avg:.1f}%, best val_loss={best_val_loss:.4f}")
     print(f"Output: {out_dir}")

@@ -82,6 +82,21 @@ pokemon-ai-starter/showdown-reference/
 
 # Reference repos (read-only clones, not our code)
 metamon_ref/
+foul_play_ref/
+
+# Local venvs (per-tool isolated Python environments — DO NOT COMMIT)
+foul_play_venv/
+metamon_venv/
+*_venv/
+venv/
+.venv/
+
+# Caches & raw scratch
+metamon_cache/
+data/
+
+# Logs (top-level)
+logs/
 
 # Generated output (replays, eval reports)
 **/replays*/
