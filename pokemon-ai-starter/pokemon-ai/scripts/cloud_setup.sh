@@ -43,10 +43,17 @@ fi
 
 # --- 2. Deps ---
 echo
-echo "[setup] installing Python deps (assuming PyTorch is pre-baked)..."
+echo "[setup] installing Python deps (using pre-baked PyTorch from container)..."
 cd "$REPO_DIR/pokemon-ai-starter/pokemon-ai"
-pip install --no-cache-dir -r requirements.txt --no-deps
-pip install --no-cache-dir einops gin-config orjson pyarrow PyYAML awscli
+# Don't install torch from our requirements.txt — the container's PyTorch
+# was built against the right CUDA version. Pinning to our local torch would
+# downgrade and break CUDA wheel matching. Install everything else.
+grep -viE "^(torch|torchvision|torchaudio)([=<>!]|$)" requirements.txt > /tmp/req_no_torch.txt
+pip install --no-cache-dir -r /tmp/req_no_torch.txt
+pip install --no-cache-dir einops gin-config awscli
+
+# Print the actual torch version in use so we know what we're running against.
+python -c "import torch; print(f'  pre-baked: torch {torch.__version__} cuda {torch.version.cuda}')"
 
 # --- 2b. R2 / S3 credentials ---
 # If r2_env.local.sh is present, source it. Otherwise expect AWS_ACCESS_KEY_ID
