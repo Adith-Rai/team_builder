@@ -36,11 +36,12 @@ from model import PokeTransformer, PokeTransformerConfig, add_model_args, config
 
 
 def _state_dict_is_transformer(state: dict) -> bool:
-    """Infer arch from state-dict keys. New arch has 'tokenizer.' / 'spatial.' /
-    'temporal.' top-level prefixes; legacy MLP has 'pokemon_net.' / 'spatial_xform.'
-    / 'temporal_xform.' etc. Used for resume-path validation."""
-    return any(k.startswith(("tokenizer.", "spatial.", "temporal.", "switch_encoder.",
-                              "action_head.", "value_head.", "summary_to_temporal."))
+    """Infer arch from state-dict keys. Both architectures use `spatial.*` and
+    `temporal.*` prefixes (different submodules but same attribute names), so
+    discriminate on prefixes that are *unique* to the new arch — `tokenizer.`,
+    `summary_to_temporal.`, and `switch_encoder.` exist only on the new
+    `TransformerBattlePolicy`. Used for resume-path validation."""
+    return any(k.startswith(("tokenizer.", "switch_encoder.", "action_head."))
                for k in state.keys())
 
 
@@ -515,7 +516,11 @@ def main():
                 f"is '{arch}'. Either rerun with --use-transformer={'on' if ckpt_arch=='transformer' else 'off'} "
                 f"or pick a matching checkpoint."
             )
-        model.load_state_dict(ckpt["model_state_dict"])
+        # torch.compile wraps modules with `_orig_mod.` prefix in state_dict;
+        # strip on load so we can resume between compiled/uncompiled runs.
+        _resume_state = {k.replace("._orig_mod.", "."): v
+                         for k, v in ckpt["model_state_dict"].items()}
+        model.load_state_dict(_resume_state)
         if args.lr_restart:
             print(f"LR restart: loaded weights only, fresh optimizer + scheduler")
         else:

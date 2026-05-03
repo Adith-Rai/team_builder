@@ -69,8 +69,7 @@ class BattleAgentTransformer(Player):
             # Legacy ckpts predate the `arch` field; fall back to state-dict prefix sniffing.
             state_keys = ckpt.get("model_state_dict", {}).keys()
             arch = "transformer" if any(
-                k.startswith(("tokenizer.", "spatial.", "temporal.", "action_head.",
-                              "value_head.", "switch_encoder.", "summary_to_temporal."))
+                k.startswith(("tokenizer.", "switch_encoder.", "action_head."))
                 for k in state_keys
             ) else "mlp"
         if arch != "transformer":
@@ -84,7 +83,11 @@ class BattleAgentTransformer(Player):
 
         lookup = load_move_flag_lookup(Path(lookup_path), expected_n_moves=self.cfg.n_moves)
         self.model = TransformerBattlePolicy(self.cfg, move_flag_lookup=lookup).to(self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        # torch.compile wraps modules with `_orig_mod.` prefix in state_dict;
+        # strip on load so we can use either compiled or uncompiled ckpts.
+        state = ckpt["model_state_dict"]
+        state = {k.replace("._orig_mod.", "."): v for k, v in state.items()}
+        self.model.load_state_dict(state, strict=True)
         self.model.eval()
 
         # Per-battle temporal history: battle_tag -> (B=1, T, d_temporal) tensor.
@@ -179,8 +182,9 @@ def is_transformer_checkpoint(ckpt_or_path) -> bool:
     if arch is not None:
         return arch == "transformer"
     keys = ckpt.get("model_state_dict", {}).keys()
+    # Both arches share `spatial.*`, `temporal.*`, `value_head.*`,
+    # `summary_to_temporal.*` — discriminate on prefixes unique to the new arch.
     return any(
-        k.startswith(("tokenizer.", "spatial.", "temporal.", "action_head.",
-                      "value_head.", "switch_encoder.", "summary_to_temporal."))
+        k.startswith(("tokenizer.", "switch_encoder.", "action_head."))
         for k in keys
     )
