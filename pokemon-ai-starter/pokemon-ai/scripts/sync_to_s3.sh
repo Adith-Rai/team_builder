@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# sync_to_s3.sh — upload the local memmap dataset to S3 so cloud A100 instances
-# can sync it back in minutes instead of paying GPU time during a 24-hr upload.
+# sync_to_s3.sh — upload the local memmap dataset to object storage so cloud
+# A100 instances can sync it back in minutes instead of paying GPU time during
+# a 24-hr upload.
+#
+# Works with AWS S3 OR Cloudflare R2 (S3-compatible). For R2:
+#   export S3_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
+#   export S3_BUCKET="team-builder-data"
+#   bash sync_to_s3.sh
 #
 # Run this on the LOCAL laptop (or a CPU box near the data).
 # Prereqs:
 #   - aws CLI installed and configured (`aws configure`)
-#   - S3 bucket created (e.g. s3://team-builder-data/)
-#   - AWS_REGION set (use the same region as your A100 instance to avoid egress fees)
+#     For R2: configure with the R2 access key + secret (in `aws configure`)
+#   - Bucket created
 #
-# Usage:
-#   bash sync_to_s3.sh                       # uses defaults
-#   S3_BUCKET=my-bucket bash sync_to_s3.sh   # override bucket
-#
-# Cost: ~$0.023/GB/mo storage. 104 GB ≈ $2.40/mo.
-# Same-region egress to A100 is free. Different region: $0.02/GB ($2 per sync).
+# Cost (Cloudflare R2):
+#   $0.015/GB/mo storage; 104 GB ≈ $1.56/mo. ZERO egress fees ever.
+# Cost (AWS S3):
+#   $0.023/GB/mo storage; same-region egress free, cross-region $0.02/GB.
 
 set -euo pipefail
 
 S3_BUCKET="${S3_BUCKET:-team-builder-data}"
 S3_PREFIX="${S3_PREFIX:-datasets/human_v8_100k}"
 LOCAL_DIR="${LOCAL_DIR:-pokemon-ai-starter/pokemon-ai/src/data/datasets/human_v8_100k}"
+
+# Optional: S3-compatible endpoint (set this for Cloudflare R2 / Backblaze B2 / etc.)
+ENDPOINT_FLAG=""
+if [ -n "${S3_ENDPOINT_URL:-}" ]; then
+  ENDPOINT_FLAG="--endpoint-url $S3_ENDPOINT_URL"
+  echo "[sync] using custom S3 endpoint: $S3_ENDPOINT_URL"
+fi
 
 echo "===================================================================="
 echo "  S3 sync (local -> $S3_BUCKET/$S3_PREFIX)"
@@ -37,7 +48,7 @@ aws configure set default.s3.multipart_chunksize 50MB
 aws configure set default.s3.max_concurrent_requests 16
 
 aws s3 sync "$LOCAL_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
-  --storage-class STANDARD \
+  $ENDPOINT_FLAG \
   --no-progress
 
 echo
