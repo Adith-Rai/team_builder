@@ -340,3 +340,9 @@
 {"iter": 2979, "name": "ppo_s35_iter2979", "elo": 1066.8, "ci_lo": 1036.7, "ci_hi": 1097.6, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt"}
 {"iter": 229, "name": "ppo_s39_iter229", "elo": 1117.3, "ci_lo": 1089.6, "ci_hi": 1145.7, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"}
 {"iter": 119, "name": "ppo_curated_iter119", "elo": 1126.4, "ci_lo": 1104.7, "ci_hi": 1157.2, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"}
+{"iter": -1, "name": "bc_v8_legacy", "elo": 989.9, "ci_lo": 964.1, "ci_hi": 1019.1, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/bc/v8_bc_20260423_195603/best.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e1", "elo": 1098.8, "ci_lo": 1071.3, "ci_hi": 1131.4, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_001.pt"}
+{"iter": 2979, "name": "ppo_s35_iter2979", "elo": 1064.9, "ci_lo": 1040.1, "ci_hi": 1091.1, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt"}
+{"iter": 229, "name": "ppo_s39_iter229", "elo": 1114.6, "ci_lo": 1086.4, "ci_hi": 1142.1, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"}
+{"iter": 119, "name": "ppo_curated_iter119", "elo": 1113.4, "ci_lo": 1087.2, "ci_hi": 1143.5, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e2", "elo": 1101.7, "ci_lo": 1071.3, "ci_hi": 1127.5, "ladder": "elo_v10_plus_e2", "n_games": 100, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_002.pt"}
