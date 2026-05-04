@@ -17,6 +17,7 @@ from poke_env.player import Player
 
 from features import make_features, MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM
 from battle_agent import BattleAgent
+from battle_agent_transformer import BattleAgentTransformer, is_transformer_checkpoint
 from rewards import RewardShaper
 from ppo import Trajectory
 from inference_batcher import InferenceBatcher
@@ -265,7 +266,12 @@ class V9RLPlayer(Player):
 
 
 class SelfPlayOpponent(BattleAgent):
-    """Opponent with temperature randomization for self-play diversity."""
+    """Legacy-arch opponent with temperature randomization for self-play diversity.
+
+    Use `make_self_play_opponent()` factory below for arch-aware dispatch — it
+    picks this class for legacy ckpts and `SelfPlayOpponentTransformer` for
+    new-arch ckpts.
+    """
 
     def __init__(self, checkpoint_path: str, device: str = "cuda",
                  temp_range: Tuple[float, float] = (1.0, 2.25), **kwargs):
@@ -279,3 +285,35 @@ class SelfPlayOpponent(BattleAgent):
         """Re-randomize temperature for next game."""
         super()._battle_finished_callback(battle)
         self.temperature = random.uniform(*self._temp_range)
+
+
+class SelfPlayOpponentTransformer(BattleAgentTransformer):
+    """New-arch opponent with temperature randomization (mirror of SelfPlayOpponent)."""
+
+    def __init__(self, checkpoint_path: str, device: str = "cuda",
+                 temp_range: Tuple[float, float] = (1.0, 2.25), **kwargs):
+        temp = random.uniform(*temp_range)
+        super().__init__(checkpoint_path=checkpoint_path, device=device,
+                         temperature=temp, fp16=False, **kwargs)
+        self._temp_range = temp_range
+
+    def _battle_finished_callback(self, battle):
+        super()._battle_finished_callback(battle)
+        self.temperature = random.uniform(*self._temp_range)
+
+
+def make_self_play_opponent(checkpoint_path: str, device: str = "cuda",
+                            temp_range: Tuple[float, float] = (1.0, 2.25),
+                            _cached_ckpt: Optional[dict] = None, **kwargs):
+    """Arch-aware factory: picks SelfPlayOpponent (legacy) or SelfPlayOpponentTransformer
+    (new arch) based on the checkpoint's state-dict keys.
+
+    `_cached_ckpt` lets repeated callers (e.g. PFSP pool spawns) avoid re-reading
+    the file from disk. If not provided, the file is opened once for arch detection
+    and the dict is forwarded to the chosen class so it doesn't re-read either.
+    """
+    if _cached_ckpt is None:
+        _cached_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    cls = SelfPlayOpponentTransformer if is_transformer_checkpoint(_cached_ckpt) else SelfPlayOpponent
+    return cls(checkpoint_path=checkpoint_path, device=device, temp_range=temp_range,
+               _cached_ckpt=_cached_ckpt, **kwargs)

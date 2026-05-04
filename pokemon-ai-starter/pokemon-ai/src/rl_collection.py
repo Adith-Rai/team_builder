@@ -30,7 +30,7 @@ from ppo import Trajectory, _cancel_listener
 # NOT imported here — it's eval-only. Training callers must pass a procedural
 # teambuilder via the teambuilder= kwarg below; we raise if not.
 from inference_batcher import InferenceBatcher
-from rl_player import V9RLPlayer, SelfPlayOpponent
+from rl_player import V9RLPlayer, SelfPlayOpponent, make_self_play_opponent
 
 import os
 _pid_tag = os.getpid() % 10000
@@ -271,7 +271,7 @@ async def collect_v9(
 
             # Both sides share THE SAME teambuilder instance — each .yield_team()
             # call samples independently from the same procedural source.
-            opponent = SelfPlayOpponent(
+            opponent = make_self_play_opponent(
                 checkpoint_path=entry.path,
                 device=opponent_device,
                 temp_range=opp_temp_range,
