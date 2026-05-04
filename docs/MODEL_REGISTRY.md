@@ -23,7 +23,8 @@ against this fixed slate (using `eval_elo_ladder.py --add-to`).
 | Canonical name | Path | Arch | Params | Canonical Elo (95% CI) | History role |
 |----------------|------|------|--------|------------------------|--------------|
 | `bc_v8_legacy` | `bc/v8_bc_20260423_195603/best.pt` | MLP (legacy) | 14.4M | **994** [969, 1021] | Pre-rewrite BC baseline. Recorded smart_avg 45.1% on 70-team pool (Session 39). Re-eval'd 42.8% on Metamon competitive (Session 48). |
-| `bc_v10_cloud_e1` | `bc/v10_cloud_gen9/epoch_001.pt` | Transformer (new arch) | 20.0M | **1101** [1076, 1128] | Cloud BC, end of epoch 1. smart_avg 63.8%. +107 Elo over `bc_v8_legacy` validates the architectural rewrite. Behind the legacy PPO peaks by ~16-25 Elo. |
+| `bc_v10_cloud_e1` | `bc/v10_cloud_gen9/epoch_001.pt` | Transformer (new arch) | 20.0M | **1117** [1103, 1132] @ 500g (1101 @ 100g) | Cloud BC, end of epoch 1. smart_avg 63.8%. +123 Elo over `bc_v8_legacy` (500g). Statistically tied with legacy PPO peaks within noise. |
+| `bc_v10_cloud_e2` | `bc/v10_cloud_gen9/epoch_002.pt` | Transformer (new arch) | 20.0M | **1122** [1108, 1137] @ 500g (1102 @ 100g) | Cloud BC, end of epoch 2. smart_avg 60.9%. Marginally above e1 (~+5 Elo), tied with all legacy PPO peaks. Direction of strength shifted away from rule-bot exploitation toward adaptive-opponent robustness. |
 | `ppo_s35_iter2979` | `rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt` | MLP (legacy) | 13.4M | **1067** [1037, 1098] | Session 35 era. Was Elo 1058 in the canonical 33-player ladder (`elo_session35_exp1.json`) — that ladder used the 70-team pool; the 1067 here is on the new 16-team Metamon set so the numbers aren't directly comparable, but ranking holds. |
 | `ppo_s39_iter229` | `rl_v9/_init_sp_0229/snapshot_0229.pt` | MLP (legacy) | 14.3M | **1117** [1090, 1146] | Session 39 PPO from new BC retrain. Recorded smart_avg 67.8% on Metamon competitive (peak of a 200-iter run). +16 Elo over `bc_v10_cloud_e1` — clearly stronger by Elo, marginally so by H2H over 200 games. |
 | `ppo_curated_iter119` | `rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt` | MLP (legacy) | 14.3M | **1126** [1105, 1157] | Session 44 curated pool peak. Sustained 66.15% smart_avg (3-eval window). **Highest-ranked model in the pre-V1 ladder.** Phase 1 PPO target: beat this. |
@@ -47,6 +48,51 @@ Bots span ~75% win-rate spread per the Session 23 round-robin → ~400 Elo of dy
 for snapshot interpolation.
 
 ### Total roster: 15 entrants → 105 all-vs-all matchups → 10,500 games at 100 g/matchup.
+
+---
+
+## High-precision 500g ladder (Session 48, 2026-05-04)
+
+The 100g baseline above is the ranking floor. For higher precision among
+the top-4 (where 100g CIs overlap massively), we ran a **500-game focused
+ladder** on just `bc_v10_cloud_e1`, `bc_v10_cloud_e2`, `ppo_s39_iter229`,
+`ppo_curated_iter119`, and the 4 smart bots. 28 matchups × 500 games =
+14,000 games, ~2 hr wall-clock.
+
+```
+Rank  Player                  Elo     95% CI       (vs 100g baseline)
+─────────────────────────────────────────────────────────────────────
+ 1    ppo_s39_iter229        1124    [1110, 1139]   (+7 from 1117)
+ 2    bc_v10_cloud_e2        1122    [1108, 1137]   (+20 from 1102)
+ 3    bc_v10_cloud_e1        1117    [1103, 1132]   (+16 from 1101)
+ 4    ppo_curated_iter119    1112    [1098, 1128]   (-14 from 1126)
+ 5    Tactical               1029    [1014, 1044]   (+6)
+ 6    SmartDmg               1019    [1003, 1034]   (+9)
+ 7    Strategic              1014    [1000, 1029]   (-8)
+ 8    SH (anchor)            1000    [1000, 1000]
+```
+
+**Key takeaway: top-4 are within 12 Elo, all CIs overlap.** They are
+statistically indistinguishable in playing strength. `bc_v10_cloud_e2`
+(1122) is tied with `ppo_s39_iter229` (1124) within noise — **the new
+arch's BC at epoch 2 matches the legacy arch's strongest 219-iter PPO peak.**
+
+Per-pair raw H2H (cumulative across all evals — gauntlet 100g + baseline
+ladder 100g + focused 500g):
+
+| Pairing | Combined wr (games) | Elo gap |
+|---------|---------------------|---------|
+| e1 vs ppo_s39_iter229 | 50.4% (700g) | ~0 |
+| e1 vs ppo_curated_iter119 | 51.9% (700g) | ~+13 |
+| e2 vs e1 | 52.2% (600g) | ~+15 |
+| e2 vs ppo_s39_iter229 | 55.0% (500g) | ~+35 |
+| e2 vs ppo_curated_iter119 | 54.4% (500g) | ~+30 |
+| ppo_s39_iter229 vs ppo_curated_iter119 | 50.2% (500g) | ~0 |
+
+Source: `data/eval/registry/elo_v10_500g_focused.json`.
+
+Phase 1 PPO target (per `PPO_PHASED_TRAINING.md`): cross **Elo ≥1140-1150
+sustained** — clearly above the legacy PPO ceiling.
 
 ---
 
