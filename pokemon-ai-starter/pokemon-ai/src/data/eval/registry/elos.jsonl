@@ -335,3 +335,8 @@
 {"iter": 3174, "name": "e5sp3174", "elo": 1047.2, "ci_lo": 1025.4, "ci_hi": 1061.8, "ladder": "elo_exp5_shard2", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260416_041529/snapshot_3174.pt"}
 {"iter": 114, "name": "sp_0114", "elo": 1067.1, "ci_lo": 1030.5, "ci_hi": 1108.1, "ladder": "eval_s43_final", "n_games": 100, "ckpt": "data/models/rl_v9_full_pool/selfplay_v9_20260428_030636/snapshot_0114.pt"}
 {"iter": 229, "name": "sp_0229", "elo": 1065.9, "ci_lo": 1027.0, "ci_hi": 1115.3, "ladder": "eval_s43_final", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260425_062416/snapshot_0229.pt"}
+{"iter": -1, "name": "bc_v8_legacy", "elo": 993.7, "ci_lo": 968.6, "ci_hi": 1020.9, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/bc/v8_bc_20260423_195603/best.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e1", "elo": 1101.3, "ci_lo": 1075.8, "ci_hi": 1128.4, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_001.pt"}
+{"iter": 2979, "name": "ppo_s35_iter2979", "elo": 1066.8, "ci_lo": 1036.7, "ci_hi": 1097.6, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt"}
+{"iter": 229, "name": "ppo_s39_iter229", "elo": 1117.3, "ci_lo": 1089.6, "ci_hi": 1145.7, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"}
+{"iter": 119, "name": "ppo_curated_iter119", "elo": 1126.4, "ci_lo": 1104.7, "ci_hi": 1157.2, "ladder": "elo_v10_baseline", "n_games": 100, "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"}

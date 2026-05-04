@@ -20,33 +20,83 @@ against this fixed slate (using `eval_elo_ladder.py --add-to`).
 
 ### Models (5)
 
-| Canonical name | Path | Arch | Params | History role |
-|----------------|------|------|--------|--------------|
-| `bc_v8_legacy` | `bc/v8_bc_20260423_195603/best.pt` | MLP (legacy) | 14.4M | Pre-rewrite BC baseline. Recorded smart_avg 45.1% on 70-team pool (Session 39). Re-eval'd 42.8% on Metamon competitive (Session 48). |
-| `bc_v10_cloud_e1` | `bc/v10_cloud_gen9/epoch_001.pt` | Transformer (new arch) | 20.0M | Cloud BC, end of epoch 1. smart_avg 63.8%. **Already beats every legacy PPO peak in head-to-head play (Session 48 gauntlet, +6 to +50 pt gaps).** |
-| `ppo_s35_iter2979` | `rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt` | MLP (legacy) | 13.4M | Session 35 era. Achieved Elo 1058 in the canonical 33-player ladder (`elo_session35_exp1.json`) — the all-time pre-rewrite Elo champion in our records. |
-| `ppo_s39_iter229` | `rl_v9/_init_sp_0229/snapshot_0229.pt` | MLP (legacy) | 14.3M | Session 39 PPO from new BC retrain. Recorded smart_avg 67.8% on Metamon competitive (peak of a 200-iter run). The strongest legacy-arch model by smart_avg metric. |
-| `ppo_curated_iter119` | `rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt` | MLP (legacy) | 14.3M | Session 44 curated pool peak. Sustained 66.15% smart_avg (3-eval window). Most recent legacy-arch ceiling before the architectural rewrite. |
+| Canonical name | Path | Arch | Params | Canonical Elo (95% CI) | History role |
+|----------------|------|------|--------|------------------------|--------------|
+| `bc_v8_legacy` | `bc/v8_bc_20260423_195603/best.pt` | MLP (legacy) | 14.4M | **994** [969, 1021] | Pre-rewrite BC baseline. Recorded smart_avg 45.1% on 70-team pool (Session 39). Re-eval'd 42.8% on Metamon competitive (Session 48). |
+| `bc_v10_cloud_e1` | `bc/v10_cloud_gen9/epoch_001.pt` | Transformer (new arch) | 20.0M | **1101** [1076, 1128] | Cloud BC, end of epoch 1. smart_avg 63.8%. +107 Elo over `bc_v8_legacy` validates the architectural rewrite. Behind the legacy PPO peaks by ~16-25 Elo. |
+| `ppo_s35_iter2979` | `rl_v9/selfplay_v9_20260413_061236/snapshot_2979.pt` | MLP (legacy) | 13.4M | **1067** [1037, 1098] | Session 35 era. Was Elo 1058 in the canonical 33-player ladder (`elo_session35_exp1.json`) — that ladder used the 70-team pool; the 1067 here is on the new 16-team Metamon set so the numbers aren't directly comparable, but ranking holds. |
+| `ppo_s39_iter229` | `rl_v9/_init_sp_0229/snapshot_0229.pt` | MLP (legacy) | 14.3M | **1117** [1090, 1146] | Session 39 PPO from new BC retrain. Recorded smart_avg 67.8% on Metamon competitive (peak of a 200-iter run). +16 Elo over `bc_v10_cloud_e1` — clearly stronger by Elo, marginally so by H2H over 200 games. |
+| `ppo_curated_iter119` | `rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt` | MLP (legacy) | 14.3M | **1126** [1105, 1157] | Session 44 curated pool peak. Sustained 66.15% smart_avg (3-eval window). **Highest-ranked model in the pre-V1 ladder.** Phase 1 PPO target: beat this. |
 
 ### Bots (10) — all from `eval_elo_ladder.py:ALL_BOTS`
 
-| Canonical name | Class | Source |
-|----------------|-------|--------|
-| `Random` | `RandomPlayer` | poke-env built-in |
-| `MaxBasePower` | `MaxBasePowerPlayer` | poke-env built-in |
-| `GreedySE` | `GreedySEPlayer` | `policy_rulebots.py` |
-| `HazardSense` | `HazardSensePlayer` | `policy_rulebots.py` |
-| `SwitchAwareEscape` | `SwitchAwareEscapePlayer` | `policy_rulebots.py` |
-| `SetupThenSweep` | `SetupThenSweepPlayer` | `policy_rulebots.py` |
-| **`SH`** (anchor at Elo 1000) | `SimpleHeuristicsPlayer` | poke-env built-in |
-| `SmartDmg` | `SmartDamagePlayer` | `policy_smartbots.py` |
-| `Tactical` | `TacticalPlayer` | `policy_smartbots.py` |
-| `Strategic` | `StrategicPlayer` | `policy_smartbots.py` |
+| Canonical name | Class | Source | Canonical Elo (95% CI) |
+|----------------|-------|--------|------------------------|
+| `Random` | `RandomPlayer` | poke-env built-in | **382** [335, 420] |
+| `MaxBasePower` | `MaxBasePowerPlayer` | poke-env built-in | **711** [686, 739] |
+| `HazardSense` | `HazardSensePlayer` | `policy_rulebots.py` | **766** [736, 791] |
+| `SwitchAwareEscape` | `SwitchAwareEscapePlayer` | `policy_rulebots.py` | **769** [738, 798] |
+| `GreedySE` | `GreedySEPlayer` | `policy_rulebots.py` | **783** [755, 811] |
+| `SetupThenSweep` | `SetupThenSweepPlayer` | `policy_rulebots.py` | **836** [811, 860] |
+| **`SH`** (anchor at Elo 1000) | `SimpleHeuristicsPlayer` | poke-env built-in | **1000** (anchor) |
+| `SmartDmg` | `SmartDamagePlayer` | `policy_smartbots.py` | **1010** [983, 1040] |
+| `Strategic` | `StrategicPlayer` | `policy_smartbots.py` | **1022** [1002, 1048] |
+| `Tactical` | `TacticalPlayer` | `policy_smartbots.py` | **1023** [1001, 1048] |
 
 Bots span ~75% win-rate spread per the Session 23 round-robin → ~400 Elo of dynamic range
 for snapshot interpolation.
 
 ### Total roster: 15 entrants → 105 all-vs-all matchups → 10,500 games at 100 g/matchup.
+
+---
+
+## Pre-V1 Elo ladder — full ranking (Session 48, 2026-05-03)
+
+```
+Rank  Player                  Elo    95% CI       Type   Class
+─────────────────────────────────────────────────────────────────
+ 1    ppo_curated_iter119    1126   [1105, 1157]  model  PPO ceiling
+ 2    ppo_s39_iter229        1117   [1090, 1146]  model  PPO #2
+ 3    bc_v10_cloud_e1        1101   [1076, 1128]  model  new-arch BC
+ 4    ppo_s35_iter2979       1067   [1037, 1098]  model  legacy PPO peak
+ 5    Tactical               1023   [1001, 1048]  bot    smart
+ 6    Strategic              1022   [1002, 1048]  bot    smart
+ 7    SmartDmg               1010   [ 983, 1040]  bot    smart
+ 8    SH (anchor)            1000   [1000, 1000]  bot    smart
+ 9    bc_v8_legacy            994   [ 969, 1021]  model  legacy BC
+10    SetupThenSweep          836   [ 811,  860]  bot    rule
+11    GreedySE                783   [ 755,  811]  bot    rule
+12    SwitchAwareEscape       769   [ 738,  798]  bot    rule
+13    HazardSense             766   [ 736,  791]  bot    rule
+14    MaxBasePower            711   [ 686,  739]  bot    floor
+15    Random                  382   [ 335,  420]  bot    floor
+```
+
+Source: `data/eval/registry/elo_v10_baseline.json` — 100 games/matchup, 105 matchups, 10,500 games total, ~53 min wall-clock on local RTX 3060.
+
+### Key observations
+
+- **Architectural rewrite is worth ~107 Elo at BC level** (`bc_v8_legacy` 994 → `bc_v10_cloud_e1` 1101). Cleanest measurement of the rewrite's gain.
+- **Our BC is below the legacy PPO ceiling by ~25 Elo** (1101 vs 1126). Phase 1 PPO target: cross 1130-1150.
+- **`bc_v10_cloud_e1` ≥ legacy s35 PPO peak** (1101 vs 1067). The new arch's BC alone matches or exceeds older PPO eras.
+- **Smart bots cluster within ±25 Elo** (1000-1023). Their differentiation is real but narrow.
+- **`bc_v8_legacy` is essentially equal to SH** (994 vs 1000). Legacy BC was barely better than a heuristic.
+- **Random vs SH = ~620 Elo gap** — wide dynamic range for placing future models.
+
+### When this ladder will be updated
+
+Add a new model via `--add-to`:
+
+```bash
+python eval_elo_ladder.py \
+  --add-to data/eval/registry/elo_v10_baseline.json \
+  --snapshots <path> --names <canonical_name> \
+  --bots all --n-games 100 --concurrency 100 --device cuda \
+  --team-set metamon-competitive \
+  --out-json data/eval/registry/elo_v10_plus_<name>.json
+```
+
+Existing players' Elos get small adjustments (10-game samples added to the BT-MLE fit), but rankings should stay stable. If a new model causes large Elo shifts on the existing players, that signals the new model exposed unmodeled exploit patterns — worth investigating.
 
 ---
 
