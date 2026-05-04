@@ -226,13 +226,20 @@ class PlayerPool:
     """
 
     def __init__(self, max_snapshots: int, server_cfg, device: str,
-                 concurrency: int, fp16: bool = False, battle_format: str = "gen9ou"):
+                 concurrency: int, fp16: bool = False, battle_format: str = "gen9ou",
+                 teambuilder_factory=None):
         self.max_snapshots = max_snapshots
         self.server_cfg = server_cfg
         self.device = device
         self.concurrency = concurrency
         self.fp16 = fp16
         self.battle_format = battle_format
+        # teambuilder_factory: zero-arg callable returning a Teambuilder instance
+        # per player. Default is the legacy 70-team random pool. For Metamon
+        # competitive eval consistency, pass MetamonCompetitiveTeambuilder().
+        if teambuilder_factory is None:
+            teambuilder_factory = random_pool_teambuilder
+        self.teambuilder_factory = teambuilder_factory
         self._bot_pool: Dict[str, Any] = {}
         self._snapshot_pool: "OrderedDict[str, Any]" = OrderedDict()
         self._account_counter = 0
@@ -248,21 +255,25 @@ class PlayerPool:
             battle_format=self.battle_format,
             max_concurrent_battles=self.concurrency,
             server_configuration=self.server_cfg,
-            team=random_pool_teambuilder(),
+            team=self.teambuilder_factory(),
             account_configuration=AccountConfiguration(self._next_account_name(), None),
         )
 
     def _make_snapshot(self, spec: 'PlayerSpec'):
         # Get the cached checkpoint (load from disk only on first request)
         ckpt = load_ckpt_cached(spec.ckpt)
-        return BattleAgent(
-            checkpoint_path=spec.ckpt,  # used only for the log message
-            _cached_ckpt=ckpt,           # the actual data — bypasses disk read
+        # Arch dispatch: legacy MLP -> BattleAgent, new transformer -> BattleAgentTransformer.
+        # Imports are lazy so older sessions that haven't built the new arch still load.
+        from battle_agent_transformer import is_transformer_checkpoint, BattleAgentTransformer
+        AgentClass = BattleAgentTransformer if is_transformer_checkpoint(ckpt) else BattleAgent
+        return AgentClass(
+            checkpoint_path=spec.ckpt,
+            _cached_ckpt=ckpt,
             device=self.device,
             battle_format=self.battle_format,
             max_concurrent_battles=self.concurrency,
             server_configuration=self.server_cfg,
-            team=random_pool_teambuilder(),
+            team=self.teambuilder_factory(),
             account_configuration=AccountConfiguration(self._next_account_name(), None),
         )
 
@@ -805,12 +816,22 @@ def _add_to_existing(args):
 
     # Set up player pool and run matches
     server_cfg = resolve_server(args.server)
+    # Build the teambuilder factory based on --team-set.
+    if getattr(args, "team_set", "metamon-competitive") == "metamon-competitive":
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        # Single shared instance — both sides + bots all sample from the same 16 teams.
+        _shared_tb = MetamonCompetitiveTeambuilder()
+        teambuilder_factory = lambda: _shared_tb
+    else:
+        teambuilder_factory = random_pool_teambuilder
+
     pool = PlayerPool(
         max_snapshots=args.max_snapshots_in_pool,
         server_cfg=server_cfg,
         device=args.device,
         concurrency=args.concurrency,
         battle_format=args.format,
+        teambuilder_factory=teambuilder_factory,
     )
 
     # Start with existing matches
@@ -1002,6 +1023,10 @@ def main():
     p.add_argument("--n-games", type=int, default=50,
                    help="Games per matchup (50 = ~+/-50 Elo CI on tight pairs)")
     p.add_argument("--concurrency", type=int, default=10)
+    p.add_argument("--team-set", choices=["pool", "metamon-competitive"], default="metamon-competitive",
+                   help="Team source. 'pool' = legacy 70-team random pool (Session 23-era convention); "
+                        "'metamon-competitive' = 16 curated Smogon teams matching our smart_avg/H2H "
+                        "eval methodology (default, recommended).")
     p.add_argument("--format", default="gen9ou", help="Battle format (gen9ou, gen8ou, etc.)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--server", default="ws://127.0.0.1:9000/showdown/websocket")
@@ -1184,12 +1209,22 @@ def main():
 
     # ---- Build PlayerPool (persistent player cache) ----
     server_cfg = resolve_server(args.server)
+    # Build the teambuilder factory based on --team-set.
+    if getattr(args, "team_set", "metamon-competitive") == "metamon-competitive":
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        # Single shared instance — both sides + bots all sample from the same 16 teams.
+        _shared_tb = MetamonCompetitiveTeambuilder()
+        teambuilder_factory = lambda: _shared_tb
+    else:
+        teambuilder_factory = random_pool_teambuilder
+
     pool = PlayerPool(
         max_snapshots=args.max_snapshots_in_pool,
         server_cfg=server_cfg,
         device=args.device,
         concurrency=args.concurrency,
         battle_format=args.format,
+        teambuilder_factory=teambuilder_factory,
     )
     _log(f"PlayerPool created (max_snapshots={args.max_snapshots_in_pool}, "
          f"concurrency={args.concurrency})")
