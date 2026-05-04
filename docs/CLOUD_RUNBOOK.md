@@ -424,9 +424,13 @@ R2 credentials persist on the pod's `r2_env.local.sh` — only need to re-create
 
 ---
 
-## 9. Quirks + gotchas (validated Session 48)
+## 9. Quirks + gotchas (validated Session 48-49)
 
-These are real things we hit in this session. Future sessions will hit them again.
+These are real things we hit. Future sessions will hit them again.
+
+### ⚠️ TOP-PRIORITY QUIRK (Session 49 — cost us a partial run)
+
+**0. Container Disk does NOT survive a `podStop` + `podResume` cycle on a different host. USE A NETWORK VOLUME.** Symptoms: pod resumes RUNNING, web terminal works, but `/workspace` is empty. All training state, code, venv, the 104 GB memmap — gone. Network Volumes (RunPod console → Storage → Network Volume → mount at `/workspace`) follow the pod across hosts. Container Disk does not. Pause/resume on the SAME host usually preserves state, but you cannot guarantee same-host on resume from EXITED. **Mandatory for any run > 1 epoch: attach a Network Volume.** Also note: SSH key auto-injection sometimes fails on resume (`/root/.ssh/authorized_keys` empty). Use the web terminal as fallback rather than triggering a stop+start to "fix" it — that's exactly the path that lost our state in Session 49.
 
 ### Setup-time quirks
 

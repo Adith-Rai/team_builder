@@ -1,5 +1,32 @@
 # NEXT_SESSION.md — Project Handover
 
+**Last updated: 2026-05-04 (Session 49 — BC v10 transformer DONE; new project peak. 3 epochs trained on RunPod A100 80GB at B=48 fp16 with `--compile`. Final 500g focused ladder anchored on SH=1000: bc_v10_cloud_e3 = Elo 1135.9 [1123, 1151] — #1 all-time, +16 Elo over legacy peak ppo_s39_iter229 (1120.4). e2 = 1122.6, e1 = 1118.1. e2→e3 gain was +13 Elo so BC was still climbing, but a stop+resume RunPod cycle re-provisioned the pod onto a fresh container with empty `/workspace` (Container Disk only, no Network Volume), losing optimizer/scheduler state + the 104 GB memmap + venv. Decided to terminate and lock in e3 rather than re-bootstrap. All four checkpoints (epoch_000/001/002/003) saved locally at `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_cloud_gen9/`. Final ladder JSON at `data/eval/registry/elo_v10_500g_focused_plus_e3.json`. Session 50 task: PPO Phase 1 setup per `docs/PPO_PHASED_TRAINING.md` — init from `epoch_003.pt`, smoke 1 iter to confirm `ppo.py::load_checkpoint` works on a transformer ckpt (arch dispatch added but never end-to-end tested with new arch), then ramp self-play-only PFSP for 50-100 iters targeting +10 Elo over e3. ⚠️ FUTURE CLOUD RUNS MUST USE NETWORK VOLUME — not Container Disk — to survive stop/start cycles.)**
+
+## Session 49 — BC v10 final (READ THIS FIRST)
+
+**Final BC v10 ladder (500g focused, anchored on SH=1000):**
+| Rank | Player | Elo | 95% CI |
+|------|--------|------|--------|
+| 1 | bc_v10_cloud_e3 | **1135.9** | [1123, 1151] |
+| 2 | bc_v10_cloud_e2 | 1122.6 | [1109, 1136] |
+| 3 | ppo_s39_iter229 | 1120.4 | [1108, 1136] |
+| 4 | bc_v10_cloud_e1 | 1118.1 | [1103, 1132] |
+| 5 | ppo_curated_iter119 | 1110.0 | [1099, 1125] |
+| 6 | Tactical (smart bot) | 1027.5 | — |
+| 7 | SmartDmg (smart bot) | 1017.2 | — |
+| 8 | Strategic (smart bot) | 1012.9 | — |
+| 9 | SH (anchor) | 1000.0 | — |
+
+JSON: `pokemon-ai-starter/pokemon-ai/src/data/eval/registry/elo_v10_500g_focused_plus_e3.json`
+
+**Cloud incident (must not repeat):** A `podStop` + `podResume` cycle on RunPod re-provisioned the pod onto a fresh container with empty `/workspace`. The pod had Container Disk only (no Network Volume), so the persistent volume didn't follow. All training state was lost: optimizer/scheduler state, code clone, venv, the 104 GB human_v8_100k memmap. The original session-48 `podResume` (resume from EXITED to RUNNING) had ALSO failed SSH key injection — `~/.ssh/authorized_keys` wasn't repopulated, so we had to fall back to web terminal, then attempt a stop-start cycle to re-trigger the startup script, which is when the volume vanished. **Future cloud runs MUST attach a Network Volume mounted at `/workspace`** (RunPod console → Storage → Network Volume). With Container Disk, pause/resume usually works but stop/start can land on a different host. Pod `t56a2jndi8iyz8` terminated; we are not billing.
+
+**Session 50 task = PPO Phase 1 setup.** See `docs/PPO_PHASED_TRAINING.md` for the full curriculum (4 phases). Phase 1 = self-play-only PFSP, init from `data/models/bc/v10_cloud_gen9/epoch_003.pt`. Critical pre-flight: `ppo.py::load_checkpoint` arch dispatch was added in Session 48 (Week 3 plumbing) but never end-to-end exercised on a real transformer ckpt — smoke 1 PPO iter first to confirm. Phase 1 success criteria: ≥+10 Elo over e3 in 50-100 iters of pure self-play.
+
+---
+
+## Session 48 final status — TL;DR (preserved for context — Week 3 plumbing notes)
+
 **Last updated: 2026-05-02 (Session 48 — Week 3 plumbing + eval pipeline shipped. Three commits: (1) `1f3ec01` `--use-transformer` plumbed through `train_bc.py` + `ppo.py::load_checkpoint`; (2) `a6e6b33` `bench_bc_step.py` + Postscript I documenting the B=8 memory cliff at 5 GB peak on the 6 GB RTX 3060 (per-turn 5 ms → 145 ms) and choice of B=4 as local operating point; (3) `5f04380` `BattleAgentTransformer` (mirror of legacy `BattleAgent` for the new arch) + arch dispatch in `eval_metamon_competitive.py`, smoke-validated end-to-end (20 random-init games in 15 s). Plumbing smoke (CPU B=4, 40 batches): loss 1.66→1.61 clean, no NaN, 19,994,924 params confirmed. CUDA fp16 bench at B=4: 6-11 ms/turn, peak ≤2.74 GB, 8/8 batches stable. Throughput projection: ~9.7 hr/epoch local → 5 epochs ≈ 2 days, 10 epochs ≈ 4 days (right at the cloud-trigger boundary). All 17/17 tokenizer + 9/9 policy tests still pass. Session 49 task: launch the full 5-epoch BC at B=4 fp16 (`--workers 2 --eval-games 0 --val-ratio 0.05 --use-transformer`), run `eval_metamon_competitive.py` post-epoch on each saved checkpoint. Eval pipeline is wired and validated. See `next-prompt.txt`.)**
 
 This is the canonical reference for resuming work on this project. It's self-contained —
