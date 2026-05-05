@@ -41,12 +41,31 @@ paths), so they're auto-fixed by the same attribute add.
 - In-loop eval transformer: SH=65, SmartDmg=80, Tactical=75, Strategic=65, smart_avg=71% on 20g/bot
 - Round-trip: both snapshots load to the correct class via `ppo.load_checkpoint` cleanly
 
-**Phase 1 launch state.** Refactor is launch-ready. The next-prompt.txt operational
-reference specifies `--max-concurrent 200`. That's sized for cloud or a high-VRAM
-workstation — on this session's local 6 GB GPU (RTX 3060 Laptop), conc=200 is highly
-likely to OOM with the 20M-param transformer (smoke ran cleanly at conc=20). User
-should confirm: launch on cloud (preferred path per project_vision_scope.md scale-out
-constraint) OR scale conc down for local launch.
+**Phase 1 launched and running on local 6 GB GPU at conc=200.** The "200 conc OOMs
+on 6 GB" concern was wrong arithmetic on my part — InferenceBatcher batches all 200
+concurrent battles through ONE shared GPU model (peak simultaneous batch ~30-100,
+not 200). Memory note: `feedback_concurrency_vram.md` in user memory.
+
+⚠️ **`--pipeline` is OPERATIONALLY BROKEN on this hardware with the new arch.** Do NOT
+re-enable for any local Phase 1+ run. Empirically validated 2026-05-05:
+- At conc=200 + 20M-param transformer, deepcopied bg model's GPU contention with
+  PPO backward starves the asyncio event loop. 200+ concurrent battle websockets
+  can't service their ping/pongs; battle_server times them out at 20s; cascading
+  `ConnectionClosedError: sent 1011 (internal error) keepalive ping timeout` on
+  every in-flight battle.
+- Wall time also went the wrong direction: iter 21 took 722s (vs 390s sequential).
+  Both `collect` and `update` dilated ~1.8-2× and failed to overlap.
+- Documented in STATUS.md:1065-1067 already (Session ~33: "Don't use --pipeline
+  locally"). The Session 32 success was a narrower regime: conc=10 + legacy 12-15M
+  arch on the same RTX 3060. New arch is 20M params with 220-token attention,
+  2-3× heavier per forward — past the GPU contention threshold.
+- See ARCH_AUDIT.md "Correction-to-correction: --pipeline is OPERATIONALLY broken
+  at this scale" for the full incident report.
+- Cloud (multi-GPU) should still benefit from `--pipeline`. Local does not.
+
+**Restart used `--init-from snapshot_0019.pt --warmup-iters 0 --n-iters 200` (no
+--pipeline)** to preserve the value-head warmup work. Sequential mode at ~390s/iter,
+ETA ~22 hr.
 
 The Phase 1 spec command (verbatim from next-prompt.txt §"Phase 1 launch command"):
 ```bash

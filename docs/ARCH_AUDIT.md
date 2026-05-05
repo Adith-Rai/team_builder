@@ -459,13 +459,49 @@ Key facts:
 - `mp_collect_v3.py` exists but isn't wired into `train_rl.py` — appears to be
   dead/experimental code (imported only by `test_mp_collection.py`).
 
-**Implication for Phase 1:** `--pipeline` is safe to enable on the transformer arch
-right now. Iter time drops from `collect+update` to `max(collect, update)` for all
-post-warmup iters, since pipeline is gated `not in_warmup` (train_rl.py:319, 334).
-At our smoke rates that's ~6.25 min/iter → ~3.5 min/iter, saving ~9-10 hr over
-220 iters (modulo GPU-stream contention overhead, realistically 6-8 hr saved).
+**Implication for Phase 1 — code compatibility only.** `--pipeline` won't crash with
+`AttributeError` on the transformer arch (the code-path concern). However, this
+correction is itself now superseded — see "Correction-to-correction" below.
 
-**Ready for Phase 1 launch.** See `next-prompt.txt` operational reference for the
-final command. Note that the spec's `--max-concurrent 200` is sized for cloud or a
-high-VRAM workstation; on the 6 GB consumer GPU used for this session's smoke
-testing, scale conc down to ~30-50 (or run on cloud).
+### Correction-to-correction: `--pipeline` is OPERATIONALLY broken at this scale
+
+**The earlier "safe to enable" claim was code-correctness only — operationally,
+pipeline kills the run on this hardware/scale.** Empirical evidence from the
+Session 50 Phase 1 launch attempt (2026-05-05, ~iter 21):
+
+- **Iter 21 wall time = 722s** (vs ~390s sequential baseline = 1.85× SLOWER)
+  - `collect=413s` (vs ~210s baseline, 2× slower)
+  - `update=307s` (vs ~175s baseline, 1.8× slower)
+  - Both phases dilated AND failed to overlap → effectively serial with overhead.
+- **Iter 22 cascading failure**: `websockets.exceptions.ConnectionClosedError:
+  sent 1011 (internal error) keepalive ping timeout` propagated to 200+ concurrent
+  battle connections simultaneously. Run was unrecoverable.
+
+**Root cause:** GPU contention between the deepcopied bg model's InferenceBatcher
+calls and the foreground PPO backward pass starves the asyncio event loop. At
+`--max-concurrent 200`, 200+ websocket clients can't get their ping/pong heartbeats
+serviced; battle_server times them out at the 20s mark and emits 1011 frames; every
+in-flight battle's listener task raises ConnectionClosedError simultaneously.
+
+**Why it's a regression from older runs:** STATUS.md:455 records pipeline at
+~21% speedup in Session 32 (`conc=10`, legacy 12-15M arch on the same RTX 3060).
+STATUS.md:1065-1067 then records a later benchmark on the same hardware as
+"SLOWER on single GPU (0.80x)" — the regime shifted as concurrency and model size
+grew. The new TransformerBattlePolicy (20M params, 220 tokens/forward, 2-3× heavier
+attention than legacy) at conc=200 amplifies the GPU contention past the WS-keepalive
+breaking point.
+
+**Verdict for Phase 1+ on local 6 GB GPU:**
+- **Do not use `--pipeline` locally with the new arch.** STATUS.md:1065 already
+  said this; we re-validated empirically.
+- Sequential collect+update is the only viable mode (~390s/iter, ~22 hr total).
+- Pipeline IS compatible with the new arch on multi-GPU cloud (where bg
+  inference and foreground PPO can run on separate devices).
+- If you want pipeline-style speedup locally, the documented `cpu_inference=True`
+  variant of `BackgroundCollector` (rl_collection.py:546-550) might work — moves
+  the bg model to CPU to avoid GPU contention. Untested at conc=200 with the
+  20M-param transformer; probably too slow (CPU forward at 20M params × ~50 turns
+  × 200 concurrent battles is hours per iter). Cloud is the better lever.
+
+**Phase 1 launched successfully without `--pipeline`.** Resumed from `snapshot_0019.pt`
+(end-of-warmup checkpoint), `--warmup-iters 0`, `--n-iters 200`. ETA ~22 hr.
