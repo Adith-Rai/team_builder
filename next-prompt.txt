@@ -180,6 +180,149 @@ BEST PRACTICES — re-read before each non-trivial decision
   assumptions or your own prior recommendation.
 
 ═══════════════════════════════════════════════════════════════════════════════
+OPERATIONAL REFERENCE — flags, files, quirks
+═══════════════════════════════════════════════════════════════════════════════
+
+**Phase 1 launch command (final, post-refactor)**
+
+```bash
+python train_rl.py \
+  --init-from data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --device cuda --servers 9000,9000,9000,9000 --fp16 \
+  --games-per-iter 200 --max-concurrent 200 \
+  --n-iters 210 --warmup-iters 10 \
+  --lr 3e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
+  --grad-accum 1 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --eval-interval 20 --eval-team-set metamon-competitive --eval-games 200 \
+  --snapshot-interval 5 \
+  --early-stop --early-stop-patience 3 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --out-dir data/models/rl_v10/ppo_phase1
+```
+
+Notes on the flags:
+- `--init-from <BC ckpt>` — start PPO from BC weights. Phase 1 uses transformer
+  e3 (Elo 1135.9). For legacy regression test use `data/models/rl_v9/_init_sp_0229/snapshot_0229.pt`.
+- `--pool-anchors <BC ckpt>` — pins the BC ckpt in the PFSP pool forever
+  (never pruned). Sample weight follows standard PFSP `(1-wr)²`, so as PPO beats
+  the anchor, weight decays; this is intentional for Phase 1 — see "anchor decision"
+  below.
+- `--servers 9000,9000,9000,9000` — **4-wave parallelism on a single battle_server**
+  (validated Session 42, not 4 separate battle_servers). Spin up ONE
+  `battle_server.js` listening on port 9000 and put 9000 four times in this list;
+  poke-env distributes connections across 4 internal "lanes" to that one server.
+- `--max-concurrent 200` — for **pure self-play only**. The "6" in some older docs
+  is for runs with external FP/MM subprocess opponents (subprocess limits the
+  parallelism). Self-play has no such cap. 200-250 is the validated user standard.
+- `--lr 3e-5` — **mandatory**. 1e-4 has diverged in 3 iters in every prior attempt
+  (S39, S43). Don't override.
+- `--reward-style terminal` — Session 43+ validated. Was `dense` in earlier runs;
+  `terminal` is the current default.
+- `--lam 0.95 --ent-coef 0.02` — Session 39 validated, set the smart_avg=64% peak.
+- `--adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95`
+  — Session 43+ safeguard. Auto-adjusts `ent_coef` to keep policy entropy
+  in [0.65, 0.95]. Prevents the entropy collapse seen in Exp 1 / S43-first-attempt.
+- `--win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50` —
+  consider adding for Phase 1; Session 39 validated. Forgets old data in PFSP
+  weighting, so a snapshot you crushed 50 iters ago doesn't keep getting weight=0
+  forever after you regress on it.
+- `--snapshot-interval 5` — save snapshot every 5 iters; with 210 iters total
+  that's ~42 self-snapshots in the pool by the end (well past the 15-member
+  pool cap, so PFSP curation kicks in via `--pool-max-current-run`).
+- `--eval-interval 20 --eval-games 200 --eval-team-set metamon-competitive` —
+  in-loop bot eval every 20 iters, 200 games × 4 smart bots = 800 games per eval,
+  ~3.5pt SE. **Metamon-competitive (16 curated Smogon teams) is the default —
+  the legacy 70-team random pool has a 51pt smart_avg spread (TEAM_AX 81.5%
+  vs TEAM_AR 30.5%) which dominates real signal as noise.** See Session 43
+  retrospective for the experiment that proved this.
+- `--procedural-teams <dir>` — path to Smogon usage stats for procedural team
+  generation during *training* collection. Validated path for gen9ou:
+  `raw_data/pokemon_usage/2024-04`. Distinct from eval teams (which use
+  `--eval-team-set`).
+- `--early-stop --early-stop-patience 3` — stops if 3 consecutive eval intervals
+  show savg regression past threshold from best rm3. Saves compute on a stalled run.
+
+**Anchor decision (Session 49 — defer floor for Phase 1)**
+
+`--pool-anchors` only pins POOL MEMBERSHIP. Sample weight in PFSP is still
+`(1-wr)²`. As PPO beats the anchor (`wr → 0.7+`), anchor weight decays
+(`(0.3)² = 0.09` → `(0.2)² = 0.04`). That's roughly 7% sample share at iter 50,
+3% at iter 100. The user's intent ("don't forget human play") is partially
+served by this natural decay (anchor stays sampled in the early-mid window when
+PPO is closest to BC and the gradient signal vs human-style matters most).
+
+**Decision: skip the floor mechanism for Phase 1, watch smart_avg for drift.**
+If smart_avg craters mid-Phase-1 while internal win-rate climbs, that's the
+drift signal — react then by adding a min-weight floor (~1 hr code change).
+A defensible floor would be ~15% sample share for anchors (double the
+all-equal share at pool=15).
+
+**External opponents (Phase 2+, NOT Phase 1)**
+
+Phase 1 is self-play only. Later phases add external opponents via
+`--external-adapters <yaml>`. YAMLs live in `pokemon-ai-starter/pokemon-ai/src/`:
+- `external_adapters_smoke.yaml` — minimal smoke (1 mcts adapter)
+- `external_adapters_all3_smoke.yaml` — 3 adapters smoke (mcts + foulplay + metamon)
+- `external_adapters_curated.yaml` — curated for training
+- `external_adapters_full_pool.yaml` — the full Session 42 pool (mcts + 4 FP +
+  4 MM variants)
+- `external_opponents_example.yaml` — reference example
+
+For Phases 2-4 you'll need:
+- `battle_server.js` running on port 9000 (Node 20)
+- `foul_play_venv` for FP subprocesses (separate venv because of dep conflicts)
+- `metamon_venv` for MM subprocesses (separate venv, vendored poke-env 0.8.3)
+- See Session 42-43 protocol fixes documented in `docs/EXTERNAL_OPPONENTS_PHASE2.md`
+
+**Battle server startup (Windows / git-bash)**
+
+```bash
+node \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  2>&1 | tee C:/Users/raiad/OneDrive/Desktop/team_builder/logs/external/battle_server.log
+```
+
+Single server on port 9000 is enough — 4-wave parallelism in poke-env is what
+distributes the load. For Phase 2+ with external adapters, the subprocesses
+each connect to the same port 9000.
+
+**Cloud (RunPod + Cloudflare R2) — full reference: `docs/CLOUD_RUNBOOK.md` (786 lines)**
+
+⚠️ **NEW (Session 49) — Network Volume is MANDATORY for any run > 1 epoch.**
+Container Disk does NOT survive `podStop+podResume` if the pod re-provisions
+on a different host. We lost a partial BC run this way. Attach a Network Volume
+in the RunPod console (Storage → Network Volume) and mount at `/workspace`.
+
+R2 credentials live in:
+`pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh` (gitignored — file is
+real but never committed). Source it before any aws s3 command:
+```bash
+source pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
+aws s3 ls s3://team-builder-data/datasets/human_v8_100k/ \
+  --endpoint-url $S3_ENDPOINT_URL
+# should list 23 files totaling ~104 GB
+```
+
+R2 layout (verified Session 48):
+- Endpoint: `https://86facaf13d3491bbc167027863b2f114.r2.cloudflarestorage.com`
+- Bucket: `team-builder-data`
+- Memmap prefix: `datasets/human_v8_100k/` — 23 files, ~104 GB
+- Keys auto-loaded by `cloud_setup.sh` on the pod
+
+RunPod API key: stored in user's environment (referenced in Session 49
+chat history if you need it; don't re-paste in code or commits).
+
+Cloud bootstrap workflow (per `CLOUD_RUNBOOK.md §3`):
+1. RunPod console → deploy pod with A100 SXM 80GB ($1.50/hr) + Network Volume
+2. SSH in → `bash cloud_setup.sh` (clones code, installs venv, downloads memmap from R2)
+3. Source `r2_env.local.sh` once on pod (handled by cloud_setup.sh)
+4. Launch training → `nohup python train_bc.py --use-transformer --compile ... &`
+5. After each epoch: `scp <pod>:/workspace/.../epoch_NNN.pt ./local/` for ladder eval
+6. When done: `podTerminate` (NOT just stop — see Network Volume warning)
+
+═══════════════════════════════════════════════════════════════════════════════
 START HERE
 ═══════════════════════════════════════════════════════════════════════════════
 
