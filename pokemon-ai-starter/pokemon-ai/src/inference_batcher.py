@@ -14,6 +14,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from arch_compat import (
+    call_action_encoder,
+    call_policy_logits,
+    call_value_logits,
+    get_v_support,
+)
 from model import PokeTransformer
 
 
@@ -127,11 +133,8 @@ class InferenceBatcher:
             if summaries.isnan().any():
                 print(f"  [NaN-DIAG] summaries has NaN", flush=True)
 
-            # Phase 2: Batched action encoding
-            action_ctx = model.action_encoder(
-                mega["active_move_ids"], mega["active_move_banks"],
-                mega["active_move_cont"], mega["switch_ids"], mega["switch_cont"],
-            )  # (N, 9, D)
+            # Phase 2: Batched action encoding (arch-aware — see arch_compat.py)
+            action_ctx = call_action_encoder(model, mega, spatial_out)  # (N, 9, D)
 
             if action_ctx.isnan().any():
                 print(f"  [NaN-DIAG] action_ctx has NaN", flush=True)
@@ -176,12 +179,12 @@ class InferenceBatcher:
                     if nan_mask[i]:
                         print(f"  [NaN-DIAG] temporal has NaN (item {i}, history_len={seq_lens[i]})", flush=True)
 
-            # Phase 4: Batched policy head
+            # Phase 4: Batched policy head (arch-aware)
             actor_out = spatial_out[:, 0, :]  # (N, D)
             at = torch.cat([actor_out, temporal_ctx], dim=-1)  # (N, 2D)
             at_exp = at.unsqueeze(1).expand(-1, 9, -1)  # (N, 9, 2D)
             pi_input = torch.cat([at_exp, action_ctx], dim=-1)  # (N, 9, 3D)
-            logits = model.policy_head(pi_input).squeeze(-1)  # (N, 9)
+            logits = call_policy_logits(model, pi_input)  # (N, 9)
 
             if logits.isnan().any():
                 print(f"  [NaN-DIAG] policy_head has NaN", flush=True)
@@ -190,12 +193,12 @@ class InferenceBatcher:
             if "legal_mask" in mega:
                 logits = logits.float().masked_fill(mega["legal_mask"] < 0.5, -100.0)
 
-            # Phase 5: Batched value head
+            # Phase 5: Batched value head (arch-aware)
             critic_out = spatial_out[:, 1, :]  # (N, D)
             vi = torch.cat([critic_out, temporal_ctx], dim=-1)  # (N, 2D)
-            v_logits = model.value_head(vi)  # (N, 51)
+            v_logits = call_value_logits(model, vi)  # (N, 51)
             v_probs = F.softmax(v_logits, dim=-1)
-            values = (v_probs * model.v_support).sum(-1)  # (N,)
+            values = (v_probs * get_v_support(model)).sum(-1)  # (N,)
 
             # Unpack results
             results = []

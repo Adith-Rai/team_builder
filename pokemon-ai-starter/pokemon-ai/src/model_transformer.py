@@ -1858,6 +1858,10 @@ class TransformerBattlePolicy(nn.Module):
     ):
         super().__init__()
         self.cfg = cfg
+        # Top-level d_temporal mirrors legacy PokeTransformer convention
+        # (model.py:597). Trainer-side helpers (InferenceBatcher) read it via
+        # getattr to size the temporal-history buffer.
+        self.d_temporal = cfg.d_temporal
         self.tokenizer = Tokenizer(cfg, move_flag_lookup=move_flag_lookup)
         self.spatial = SpatialTransformer(cfg, type_ids=self.tokenizer.type_ids)
 
@@ -1956,6 +1960,32 @@ class TransformerBattlePolicy(nn.Module):
         switch_ctx = self.switch_encoder(bench_pooled, eff)                 # (B, 5, d)
 
         return torch.cat([move_ctx, switch_ctx], dim=1)                    # (B, 9, d)
+
+    # ---- Trainer-side adapter (used by InferenceBatcher / ppo.ppo_update) ----
+
+    def action_encoder_from_spatial(
+        self,
+        batch: dict,
+        spatial_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """(B, 9, d_model) action context from an already-computed spatial pass.
+
+        InferenceBatcher and ppo.ppo_update have spatial_out in hand from a
+        prior `forward_spatial` call and need per-action context next. This
+        method derives the spatial-order ids from `batch` via the tokenizer
+        and dispatches to `_per_action_context` — analogous to legacy
+        `model.action_encoder(...)` but consuming the already-computed
+        spatial output rather than re-running the spatial transformer.
+        """
+        our_full_ids = self.tokenizer._fix_ids(batch, "our")  # (B, team_size, 7)
+        return self._per_action_context(
+            spatial_out=spatial_out,
+            our_pokemon_move_ids=our_full_ids[..., 3:7],
+            active_move_ids=batch["active_move_ids"],
+            switch_ids=batch["switch_ids"],
+            our_pokemon_species_ids=our_full_ids[..., 0],
+            switch_cont=batch["switch_cont"],
+        )
 
     # ---- Spatial pass with summary projection ----
 

@@ -286,6 +286,15 @@ def eval_vs_bots(checkpoint_path: str, device: str = "cuda", n_battles: int = 20
     from poke_env.player.baselines import SimpleHeuristicsPlayer
     from policy_smartbots import SmartDamagePlayer, TacticalPlayer, StrategicPlayer
     from battle_agent import BattleAgent
+    from battle_agent_transformer import BattleAgentTransformer, is_transformer_checkpoint
+
+    # Arch dispatch: load ckpt once and pick the right BattleAgent class.
+    # Mirrors eval_metamon_competitive.py:137 pattern. Required for in-loop
+    # eval during PPO Phase 1 where the init is a transformer checkpoint.
+    _cached_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    AgentClass = (
+        BattleAgentTransformer if is_transformer_checkpoint(_cached_ckpt) else BattleAgent
+    )
 
     if team_set == "metamon-competitive":
         from eval_metamon_competitive import MetamonCompetitiveTeambuilder
@@ -318,8 +327,8 @@ def eval_vs_bots(checkpoint_path: str, device: str = "cuda", n_battles: int = 20
             if replay_dir:
                 save_dir = os.path.join(replay_dir, opp_name)
                 os.makedirs(save_dir, exist_ok=True)
-            p1 = BattleAgent(
-                checkpoint_path, device=device,
+            p1 = AgentClass(
+                checkpoint_path, device=device, _cached_ckpt=_cached_ckpt,
                 account_configuration=AccountConfiguration.generate("Eval", rand=True),
                 battle_format=battle_format, max_concurrent_battles=5,
                 server_configuration=SERVER, team=_make_tb(),

@@ -1,6 +1,74 @@
 # NEXT_SESSION.md — Project Handover
 
-**Last updated: 2026-05-04 (Session 49 — BC v10 transformer DONE; new project peak. 3 epochs trained on RunPod A100 80GB at B=48 fp16 with `--compile`. Final 500g focused ladder anchored on SH=1000: bc_v10_cloud_e3 = Elo 1135.9 [1123, 1151] — #1 all-time, +16 Elo over legacy peak ppo_s39_iter229 (1120.4). e2 = 1122.6, e1 = 1118.1. e2→e3 gain was +13 Elo so BC was still climbing, but a stop+resume RunPod cycle re-provisioned the pod onto a fresh container with empty `/workspace` (Container Disk only, no Network Volume), losing the 104 GB memmap + venv + code clone. (Note: the per-epoch optimizer + scheduler state was NOT lost — it's saved into each `epoch_NNN.pt` and we'd scp'd e1/e2/e3 down to local. A re-bootstrap with `--resume epoch_003.pt` would have continued e4 with full AdamW momentum and scheduler position preserved.) Decided to terminate and lock in e3 rather than re-bootstrap. All four checkpoints (epoch_000/001/002/003) saved locally at `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_cloud_gen9/`. Final ladder JSON at `data/eval/registry/elo_v10_500g_focused_plus_e3.json`. Session 50 task: PPO Phase 1 setup per `docs/PPO_PHASED_TRAINING.md` — init from `epoch_003.pt`, smoke 1 iter to confirm `ppo.py::load_checkpoint` works on a transformer ckpt (arch dispatch added but never end-to-end tested with new arch), then ramp self-play-only PFSP for 50-100 iters targeting +10 Elo over e3. ⚠️ FUTURE CLOUD RUNS MUST USE NETWORK VOLUME — not Container Disk — to survive stop/start cycles.)**
+**Last updated: 2026-05-04 (Session 50 — arch-dispatch refactor DONE; PPO Phase 1 unblocked. ARCH_AUDIT.md punch list §4 steps 1-8 complete. Two arches now share the trainer-side compute path via `arch_compat.py` helpers (`call_action_encoder`, `call_policy_logits`, `call_value_logits`, `get_v_support`) + one new `TransformerBattlePolicy.action_encoder_from_spatial(batch, spatial_out)` adapter that wraps `_per_action_context` to reuse the already-computed spatial pass. Also added `self.d_temporal = cfg.d_temporal` on `TransformerBattlePolicy` — the audit missed this; without it the InferenceBatcher pre-allocates the all_summaries buffer at `d_model=256` and crashes on every collection because forward_spatial returns shape `d_temporal=512`. BC-2 fixed in `train_bc.eval_vs_bots` (arch dispatch via `is_transformer_checkpoint`, mirrors eval_metamon_competitive.py:137). All §5 test plan items pass on both arches: 1-iter PPO on `sp_0229.pt` (legacy, W/L/T=8/12/0) AND `epoch_003.pt` (transformer, W/L/T=6/14/0); pi/v/kl finite; in-loop eval on transformer init returned smart_avg=71% on metamon-competitive 20g/bot; both saved snapshots round-trip via `ppo.load_checkpoint` to correct class. Files touched: `model_transformer.py`, NEW `arch_compat.py`, `inference_batcher.py`, `ppo.py`, `train_bc.py`. Deferred per audit §6 (no Phase 1 impact): mp_collect_v2/v3 + rl_pipeline arch dispatch; legacy eval scripts cleanup; train_rl.py `--use-transformer` flag. Phase 1 launch is now blocking only on user confirmation of hardware target — the spec's `--max-concurrent 200` is sized for cloud or workstation, not this session's local 6 GB GPU. See `docs/ARCH_AUDIT.md` "Session 50 — implementation outcome" section for the verification trail.)**
+
+## Session 50 — arch-dispatch refactor (READ THIS FIRST)
+
+The Session 49 PPO smoke crashed because `InferenceBatcher._gpu_forward` and
+`ppo.ppo_update` were hardcoded to legacy `PokeTransformer`'s 4-stage decomposition
+(`forward_spatial` / `action_encoder` / `policy_head` / `value_head`). The new
+`TransformerBattlePolicy` exposes a monolithic `forward()` and uses different head
+classes (`ActionHead.forward(actor, temporal, action_ctx, legal_mask)` instead of
+`policy_head(concat_tensor)`; `ValueHead.forward(critic, temporal) → (v_logits, value)`
+instead of `value_head(concat) → v_logits`).
+
+**Refactor approach (diverged from audit recommendation, lighter):**
+- Single new method `TransformerBattlePolicy.action_encoder_from_spatial(batch, spatial_out)`
+  that derives spatial-order ids via tokenizer and dispatches to `_per_action_context`.
+- Single new module `pokemon-ai-starter/pokemon-ai/src/arch_compat.py` with 4 dispatch
+  helpers (`call_action_encoder`, `call_policy_logits`, `call_value_logits`,
+  `get_v_support`). Duck-typed on `hasattr(model, "_per_action_context")`.
+- `InferenceBatcher` and `ppo.ppo_update` import the helpers and call them at the 4
+  hotspots; transformer's `ActionHead.mlp` and `ValueHead.mlp` (the inner Sequentials)
+  are shape-compatible with legacy's `policy_head` / `value_head` Sequentials, so the
+  helpers just route MLP calls without further reshaping.
+- BC-2: `train_bc.eval_vs_bots` now loads ckpt once and dispatches via
+  `is_transformer_checkpoint(_cached_ckpt)`, mirroring the production
+  `eval_metamon_competitive.py:137` pattern. Required for in-loop eval during PPO
+  Phase 1 from a transformer init.
+
+**Audit-missed bug fixed:** `TransformerBattlePolicy` had no top-level `d_temporal`
+attribute, so the InferenceBatcher's `getattr(model, "d_temporal", model.cfg.d_model)`
+fell back to `d_model=256` when the actual summary tensor shape is `d_temporal=512`.
+Added `self.d_temporal = cfg.d_temporal` in `__init__` to mirror the legacy convention.
+This pattern is also used in `mp_collect_v2.py:168` and `rl_pipeline.py:74` (deferred
+paths), so they're auto-fixed by the same attribute add.
+
+**Smoke results (§5 test plan):**
+- Legacy `sp_0229.pt`: 20 trajs, W/L/T=8/12/0, pi=-0.0104 v=2.4270 ent=0.858 kl=0.0344
+- Transformer `epoch_003.pt`: 20 trajs, W/L/T=6/14/0, pi=0.0715 v=9.1691 ent=1.125 kl=0.0534
+  (high `v_loss` is the cold-critic-from-BC signal — expected on iter 0)
+- In-loop eval transformer: SH=65, SmartDmg=80, Tactical=75, Strategic=65, smart_avg=71% on 20g/bot
+- Round-trip: both snapshots load to the correct class via `ppo.load_checkpoint` cleanly
+
+**Phase 1 launch state.** Refactor is launch-ready. The next-prompt.txt operational
+reference specifies `--max-concurrent 200`. That's sized for cloud or a high-VRAM
+workstation — on this session's local 6 GB GPU (RTX 3060 Laptop), conc=200 is highly
+likely to OOM with the 20M-param transformer (smoke ran cleanly at conc=20). User
+should confirm: launch on cloud (preferred path per project_vision_scope.md scale-out
+constraint) OR scale conc down for local launch.
+
+The Phase 1 spec command (verbatim from next-prompt.txt §"Phase 1 launch command"):
+```bash
+python train_rl.py \
+  --init-from data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --device cuda --servers 9000,9000,9000,9000 --fp16 \
+  --games-per-iter 200 --max-concurrent 200 \
+  --n-iters 210 --warmup-iters 10 \
+  --lr 3e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
+  --grad-accum 1 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --eval-interval 20 --eval-team-set metamon-competitive --eval-games 200 \
+  --snapshot-interval 5 \
+  --early-stop --early-stop-patience 3 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --out-dir data/models/rl_v10/ppo_phase1
+```
+
+---
+
+## Session 49 — BC v10 final (preserved for context — Last updated: 2026-05-04 — BC v10 transformer DONE; new project peak. 3 epochs trained on RunPod A100 80GB at B=48 fp16 with `--compile`. Final 500g focused ladder anchored on SH=1000: bc_v10_cloud_e3 = Elo 1135.9 [1123, 1151] — #1 all-time, +16 Elo over legacy peak ppo_s39_iter229 (1120.4). e2 = 1122.6, e1 = 1118.1. e2→e3 gain was +13 Elo so BC was still climbing, but a stop+resume RunPod cycle re-provisioned the pod onto a fresh container with empty `/workspace` (Container Disk only, no Network Volume), losing the 104 GB memmap + venv + code clone. (Note: the per-epoch optimizer + scheduler state was NOT lost — it's saved into each `epoch_NNN.pt` and we'd scp'd e1/e2/e3 down to local. A re-bootstrap with `--resume epoch_003.pt` would have continued e4 with full AdamW momentum and scheduler position preserved.) Decided to terminate and lock in e3 rather than re-bootstrap. All four checkpoints (epoch_000/001/002/003) saved locally at `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_cloud_gen9/`. Final ladder JSON at `data/eval/registry/elo_v10_500g_focused_plus_e3.json`. Session 50 task: PPO Phase 1 setup per `docs/PPO_PHASED_TRAINING.md` — init from `epoch_003.pt`, smoke 1 iter to confirm `ppo.py::load_checkpoint` works on a transformer ckpt (arch dispatch added but never end-to-end tested with new arch), then ramp self-play-only PFSP for 50-100 iters targeting +10 Elo over e3. ⚠️ FUTURE CLOUD RUNS MUST USE NETWORK VOLUME — not Container Disk — to survive stop/start cycles.)**
 
 ## Session 49 — BC v10 final (READ THIS FIRST)
 

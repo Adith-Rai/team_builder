@@ -1,5 +1,11 @@
 # ARCH_AUDIT.md — Architecture-Awareness Audit Across Pipelines
 
+**STATUS (2026-05-04, Session 50): PHASE 1 BLOCKERS RESOLVED.** All four critical
+gaps (PPO-1..PPO-4) and BC-2 are fixed; both arches smoke cleanly at small scale.
+See `## Session 50 — implementation outcome` at the bottom of this document for the
+landed approach and verification trail. The audit body below is preserved verbatim
+as historical context for the design decisions.
+
 **Created:** Session 49 (2026-05-04). After cloud BC v10 e3 hit Elo 1135.9 (#1 all-time), a smoke
 test of PPO Phase 1 from `epoch_003.pt` revealed that the trainer-side compute paths are
 hardcoded to the legacy `PokeTransformer` decomposition and crash on the new
@@ -366,3 +372,68 @@ If all 6 pass on both arches, ship Phase 1.
 
 **End of audit.** Next session: walk down §4 punch list top-to-bottom. Tests are the
 exit criterion, not "looks like it should work."
+
+---
+
+## Session 50 — implementation outcome (2026-05-04)
+
+**Approach landed.** §4 steps 1-7 done; §4 step 8 (this update) covers documentation.
+Diverged from the audit's "adapter methods that mimic the legacy signature" recommendation
+in favor of a thinner option that keeps the new arch's native API clean:
+
+1. **`TransformerBattlePolicy.action_encoder_from_spatial(batch, spatial_out)`** —
+   single new method that derives spatial-order ids via the tokenizer and dispatches
+   to `_per_action_context`. Reuses an already-computed `spatial_out` rather than
+   re-running the spatial pass. ~10 lines.
+2. **`TransformerBattlePolicy.d_temporal = cfg.d_temporal`** in `__init__` — one
+   line, mirrors the legacy `PokeTransformer` convention so trainer-side helpers
+   (`InferenceBatcher`, `mp_collect_v2`, `rl_pipeline`) can size temporal-history
+   buffers via `getattr(model, "d_temporal", model.cfg.d_model)`. **This was a
+   silent bug the audit missed:** without it, the InferenceBatcher pre-allocates
+   `all_summaries` at `d_model=256` while `forward_spatial` returns summaries at
+   `d_temporal=512`, causing every collection to crash mid-game.
+3. **New `arch_compat.py`** with 4 helpers (`call_action_encoder`,
+   `call_policy_logits`, `call_value_logits`, `get_v_support`). Duck-typed dispatch
+   on `hasattr(model, "_per_action_context")` and `hasattr(model, "tokenizer")`.
+   InferenceBatcher and ppo.py both import these. ~70 lines including docs.
+4. **Audit-missed gaps fixed via the same helpers:** PPO-15-equivalents in
+   `inference_batcher.py:196` and `ppo.py:198` (`model.value_head(vi)` returns
+   `(v_logits, value)` tuple on transformer, not the bare `v_logits` legacy returns)
+   and `model.v_support` access (top-level on legacy, nested in `value_head` on
+   transformer). Both were latent landmines the audit didn't enumerate.
+5. **BC-2 fix in `train_bc.py:eval_vs_bots`** — load ckpt once, dispatch via
+   `is_transformer_checkpoint`, mirror `eval_metamon_competitive.py:137` pattern.
+   ~10 lines.
+
+**Files touched:**
+- `pokemon-ai-starter/pokemon-ai/src/model_transformer.py` — adapter method + `d_temporal` attr
+- `pokemon-ai-starter/pokemon-ai/src/arch_compat.py` — NEW
+- `pokemon-ai-starter/pokemon-ai/src/inference_batcher.py` — 4 lines call helpers
+- `pokemon-ai-starter/pokemon-ai/src/ppo.py` — 4 lines call helpers
+- `pokemon-ai-starter/pokemon-ai/src/train_bc.py` — BC-2 dispatch
+
+**Verification (§5 test plan):**
+
+| Test | Result |
+|------|--------|
+| 1. 1-iter PPO on `sp_0229.pt` (legacy) | ✓ W/L/T=8/12/0, pi=-0.0104 v=2.4270 ent=0.858 kl=0.0344, snapshot saved |
+| 2. 1-iter PPO on `epoch_003.pt` (transformer) | ✓ W/L/T=6/14/0, pi=0.0715 v=9.1691 ent=1.125 kl=0.0534, snapshot saved |
+| 3. Real games completed | ✓ Both arches: non-zero W/L counts, real trajectories |
+| 4. pi/v/kl finite (no NaN) | ✓ Both arches |
+| 5. In-loop eval on transformer init | ✓ smart_avg=71% (SH=65 SmartDmg=80 Tactical=75 Strategic=65) at 20g/bot |
+| 6. Round-trip via `ppo.load_checkpoint` | ✓ Both saved snapshots load to correct class with correct cfg |
+
+**Deferred (audit §6, no Phase 1 impact):**
+- `mp_collect_v2.py`, `mp_collect_v3.py`, `rl_pipeline.py` arch dispatch (Phase 1
+  doesn't use `--mp` or `--pipeline`; the same helpers in `arch_compat.py` will
+  apply when those paths are needed for scaling).
+- `eval_h2h_v8.py`, `eval_report_v8.py`, `eval_vs_external_pool.py` legacy script
+  cleanup (production eval already arch-aware).
+- `train_rl.py --use-transformer` flag for from-scratch transformer training (Phase
+  1 uses `--init-from`, not from scratch).
+- BC-1 (`--compile` in legacy branch), BC-3 (`add_model_args` cosmetic), BC-4 (doc).
+
+**Ready for Phase 1 launch.** See `next-prompt.txt` operational reference for the
+final command. Note that the spec's `--max-concurrent 200` is sized for cloud or a
+high-VRAM workstation; on the 6 GB consumer GPU used for this session's smoke
+testing, scale conc down to ~30-50 (or run on cloud).

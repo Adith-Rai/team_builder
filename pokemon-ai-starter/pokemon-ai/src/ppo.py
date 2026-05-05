@@ -27,6 +27,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from arch_compat import (
+    call_action_encoder,
+    call_policy_logits,
+    call_value_logits,
+    get_v_support,
+)
 from model import PokeTransformer, PokeTransformerConfig
 
 
@@ -163,10 +169,8 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
                 mega = {k: _stack_field(k) for k in ep["feat_batches"][0].keys()}
                 spatial_out, all_summaries = model.forward_spatial(mega)
-                action_ctx = model.action_encoder(
-                    mega["active_move_ids"], mega["active_move_banks"],
-                    mega["active_move_cont"], mega["switch_ids"], mega["switch_cont"],
-                )
+                # Arch-aware action context (see arch_compat.py).
+                action_ctx = call_action_encoder(model, mega, spatial_out)
                 legal_all = mega["legal_mask"]
 
                 # --- Sequential temporal + heads ---
@@ -190,12 +194,15 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                     at = torch.cat([actor_out, temporal_ctx.squeeze(0)], dim=-1)
                     at_exp = at.unsqueeze(0).expand(9, -1)
                     pi_input = torch.cat([at_exp, act_ctx], dim=-1)
-                    logits = model.policy_head(pi_input).squeeze(-1)
+                    # Arch-aware policy/value heads. Returns (9,) and (1, v_bins)
+                    # respectively; legacy and transformer share the underlying
+                    # MLP shape so post-MLP arithmetic is unchanged.
+                    logits = call_policy_logits(model, pi_input)
                     logits = logits.masked_fill(legal_all[t] < 0.5, -100.0)
                     all_logits.append(logits)
 
                     vi = torch.cat([critic_out, temporal_ctx.squeeze(0)], dim=-1)
-                    vl = model.value_head(vi.unsqueeze(0)).squeeze(0)
+                    vl = call_value_logits(model, vi.unsqueeze(0)).squeeze(0)
                     all_vlogits.append(vl)
 
                 logits_seq = torch.stack(all_logits)
@@ -268,7 +275,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 # critic is learning the wrong scale (Exp 4 post-mortem symptom).
                 with torch.no_grad():
                     v_probs_step = F.softmax(vlogits_seq, dim=-1)
-                    v_pred_step = (v_probs_step * model.v_support).sum(-1)
+                    v_pred_step = (v_probs_step * get_v_support(model)).sum(-1)
                     stats["value_mean"] += v_pred_step.mean().item()
                     stats["return_mean"] += returns.mean().item()
                     stats["adv_abs_mean"] += advantages.abs().mean().item()
