@@ -4,320 +4,192 @@ THE GOAL — read this every time you make a decision
 
 We are building a Pokemon battle AI that competes at an elite level — among
 the strongest human players, the strongest published bots (Metamon's Kakuna,
-SmallRL, Minikazam), and the strongest other engines. V1 scope is singles
-gen 9. Future scope: multi-gen (4+), doubles, triples, 3v3, other formats.
+SmallRL, Minikazam), and the strongest other engines.
 
-Elite Pokemon play is about:
-  - Damage prediction (BP × types × items × abilities × screens × weather × boosts)
-  - Speed-tier reasoning (item × ability × boost × terrain × Trick Room)
-  - Win-condition identification (which of my Pokemon can sweep, against what)
-  - Opp set prediction from incomplete info (revealed moves + metagame priors)
-  - Hazard tracking, status timing, item / ability identification
-  - Probabilistic reasoning, long-horizon resource management
+**Ultimate scope (load-bearing):** elite play across **every legal Pokemon
+format** — singles, doubles, triples, 4v4, 6v6, all tiers (OU, Ubers, AG,
+UU, RU, etc.), random battles (which have varied levels), in-game/cartridge
+battles. All gens (4-9+, expanding as new gens release). Plus team
+building, not just play.
 
-Every architectural / training / feature decision should be evaluated against
-"does this help reach elite-level play, or is it premature optimization?"
-The user has explicitly said they prefer to fix it now while we're flexible
-than come back later and break working code.
+**Deployment scope:** must scale **massively on paid cloud** for throughput-
+heavy training AND remain **runnable locally** on a 6 GB consumer GPU for
+development + smoke tests. Same code, both environments. Not parallel
+codebases. See `memory/project_vision_scope.md` for full constraints.
 
-═══════════════════════════════════════════════════════════════════════════════
-READ THIS FIRST — IN ORDER, WITH REASONING NOT SKIMMING
-═══════════════════════════════════════════════════════════════════════════════
+V1 baseline is singles gen 9 — but every refactor decision must NOT
+foreclose paths to the broader scope. If a shortcut hardcodes gen9ou or
+6v6, surface the tradeoff explicitly before shipping.
 
-Lesson from Sessions 44 + 47 + 48: don't trust the docs alone. Re-confirm every
-load-bearing claim against the actual code before acting on it. Memory cliffs
-are easy to hide behind "should fit"; benchmarks beat estimates.
-
-1. **`docs/NEXT_SESSION.md`** — top-to-bottom. Session 48 TL;DR is at the top.
-   The "BC vs PPO infrastructure split" table is canonical for where each
-   piece of work lives.
-
-2. **`docs/REWRITE_DESIGN.md`** — read §6.2 (BC training), §6.5 (eval
-   methodology), §7 Week 3 (your task), and **Postscript I (Session 48)**.
-   Postscript I explains the B=8 memory cliff finding and the chosen B=4
-   operating point. Don't go back to B=8 without re-running the bench.
-
-3. **`pokemon-ai-starter/pokemon-ai/src/train_bc.py`** — read the
-   `--use-transformer` factory at L407-435 and the resume/save paths.
-   The flag is wired; you should be able to launch a real run with it.
-
-4. **`pokemon-ai-starter/pokemon-ai/src/bench_bc_step.py`** — Session 48's
-   throughput bench. Re-run it before the long run if you want to confirm
-   the 7 ms/turn projection still holds (e.g. if you've changed driver,
-   batch size, fp16 mode). One-shot diagnostic; doesn't run the full pipeline.
-
-5. **`pokemon-ai-starter/pokemon-ai/src/eval_metamon_competitive.py`** —
-   the standalone eval, Session-48-arch-aware. Dispatches between
-   `BattleAgent` (legacy mlp) and `BattleAgentTransformer` (new arch)
-   per `ckpt["arch"]`. `--checkpoints label=path` syntax; writes per-bot
-   wr + smart_avg to JSON. Smoke-validated end-to-end against a
-   random-init transformer ckpt (Session 48 final commit `5f04380`).
-
-6. **`pokemon-ai-starter/pokemon-ai/src/battle_agent_transformer.py`** —
-   inference player for new-arch ckpts (mirror of `battle_agent.py`).
-   Same Player interface, same `make_features` / `build_turn_batch` /
-   `action_to_order` flow. `is_transformer_checkpoint()` helper is the
-   dispatch oracle for any custom eval scripts you write.
-
-7. **`pokemon-ai-starter/pokemon-ai/src/ppo.py:347-409`** — Session 48's
-   arch-dispatch `load_checkpoint`. Used by `train_rl.py` (Week 4) to
-   resume + by analysis tools.
+Elite Pokemon play is about long-horizon planning, opponent modeling,
+risk-adjusted decision making, and squeezing every fractional advantage
+from type/STAB/effectiveness/speed/items/abilities/positioning.
 
 ═══════════════════════════════════════════════════════════════════════════════
-PRE-FLIGHT (do this before anything else)
+SESSION 50 TASK — unblock PPO Phase 1 by making the trainer-side compute
+paths arch-aware. Then launch Phase 1.
 ═══════════════════════════════════════════════════════════════════════════════
 
-  cd pokemon-ai-starter/pokemon-ai/src
-  python verify_move_lookup.py    # 50/50 strict + STAB-only
-  python test_tokenizer.py         # 17/17
-  python test_policy.py            # 9/9
-  python bench_bc_step.py --batch-size 4 --n-batches 5 --device cuda --fp16
-    # expect ≤15 ms/turn, peak_mem ≤3 GB, all 5 batches stable
+**Where we are (Session 49 wrap):**
+- BC v10 e3 = #1 all-time at Elo 1135.9 [1123, 1151], +16 over legacy peak.
+  3 epochs trained on RunPod A100; e4-e5 didn't happen because a stop+resume
+  cycle re-provisioned the pod onto a fresh container without our Network
+  Volume mounted (Container Disk doesn't follow pod hosts). All 4 ckpts
+  (epoch_000-003) saved locally; final ladder JSON saved.
+- Tried smoking PPO from epoch_003.pt → caught a deep arch-dispatch gap:
+  trainer-side `InferenceBatcher` + `ppo.py` update + `mp_collect_v2/v3` +
+  `rl_pipeline` all hardcode the legacy `PokeTransformer`'s staged
+  decomposition (`forward_spatial` / `action_encoder` / `policy_head`).
+  New `TransformerBattlePolicy` only exposes monolithic `forward()`.
+  Crash is `'TransformerBattlePolicy' object has no attribute action_encoder'`.
+- Ran a 3-agent audit and produced **`docs/ARCH_AUDIT.md`** — 22-item
+  punch list across BC (4) / PPO (15) / Eval (3), with file:line citations,
+  severity ranking, and a recommended unblock plan.
+- Already-shipped piece that works: `make_self_play_opponent()` factory in
+  `rl_player.py` + `SelfPlayOpponentTransformer` class. The OPPONENT side
+  of self-play dispatches arch correctly (validated). Trainer side is the
+  blocker.
 
-  # Verify eval round-trip on a fresh random ckpt (sanity, ~30s):
-  python -c "
-import torch
-from pathlib import Path
-from model_transformer import TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup
-cfg = TransformerConfig.with_vocab_sizes_from_disk()
-lookup = load_move_flag_lookup(Path('data/lookup/move_flags_v1.pt'), expected_n_moves=cfg.n_moves)
-m = TransformerBattlePolicy(cfg, move_flag_lookup=lookup)
-torch.save({'arch':'transformer','model_state_dict':m.state_dict(),'model_config':cfg.to_dict()},
-           'data/models/bc/_smoke_random.pt')
-"
-  # In another terminal start the battle_server:
-  #   $TOOLS\node-v20.18.1-win-x64\node.exe battle_server.js --port 9000
-  python -u eval_metamon_competitive.py \
-    --checkpoints sm=data/models/bc/_smoke_random.pt \
-    --servers 9000 --n-games 5 --concurrency 2 --device cuda \
-    --out-json data/eval/_smoke.json
-    # expect: smart_avg ~0% (random net), 4 matchups complete, no exception
+**What you're doing this session:**
 
-If any fail, STOP. Run `git log --oneline | head -10` and figure out what's
-recently changed before proceeding.
+1. **Read first, plan second, code third.** Specifically:
+   - `docs/ARCH_AUDIT.md` cover-to-cover (the §4 punch list IS your work plan)
+   - `docs/PPO_PHASED_TRAINING.md` for Phase 1 spec
+   - `docs/NEXT_SESSION.md` Session 49 wrap section
+   - `docs/RESEARCH.md` §0 for architecture context if needed
+   - `memory/project_vision_scope.md` for the load-bearing scope constraints
+   - `memory/MEMORY.md` for project history + prior decisions
 
-═══════════════════════════════════════════════════════════════════════════════
-WEEK 3 DELIVERABLE (REWRITE_DESIGN.md §7 Week 3)
-═══════════════════════════════════════════════════════════════════════════════
+2. **Implement the recommended adapter-method approach** (ARCH_AUDIT.md §2
+   "Key insight"): add `action_encoder()` and `policy_head_compat()` adapter
+   methods to `TransformerBattlePolicy` that wrap its native `_per_action_context`
+   and `ActionHead` to match legacy signatures. ~30 lines on the model vs.
+   ~300 lines of branching across 4 hotspots. Future arch swaps don't need
+   to retouch InferenceBatcher / ppo.py.
 
-A new-arch BC checkpoint with smart_avg ≥45% on Metamon competitive teams
-(matching legacy v8 BC's mark, ±2pt). Estimated effort: 2-5 days local
-at B=4 fp16, depending on convergence epoch (legacy converged at epoch 2).
-Cloud option triggers if local takes >5 days.
+3. **Wire the adapter calls through InferenceBatcher + ppo.py** (the 4
+   critical hotspots). The audit names the exact lines:
+   - `inference_batcher.py:131, 184`
+   - `ppo.py:166, 193`
 
-**The goal under elite-play framing:**
-- BC convergence proves the new arch CAN learn from human play. If it
-  can't, the architectural fix wasn't decisive — re-evaluate before PPO.
-- Watchpoint: if BC smart_avg looks fine but specific failure modes
-  (item-ID, set prediction, PP-aware play) remain, those are Week-4 PPO
-  problems, not BC ones.
+4. **Fix BC-2** (`train_bc.py:267-350` `eval_vs_bots` hardcodes `BattleAgent`).
+   Required for in-loop eval during Phase 1 from the transformer init.
+   ~15 lines, mirror the dispatch pattern from `eval_metamon_competitive.py`.
 
-═══════════════════════════════════════════════════════════════════════════════
-SUB-TASKS (in order; each ends in a measurable milestone)
-═══════════════════════════════════════════════════════════════════════════════
+5. **Smoke + regression test** (NON-OPTIONAL):
+   - 1-iter PPO on `epoch_003.pt` (transformer) at small scale (e.g.
+     `--games-per-iter 20 --max-concurrent 20 --n-iters 1`)
+   - 1-iter PPO on `sp_0229.pt` (legacy) at the same scale — to confirm
+     the refactor didn't break legacy backward compatibility
+   - Both must complete cleanly: real games played, snapshot saved, no NaN
+     in pi_loss / value_loss / kl_div, in-loop eval doesn't crash
+   - **Backward compatibility is non-negotiable** — legacy ckpts (s39 PPO
+     peaks, all the sp_NNNN snapshots, iter_0119) must remain valid PFSP
+     opponents in any future training. The dispatch invariant
+     (`is_transformer_checkpoint`) is what protects this.
 
-### 1. Quick CUDA smoke at B=4 (validate Session 48's bench)
+6. **Once smoke passes both arches:** launch the actual Phase 1 run per
+   `docs/PPO_PHASED_TRAINING.md`. The launch command was finalized in
+   Session 49 (see Session 49 chat for exact flags) — 210 iters
+   (10 warmup + 200 main), conc=200 (NOT 6 — that's external-opp default;
+   pure self-play uses 200-250 per user), `--pool-anchors epoch_003.pt`,
+   eval-interval 20, eval-team-set metamon-competitive, lr=3e-5, lam=0.95,
+   ent=0.02 with adaptive entropy, terminal reward, snapshot-interval 5,
+   --servers 9000,9000,9000,9000 (4-wave on one battle_server, validated
+   pattern from Session 42).
 
-Re-run `bench_bc_step.py` first (above). Then a real DataLoader smoke,
-50 batches:
+7. **Anchor sample-weight floor** (raised in Session 49 → DEFER): user
+   chose to skip the floor for Phase 1 and watch smart_avg for drift.
+   Current `--pool-anchors` only pins pool MEMBERSHIP, not sampling weight
+   (PFSP weight `(1-wr)²` decays as we beat the anchor). If smart_avg
+   craters mid-Phase-1 while internal win-rate climbs, that's drift signal
+   → add a min-weight floor (~1 hr) for Phase 2.
 
-  cd pokemon-ai-starter/pokemon-ai/src
-  python -u train_bc.py --use-transformer \
-    --memmap-dir data/datasets/human_v8_100k \
-    --epochs 1 --batch-size 4 --lr 1e-4 --fp16 --workers 2 \
-    --eval-games 0 --val-ratio 0.05 \
-    --run-name v10_smoke_real --device cuda \
-    > ../../../logs/v10_smoke_real.log 2>&1 &
-
-Watch `tail -F ../../../logs/v10_smoke_real.log` for:
-- `[20] loss=...` should fire within ~3-5 minutes (20 batches × ~6-10s/batch).
-- Loss decreasing across the first 100 batches.
-- No NaN, no `[WARN]` lines.
-- If it hangs >10 min before batch 20, kill and check GPU memory; the
-  cliff returned. Drop B to 2 or migrate to cloud.
-
-Stop the smoke after batch 100-200 once it's clearly healthy. Don't waste
-GPU hours here — the throughput is now characterized.
-
-### 2. Full BC run (5 epochs, B=4 fp16, local)
-
-  cd pokemon-ai-starter/pokemon-ai/src
-  nohup python -u train_bc.py --use-transformer \
-    --memmap-dir data/datasets/human_v8_100k \
-    --epochs 5 --batch-size 4 --lr 1e-4 --fp16 --workers 2 \
-    --eval-games 0 --val-ratio 0.1 \
-    --sched cosine --warmup-steps 200 \
-    --run-name v10_full --device cuda \
-    > ../../../logs/v10_full.log 2>&1 &
-
-Notes:
-- 5 epochs at projected ~10 hr/epoch ≈ 50 hr (~2.1 days).
-- `--eval-games 0` because BattleAgentTransformer doesn't exist yet
-  (Week 5). Run `eval_metamon_competitive.py` separately between epochs.
-- val-ratio 0.1 (10% held-out) for clean val_loss trajectory.
-- LR 1e-4 conservative starting point. Bump to 2e-4 with `--lr-restart`
-  if val_loss plateaus in epoch 1.
-
-**Health checks (run hourly the first day):**
-- `nvidia-smi`: util should be 80-100%, mem 2.5-3 GB peak.
-- `tail -50 logs/v10_full.log`: loss + acc + lr should look sane.
-- `ls -la pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_full/`:
-  every 1000 batches should drop a `mid_step*.pt` (~80 MB each).
-- If `[WARN] NaN/Inf loss` ever fires, kill and inspect.
-
-**Cloud-trigger (revisit at end of epoch 1):**
-- Wall-clock for epoch 1 finished. If >24 hr, project: 5 epochs > 5 days.
-- Hard trigger: kill, follow CLOUD_DEPLOY.md, replicate the run on A100
-  ($50-150 budget, ~12-24 hr to converge).
-
-### 3. Per-epoch eval via `eval_metamon_competitive.py`
-
-`BattleAgentTransformer` (`battle_agent_transformer.py`) shipped at the
-end of Session 48 — `eval_metamon_competitive.py` now dispatches by
-`ckpt["arch"]`. Smoke verified: 20 games on a random-init transformer
-ckpt complete in 15 s. After each epoch saves (`epoch_NNN.pt`), in a
-separate terminal:
-
-  cd pokemon-ai-starter/pokemon-ai/src
-  python -u eval_metamon_competitive.py \
-    --checkpoints v10_e1=data/models/bc/v10_full/epoch_001.pt \
-    --servers 9000 --n-games 200 --concurrency 100 --device cuda \
-    --out-json data/eval/registry/v10_bc_epoch001.json
-
-**Concurrency note:** the script's argparse default is 8, but vs-smart-bot
-eval can run far higher because the bots are CPU-bound and a single
-BattleAgent serves all websockets through one GPU stream (forwards queue,
-no parallel CUDA contention). Project history (NEXT_SESSION.md L2346,
-ladder runs) used `--concurrency 70-200`. **Default to 100 for transformer
-ckpts** — bigger model means each forward is ~36 ms (B=32 equiv), and at
-200-way poke-env concurrency the 20M model can starve. 100 is a safe
-ceiling. Bump to 200 if you measure slack at 100. Don't run eval while
-the BC training process holds 5.96 GB of GPU.
-
-Expected wall-clock: ~3-5 min per checkpoint at concurrency 100 (4 matchups
-in series × ~50-75 s each). Append the smart_avg result to
-`data/eval/registry/evals.jsonl` once you have it.
-
-If a real BC checkpoint fails to load: `is_transformer_checkpoint(ckpt)`
-in `battle_agent_transformer.py` is the dispatch oracle — verify it
-reports `True` for the saved ckpt.
-
-### 4. Final eval + checkpoint registration
-
-After the run finishes (or cloud comes back):
-
-  python -u eval_metamon_competitive.py \
-    --checkpoints v10_best=data/models/bc/v10_full/best.pt \
-    --servers 9000 --n-games 500 --concurrency 8 --device cuda \
-    --out-json data/eval/registry/v10_bc_final.json
-
-Append to `data/eval/registry/evals.jsonl` via the standard tooling.
+**What can wait (deferred from audit):**
+- mp_collect_v2/v3, rl_pipeline arch-dispatch (Phase 1 doesn't use --mp
+  or --pipeline; future scaling does)
+- eval_h2h_v8.py, eval_report_v8.py, eval_vs_external_pool.py legacy
+  cleanup (no Phase 1 impact)
+- Deduplicating dim-expansion logic (cosmetic; harmless duplication)
+- `train_rl.py` `--use-transformer` flag (Phase 1 uses --init-from, not
+  scratch training)
 
 ═══════════════════════════════════════════════════════════════════════════════
-DECISIONS THAT NEED ELITE-PLAY THINKING
+BEST PRACTICES — re-read before each non-trivial decision
 ═══════════════════════════════════════════════════════════════════════════════
 
-A. **LR for the bigger model + smaller batch.** B=4 means smaller per-step
-   gradient noise compared to B=16. Effective LR scaling: lower B usually
-   wants lower LR. Start at 1e-4. If val_loss plateaus in epoch 1, try
-   `--lr-restart --lr 2e-4` (resume weights, fresh optimizer).
+**Lessons paid for in prior sessions (don't repeat):**
 
-B. **Workers + DataLoader.** B=4 with workers=2 was healthy in the bench.
-   On Windows, workers can stutter — if you see frequent gaps in the
-   progress lines (e.g. 30s between batches when GPU is idle), drop to
-   workers=0 (synchronous) and accept the throughput hit.
+1. **Read docs + code BEFORE estimating scope.** Session 49 burned an
+   evening because I called PPO Phase 1 "30 min smoke + launch" based on
+   grep matches; reality was a 6.5 hr refactor uncovered only by smoke.
+   The codebase is bigger than your grep cache. Trust line-cited audits,
+   not first-impression reads.
 
-C. **Eval-during-BC vs deferred eval.** Sub-task 3 above. Decide on
-   `BattleAgentTransformer` build vs deferred eval BEFORE starting the
-   long run.
+2. **Verify before recommending from memory.** A memory record naming a
+   function/flag is a claim about a past moment, not current state.
+   `is_transformer_checkpoint()` originally false-matched legacy because
+   both arches share `spatial.*`/`temporal.*` prefixes — the discriminator
+   is `tokenizer.`/`switch_encoder.`/`action_head.` only. If memory says
+   X exists, grep for it before promising it works.
 
-D. **Cloud trigger.** End of epoch 1: wall-clock × 5 < 5 days = stay
-   local. Otherwise migrate. CLOUD_DEPLOY.md has the runbook.
+3. **Smoke ALWAYS before launching long runs.** Session 49's smoke caught
+   a bug that would have wasted 40+ hours of self-play if launched blind.
+   The smoke is non-optional even when "it should just work." Also smoke
+   on BOTH arches when changes touch the dispatch — legacy regression is
+   the silent killer.
 
-E. **What if BC underfits (smart_avg <40% after 5 epochs)?** Cheapest
-   levers: bump `n_spatial_layers` 6 → 8 (~+1.6M params), bump LR to
-   3e-4, more epochs. Don't change the architecture spec without seeing
-   evidence of compositional bottleneck (the rewrite was supposed to
-   address that — if it hasn't, debug the tokenizer first via
-   activation hooks).
+4. **Concurrency for self-play is 200-250, not 6.** The "6" in old docs
+   was for runs WITH external opponents (FP/MM subprocess limits). Pure
+   self-play has been 200-250 historically per user. Check user before
+   trusting doc-default conc values.
 
-═══════════════════════════════════════════════════════════════════════════════
-GUARD RAILS — DO NOT VIOLATE
-═══════════════════════════════════════════════════════════════════════════════
+5. **Cloud: Network Volume, not Container Disk.** Pause/resume on the
+   same host preserves Container Disk; stop/start can land on a different
+   host and your `/workspace` is gone (104 GB memmap and all). Documented
+   in `CLOUD_RUNBOOK.md §9` after Session 49 lost a partial run this way.
 
-1. **Do not modify `model.py`, `features.py`, `battle_agent.py`,
-   `vocab.py`, `format_config.py`** beyond minimal additive changes.
-   The legacy path must keep loading — sp_0229 is the H2H baseline
-   for Week 5.
+6. **Don't rush refactors under time pressure.** "Just ship it tonight"
+   is the pattern that produces next session's surprise gaps. Better to
+   stop at a clean breakpoint and resume fresh.
 
-2. **Do not modify the memmap.** Tokenizer slices the existing 104 GB
-   `human_v8_100k` at training time.
+7. **Backward compat is a hard constraint, not a nice-to-have.** Legacy
+   PPO ckpts (s39 peaks, all sp_NNNN snapshots, iter_0119) must remain
+   loadable as PFSP opponents in every future run. The legacy
+   `BattleAgent` / `SelfPlayOpponent` classes must keep working unchanged.
+   Adding new dispatch is fine; replacing legacy paths is not.
 
-3. **Do not change the lookup .pt format casually.** Schema v4 is
-   committed.
+**Scope-respecting habits:**
 
-4. **Do not start PPO in Week 3.** PPO is Week 4. BC convergence
-   first; PPO from BC second.
+- Before any refactor, ask: "does this work for doubles? for randoms with
+  levels? for gen 4? for 11M-param vs 100M-param models?" If not, surface
+  the tradeoff before shipping.
+- Anything format-specific must come from `cfg.format_config` (the
+  `FormatConfig` infra exists from Session 34's refactor). Don't hardcode
+  `team_size=6`, `n_actions=9`, `n_moves=4`.
+- Anything gen-specific must be a per-gen lookup (move banks, ability
+  lookups, item tokenizers) even if only gen9 is currently populated.
 
-5. **Do not bump batch size past 4 on the local 6 GB GPU** without
-   re-running `bench_bc_step.py` and confirming peak_mem stays below
-   ~4.5 GB across at least 8 consecutive batches with varied T_max.
-   The cliff at ~5 GB is real and persistent.
+**Tone / cadence:**
 
-6. **Do not skip eval.** If you train without `eval_metamon_competitive.py`,
-   you don't know if you converged.
-
-7. **Do not delete `bench_bc_step.py`.** It's a regression-detector for
-   future GPU/torch upgrades.
-
-═══════════════════════════════════════════════════════════════════════════════
-SUCCESS CRITERIA
-═══════════════════════════════════════════════════════════════════════════════
-
-- New BC checkpoint at smart_avg ≥45% on Metamon competitive (200×4
-  games min; 500×4 ideal).
-- Loss curves clean: train+val both decreasing for ≥2 epochs before
-  divergence (overfit signal).
-- Existing tests still pass: 17/17 tokenizer + 9/9 policy.
-- BC training time logged. If <5 days local: that's the V1 baseline.
-  If >5 days: cloud-migrated checkpoint is the V1 deliverable.
+- Be terse. The user values direct technical responses over hedging.
+- State results and decisions directly; user-facing text is for relevant
+  updates, not internal deliberation.
+- When uncertain, say so explicitly — don't fake confidence.
+- Honest takes are valued, especially when they push back on user
+  assumptions or your own prior recommendation.
 
 ═══════════════════════════════════════════════════════════════════════════════
-WHEN YOU'RE DONE
+START HERE
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. Mark Week 3 tasks `[x]` in REWRITE_DESIGN.md §7.
-2. If you encountered any spec-vs-reality divergences, add a Postscript J
-   (or higher) to REWRITE_DESIGN.md describing what changed and why.
-3. Update NEXT_SESSION.md TL;DR with Session 49 status. Session 50 task =
-   Week 4 (PPO from BC).
-4. Write `next-prompt.txt` for Session 50, pointing at REWRITE_DESIGN.md
-   §7 Week 4. Carry forward this document's "read first, reason hard" tone.
-5. Commit per-tier: BattleAgentTransformer if built, smoke results, full
-   BC run results, eval. Smaller commits = easier to revert.
+1. `cat docs/ARCH_AUDIT.md` cover-to-cover
+2. `cat docs/PPO_PHASED_TRAINING.md`
+3. `cat memory/project_vision_scope.md` (if memory loads it)
+4. Walk down ARCH_AUDIT.md §4 punch list in order
+5. After step 5 of the punch list (smoke both arches), launch Phase 1
 
-═══════════════════════════════════════════════════════════════════════════════
-CONTEXT FOR FUTURE SESSIONS
-═══════════════════════════════════════════════════════════════════════════════
-
-- Week 4: PPO from BC. Smart_avg ≥70% target (≥3pt above sp_0229's 67.8%).
-  If trajectory mirrors attempt-11 (peak 64-66% then plateau), the
-  architectural fix wasn't decisive — pivot to data scaling, larger
-  model, or test-time adaptation.
-- Week 5: long PPO + popart + direct H2H eval vs sp_0229.
-- Week 6: analysis + retrospective + decision on next direction.
-
-If Week 3 milestone fails (BC <40% after 10 epochs), STOP and update
-REWRITE_DESIGN.md. Common Week-3 risks per §8: tokenizer slicing bug
-(#3), training instability (#2), feature gap discovered late (#4).
-
-═══════════════════════════════════════════════════════════════════════════════
-FINAL REMINDER
-═══════════════════════════════════════════════════════════════════════════════
-
-Every line of code, every architectural decision, every test you write —
-ask "does this serve the goal of building an elite-level Pokemon battler?"
-
-Read the docs reasoning, read the code reasoning, write code reasoning.
-The goal is elite Pokemon AI — not pretty code, not the cleanest design,
-not the fewest tokens. Elite play. Keep it the focus.
+End-of-session deliverable: Phase 1 PPO running cleanly from
+`epoch_003.pt`, generating snapshots every 5 iters, smart_avg eval every
+20 iters logging to JSON. If anything blocks launch, document the new
+gap clearly in NEXT_SESSION.md so Session 51 doesn't rediscover it.
