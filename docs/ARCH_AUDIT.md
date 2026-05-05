@@ -424,14 +424,46 @@ in favor of a thinner option that keeps the new arch's native API clean:
 | 6. Round-trip via `ppo.load_checkpoint` | ✓ Both saved snapshots load to correct class with correct cfg |
 
 **Deferred (audit §6, no Phase 1 impact):**
-- `mp_collect_v2.py`, `mp_collect_v3.py`, `rl_pipeline.py` arch dispatch (Phase 1
-  doesn't use `--mp` or `--pipeline`; the same helpers in `arch_compat.py` will
-  apply when those paths are needed for scaling).
+- `mp_collect_v2.py`, `mp_collect_v3.py` arch dispatch (Phase 1 doesn't use `--mp`;
+  the same helpers in `arch_compat.py` will apply when that path is needed for
+  cloud scaling).
 - `eval_h2h_v8.py`, `eval_report_v8.py`, `eval_vs_external_pool.py` legacy script
   cleanup (production eval already arch-aware).
 - `train_rl.py --use-transformer` flag for from-scratch transformer training (Phase
   1 uses `--init-from`, not from scratch).
 - BC-1 (`--compile` in legacy branch), BC-3 (`add_model_args` cosmetic), BC-4 (doc).
+
+### Correction: `--pipeline` alone is NOT broken on the transformer
+
+The audit's TL;DR row "PPO multiprocess paths" and §2 row 15 conflated two distinct
+code paths under the umbrella "rl_pipeline.py:28+ MPPipelineCollector". The actual
+import graph in `train_rl.py`:
+
+| Flag combo | Code path | Arch status (post-Session 50) |
+|---|---|---|
+| (neither) | `_collect_data` → `collect_v9()` → `InferenceBatcher` | ✓ FIXED |
+| `--pipeline` alone | `BackgroundCollector` (rl_collection.py:524) → bg thread → `collect_v9()` → `InferenceBatcher` | ✓ FIXED transitively |
+| `--mp` alone | `mp_collect_v2(...)` (mp_collect_v2.py:434) → `MPRLPlayer`/`InferenceServer` (rl_pipeline.py) | ✗ Still broken |
+| `--mp --pipeline` | `MPPipelineCollector` (mp_collect_v2.py:527) → `mp_collect_v2(...)` | ✗ Still broken |
+
+Key facts:
+- `rl_pipeline.py` houses **shared multiprocess infrastructure** (`MPRLPlayer`,
+  `InferenceServer`, `mp_collect_v9`) that's only imported by `mp_collect_v2.py`
+  and `mp_collect_v3.py`. **`--pipeline` alone never touches it.**
+- `MPPipelineCollector` lives in `mp_collect_v2.py:527`, NOT `rl_pipeline.py:28+`
+  as the audit claimed. It's only activated by `--mp AND --pipeline`
+  (train_rl.py:319 `if args.mp and args.pipeline`).
+- `BackgroundCollector` (rl_collection.py:524) is the correct path for `--pipeline`
+  alone — it's a `threading.Thread` wrapper around `collect_v9()` with a
+  deepcopied model, and inherits all the arch fixes that landed in `InferenceBatcher`.
+- `mp_collect_v3.py` exists but isn't wired into `train_rl.py` — appears to be
+  dead/experimental code (imported only by `test_mp_collection.py`).
+
+**Implication for Phase 1:** `--pipeline` is safe to enable on the transformer arch
+right now. Iter time drops from `collect+update` to `max(collect, update)` for all
+post-warmup iters, since pipeline is gated `not in_warmup` (train_rl.py:319, 334).
+At our smoke rates that's ~6.25 min/iter → ~3.5 min/iter, saving ~9-10 hr over
+220 iters (modulo GPU-stream contention overhead, realistically 6-8 hr saved).
 
 **Ready for Phase 1 launch.** See `next-prompt.txt` operational reference for the
 final command. Note that the spec's `--max-concurrent 200` is sized for cloud or a
