@@ -1,5 +1,15 @@
 # Phase 1 v2 — Cloud Launch Checklist
 
+> ⚠️ **SUPERSEDED (Session 50)** — Phase 1 v2 was killed at iter 0 update; the
+> v2 path used `--pipeline` only and hit a single-process Python event-loop
+> bottleneck (~30 min/iter at games=1500). Phase 1 v3 (current production)
+> uses the new `--mp` disk-backed implementation; see
+> **`PPO_CLOUD_COOKBOOK.md`** for the current canonical launch + all cloud
+> quirks documented post-Session-50. This file kept for historical reference
+> (the lr=1e-5 diagnosis described here is still valid).
+
+---
+
 **Goal:** Run Phase 1 v2 on RunPod A100 80GB with the lr=1e-5 fix + bigger batches.
 **Expected duration:** ~25-35 hours wall-clock for 200 iters.
 **Expected cost:** $40-60 at RunPod's $1.50/hr A100 SXM rate.

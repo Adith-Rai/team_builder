@@ -510,6 +510,13 @@ Per-epoch loss/acc trajectory we've validated:
 
 ## 11. PPO on cloud (Week 4 — scaling guide + bottleneck audit)
 
+> ⚠️ **SUPERSEDED (Session 50)** — this section pre-dates the `--mp`
+> disk-backed redesign and the lr=1e-5 diagnosis. Numbers and config here
+> are obsolete. **For current PPO cloud running, see
+> `docs/PPO_CLOUD_COOKBOOK.md`.** Section retained as historical reference
+> for the original scaling-bottleneck audit (still useful for understanding
+> WHY the redesign was needed).
+
 This is the next deliverable. The doc here is **concrete recipes for scaling
 PPO collection on cloud**, not a "we'll figure it out later" placeholder.
 
