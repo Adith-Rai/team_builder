@@ -28,6 +28,13 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+# Linux/Ampere optimizations (parity with train_bc.py — Session 50 audit found
+# these were missing from train_rl.py despite being free wins):
+# - TF32 matmul: 5-15% speedup on Ampere (A100) for fp32 matmuls
+# - cuDNN benchmark: 5-10% speedup by autotuning kernels for stable shapes
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+
 # Set sharing strategy BEFORE any other imports that touch torch.multiprocessing.
 # file_system uses ref-counted /tmp files instead of POSIX shm_open per tensor;
 # avoids vm.max_map_count exhaustion on linux containers (default cap 65530)

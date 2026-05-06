@@ -15,6 +15,7 @@ python train_rl.py \
   --servers 9000,9001,9002,9003,9004,9005,9006,9007 \
   --fp16 --mp --mp-workers 8 \
   --games-per-iter 1600 --max-concurrent 200 \
+  --opponent-device cpu \
   --n-iters 200 --warmup-iters 20 \
   --lr 1e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
   --grad-accum 1 \
@@ -27,7 +28,13 @@ python train_rl.py \
   --out-dir data/models/rl_v10/<run_name>
 ```
 
-Expected: ~12-15 min/iter steady, **~$60-70 for 200 iters on A100 SXM 80GB**.
+Expected: ~12-15 min/iter steady (post-warmup). Warmup iters (0-19) are
+slower (~30 min/iter) because all 5 PPO epochs run even though only
+value_head trains — see §8 Active TODOs for warmup-speedup engineering.
+
+**Cost**: ~$80-150 for 200 iters on A100 SXM 80GB depending on KL early-stop
+behavior in main phase + warmup overhead. (Original $60-70 estimate was
+optimistic; actual range observed Session 50.)
 
 ---
 
@@ -187,6 +194,53 @@ Worst-case loss bound on pod death: 5 min of progress.
 ### 3f. Forkserver cmd queue draining (legacy `mp_collect_v2`)
 
 **Note**: legacy `mp_collect_v2.py` is no longer reachable from `--mp` flag (replaced by `mp_disk_collect.py`). Kept in repo for reference. Don't use.
+
+### 3g. Linux/Ampere optimizations now applied (Session 50)
+
+`train_bc.py` had these baked in but `train_rl.py` was missing them. Patched in Session 50:
+
+```python
+# train_rl.py module top:
+torch.set_float32_matmul_precision("high")  # TF32 → 5-15% on Ampere fp32 matmul
+torch.backends.cudnn.benchmark = True       # autotune kernels → 5-10%
+```
+
+`--fp16` flag still required at launch for mixed precision. Together these match BC training defaults.
+
+### 3h. opponent_device=cpu — DOESN'T WORK at production scale (verified Session 50)
+
+**Hypothesis (initially)**: 8 workers × main+opp = 16 simultaneous GPU forwards causing queue contention. Move opps to CPU to reduce GPU pressure.
+
+**Actual result (Session 50 second launch)**: workers timeout, 0 trajs collected. Cause:
+```
+websockets.exceptions.ConnectionClosedError: sent 1011 (internal error)
+keepalive ping timeout; no close frame received
+```
+
+CPU forward of 20M-param transformer at single-batch is 200-500ms. At
+conc=200 with 200 simul battles per worker, the asyncio loop can't keep up
+— WS keepalive (default 30s) fires before opps can respond → battles drop.
+At small scale (games=20, conc=10) the math works, but production scale
+(conc=200) is where it breaks.
+
+**Conclusion**: keep `--opponent-device cuda` (default). Workers and opps
+both on GPU. Accept the ~15% GPU contention cost for now.
+
+**Real fix (deferred to multi-gen)**: centralized inference server (§3c
+issue's real fix) handles GPU contention properly via stream priority +
+arbitration. That's the project that simultaneously fixes mp+pipeline AND
+unlocks safer opp_device options.
+
+**`mp_disk_collect.py` change retained**: workers now actually thread
+`opponent_device` through (it was unused before Session 50). If you ever
+revisit CPU opp at smaller scale (small concurrency, small N workers),
+the plumbing works. Just don't use at production conc.
+
+### 3i. `--compile` flag is broken for new arch
+
+`train_rl.py:612` calls `torch.compile(model.forward_spatial, ...)` — but `forward_spatial` only exists on legacy `PokeTransformer`. New `TransformerBattlePolicy` doesn't have that method. Compile silently fails with `AttributeError` (caught + printed as "torch.compile: SKIPPED").
+
+**Status**: known issue. Real fix needs ~1 day to compile `tokenizer + spatial + temporal` separately + validate. Listed as multi-gen prep in §8. **Don't pass `--compile` until fixed.**
 
 ---
 

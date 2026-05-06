@@ -334,6 +334,7 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
     opp_pool = cmd["opp_pool"]  # list of dicts: {path, wr, weight}
     temp_range = tuple(cmd.get("temp_range", (1.0, 2.25)))
     opp_temp_range = tuple(cmd.get("opp_temp_range", temp_range))
+    opponent_device = cmd.get("opponent_device", "cuda")  # NEW
 
     # Seed RNG (per-worker offset to vary games across workers)
     random.seed(rng_seed + worker_id * 1000 + iter_n)
@@ -403,6 +404,7 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
         opp_cache=state["opp_cache"],
         opp_cache_max=state["opp_cache_max"],
         liveness_state=_liveness_state,
+        opponent_device=opponent_device,
     )
     elapsed_s = time.time() - t0
     _liveness_state["alive"] = False  # stop probe thread
@@ -451,7 +453,7 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
                             temp_range, opp_temp_range, fp16, rs_cfg,
                             turn_cap, battle_format, procedural_teams_path,
                             heartbeat_fn, opp_cache, opp_cache_max,
-                            liveness_state=None):
+                            liveness_state=None, opponent_device="cuda"):
     """Single-process collect inside a worker. Picks one PFSP-sampled
     opponent per game (weighted by `weight` from main's PFSP calc),
     runs n_games battles via V9RLPlayer.battle_against. Aggregates
@@ -528,12 +530,14 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
             if len(opp_cache) >= opp_cache_max:
                 lru = min(opp_cache.items(), key=lambda kv: kv[1]["last_used"])[0]
                 del opp_cache[lru]
-            cached_ckpt = torch.load(opp_path, map_location=device, weights_only=False)
+            # Load opp ckpt onto opponent_device (cpu reduces GPU contention
+            # when N workers + main all share one A100)
+            cached_ckpt = torch.load(opp_path, map_location=opponent_device, weights_only=False)
             opp_cache[opp_path] = {"ckpt": cached_ckpt, "last_used": time.time()}
 
         opponent = make_self_play_opponent(
             checkpoint_path=opp_path,
-            device=str(device),
+            device=opponent_device,    # use opp_device, not worker's main device
             temp_range=opp_temp_range,
             battle_format=battle_format,
             team=opp_tb,
@@ -794,6 +798,7 @@ def mp_disk_collect_sync(
             "battle_format": battle_format,
             "procedural_teams_path": procedural_teams_path,
             "device": str(device),
+            "opponent_device": opponent_device,  # workers load opp ckpt on this device
             "rng_seed": rng_seed,
         }
         # Pipe.send is blocking-but-fast (no timeout API); fine for small msgs

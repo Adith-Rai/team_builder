@@ -1,22 +1,20 @@
 ═══════════════════════════════════════════════════════════════════════════════
-SESSION BOOT — read this first
+SESSION BOOT — read this first, then start work
 ═══════════════════════════════════════════════════════════════════════════════
 
-This file used to contain session-specific tactical notes. Most of that became
-stale across sessions, contradicted later findings, and confused fresh
-sessions. **As of Session 50, this file is a thin pointer.**
+This session's focus: **MULTI-GEN PREP** (gen 6+ scope). Phase 1 v3 (gen9ou
+PPO from BC) launched in the prior session and is the validation gate.
+All work this session prepares for multi-gen training, which is the
+load-bearing project deliverable.
 
-For current state, read in order:
+Read in this exact order before doing anything:
 
-1. **`memory/MEMORY.md`** — current run state, recent decisions, project memory
-2. **`docs/PPO_CLOUD_COOKBOOK.md`** — single authoritative reference for cloud
-   PPO runs. Pre-flight checklist, canonical launch command, all cloud quirks
-   (SemLock race, heartbeat, mp+pipeline overlap), validated hyperparameters,
-   common errors + fixes. THIS IS THE ONE TO READ.
-3. **`memory/project_vision_scope.md`** — load-bearing project goals (elite
-   play across all formats/gens, cloud + local, etc.)
-4. **`docs/MP_DISK_REDESIGN.md`** — architectural design doc for the mp-disk
-   implementation. Worker manager, IPC design, failure modes, validation plan.
+1. **`memory/MEMORY.md`** — current run state, recent decisions
+2. **`memory/project_vision_scope.md`** — load-bearing project goals
+3. **§ THE GOAL** below — re-read every time you make a decision
+4. **`docs/PPO_CLOUD_COOKBOOK.md`** — single authoritative cloud-runs reference
+5. **`docs/MULTIGEN_FEASIBILITY.md`** — multi-gen architecture scoping (gen 6+)
+6. **`docs/MP_DISK_REDESIGN.md`** — mp-disk implementation reference
 
 ═══════════════════════════════════════════════════════════════════════════════
 THE GOAL — re-read every time you make a decision
@@ -35,80 +33,344 @@ building, not just play.
 **Deployment scope:** must scale **massively on paid cloud** for throughput-
 heavy training AND remain **runnable locally** on a 6 GB consumer GPU for
 development + smoke tests. Same code, both environments. Not parallel
-codebases. See `memory/project_vision_scope.md` for full constraints.
+codebases.
 
-V1 baseline is singles gen 9 — but every refactor decision must NOT
-foreclose paths to the broader scope. If a shortcut hardcodes gen9ou or
-6v6, surface the tradeoff explicitly before shipping.
+V1 baseline is gen 9 OU singles (Phase 1 v3 currently running). Multi-gen
+(gen 6+) is the natural Phase 3. Pre-gen-6 is explicitly out of scope per
+`MULTIGEN_FEASIBILITY.md`.
 
-Elite Pokemon play is about long-horizon planning, opponent modeling,
-risk-adjusted decision making, and squeezing every fractional advantage
-from type/STAB/effectiveness/speed/items/abilities/positioning.
+Elite play is about long-horizon planning, opponent modeling, risk-adjusted
+decision making, and squeezing every fractional advantage from
+type/STAB/effectiveness/speed/items/abilities/positioning.
 
 ═══════════════════════════════════════════════════════════════════════════════
-KEY DOCS BY TOPIC
+WHERE PHASE 1 V3 STANDS (started Session 50, end of session)
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Currently authoritative**:
-- `docs/PPO_CLOUD_COOKBOOK.md` — PPO cloud runs (Session 50+)
-- `docs/MP_DISK_REDESIGN.md` — mp-disk architecture
-- `docs/MULTIGEN_FEASIBILITY.md` — multi-gen scoping (gen 6+)
-- `docs/CLOUD_RUNBOOK.md` §1-10 — BC training (still valid; §11 superseded)
-- `docs/PPO_PHASED_TRAINING.md` — phased curriculum spec
-- `memory/MEMORY.md` — project memory, current state
+**Phase 1 v3 launched 2026-05-06 23:16 UTC (3rd attempt)** with optimizations:
+```
+--init-from data/models/bc/v10_cloud_gen9/epoch_003.pt
+--device cuda --servers 9000-9007 --fp16 --mp --mp-workers 8
+--games-per-iter 1600 --max-concurrent 200
+--n-iters 200 --warmup-iters 20 --lr 1e-5 --grad-accum 1
+--reward-style terminal --adaptive-entropy
+```
 
-**Historical (correct for their era; do NOT use for current decisions)**:
-- `docs/PHASE1_POSTMORTEM.md` — Session 50 lr=3e-5 failure analysis
-- `docs/PHASE1_DIAGNOSIS_REPORT.md` — Session 50 lr ablation matrix
-- `docs/PHASE1_INVESTIGATION_PLAN.md` — Session 50 hypothesis tests
-- `docs/PHASE1_V2_CLOUD_CHECKLIST.md` — v2 launch (killed; replaced by v3 mp-only)
-- `docs/ARCH_AUDIT.md` — Session 49 arch audit (mostly resolved)
-- `docs/STATUS.md` — long-form session history
-- `docs/RESEARCH.md` — research notes through Session 35
+**TF32 + cudnn.benchmark are now in `train_rl.py` module top** (parity with
+`train_bc.py`). `--fp16` enabled at launch. NO `--opponent-device cpu`
+(tried Session 50 — broke at production scale due to CPU forward latency
+exceeding WS keepalive; see cookbook §3h). NO `--compile` (broken for new
+arch — see §3i).
 
-**Code source-of-truth for behavioral questions**: when docs and code
-disagree, trust the code. Use `git log`/`git blame` for recent context.
+Run dir: `data/models/rl_v10/ppo_phase1_v3_cloud/selfplay_v9_<timestamp>/`
+R2 sync at `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/`
+
+**Expected**: ~12-15 min/iter steady (post-warmup). Total ~40-72 hr / **~$60-150**.
+Range is wide because warmup iters (0-19) are slower (~30-45 min/iter)
+since only value_head trains but full 5 PPO epochs run regardless.
+
+**First eval at iter 19** (smart_avg vs SH/SmartDmg/Tactical/Strategic on
+metamon-competitive 16-team set). Should be ≥67% (BC baseline). If lower,
+investigate; if at/above, training is healthy, multi-gen prep proceeds.
+
+**To check status now**:
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+  "tail -F /workspace/logs/ppo_phase1_v3.log" | \
+  grep --line-buffered -E "Iter [0-9]+: W/L|EVAL|smart_avg|FATAL|Snapshot"
+```
+
+═══════════════════════════════════════════════════════════════════════════════
+SESSION 51 (THIS SESSION) — MULTI-GEN PREP TASK LIST
+═══════════════════════════════════════════════════════════════════════════════
+
+The goal for this session is **multi-gen prep** — get all the engineering
+work done so multi-gen training can launch cleanly. Phase 1 v3 in flight is
+the V1 validation gate; do not block on it.
+
+### Engineering work (likely the main session)
+
+#### A. Pipeline+mp overlap proper fix (~2-3 days)
+
+The `--mp --pipeline` combo currently silently no-ops for bg overlap.
+Diagnosed Session 50 as GPU contention: when bg cmd processing runs
+parallel to main's `optimizer.step()`, worker CUDA forwards stall and
+don't recover after main finishes.
+
+**Fix design**: centralized inference server. Workers send obs to a single
+GPU process (queues forwards on appropriate CUDA streams, arbitrating with
+main's compute). Avoids parallel GPU contention. Saves ~$200-300 over a
+multi-gen run (5-7 weeks compute) where the savings compound.
+
+Implementation outline:
+- New file `mp_centralized_inference.py` (or extend `mp_disk_collect.py`)
+- Workers send obs via numpy arrays through stdlib Queue (no torch tensor
+  IPC — that's the SemLock issue Session 50 fixed via Pipes)
+- Inference server dispatches to GPU on a low-priority CUDA stream so main
+  optimizer.step() takes priority
+- Workers buffer requests, await response Future
+- Pause/resume protocol DOESN'T work (workers can't progress mid-iter when
+  paused; tested Session 50)
+
+Reference: `docs/MP_DISK_REDESIGN.md` for current architecture; `metamon`
+uses AsyncVectorEnv + disk-backed (different approach but informs design);
+`ps-ppo` (Nebraskinator's GitHub) uses Ray actors with centralized
+inference (closer to what we need).
+
+#### B. Warmup speedup (~30 min)
+
+PPO update during warmup currently runs 5 epochs × 1600 episodes × full
+backward through all params, even though only `value_head` updates. Each
+warmup iter wastes ~25 min on unused gradient compute.
+
+**Fix**: when `in_warmup` is True in `train_rl.py`:
+1. Pass `epochs=1` to `ppo_update` instead of `args.ppo_epochs` (5 → 1)
+2. In `ppo_update`, wrap backbone forward in `torch.no_grad()` + `.detach()`
+   when only value_head trains. Backward stops at the cut, ~50% saving.
+
+Saves ~$15-25 over a 20-warmup-iter run. Bigger win for multi-gen runs
+where warmup repeats per phase.
+
+#### C. torch.compile fix for new arch (~1 day)
+
+The `--compile` flag in `train_rl.py:612` targets `model.forward_spatial`
+which only exists on legacy `PokeTransformer`. New `TransformerBattlePolicy`
+doesn't have that method, so `--compile` silently fails.
+
+**Fix**:
+- Compile `tokenizer + spatial + temporal` separately on new arch
+- Validate forward output equivalence (compiled vs uncompiled, fp16, on
+  identical seeded inputs — small max abs diff acceptable)
+- Document in cookbook
+
+Saves ~10-25% per iter. Multi-gen lever.
+
+#### D. Multi-gen architectural changes (~1-2 weeks)
+
+Per `docs/MULTIGEN_FEASIBILITY.md` (Phase 3a-d):
+
+**3a Foundation (~1-1.5 weeks)**:
+1. **Gen-id token in `TransformerBattlePolicy`** (~30-50 LOC):
+   ```python
+   # In __init__:
+   self.gen_embed = nn.Embedding(10, cfg.d_model)  # gens 0-9
+   # In forward:
+   gen_id = batch.get("gen_id")  # (B,) long
+   gen_token = self.gen_embed(gen_id).unsqueeze(1)
+   seq = torch.cat([actor_t, critic_t, trans_t, gen_token, ...], dim=1)
+   ```
+2. **Gen-aware feature pipeline** in `make_features` (`features.py`):
+   - Add `gen_id` to batch dict (from `battle.gen` poke-env attr)
+   - Gate gen-specific features (Tera type only gen 9; Z-moves only gen 7;
+     Mega only gens 6-7; Dynamax only gen 8)
+3. **Per-gen procedural teambuilder** (`team_generator.py`):
+   - `team_generator.py:477` already has `gen` field
+   - Filter species/movesets/items by `gen_added <= gen`
+   - Gen-specific viability (no Mega stones in gen 8+)
+
+**3b Data scale (~2 weeks)**:
+4. Pull replay corpora from HuggingFace `jakegrigsby/metamon-raw-replays`
+   for gens 6, 7, 8 at ≥1500 ELO (gens 5-9 dumps 2014-2024 in
+   `raw_data/pokemon_usage/`)
+5. Multi-gen `replay_to_memmap` (already mostly gen-aware via
+   `_parse_gen_from_format`)
+6. **BC v11 multi-gen retrain** — ~5-7 days A100 compute, 5 epochs at
+   B=48 fp16. ~$10-15 cost. Validate per-gen smart_avg holds.
+
+**3c PPO multi-gen (~1-2 weeks)**:
+7. Per-iter format selection (mix gens within one PPO run)
+8. Per-gen eval (smart_avg-per-gen tracking)
+9. PFSP per-gen pool optionally separated
+
+**3d Production quality (~1-2 weeks)**:
+10. Per-gen bot tuning (smart bots may need updates per gen)
+11. Per-gen procedural team validation
+12. Multi-gen evaluation harness
+
+### Validation work (during/after each engineering item)
+
+Use the 6-test pattern from `docs/PPO_CLOUD_COOKBOOK.md` §5 for each
+substantive change. Don't skip.
+
+═══════════════════════════════════════════════════════════════════════════════
+HOW TO RUN THINGS (commands by task)
+═══════════════════════════════════════════════════════════════════════════════
+
+### Cloud pod connection
+
+```bash
+# Current pod (likely terminated by start of Session 51 — check first)
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
+```
+
+If pod is gone, provision a new one per `docs/PPO_CLOUD_COOKBOOK.md` §9.
+
+### Local invocations
+
+```bash
+# Working dir
+cd C:/Users/raiad/OneDrive/Desktop/team_builder
+
+# Start a battle_server (Windows / git-bash)
+node \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  2>&1 | tee logs/battle_server.log
+
+# Run a smoke test locally (small scale, 6GB GPU works fine)
+cd pokemon-ai-starter/pokemon-ai/src
+python train_rl.py \
+  --init-from data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
+  --device cuda --servers 9000 --fp16 \
+  --games-per-iter 20 --max-concurrent 10 \
+  --n-iters 1 --warmup-iters 0 \
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
+  --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
+  --out-dir data/models/rl_v10/local_smoke
+```
+
+### Cloud bootstrap (fresh A100 pod, full setup)
+
+See `docs/PPO_CLOUD_COOKBOOK.md` §9 for canonical commands. Summary:
+
+```bash
+# 1. Repo + Python deps + libcudnn + Node 20 + npm + awscli
+# 2. R2 credentials in scripts/r2_env.local.sh (gitignored — recreate from local)
+# 3. Sync data from R2 (BC ckpt, procedural teams)
+# 4. scp from local: vocab/*.json, lookup/move_flags_v1.pt, eval teams
+# 5. Start 8 battle_servers (ports 9000-9007)
+# 6. ulimit -n 65536 + verify /dev/shm space
+# 7. Pre-flight checklist from cookbook §1
+# 8. Launch
+```
+
+### Production launch (Phase 1 v4 / multi-gen / etc.)
+
+Use canonical command from `docs/PPO_CLOUD_COOKBOOK.md` TL;DR. The current
+production config (lr=1e-5, grad-accum=1, mp+N=8, conc=200, opp_device=cpu,
+TF32+cudnn.benchmark autoselected) is what we ship.
+
+═══════════════════════════════════════════════════════════════════════════════
+DATA / LOOKUP TABLES — where each lives
+═══════════════════════════════════════════════════════════════════════════════
+
+| Component | Local path | Pod path | R2 path |
+|---|---|---|---|
+| BC ckpt v10 e3 | `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_cloud_gen9/epoch_003.pt` | same | `s3://team-builder-data/models/bc/v10_cloud_gen9/` |
+| Phase 1 v3 outputs | (R2 only) | `data/models/rl_v10/ppo_phase1_v3_cloud/` | `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/` |
+| Vocab (5 JSON) | `pokemon-ai-starter/pokemon-ai/src/data/vocab/` | same | (gitignored, scp from local) |
+| Move flags lookup | `pokemon-ai-starter/pokemon-ai/src/data/lookup/move_flags_v1.pt` | same | (gitignored, scp from local) |
+| Procedural teams (2024-04 month) | `raw_data/pokemon_usage/2024-04/` (256 files) | `/workspace/raw_data/pokemon_usage/2024-04/` | `s3://team-builder-data/raw_data/pokemon_usage/2024-04/` |
+| All Smogon usage stats (2014-2024) | `raw_data/pokemon_usage/<YYYY-MM>/` | (sync as needed) | (could upload for multi-gen) |
+| Eval teams metamon-competitive | `metamon_cache/teams/competitive/gen9ou/` (16 teams) | `/workspace/metamon_cache/teams/competitive/gen9ou/` | (gitignored, scp from local) |
+| Pokedex / moves / items / abilities | `raw_data/pokemon/`, `raw_data/items/items.csv` (with gen_added), `raw_data/movesets/moves.csv` (with gen_added) | (sync if needed for multi-gen) | (could upload) |
+| HuggingFace replay corpora | (download fresh per-gen) | (download per-gen) | n/a |
+
+For multi-gen: per `MULTIGEN_FEASIBILITY.md`, ~80% of needed data already exists.
+The big remaining piece is per-gen replay corpora from HuggingFace.
 
 ═══════════════════════════════════════════════════════════════════════════════
 CARRY-OVER PRACTICES (lessons paid for in prior sessions)
 ═══════════════════════════════════════════════════════════════════════════════
 
 1. **Read docs + code BEFORE estimating scope.** Sessions 49 + 50 both burned
-   evenings because of "should be a quick fix" estimates that ignored real
-   complexity. Trust line-cited audits, not first-impression reads.
+   evenings on "should be a quick fix" estimates. Trust line-cited audits.
 
-2. **Verify before recommending from memory.** A memory record naming a
-   function/flag is a claim about a past moment, not current state. Grep
-   for it before promising it works.
+2. **Verify before recommending from memory.** Memory is a snapshot, not
+   current state. Grep for functions/flags before promising they work.
 
 3. **Smoke ALWAYS before launching long runs.** Session 50 caught multiple
-   bugs that would have wasted 40+ hours each if launched blind:
-   - V9RLPlayer kwarg mismatch
-   - return-tuple shape
-   - opp_records format
-   - mp+pipeline GPU contention deadlock
+   bugs that would have wasted 40+ hr each (V9RLPlayer kwarg, return-tuple
+   shape, opp_records format, mp+pipeline GPU contention). The 6-test
+   pattern in cookbook §5 is non-optional.
 
-4. **`--mp` is transformer-only.** Legacy ckpts (sp_NNNN, BattleAgent class)
-   work as PFSP opponents (factory dispatches via `is_transformer_checkpoint`)
+4. **`--mp` is transformer-only.** Legacy `BattleAgent` ckpts (sp_NNNN) work
+   as PFSP opponents (factory dispatches via `is_transformer_checkpoint`)
    but cannot be `--init-from` for `--mp`.
 
-5. **Cloud: Network Volume MANDATORY for any run > 1 epoch.** Container Disk
+5. **Cloud: Network Volume MANDATORY for runs > 1 epoch.** Container Disk
    doesn't survive `podStop+podResume` if pod re-provisions on a different
    host. Lost a partial BC run this way (Session 49).
 
-6. **Don't rush refactors under time pressure.** "Just ship it tonight" is
-   the pattern that produces next session's surprise gaps. Stop at clean
-   breakpoints if needed.
+6. **Don't rush refactors under time pressure.** "Just ship tonight" is the
+   pattern that produces next session's surprise gaps.
 
-7. **Backward compat is a hard constraint, not a nice-to-have.** Legacy PPO
-   ckpts must remain loadable as PFSP opponents in every future run. The
-   `is_transformer_checkpoint` factory-dispatch invariant protects this.
+7. **Backward compat is a hard constraint.** Legacy ckpts must remain loadable
+   as PFSP opponents. The factory-dispatch invariant protects this.
+
+8. **Cloud-only bug discovery**: many bugs (SemLock race, GPU contention,
+   heartbeat starvation) only reproduce on Linux + RunPod. Schedule cloud
+   debug time when context is fresh — these don't reproduce locally.
 
 ═══════════════════════════════════════════════════════════════════════════════
-START HERE FOR NEW SESSIONS
+KEY DOCS BY TOPIC (current vs historical)
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. Read `memory/MEMORY.md` for current run state
-2. Read `docs/PPO_CLOUD_COOKBOOK.md` for current cloud running
-3. Check `git log --oneline -10` for very recent changes
-4. Ask user what they want to work on — don't assume from prior sessions
+**Authoritative (read these first)**:
+- `docs/PPO_CLOUD_COOKBOOK.md` — single ref for cloud PPO runs (Session 50+)
+- `docs/MP_DISK_REDESIGN.md` — mp-disk architecture
+- `docs/MULTIGEN_FEASIBILITY.md` — multi-gen scope (gen 6+)
+- `docs/CLOUD_RUNBOOK.md` §1-10 — BC training (§11 superseded, see cookbook)
+- `docs/PPO_PHASED_TRAINING.md` — phased curriculum spec
+- `memory/MEMORY.md` — project memory, current state
+
+**Historical (correct for their era; don't use for current decisions)**:
+- `docs/PHASE1_POSTMORTEM.md` — Session 50 lr=3e-5 failure analysis
+- `docs/PHASE1_DIAGNOSIS_REPORT.md` — Session 50 lr ablation matrix
+- `docs/PHASE1_INVESTIGATION_PLAN.md` — Session 50 hypothesis tests
+- `docs/PHASE1_V2_CLOUD_CHECKLIST.md` — v2 launch (killed; replaced by v3)
+- `docs/ARCH_AUDIT.md` — Session 49 arch audit (mostly resolved)
+- `docs/STATUS.md`, `docs/RESEARCH.md` — long-form session/research history
+
+**Code source-of-truth for behavioral questions**: when docs and code
+disagree, trust the code. Use `git log`/`git blame` for recent context.
+
+═══════════════════════════════════════════════════════════════════════════════
+ACTIVE TODOs (multi-gen prep, in priority order)
+═══════════════════════════════════════════════════════════════════════════════
+
+**HIGH (do this session)**:
+- [ ] A. Pipeline+mp redesign (centralized inference server) — ~2-3 days
+- [ ] B. Warmup speedup (epochs=1 + torch.no_grad backbone) — ~30 min
+- [ ] C. torch.compile fix for new arch — ~1 day
+- [ ] D1. Gen-id token in TransformerBattlePolicy — ~half day
+- [ ] D2. Gen-aware feature pipeline (gen_id in batch + gen-specific
+  feature gating for Mega/Z/Dynamax/Tera) — ~1 day
+- [ ] D3. Per-gen procedural teambuilder (filter by gen_added) — ~half day
+
+**MEDIUM (likely next session after)**:
+- [ ] D4. Multi-gen replay corpus assembly (HuggingFace pull, gen 6/7/8) —
+  compute-heavy
+- [ ] D5. Multi-gen `replay_to_memmap` (already mostly gen-aware)
+- [ ] D6. **BC v11 multi-gen retrain** — A100 80GB, ~5-7 days, ~$10-15
+
+**LOW (after BC v11 lands)**:
+- [ ] E1. PPO multi-gen run setup
+- [ ] E2. Per-gen eval bots (validate smart bots work in older gens)
+- [ ] E3. Per-gen evaluation harness (smart_avg-per-gen tracking)
+
+═══════════════════════════════════════════════════════════════════════════════
+START HERE FOR THIS SESSION
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Check Phase 1 v3 status:
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+     "grep '^\\[' /workspace/logs/ppo_phase1_v3.log | tail -5"
+   ```
+   If running: don't disrupt, work on prep tasks
+   If finished: pull final.pt + evals.json from R2, analyze
+
+2. Pick task A (pipeline+mp redesign) as the headline work — biggest win
+   for multi-gen. Spec it carefully, validate at small scale, then scale up.
+
+3. While engineering, multi-gen feasibility doc may need updates as you
+   discover more — keep `docs/MULTIGEN_FEASIBILITY.md` current.
+
+4. Update `docs/PPO_CLOUD_COOKBOOK.md` if you find anything not yet captured.
+
+5. After BC v11 multi-gen retrain (when it happens), do a multi-gen smoke
+   for gen 6 + 7 + 8 + 9 PPO before committing to long run.
+
+If stuck or context-loaded, ask user — don't assume from prior session
+beyond what's documented here.
