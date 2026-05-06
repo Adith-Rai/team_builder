@@ -316,7 +316,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             iter_n=getattr(args, '_current_iter', 0),
             n_workers=args.mp_workers,
         )
-        _flow(f"mp-disk collect done: {mp_result[5]:.0f}s, "
+        _flow(f"mp-disk collect done: {mp_result[6]:.0f}s, "
               f"{len(mp_result[0])} trajs")
         return mp_result
 

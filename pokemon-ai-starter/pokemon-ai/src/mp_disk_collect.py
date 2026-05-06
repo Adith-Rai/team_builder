@@ -442,9 +442,9 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
 
         opp_tb = train_tb or random_pool_teambuilder()
         player = V9RLPlayer(
-            inference_batcher=batcher,
+            batcher=batcher, device=device,
             reward_shaper_cfg=rs_cfg,
-            temp_range=temp_range,
+            temperature=1.0,
             turn_cap=turn_cap,
             battle_format=battle_format,
             team=train_tb or random_pool_teambuilder(),
@@ -500,7 +500,7 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
         opp_fft_w = getattr(player, 'n_forfeit_wins', 0)
         opp_fft_l = getattr(player, 'n_forfeit_losses', 0)
 
-        all_trajs.extend(player.trajectories)
+        all_trajs.extend(player.completed_trajectories)
         total_w_count += opp_w
         total_l += opp_l
         total_ties += opp_t
@@ -532,7 +532,17 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
                 if n_for <= 0:
                     continue
                 opp_coros.append(_play_vs_opp(opp_entry, n_for))
-            await asyncio.gather(*opp_coros, return_exceptions=True)
+            print(f"[worker {worker_id}] gather start: {len(opp_coros)} opp coros, "
+                  f"n_per_opp={n_per_opp}, opp_pool={[o['path'] for o in opp_pool]}",
+                  flush=True)
+            results = await asyncio.gather(*opp_coros, return_exceptions=True)
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    import traceback as _tb
+                    print(f"[worker {worker_id}] opp {i} EXCEPTION: "
+                          f"{type(r).__name__}: {r}\n"
+                          f"{''.join(_tb.format_exception(type(r), r, r.__traceback__))}",
+                          flush=True)
         finally:
             hb_task.cancel()
             try:
@@ -762,11 +772,13 @@ def mp_disk_collect_sync(
             _GLOBAL_MANAGER.respawn(wid, iter_n)
 
     # 5. Aggregate: read traj files, sum stats
+    # opp_records format MUST match collect_v9's: {path: [wins, games]} (2-list).
+    # Forfeit counters tracked separately in main if needed.
     all_trajs = []
     total_w = 0
     total_l = 0
     total_ties = 0
-    aggregated_wr: Dict[str, Dict[str, int]] = {}
+    aggregated_wr: Dict[str, List[int]] = {}
     for r in results:
         traj_path = r.get("traj_path")
         if not traj_path or not Path(traj_path).exists():
@@ -785,24 +797,20 @@ def mp_disk_collect_sync(
         total_l += r["losses"]
         total_ties += r["ties"]
         for opp_path, stats in r.get("wr_per_opp", {}).items():
-            agg = aggregated_wr.setdefault(opp_path, {"w": 0, "g": 0,
-                                                       "fft_w": 0, "fft_l": 0})
-            agg["w"] += stats.get("w", 0)
-            agg["g"] += stats.get("g", 0)
-            agg["fft_w"] += stats.get("fft_w", 0)
-            agg["fft_l"] += stats.get("fft_l", 0)
+            rec = aggregated_wr.setdefault(opp_path, [0, 0])
+            rec[0] += stats.get("w", 0)
+            rec[1] += stats.get("g", 0)
 
     # 6. Cleanup old files (keep last 2)
     _cleanup_old_files(iter_n, keep_last=2)
 
     elapsed = time.time() - t_start
-    summary = {
-        "n_workers_alive": len(alive),
-        "n_workers_responded": len(results),
-        "iter_n": iter_n,
-    }
-    return (all_trajs, total_w, total_l, total_ties, summary, elapsed,
-            aggregated_wr)
+    total_steps = sum(len(t) for t in all_trajs)
+    opp_name = f"mp-disk(N={len(alive)},responded={len(results)})"
+    # Return signature matches collect_v9: (trajs, w, l, t, steps, opp_name,
+    # collect_time, opp_records).
+    return (all_trajs, total_w, total_l, total_ties, total_steps, opp_name,
+            elapsed, aggregated_wr)
 
 
 # =============================
@@ -939,10 +947,10 @@ def _wait_for_iter_results(iter_n: int, cmds_sent: List[int]) -> Tuple:
                   f"{msg.get('exc_msg')}", flush=True)
             _GLOBAL_MANAGER.respawn(msg.get("worker_id"), iter_n)
 
-    # Read traj files
+    # Read traj files. opp_records format = {path: [wins, games]} per collect_v9.
     all_trajs = []
     total_w, total_l, total_ties = 0, 0, 0
-    aggregated_wr: Dict[str, Dict[str, int]] = {}
+    aggregated_wr: Dict[str, List[int]] = {}
     for r in results:
         traj_path = r.get("traj_path")
         if not traj_path or not Path(traj_path).exists():
@@ -955,18 +963,15 @@ def _wait_for_iter_results(iter_n: int, cmds_sent: List[int]) -> Tuple:
             total_l += r["losses"]
             total_ties += r["ties"]
             for opp_path, stats in r.get("wr_per_opp", {}).items():
-                agg = aggregated_wr.setdefault(opp_path,
-                                                {"w": 0, "g": 0,
-                                                 "fft_w": 0, "fft_l": 0})
-                for k in ("w", "g", "fft_w", "fft_l"):
-                    agg[k] += stats.get(k, 0)
+                rec = aggregated_wr.setdefault(opp_path, [0, 0])
+                rec[0] += stats.get("w", 0)
+                rec[1] += stats.get("g", 0)
         except Exception as e:
             print(f"[mp-disk] read failure for {traj_path}: {e}", flush=True)
 
     _cleanup_old_files(iter_n, keep_last=2)
-    summary = {"iter_n": iter_n,
-               "n_workers_responded": len(results),
-               "n_workers_expected": len(cmds_sent)}
+    total_steps = sum(len(t) for t in all_trajs)
+    opp_name = f"mp-disk-bg(responded={len(results)}/{len(cmds_sent)})"
     elapsed = 0.0  # bg mode doesn't track its own elapsed cleanly
-    return (all_trajs, total_w, total_l, total_ties, summary, elapsed,
-            aggregated_wr)
+    return (all_trajs, total_w, total_l, total_ties, total_steps, opp_name,
+            elapsed, aggregated_wr)
