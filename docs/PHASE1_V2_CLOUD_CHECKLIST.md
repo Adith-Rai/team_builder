@@ -20,9 +20,10 @@
 ## Phase 1 — Provision pod (5-10 min)
 
 - [ ] RunPod console → Deploy → A100 SXM 80GB ($1.50/hr)
-- [ ] **Network Volume MANDATORY** (per Session 49 incident — Container Disk doesn't survive `podStop+Resume`):
-      - Storage → Network Volume → 200 GB minimum (or pre-existing if you have one)
-      - Mount at `/workspace` in pod template
+- [ ] **Network Volume optional this run** (Container Disk is fine IF you don't `podStop+Resume`):
+      - The Session 49 incident specifically required a stop+resume cycle to break Container Disk persistence.
+      - Plan for THIS run: don't stop/resume, just terminate when done. R2-sync at every snapshot (Phase 8) gives a recovery point if the pod dies unexpectedly. Worst-case loss = 5 iters (~30 min, ~$1).
+      - If you prefer the safety net, attach a Network Volume; not required.
 - [ ] Region: same as your R2 bucket (US-East per `r2_env.local.sh`) for fast transfer
 - [ ] Container template: PyTorch 2.1+ with CUDA 12.x base
 - [ ] Note the pod ID — for SSH and termination later
@@ -113,7 +114,7 @@ nohup python train_rl.py \
   --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
   --device cuda --servers 9000,9000,9000,9000 --fp16 \
   --games-per-iter 1000 --max-concurrent 500 \
-  --n-iters 200 --warmup-iters 15 \
+  --n-iters 200 --warmup-iters 20 \
   --lr 1e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
   --grad-accum 1 \
   --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
@@ -135,8 +136,8 @@ nohup python train_rl.py \
 | `--lr 1e-5` | Validated stable on new arch via 4-point lr ablation (Session 50 diagnosis) |
 | `--games-per-iter 1000` | 5x more samples than local Phase 1 → cleaner gradient → small lr can actually move policy |
 | `--max-concurrent 500` | A100 80GB has VRAM headroom; pushes throughput. Could go higher with `--mp` later. |
-| `--turn-cap 300` | Cloud has memory headroom; keep historical default (vs local's 200) |
-| `--warmup-iters 15` | Re-anchor value head at lr=1e-5 (was lr=3e-5 at sp_0019). Prevents anchor-wr drift artifact in early iters. |
+| `--turn-cap 300` | Historical default. T-quadratic memory means T=1000 would be ~40 GB (slows everything; no real battle goes that long). T=300 catches the safety-net case. |
+| `--warmup-iters 20` | Re-anchor value head at lr=1e-5 (sp_0019 was warmup-trained at lr=3e-5). With eval-interval=20, this puts the first eval (iter 19) cleanly at end-of-warmup before any policy training muddies the signal. |
 | `--pipeline` | A100 has VRAM for bg model deepcopy without contention; cuts iter time ~30% |
 | `--early-stop --early-stop-patience 3` | Fail fast if smart_avg regresses past noise threshold |
 | `--servers 9000,9000,9000,9000` | 4-wave parallelism on one battle_server (validated pattern) |
@@ -165,20 +166,35 @@ What to watch:
 - **Iters 20-79**: trajectory should hold or slowly climb. If smart_avg trends down past noise (target_threshold=2.0), --early-stop will fire.
 - **Iter 79+**: hopefully smart_avg climbs to 70-75% range. That's the "BC + PPO actually working" territory.
 
-## Phase 8 — Snapshot back to R2 (incremental during run)
+## Phase 8 — R2 sync at every snapshot save (recovery point)
 
-After each successful eval, sync the latest snapshot back so we don't lose progress on pod failure:
+Replaces the Network Volume approach. Bash bg loop runs alongside training and syncs the run dir to R2 frequently. Worst-case progress loss if pod dies = 1 sync interval.
 
 ```bash
-# Optional cron-like script — run every 30 min:
-while true; do
-  aws s3 sync data/models/rl_v10/ppo_phase1_v2_cloud/ \
-    s3://team-builder-data/models/rl_v10/ppo_phase1_v2_cloud/ \
-    --endpoint-url $S3_ENDPOINT_URL \
-    --exclude "*" --include "snapshot_*.pt" --include "*.json"
-  sleep 1800
-done &
+# Recommended: sync every 5 minutes. Catches every snapshot (every 5 iters
+# ≈ ~30-60 min) plus interim PFSP win_rates updates and config changes.
+nohup bash -c '
+  while true; do
+    aws s3 sync data/models/rl_v10/ppo_phase1_v2_cloud/ \
+      s3://team-builder-data/models/rl_v10/ppo_phase1_v2_cloud/ \
+      --endpoint-url $S3_ENDPOINT_URL \
+      --exclude "*" \
+      --include "snapshot_*.pt" --include "*.json" --include "config.json" \
+      --include "win_rates.json" --include "evals.json" 2>&1
+    sleep 300
+  done
+' > /workspace/logs/r2_sync.log 2>&1 &
 ```
+
+This syncs:
+- Every saved snapshot (`.pt` files)
+- PFSP win-rate state (`win_rates.json`)
+- Eval results (`evals.json`)
+- Run config (`config.json`)
+
+Skipped: tensorboard event files, training logs (rebuildable / not critical for resume).
+
+**Recovery:** if pod dies, provision a new pod, sync FROM R2, resume with `--resume <latest_snapshot>.pt`. Loss bound: ≤5 min of progress (last sync interval).
 
 ## Phase 9 — Wrap (after run completes or early-stops)
 
