@@ -335,20 +335,43 @@ Before launching production (~$60-70 commit), validate at small scale (~$1):
 
 ## 8. Active TODOs (post-Phase 1 v3)
 
-### Multi-gen prep (next major work session)
+### Multi-gen prep (next major work session — engineering throughput wins)
 
-1. **mp+pipeline redesign** (~2-3 day engineering project): centralized inference server. Saves $200-300 over multi-gen run.
-2. **Multi-gen support** (per `MULTIGEN_FEASIBILITY.md`):
-   - Gen-id token in TransformerBattlePolicy (~1 week)
-   - Per-gen procedural teambuilder (gen-aware filtering)
-   - Multi-gen replay assembly (HuggingFace)
-   - BC v11 multi-gen retrain (~1-2 weeks compute)
-3. **Per-gen eval bots** if multi-gen run goes through
+1. **mp+pipeline redesign** (~2-3 day engineering project): centralized inference server. Workers send obs to single GPU process, queues forwards on low-priority CUDA streams (arbitrating with main's optimizer.step). Fixes both the GPU-contention deadlock (§3c) AND unlocks safer opp_device options (§3h). Saves $200-300 over a multi-gen run.
+
+2. **`torch.compile` fix for new arch** (~1 day): current `--compile` flag at `train_rl.py:612` targets `model.forward_spatial` which only exists on legacy `PokeTransformer`. New arch has `tokenizer + spatial + temporal` instead. Need to compile each module separately + validate forward output equivalence (compiled vs uncompiled, fp16, on identical seeded inputs). ~10-25% speedup per iter. Multi-gen lever.
+
+3. **Warmup speedup** (~30 min total):
+   - 3a. `epochs=1` during warmup (vs `args.ppo_epochs=5`). 5x fewer optimizer steps when only value_head trains. Tiny risk of undertraining value_head — debatable but probably fine.
+   - 3b. `torch.no_grad()` around backbone forward in warmup, then `.detach()` before value_head. Skips backward through frozen layers. Cuts warmup update from ~25 min → ~3-5 min.
+   - Combined: warmup phase 30 min/iter → ~8 min/iter. Saves ~$15-25 on a 20-warmup-iter run; bigger win for multi-gen with multiple warmup phases.
+
+### Multi-gen architectural work (per `MULTIGEN_FEASIBILITY.md`)
+
+4. **Gen-id token** in `TransformerBattlePolicy` (~half day): `nn.Embedding(10, d_model)` for gens 0-9, concat into spatial sequence.
+5. **Gen-aware feature pipeline** (~1 day): add `gen_id` to batch dict in `make_features`, gate gen-specific features (Mega gens 6-7, Z gen 7, Dynamax gen 8, Tera gen 9).
+6. **Per-gen procedural teambuilder** (~half day): filter species/movesets/items by `gen_added <= gen` in `team_generator.py`.
+7. **Multi-gen replay corpus assembly**: pull HuggingFace `jakegrigsby/metamon-raw-replays` for gens 6/7/8 at ≥1500 ELO. Compute-heavy.
+8. **Multi-gen `replay_to_memmap`**: already mostly gen-aware via `_parse_gen_from_format`. Validate.
+9. **BC v11 multi-gen retrain**: A100 80GB, ~5-7 days, ~$10-15 cost. Validate per-gen smart_avg holds.
+10. **Per-gen eval bots**: smart bots may need updates per gen (gen-specific item/move pool assumptions in SmartDmg, Tactical, etc.).
+11. **Multi-gen evaluation harness**: smart_avg-per-gen tracking.
 
 ### Smaller cleanups
 
 - Migrate old runs from `data/models/rl_v9/*` to R2-only (free local disk)
 - Document smart-bot eval baseline ranges per gen for benchmarking
+- Consider per-gen PFSP pool curation if multi-gen distribution shift hurts self-play
+
+### Where each saves time / cost
+
+| TODO | Saves | Phase 1 v3 | Multi-gen run |
+|---|---|---|---|
+| #1 pipeline+mp redesign | ~25-30% iter time | $30-45 | $200-300 |
+| #2 torch.compile new arch | ~10-25% per iter | $15-25 | $100-200 |
+| #3 warmup speedup | ~75% on warmup phase | $15-25 | $50-100 |
+| #4-6 gen-id + features | (enables multi-gen) | n/a | needed |
+| #7-9 corpus + BC v11 | (enables multi-gen) | n/a | needed |
 
 ---
 
