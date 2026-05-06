@@ -188,6 +188,7 @@ async def collect_v9(
     battle_format: str = "gen9ou",
     win_rates: Optional[Dict[str, list]] = None,
     external_manager=None,
+    turn_cap: int = 300,
 ):
     """Pure self-play collection with batched inference.
     Plays against MULTIPLE opponents per iteration (uniform from pool, max 15).
@@ -253,7 +254,7 @@ async def collect_v9(
             batcher=batcher, device=device,
             reward_shaper_cfg=rs_cfg,
             temperature=1.0,
-            turn_cap=300,
+            turn_cap=turn_cap,
             battle_format=battle_format,
             team=tb,
             max_concurrent_battles=conc_per_pair,
@@ -275,6 +276,7 @@ async def collect_v9(
                 checkpoint_path=entry.path,
                 device=opponent_device,
                 temp_range=opp_temp_range,
+                turn_cap=turn_cap,
                 battle_format=battle_format,
                 team=teambuilder,
                 max_concurrent_battles=conc_per_pair,
@@ -585,6 +587,7 @@ class BackgroundCollector:
                     teambuilder=a.get("teambuilder"),
                     win_rates=win_rates,
                     external_manager=external_manager,
+                    turn_cap=a.get("turn_cap", 300),
                 )
             )
             loop.close()

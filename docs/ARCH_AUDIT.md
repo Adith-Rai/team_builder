@@ -424,9 +424,12 @@ in favor of a thinner option that keeps the new arch's native API clean:
 | 6. Round-trip via `ppo.load_checkpoint` | ✓ Both saved snapshots load to correct class with correct cfg |
 
 **Deferred (audit §6, no Phase 1 impact):**
-- `mp_collect_v2.py`, `mp_collect_v3.py` arch dispatch (Phase 1 doesn't use `--mp`;
-  the same helpers in `arch_compat.py` will apply when that path is needed for
-  cloud scaling).
+- ~~`mp_collect_v2.py`~~ — **refactored Session 50 continuation 2026-05-06** with the
+  same `arch_compat` helper pattern (4 call sites in `InferenceServerV2._process_batch`).
+  Numerical equivalence to single-process InferenceBatcher is by construction (same helpers,
+  same pattern proven bit-identical in Pri 1.5 equality test). Runtime validation pending
+  cloud test.
+- `mp_collect_v3.py` — appears dead/experimental (not imported by `train_rl.py`). Skip.
 - `eval_h2h_v8.py`, `eval_report_v8.py`, `eval_vs_external_pool.py` legacy script
   cleanup (production eval already arch-aware).
 - `train_rl.py --use-transformer` flag for from-scratch transformer training (Phase

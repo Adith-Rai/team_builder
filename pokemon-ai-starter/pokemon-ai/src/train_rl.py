@@ -161,6 +161,12 @@ def parse_args():
                         "pool (still saved on disk). Anchor checkpoints and the init "
                         "checkpoint are not affected. Default -1 = unbounded (old "
                         "behavior — caused S43/S44 dilution).")
+    # Memory: per-battle turn cap. New arch's per-attribute tokenization makes
+    # PPO's per-episode forward over T turns scale ~quadratically (T=45 ≈ 1.7 GB,
+    # T=200 ≈ 8 GB on a 6 GB GPU). Lowering turn_cap on local; cloud can keep 300.
+    p.add_argument("--turn-cap", type=int, default=300,
+                   help="Per-battle turn cap before forfeit. Local 6 GB GPU: 200. "
+                        "Cloud 80 GB: 300 (default).")
     add_model_args(p)
     return p.parse_args()
 
@@ -306,6 +312,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             battle_format=battle_format,
             win_rates=win_rates,
             external_manager=external_manager,
+            turn_cap=args.turn_cap,
         )
     )
     _flow(f"sync collection done: {result[6]:.0f}s, {len(result[0])} trajs")
@@ -750,6 +757,7 @@ def main():
         "opponent_device": args.opponent_device,
         "teambuilder": train_teambuilder,
         "win_rates": win_rates,
+        "turn_cap": args.turn_cap,
     }
     pending_collection = None
     mp_bg_collector = None

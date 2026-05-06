@@ -53,6 +53,12 @@ from poke_env.player import Player
 from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
 
+from arch_compat import (
+    call_action_encoder,
+    call_policy_logits,
+    call_value_logits,
+    get_v_support,
+)
 from features import make_features
 from model import PokeTransformer
 from rewards import RewardShaper
@@ -244,11 +250,10 @@ class InferenceServerV2:
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.fp16):
             t0 = time.time()
 
+            # Arch-aware: call_action_encoder dispatches to the right shape for
+            # legacy PokeTransformer vs new TransformerBattlePolicy. See arch_compat.py.
             spatial_out, summaries = model.forward_spatial(mega)
-            action_ctx = model.action_encoder(
-                mega["active_move_ids"], mega["active_move_banks"],
-                mega["active_move_cont"], mega["switch_ids"], mega["switch_cont"],
-            )
+            action_ctx = call_action_encoder(model, mega, spatial_out)
 
             # Batched temporal
             seq_lens = []
@@ -278,21 +283,21 @@ class InferenceServerV2:
                 all_summaries.float(), seq_lens_t
             ).to(summaries.dtype)
 
-            # Batched heads
+            # Batched heads (arch-aware via arch_compat helpers)
             actor_out = spatial_out[:, 0, :]
             at = torch.cat([actor_out, temporal_ctx], dim=-1)
             at_exp = at.unsqueeze(1).expand(-1, 9, -1)
             pi_input = torch.cat([at_exp, action_ctx], dim=-1)
-            logits = model.policy_head(pi_input).squeeze(-1)
+            logits = call_policy_logits(model, pi_input)
 
             if "legal_mask" in mega:
                 logits = logits.float().masked_fill(mega["legal_mask"] < 0.5, -100.0)
 
             critic_out = spatial_out[:, 1, :]
             vi = torch.cat([critic_out, temporal_ctx], dim=-1)
-            v_logits = model.value_head(vi)
+            v_logits = call_value_logits(model, vi)
             v_probs = F.softmax(v_logits, dim=-1)
-            values = (v_probs * model.v_support).sum(-1)
+            values = (v_probs * get_v_support(model)).sum(-1)
 
             gpu_ms = (time.time() - t0) * 1000
             self._prof_batch_sizes.append(N)
