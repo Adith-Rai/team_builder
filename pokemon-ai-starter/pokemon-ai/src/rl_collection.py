@@ -483,11 +483,32 @@ async def collect_v9(
             timeout_ms=15,
         )
 
+        # When a wave has fewer opponents than servers, split each opponent's
+        # games across the remaining servers — otherwise 5 of 6 servers sit
+        # idle when pool=1 (Phase 1 init). At pool ≥ n_servers the original
+        # 1-opp-per-server pattern still applies.
         coros = []
-        for wi, (oi, opp_item, n) in enumerate(wave):
-            batch_id = rid * 100 + oi
-            srv = server_pool[wi % n_servers]
-            coros.append(_play_one_opponent(oi, opp_item, n, batcher, srv, batch_id))
+        if len(wave) < n_servers:
+            servers_per_opp = n_servers // len(wave)
+            for wi, (oi, opp_item, n) in enumerate(wave):
+                # Slice this opponent's allotted server range.
+                start = wi * servers_per_opp
+                end = start + servers_per_opp if wi < len(wave) - 1 else n_servers
+                opp_servers = server_pool[start:end]
+                # Split this opponent's n games across opp_servers.
+                gpsplit = n // len(opp_servers)
+                rem = n % len(opp_servers)
+                for si, srv in enumerate(opp_servers):
+                    sub_n = gpsplit + (1 if si < rem else 0)
+                    if sub_n <= 0:
+                        continue
+                    sub_batch_id = rid * 1000 + oi * 100 + si
+                    coros.append(_play_one_opponent(oi, opp_item, sub_n, batcher, srv, sub_batch_id))
+        else:
+            for wi, (oi, opp_item, n) in enumerate(wave):
+                batch_id = rid * 100 + oi
+                srv = server_pool[wi % n_servers]
+                coros.append(_play_one_opponent(oi, opp_item, n, batcher, srv, batch_id))
 
         wave_results = await asyncio.gather(*coros, return_exceptions=True)
 

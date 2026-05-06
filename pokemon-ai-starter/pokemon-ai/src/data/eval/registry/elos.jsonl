@@ -350,3 +350,8 @@
 {"iter": -1, "name": "bc_v10_cloud_e2", "elo": 1122.0, "ci_lo": 1108.4, "ci_hi": 1137.0, "ladder": "elo_v10_500g_focused", "n_games": 500, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_002.pt"}
 {"iter": 229, "name": "ppo_s39_iter229", "elo": 1124.2, "ci_lo": 1110.3, "ci_hi": 1138.9, "ladder": "elo_v10_500g_focused", "n_games": 500, "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"}
 {"iter": 119, "name": "ppo_curated_iter119", "elo": 1112.2, "ci_lo": 1097.7, "ci_hi": 1128.1, "ladder": "elo_v10_500g_focused", "n_games": 500, "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e1", "elo": 1118.1, "ci_lo": 1103.1, "ci_hi": 1132.2, "ladder": "elo_v10_500g_focused_plus_e3", "n_games": 500, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_001.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e2", "elo": 1122.6, "ci_lo": 1109.0, "ci_hi": 1136.2, "ladder": "elo_v10_500g_focused_plus_e3", "n_games": 500, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_002.pt"}
+{"iter": 229, "name": "ppo_s39_iter229", "elo": 1120.4, "ci_lo": 1107.5, "ci_hi": 1136.0, "ladder": "elo_v10_500g_focused_plus_e3", "n_games": 500, "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"}
+{"iter": 119, "name": "ppo_curated_iter119", "elo": 1110.0, "ci_lo": 1098.6, "ci_hi": 1125.0, "ladder": "elo_v10_500g_focused_plus_e3", "n_games": 500, "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"}
+{"iter": -1, "name": "bc_v10_cloud_e3", "elo": 1135.9, "ci_lo": 1123.3, "ci_hi": 1151.5, "ladder": "elo_v10_500g_focused_plus_e3", "n_games": 500, "ckpt": "data/models/bc/v10_cloud_gen9/epoch_003.pt"}

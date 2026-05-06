@@ -81,6 +81,25 @@ aws s3 sync s3://team-builder-data/raw_data/pokemon_usage/2024-04 \
   /workspace/raw_data/pokemon_usage/2024-04 --endpoint-url $S3_ENDPOINT_URL
 ```
 
+## Phase 4.5 — Cloud-only optimizations (linux + A100)
+
+**System-level — required:**
+- **`ulimit -n 65536`**: Default 1024 is too low for `--mp`. Linux mp workers + torch shared-memory + battle WS sockets exhaust FDs immediately — fails with `OSError [Errno 24] Too many open files`. Set INSIDE the screen/launch context, not just current SSH shell.
+
+**System-level — recommended:**
+- **`libcudnn8` install** (if not already): `apt install -y libcudnn8`. Without it, `import torch` fails on plain CUDA 12.x base images.
+- **TF32 matmul**: `torch.set_float32_matmul_precision('high')` — ~5-15% speedup on A100 matmuls without accuracy hit.
+- **flash-attention**: torch 2.2 + cudnn 8 supports flash-attn. Currently emits `1Torch was not compiled with flash attention`; needs nightly/2.3+ or rebuild. Not blocking for the run; known marginal speedup.
+
+**Training-level:**
+- **`--compile`**: torch.compile fusion. Validated on A100 during BC v10 training; expected 1.3-2× forward speedup. Add as launch flag.
+- **Per-server `--max-concurrent` 200-300** with 4-8 servers → 800-2400 effective concurrency. Battle simulation throughput is the bottleneck at conc=500/single-server (Test A confirmed: GPU only 7% utilized during collect).
+- **`--mp --pipeline` together**: activates `MPPipelineCollector` (collect & update overlap across N inference workers). The most aggressive config; designed pairing.
+
+**arch_compat bug fix landed Session 50 cont.:**
+- `mp_collect_v2.py:402`, `mp_collect_v3.py:312`, `rl_pipeline.py:429` were all calling raw `SelfPlayOpponent(...)` (legacy BattleAgent) — fails on transformer ckpt with `Missing key(s) in state_dict`. Fixed to use `make_self_play_opponent()` factory which dispatches on `is_transformer_checkpoint`.
+- Without this fix, ANY config with `--mp` (Test B/C/D and the production launch) crashes immediately on opponent worker spawn.
+
 ## Phase 5 — Start battle_server.js × N (1 min)
 
 Single battle_server is enough at games_per_iter=1000 (poke-env distributes via the 4-wave hack). For more headroom, start 4:
@@ -151,7 +170,7 @@ If you set up 8 battle_servers, you can use the just-refactored `--mp` for ~3x m
 --max-concurrent 200 --games-per-iter 4000
 ```
 
-(Note: --pipeline is incompatible with --mp; pick one.) Numerical equivalence proven; runtime untested at scale. Worth doing if you want a much faster iter cadence (~3-5 min/iter) at the cost of slightly more setup and zero local validation data.
+(Note: `--mp --pipeline` together activates `MPPipelineCollector` — designed combination, not exclusive. They were corrected here in Session 50 cont.) Numerical equivalence proven; runtime untested at scale. Worth doing if you want a much faster iter cadence (~3-5 min/iter) at the cost of slightly more setup and zero local validation data.
 
 ## Phase 7 — Monitor (passive, ~25-35 hr)
 

@@ -27,6 +27,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+# Set sharing strategy BEFORE any other imports that touch torch.multiprocessing.
+# file_system uses ref-counted /tmp files instead of POSIX shm_open per tensor;
+# avoids vm.max_map_count exhaustion on linux containers (default cap 65530)
+# under high-volume tensor IPC. RunPod containers don't allow sysctl bumps.
+import torch.multiprocessing as _mp_train
+try:
+    _mp_train.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 from torch.utils.tensorboard import SummaryWriter
 
 from model import PokeTransformer, PokeTransformerConfig, add_model_args

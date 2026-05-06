@@ -48,6 +48,13 @@ try:
 except RuntimeError:
     pass
 
+# See mp_collect_v2.py for rationale (avoid vm.max_map_count exhaustion under
+# high-volume tensor IPC). file_system strategy uses ~100x fewer mmaps.
+try:
+    mp.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 from multiprocessing import Queue as MPQueue, Event as MPEvent
 
 from poke_env.ps_client.account_configuration import AccountConfiguration
@@ -58,7 +65,7 @@ from teams_ou import random_pool_teambuilder
 from team_generator import procedural_teambuilder
 
 from ppo import Trajectory, _cancel_listener
-from rl_player import SelfPlayOpponent
+from rl_player import SelfPlayOpponent, make_self_play_opponent
 from rl_pipeline import MPRLPlayer
 from rl_collection import _make_server
 
@@ -309,7 +316,7 @@ def _mp_worker_v3(
 
         opp_temp_range = (1.0, 1.0) if snapshot_pool_size > 15 else temp_range
 
-        opponent = SelfPlayOpponent(
+        opponent = make_self_play_opponent(
             checkpoint_path=opp_ckpt,
             device=opponent_device,
             temp_range=opp_temp_range,

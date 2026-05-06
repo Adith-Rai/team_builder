@@ -49,6 +49,18 @@ try:
 except RuntimeError:
     pass
 
+# Use file_system sharing strategy (vs default file_descriptor) to avoid
+# vm.max_map_count exhaustion on linux. Each tensor sent across processes
+# under file_descriptor strategy creates one mmap region; with high-volume
+# inference traffic (1000+ in-flight games × small tensors/step) that hits
+# the kernel's 65K mmap cap in seconds. file_system uses ref-counted POSIX
+# shm regions instead, ~100x fewer mmaps. Must be set BEFORE any tensor
+# sharing — module-import time is the safe spot.
+try:
+    mp_mod.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 from poke_env.player import Player
 from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
@@ -66,7 +78,7 @@ from teams_ou import random_pool_teambuilder
 from team_generator import procedural_teambuilder
 
 from ppo import Trajectory, _cancel_listener
-from rl_player import SelfPlayOpponent
+from rl_player import SelfPlayOpponent, make_self_play_opponent
 from rl_collection import _make_server
 
 _pid_tag = os.getpid() % 10000
@@ -367,6 +379,14 @@ def _mp_worker_v2(
     import warnings
     warnings.filterwarnings("ignore")
 
+    # Spawn doesn't inherit parent's sharing strategy. Set it here in the
+    # child too, BEFORE any tensor mp ops, to drop mmap usage to ~1/100.
+    import torch.multiprocessing as _mp_child
+    try:
+        _mp_child.set_sharing_strategy('file_system')
+    except Exception:
+        pass
+
     # Import here to avoid issues with spawn
     from rl_pipeline import MPRLPlayer
 
@@ -399,7 +419,7 @@ def _mp_worker_v2(
 
         opp_temp_range = (1.0, 1.0) if snapshot_pool_size > 15 else temp_range
 
-        opponent = SelfPlayOpponent(
+        opponent = make_self_play_opponent(
             checkpoint_path=opp_ckpt,
             device=opponent_device,
             temp_range=opp_temp_range,

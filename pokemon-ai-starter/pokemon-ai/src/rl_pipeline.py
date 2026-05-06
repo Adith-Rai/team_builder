@@ -30,7 +30,7 @@ from ppo import Trajectory, _cancel_listener
 from rewards import RewardShaper
 from teams_ou import random_pool_teambuilder
 from team_generator import procedural_teambuilder
-from rl_player import SelfPlayOpponent
+from rl_player import SelfPlayOpponent, make_self_play_opponent
 from rl_collection import _make_server
 
 # Must use 'spawn' for CUDA in child processes (not 'fork')
@@ -426,7 +426,7 @@ def _mp_worker(
             opp_temp_range = temp_range
 
         opp_tb = tb or random_pool_teambuilder()
-        opponent = SelfPlayOpponent(
+        opponent = make_self_play_opponent(
             checkpoint_path=opp_ckpt,
             device="cpu",
             temp_range=opp_temp_range,

@@ -261,3 +261,9 @@
 {"iter": 179, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260501_011537", "SH": 67.4, "SmartDmg": 62.0, "Tactical": 66.0, "Strategic": 66.2, "smart_avg": 65.4}
 {"iter": 199, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260501_011537", "SH": 68.4, "SmartDmg": 65.6, "Tactical": 64.2, "Strategic": 66.0, "smart_avg": 66.05}
 {"iter": 219, "run_dir": "data\\models\\rl_v9_curated_pool\\selfplay_v9_20260501_011537", "SH": 69.0, "SmartDmg": 64.6, "Tactical": 62.6, "Strategic": 64.4, "smart_avg": 65.15}
+{"iter": 0, "run_dir": "data\\models\\rl_v10\\smoke_eval_xfm\\selfplay_v9_20260504_211402", "SH": 65.0, "SmartDmg": 80.0, "Tactical": 75.0, "Strategic": 65.0, "smart_avg": 71.25}
+{"iter": 19, "run_dir": "data\\models\\rl_v10\\ppo_phase1\\selfplay_v9_20260504_223016", "SH": 65.5, "SmartDmg": 69.5, "Tactical": 66.0, "Strategic": 66.5, "smart_avg": 66.875}
+{"iter": 19, "run_dir": "data\\models\\rl_v10\\ppo_phase1\\selfplay_v9_20260505_060410", "SH": 65.0, "SmartDmg": 67.0, "Tactical": 56.0, "Strategic": 69.0, "smart_avg": 64.25}
+{"iter": 39, "run_dir": "data\\models\\rl_v10\\ppo_phase1\\selfplay_v9_20260505_060410", "SH": 51.0, "SmartDmg": 59.0, "Tactical": 52.5, "Strategic": 55.0, "smart_avg": 54.375}
+{"iter": 59, "run_dir": "data\\models\\rl_v10\\ppo_phase1\\selfplay_v9_20260505_060410", "SH": 50.0, "SmartDmg": 46.0, "Tactical": 47.0, "Strategic": 47.5, "smart_avg": 47.625}
+{"iter": 79, "run_dir": "data\\models\\rl_v10\\ppo_phase1\\selfplay_v9_20260505_060410", "SH": 31.0, "SmartDmg": 31.5, "Tactical": 36.5, "Strategic": 40.0, "smart_avg": 34.75}
