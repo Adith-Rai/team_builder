@@ -93,7 +93,7 @@ def parse_args():
     p.add_argument("--adaptive-entropy-min", type=float, default=0.01,
                    help="Floor for ent_coef under adaptive adjustment (default: 0.01)")
     p.add_argument("--adaptive-entropy-step", type=float, default=0.1,
-                   help="Per-iter multiplicative change to ent_coef (default: 0.1 = ±10%)")
+                   help="Per-iter multiplicative change to ent_coef (default: 0.1 = +/-10 percent)")
     # Early stopping (composite: savg + per-bot consensus)
     p.add_argument("--early-stop", action="store_true",
                    help="Enable composite early stopping based on eval regression")
@@ -152,7 +152,15 @@ def parse_args():
     p.add_argument("--lr-restart", action="store_true",
                    help="Reset optimizer on resume (use when dims/hyperparams changed)")
     p.add_argument("--mp", action="store_true",
-                   help="Use multiprocess collection (workers on CPU, GPU inference centralized)")
+                   help="Use disk-backed multiprocess collection (mp_disk_collect.py). "
+                        "N forkserver workers, each with own GPU model copy + own "
+                        "InferenceBatcher; trajectories written to /tmp at iter end. "
+                        "Cloud-only, transformer arch only. See docs/MP_DISK_REDESIGN.md.")
+    p.add_argument("--mp-workers", type=int, default=8,
+                   help="Number of mp-disk workers when --mp is set (default 8 for "
+                        "RunPod A100 80GB; tune down for smaller VRAM).")
+    p.add_argument("--mp-cache-size", type=int, default=3,
+                   help="Per-worker LRU cache size for opponent ckpts (default 3).")
     p.add_argument("--batch-timeout-ms", type=float, default=15,
                    help="InferenceBatcher batch timeout in ms")
     p.add_argument("--reward-style", choices=["dense", "sparse", "terminal"], default="dense",
@@ -286,10 +294,13 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         return result
 
     if getattr(args, 'mp', False):
-        from mp_collect_v2 import mp_collect_v2
+        # --mp now routes to disk-backed implementation (mp_disk_collect.py).
+        # Old mp_collect_v2.py kept in repo for reference; not called.
+        # Transformer arch only; CPU not supported. See docs/MP_DISK_REDESIGN.md.
+        from mp_disk_collect import mp_disk_collect_sync
         model.eval()
-        latest_sp = snapshot_pool[-1] if len(snapshot_pool) > 1 else None
-        mp_result = mp_collect_v2(
+        _flow(f"starting MP-DISK collection (n_workers={args.mp_workers})")
+        mp_result = mp_disk_collect_sync(
             model, device, server_pool,
             n_games=args.games_per_iter,
             max_concurrent=args.max_concurrent,
@@ -297,13 +308,17 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             fp16=args.fp16,
             reward_shaper_cfg=rs_cfg,
             temp_range=(args.temp_min, args.temp_max),
-            latest_snapshot=latest_sp,
-            teambuilder_path=getattr(args, 'procedural_teams', None),
             opponent_device=args.opponent_device,
-            batch_timeout_ms=args.batch_timeout_ms,
+            win_rates=win_rates,
+            turn_cap=args.turn_cap,
+            battle_format=battle_format,
+            procedural_teams_path=getattr(args, 'procedural_teams', None),
+            iter_n=getattr(args, '_current_iter', 0),
+            n_workers=args.mp_workers,
         )
-        # mp_collect_v2 returns 7-tuple; add empty opp_records for compatibility
-        return mp_result + ({},)
+        _flow(f"mp-disk collect done: {mp_result[5]:.0f}s, "
+              f"{len(mp_result[0])} trajs")
+        return mp_result
 
     _flow("starting SYNC collection")
     model.eval()
@@ -335,20 +350,30 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
                                   in_warmup, _flow, external_manager=None):
     """Kick off background collection for the NEXT iteration (pipeline mode)."""
     if args.mp and args.pipeline and not in_warmup:
-        from mp_collect_v2 import MPPipelineCollector
+        # --mp + --pipeline: disk-backed bg collector. Workers always use the
+        # last finalized weights (off-by-1 stale, same semantics as the regular
+        # BackgroundCollector pipeline path).
+        from mp_disk_collect import MPDiskBgCollector
         if mp_bg_collector is None:
-            mp_bg_collector = MPPipelineCollector()
+            mp_bg_collector = MPDiskBgCollector()
         mp_collect_args = {
             "games_per_iter": args.games_per_iter,
             "max_concurrent": args.max_concurrent,
+            "n_workers": args.mp_workers,
             "fp16": args.fp16,
             "rs_cfg": collect_args["rs_cfg"],
             "temp_range": collect_args["temp_range"],
+            "opp_temp_range": collect_args["temp_range"],
             "teambuilder_path": getattr(args, 'procedural_teams', None),
             "opponent_device": collect_args["opponent_device"],
-            "batch_timeout_ms": args.batch_timeout_ms,
+            "battle_format": collect_args.get("battle_format", "gen9ou"),
+            "turn_cap": args.turn_cap,
         }
-        mp_bg_collector.start(model, device, server_pool, snapshot_pool, mp_collect_args)
+        # Bg collector handles its own iter_n via the iteration index passed in
+        next_iter = getattr(args, '_current_iter', 0) + 1
+        mp_bg_collector.start(model, device, server_pool, snapshot_pool,
+                              mp_collect_args, win_rates=collect_args.get("win_rates"),
+                              iter_n=next_iter)
     elif bg_collector and not in_warmup and not args.mp:
         _flow("starting BACKGROUND collection for next iter")
         bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
@@ -796,6 +821,8 @@ def main():
             print(f"  Value warmup complete, unfreezing all parameters", flush=True)
 
         # ---- Collect ----
+        # mp-disk path needs current iter index for traj/weights filenames
+        args._current_iter = it
         collect_result = _collect_data(
             args, model, device, server_pool, snapshot_pool,
             rs_cfg, train_teambuilder, battle_format,
@@ -931,6 +958,16 @@ def main():
     save_checkpoint(final_path, model, cfg, optimizer, start_iter + args.n_iters - 1,
                     metrics={"best_eval_wr": best_eval_wr, "snapshot_pool": [s for s in snapshot_pool if isinstance(s, str)]})
     print(f"\nTraining complete. Final checkpoint: {final_path}", flush=True)
+
+    # Clean shutdown of mp-disk workers if --mp was used.
+    if getattr(args, 'mp', False):
+        try:
+            from mp_disk_collect import shutdown_workers
+            shutdown_workers()
+            print("[mp-disk] workers shut down cleanly.", flush=True)
+        except Exception as e:
+            print(f"[mp-disk] shutdown error (non-fatal): {e}", flush=True)
+
     writer.close()
     loop.close()
 
