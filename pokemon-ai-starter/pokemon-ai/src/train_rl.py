@@ -846,6 +846,7 @@ def main():
             ent_coef=ent_coef, vf_coef=args.vf_coef,
             max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
             grad_accum=args.grad_accum,
+            in_warmup=in_warmup,  # skips autograd through frozen backbone
         )
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")

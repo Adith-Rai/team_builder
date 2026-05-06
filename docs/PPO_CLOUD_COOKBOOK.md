@@ -341,10 +341,9 @@ Before launching production (~$60-70 commit), validate at small scale (~$1):
 
 2. **`torch.compile` fix for new arch** (~1 day): current `--compile` flag at `train_rl.py:612` targets `model.forward_spatial` which only exists on legacy `PokeTransformer`. New arch has `tokenizer + spatial + temporal` instead. Need to compile each module separately + validate forward output equivalence (compiled vs uncompiled, fp16, on identical seeded inputs). ~10-25% speedup per iter. Multi-gen lever.
 
-3. **Warmup speedup** (~30 min total):
-   - 3a. `epochs=1` during warmup (vs `args.ppo_epochs=5`). 5x fewer optimizer steps when only value_head trains. Tiny risk of undertraining value_head — debatable but probably fine.
-   - 3b. `torch.no_grad()` around backbone forward in warmup, then `.detach()` before value_head. Skips backward through frozen layers. Cuts warmup update from ~25 min → ~3-5 min.
-   - Combined: warmup phase 30 min/iter → ~8 min/iter. Saves ~$15-25 on a 20-warmup-iter run; bigger win for multi-gen with multiple warmup phases.
+3. **Warmup speedup**:
+   - 3a. ✅ **DONE Session 50**: `torch.no_grad()` around backbone + policy forward in warmup. `ppo.py:ppo_update` accepts `in_warmup` arg. Saves ~50% on warmup update wall-time. ~$10-15 saved per 20-warmup-iter run.
+   - 3b. (deferred) `epochs=1` during warmup (vs `args.ppo_epochs=5`). Additional 5x fewer optimizer steps. Defer until validated that `value_head` quality is preserved at fewer epochs.
 
 ### Multi-gen architectural work (per `MULTIGEN_FEASIBILITY.md`)
 
