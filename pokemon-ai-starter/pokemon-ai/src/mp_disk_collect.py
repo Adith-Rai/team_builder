@@ -99,10 +99,12 @@ class WorkerManager:
     mp.Queue for results. This avoids the CPython 3.11 + RunPod-container
     SemLock unlink race that fires on N>=4 with per-worker mp.Queue."""
 
-    # Heartbeat tolerance: model load on first iter can take 30-60s when N
-    # workers concurrently load a 240MB ckpt from disk; bump to 120s to be
-    # safe. Workers send acks BEFORE model load, so this is mostly a safety net.
-    HEARTBEAT_TIMEOUT_S = 120.0
+    # Heartbeat tolerance: under heavy disk contention (multiple parallel
+    # mp processes on same pod), 8-worker model loads can stretch to
+    # several minutes. 300s ceiling. Workers send ack-heartbeat on cmd
+    # receipt and during async collect; this is the safety net for the
+    # blocking gap between cmd recv and asyncio loop entry.
+    HEARTBEAT_TIMEOUT_S = 300.0
     RESPAWN_CAP = 3                 # >this respawns in 5 iters → mark dead
     RESPAWN_WINDOW_ITERS = 5
 
@@ -358,6 +360,25 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
     model = state["model"]
     device = state["device"]
 
+    # Liveness probe thread: prints worker status every 5s INDEPENDENTLY
+    # of asyncio loop. If asyncio is dead, this thread keeps printing,
+    # which lets us distinguish "asyncio dead" from "worker fully dead".
+    import threading
+    _liveness_state = {"alive": True, "n_done": 0, "n_total": n_games}
+    def _liveness_loop():
+        i = 0
+        while _liveness_state["alive"]:
+            try:
+                print(f"[w{worker_id} LIVE +{i*5}s iter={iter_n}] "
+                      f"n_done={_liveness_state['n_done']}/{_liveness_state['n_total']}",
+                      flush=True)
+            except Exception:
+                pass
+            i += 1
+            time.sleep(5.0)
+    _liveness_thread = threading.Thread(target=_liveness_loop, daemon=True)
+    _liveness_thread.start()
+
     # Run collection. Reuse collect_v9 single-process via a slim adapter
     # that builds the local server pool + InferenceBatcher.
     heartbeat_fn(iter_n=iter_n, n_done=0, n_total=n_games)
@@ -381,8 +402,10 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
         heartbeat_fn=heartbeat_fn,
         opp_cache=state["opp_cache"],
         opp_cache_max=state["opp_cache_max"],
+        liveness_state=_liveness_state,
     )
     elapsed_s = time.time() - t0
+    _liveness_state["alive"] = False  # stop probe thread
 
     # Write traj file atomically.
     traj_path = f"/tmp/traj_w{worker_id}_iter{iter_n}.pkl.gz"
@@ -427,7 +450,8 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
                             max_concurrent, server_url, opp_pool,
                             temp_range, opp_temp_range, fp16, rs_cfg,
                             turn_cap, battle_format, procedural_teams_path,
-                            heartbeat_fn, opp_cache, opp_cache_max):
+                            heartbeat_fn, opp_cache, opp_cache_max,
+                            liveness_state=None):
     """Single-process collect inside a worker. Picks one PFSP-sampled
     opponent per game (weighted by `weight` from main's PFSP calc),
     runs n_games battles via V9RLPlayer.battle_against. Aggregates
@@ -553,6 +577,8 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
             "fft_w": opp_fft_w, "fft_l": opp_fft_l,
         }
         n_done += n_for_opp
+        if liveness_state is not None:
+            liveness_state["n_done"] = n_done
 
         try:
             player.reset_battles()

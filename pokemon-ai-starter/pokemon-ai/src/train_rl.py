@@ -350,30 +350,19 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
                                   in_warmup, _flow, external_manager=None):
     """Kick off background collection for the NEXT iteration (pipeline mode)."""
     if args.mp and args.pipeline and not in_warmup:
-        # --mp + --pipeline: disk-backed bg collector. Workers always use the
-        # last finalized weights (off-by-1 stale, same semantics as the regular
-        # BackgroundCollector pipeline path).
-        from mp_disk_collect import MPDiskBgCollector
-        if mp_bg_collector is None:
-            mp_bg_collector = MPDiskBgCollector()
-        mp_collect_args = {
-            "games_per_iter": args.games_per_iter,
-            "max_concurrent": args.max_concurrent,
-            "n_workers": args.mp_workers,
-            "fp16": args.fp16,
-            "rs_cfg": collect_args["rs_cfg"],
-            "temp_range": collect_args["temp_range"],
-            "opp_temp_range": collect_args["temp_range"],
-            "teambuilder_path": getattr(args, 'procedural_teams', None),
-            "opponent_device": collect_args["opponent_device"],
-            "battle_format": collect_args.get("battle_format", "gen9ou"),
-            "turn_cap": args.turn_cap,
-        }
-        # Bg collector handles its own iter_n via the iteration index passed in
-        next_iter = getattr(args, '_current_iter', 0) + 1
-        mp_bg_collector.start(model, device, server_pool, snapshot_pool,
-                              mp_collect_args, win_rates=collect_args.get("win_rates"),
-                              iter_n=next_iter)
+        # KNOWN LIMITATION (Session 50): mp+pipeline overlap causes worker
+        # GPU contention deadlock when bg cmd processing runs in parallel
+        # with main's PPO update. Workers' inference forwards stall when
+        # main is doing optimizer.step()-heavy update; deadlock doesn't
+        # recover after main finishes. See docs/MP_DISK_REDESIGN.md.
+        # Until a proper fix lands (eg. separate inference workers, pause/
+        # resume on update boundaries, or centralized inference server
+        # arbitrating GPU access), skip bg startup. --mp --pipeline silently
+        # behaves as --mp only. mp-only is fully validated; the cost
+        # difference is ~$15-25 on Phase 1.
+        # Future work: TODO redesign for multi-gen run.
+        pass  # no-op; mp_bg_collector stays None
+    elif bg_collector and not in_warmup and not args.mp:
     elif bg_collector and not in_warmup and not args.mp:
         _flow("starting BACKGROUND collection for next iter")
         bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
