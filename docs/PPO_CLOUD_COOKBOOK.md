@@ -279,21 +279,88 @@ For Phase 1 (BC→PPO), use `--init-from data/models/bc/v10_cloud_gen9/epoch_003
 
 ## 5. Validation pattern (small-scale → production)
 
-Before launching production (~$60-70 commit), validate at small scale (~$1):
+Before launching any production run (~$60-150 commit), validate at small scale
+(~$1-3 cloud time). Skipping validation costs more than running it: Session 50
+caught 5 bugs through this pattern that would have wasted 40+ hr each in prod.
 
-| Test | Scale | Validates |
+### 5a. The 6-test plan
+
+| Test | Scale | Validates | Acceptance |
+|---|---|---|---|
+| **1. Logits identity** | 100 fixed Battle states fed through worker forward path AND main path, same seeded inputs | Model loads correctly in worker, features round-trip through worker, no IPC corruption | `max(abs(diff_per_logit))` < 1e-3 (allows fp16 noise) |
+| **2. Data flow integrity** | pickle.gzip round-trip a Trajectory dataclass on disk | traj file format preserves all fields | All fields exactly equal (lossless pickle) |
+| **3. Numerical equivalence** | 1-iter `--mp` vs 1-iter `--pipeline only` at games=200, same seed | mp produces same training signal as pipeline-only (no algorithmic divergence) | Iter line within 2σ noise: `|wr_diff| < 5%`, `|pi_loss_diff| < 0.05`, `|v_loss_diff| < 0.3`, `|kl_diff| < 0.01`, `|ent_diff| < 0.05` |
+| **4. 5-iter sustained** | 5-iter `--mp --mp-workers N` at games=200 with `--snapshot-interval=2` and `--eval-interval=5` | Workers reload weights iter-to-iter, pool growth (PFSP cache miss), no NaN/drift over multiple iters, eval pipeline works | No NaN in any metric across 5 iters; v_loss monotonically descending in warmup; smart_avg at iter 4 ≥ BC baseline (within 2pp) |
+| **5. Wall-time smoke** | 3 iters at production scale (games=1500-1600, conc=200, N=8) | Throughput matches expectations; no scale-dependent bugs | Iter 0 ~13-14 min, iter 1+ ~12-13 min steady. If iter time > 25 min, diagnose before production |
+| **6. Failure recovery** | 5-iter `--mp` with manual `kill -9 worker` mid-iter 2 | Watchdog respawn correctly drops slice, run continues with reduced sample | Watchdog respawns within 60s of stale; iter 2 completes with ~7/8 worker sample; subsequent iters return to 8/8 |
+
+### 5b. Validation scope by change type
+
+What to validate for different kinds of changes (run only the relevant subset, save time):
+
+| Change type | Required tests | Why |
 |---|---|---|
-| **A** | 5-iter `--mp --mp-workers N` at games=200, conc=20 | Sustained correctness, no NaN/drift, weight reload across iters |
-| **B-mp** | 1-iter `--mp` at games=200, conc=200 | mp metrics match pipeline-only baseline |
-| **B-pipe** | 1-iter `--pipeline` at games=200, conc=200 | Reference baseline metrics |
-| **C** | 3-iter `--mp --pipeline` at games=200 | Currently no-op for bg overlap; will revisit |
-| **D** | 5-iter `--mp` + manual `kill -9 worker` mid-iter | Watchdog respawn, slice drop, run continues |
+| **Algorithmic change (e.g., new loss term, gradient flow change)** | 1 (logits) + 3 (numerical equiv) + 4 (sustained) | Need to prove no metric drift |
+| **Architectural change (model.py, features)** | 1 (logits) + 4 (sustained) | Forward path output must match expected; sustained run validates training health |
+| **Optimization with semantic change (e.g., torch.compile, no_grad)** | 1 (logits) + 4 (sustained) — sustained run tests if optimization preserves training quality | Subtle divergences from optimization can compound across iters |
+| **Optimization without semantic change (e.g., TF32, cudnn.benchmark)** | 4 (sustained) only | Trust the optimization; verify no regression |
+| **mp infrastructure change** | 3 (numerical equiv) + 4 (sustained) + 6 (failure recovery) | mp paths have unique edge cases (worker race, pipe IPC, etc.) |
+| **Hyperparameter change (lr, ent_coef, etc.)** | 4 (sustained) at full N | Behavior change is intentional; check no NaN/explosion |
+| **Data pipeline change (replay format, vocab, lookup)** | 1 (logits) + 2 (data flow) | Data corruption is silent and corrupts training |
 
-**Pre-launch acceptance**:
-- Iter line metrics within noise: |wr_diff| < 5%, |pi_loss_diff| < 0.05, |v_loss_diff| < 0.3, |kl_diff| < 0.01
-- No NaN in any metric
-- Workers shut down cleanly at end
-- smart_avg ≥ BC baseline (67% for v10 e3) on iter 4 of sustained test
+### 5c. Specific validation for current optimizations (Session 50)
+
+**TF32 + cudnn.benchmark** (just enabled in train_rl.py): Test 4 only. Run a 5-iter sustained mp run at small scale. Verify v_loss trajectory is similar to pre-optimization runs and no NaN.
+
+**Warmup `no_grad()`** (just added to ppo_update): Test 1 + Test 4. Need to prove:
+1. Logits in warmup match without no_grad — same forward output, just no autograd graph (Test 1 with in_warmup=True flag)
+2. v_loss trajectory in warmup matches non-no_grad warmup — value_head learning is identical (Test 4 first 5 iters)
+
+**Pipeline+mp redesign (deferred, multi-gen prep)**: ALL 6 tests. This is a major architectural change with potential for subtle bugs. Required:
+- Test 1 (logits identity): prove inference server's forward output matches centralized inference output
+- Test 3 (numerical equivalence): mp+pipeline iter-line metrics match `--pipeline only` baseline
+- Test 4 (sustained): no drift, no GPU contention regression
+- Test 6 (failure recovery): worker death + inference server death scenarios
+
+**torch.compile fix for new arch (deferred, multi-gen prep)**: Test 1 + Test 4.
+- Test 1: compiled vs uncompiled forward output. Acceptable diff: max 1e-2 (compile uses different fused kernels, small numerical diff is OK)
+- Test 4: 5-iter run with compile on, no NaN, no v_loss explosion
+
+**Multi-gen architectural changes (gen-id token, gen-aware features)**: ALL 6 tests + per-gen smart_avg eval.
+- Test 1 per gen (forward output equivalence within gen)
+- Cross-gen: gen-id token actually conditions output (different gen tokens → different output for same battle state)
+- Per-gen sustained run (5 iters per gen at small scale)
+- BC v11 multi-gen retrain: per-gen eval bots, per-gen smart_avg ≥ gen-9-only baseline (within 5pp)
+
+### 5d. Test runner / scripts
+
+Test scripts staged on the pod from Session 50:
+- `/tmp/test_A_sustained.sh` — 5-iter sustained mp+N=8 at games=200 conc=20 with snapshot+eval
+- `/tmp/test_Bmp.sh` — 1-iter mp+N=8 at games=200 conc=200
+- `/tmp/test_Bpipe.sh` — 1-iter pipeline only at games=200 conc=200
+- `/tmp/test_C_pipe_mp.sh` — 3-iter mp+pipeline at games=200 (currently no-op for bg, future test target)
+- `/tmp/test_D_killworker.sh` — 5-iter mp + kill -9 worker mid-iter 2
+- `/tmp/test_n4_small.sh` / `test_n8_small.sh` — N=4/N=8 spawn smoke tests
+
+Reuse these as templates. Don't recreate from scratch.
+
+### 5e. What to look for in iter line metrics
+
+Healthy training signals:
+- `pi_loss`: small magnitude, can be negative (improving) or positive (in warmup pi is frozen so doesn't matter)
+- `v_loss`: should descend over iters, especially in warmup
+- `entropy` (`ent`): in `[0.65, 0.95]` range with adaptive entropy on. If <0.5: policy collapse. If >1.5: not learning.
+- `kl`: < `target_kl=0.03` typically. If consistently >0.05: too aggressive, lr may be too high
+- `wr` vs anchor: ~50% in early iters (model is BC-init, ≈ anchor). Should rise to 60-80% by iter 50+ (model improves vs frozen anchor).
+- `responded=N/N`: 8/8 means all workers OK. Less = some workers died (watchdog respawned). Acceptable up to 1-2 lost slices per iter; >2 is concerning.
+
+NaN signals (FATAL — abort and diagnose):
+- pi_loss / v_loss / entropy / kl = NaN: forward or backward divergence. Check:
+  - Recent grad norm (spike?)
+  - Last few iters' kl (climbing?)
+  - lr too high?
+  - Reward shaping bugs (bad reward values feeding into GAE)
+- 0 episodes / 0 trajs: no workers responded. See cookbook §3 cloud quirks for spawn/heartbeat issues.
 
 ---
 

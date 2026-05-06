@@ -187,10 +187,57 @@ Per `docs/MULTIGEN_FEASIBILITY.md` (Phase 3a-d):
 11. Per-gen procedural team validation
 12. Multi-gen evaluation harness
 
-### Validation work (during/after each engineering item)
+### Validation work — DO NOT SKIP for any substantive change
 
-Use the 6-test pattern from `docs/PPO_CLOUD_COOKBOOK.md` §5 for each
-substantive change. Don't skip.
+Session 50 caught 5 bugs through validation (V9RLPlayer kwarg, return-tuple
+shape, opp_records format, mp+pipeline GPU contention, --opp-cpu WS
+keepalive timeout). Each would have wasted 40+ hours in production. Validate
+small-scale (~$1-3 cloud) BEFORE committing to production runs (~$60-150).
+
+**6-test pattern** in `docs/PPO_CLOUD_COOKBOOK.md` §5 — full details there.
+Quick reference for THIS session's work:
+
+**For pipeline+mp redesign (TODO #1)**:
+- Test 1: logits identity — inference server's forward output matches centralized inference (max abs diff < 1e-3)
+- Test 3: numerical equivalence — mp+pipeline iter-line metrics match `--pipeline only` baseline within 2σ noise (`|wr_diff| < 5%`, `|pi_loss_diff| < 0.05`, `|v_loss_diff| < 0.3`, `|kl_diff| < 0.01`)
+- Test 4: 5-iter sustained — no NaN, no drift, smart_avg ≥ BC baseline
+- Test 6: failure recovery — worker death AND inference server death scenarios
+
+**For torch.compile fix for new arch (TODO #2)**:
+- Test 1: compiled vs uncompiled forward output equivalence (allow max 1e-2 diff for fused-kernel numerical noise)
+- Test 4: 5-iter sustained, no NaN, v_loss not exploding
+
+**For warmup `epochs=1` (deferred TODO #3a)** if you take it on:
+- Test 4: 5-iter run, compare v_loss trajectory at iter 4 between epochs=5 (current) and epochs=1. Trajectory should be similar; if v_loss flat at iter 4 in epochs=1, value_head is undertrained
+- Test 1 logits won't catch this; only sustained run does
+
+**For multi-gen architectural changes (TODO #4-6)**:
+- Test 1 per gen (forward equivalence within each gen)
+- Cross-gen: feed same battle state with different gen_id tokens → output should differ
+- Sustained run per gen (5 iters at games=200, conc=20)
+- BC v11 multi-gen retrain: per-gen smart_avg ≥ gen-9-only baseline within 5pp
+
+**Pre-launch acceptance for any production run**:
+- All required tests above pass
+- No NaN in any metric across small-scale 5-iter sustained
+- Workers shut down cleanly at end
+- smart_avg at iter 4 of sustained ≥ BC baseline (67% for v10 e3)
+- For pipeline+mp specifically: numerical equivalence to baseline must hold
+
+**What to look for in iter line metrics during production**:
+- `pi_loss`: small magnitude. Negative (improving) or positive (warmup, doesn't matter).
+- `v_loss`: descending over iters, especially warmup
+- `entropy` in [0.65, 0.95] (adaptive on)
+- `kl` < target_kl=0.03 typically; >0.05 consistently = too aggressive
+- `wr` vs anchor: ~50% early, rising to 60-80% post-warmup
+- `responded=N/N`: 8/8 healthy. <8 = some workers died (acceptable if 1-2; >2 is concerning)
+
+NaN signals = FATAL, abort + diagnose. Common causes: lr too high, reward shaping bug, kl explosion (recent kl climbing).
+
+Reuse Session 50 test scripts on pod (don't recreate):
+`/tmp/test_A_sustained.sh`, `/tmp/test_Bmp.sh`, `/tmp/test_Bpipe.sh`,
+`/tmp/test_C_pipe_mp.sh`, `/tmp/test_D_killworker.sh`,
+`/tmp/test_n4_small.sh`, `/tmp/test_n8_small.sh`
 
 ═══════════════════════════════════════════════════════════════════════════════
 HOW TO RUN THINGS (commands by task)
