@@ -363,7 +363,6 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
         # Future work: TODO redesign for multi-gen run.
         pass  # no-op; mp_bg_collector stays None
     elif bg_collector and not in_warmup and not args.mp:
-    elif bg_collector and not in_warmup and not args.mp:
         _flow("starting BACKGROUND collection for next iter")
         bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
                            win_rates=collect_args.get("win_rates"),
