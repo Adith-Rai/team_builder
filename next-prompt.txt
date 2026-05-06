@@ -1,5 +1,23 @@
 ═══════════════════════════════════════════════════════════════════════════════
-THE GOAL — read this every time you make a decision
+SESSION BOOT — read this first, then start work
+═══════════════════════════════════════════════════════════════════════════════
+
+This session's focus: **MULTI-GEN PREP** (gen 6+ scope). Phase 1 v3 (gen9ou
+PPO from BC) launched in the prior session and is the validation gate.
+All work this session prepares for multi-gen training, which is the
+load-bearing project deliverable.
+
+Read in this exact order before doing anything:
+
+1. **`memory/MEMORY.md`** — current run state, recent decisions
+2. **`memory/project_vision_scope.md`** — load-bearing project goals
+3. **§ THE GOAL** below — re-read every time you make a decision
+4. **`docs/PPO_CLOUD_COOKBOOK.md`** — single authoritative cloud-runs reference
+5. **`docs/MULTIGEN_FEASIBILITY.md`** — multi-gen architecture scoping (gen 6+)
+6. **`docs/MP_DISK_REDESIGN.md`** — mp-disk implementation reference
+
+═══════════════════════════════════════════════════════════════════════════════
+THE GOAL — re-read every time you make a decision
 ═══════════════════════════════════════════════════════════════════════════════
 
 We are building a Pokemon battle AI that competes at an elite level — among
@@ -15,324 +33,391 @@ building, not just play.
 **Deployment scope:** must scale **massively on paid cloud** for throughput-
 heavy training AND remain **runnable locally** on a 6 GB consumer GPU for
 development + smoke tests. Same code, both environments. Not parallel
-codebases. See `memory/project_vision_scope.md` for full constraints.
+codebases.
 
-V1 baseline is singles gen 9 — but every refactor decision must NOT
-foreclose paths to the broader scope. If a shortcut hardcodes gen9ou or
-6v6, surface the tradeoff explicitly before shipping.
+V1 baseline is gen 9 OU singles (Phase 1 v3 currently running). Multi-gen
+(gen 6+) is the natural Phase 3. Pre-gen-6 is explicitly out of scope per
+`MULTIGEN_FEASIBILITY.md`.
 
-Elite Pokemon play is about long-horizon planning, opponent modeling,
-risk-adjusted decision making, and squeezing every fractional advantage
-from type/STAB/effectiveness/speed/items/abilities/positioning.
-
-═══════════════════════════════════════════════════════════════════════════════
-SESSION 50 TASK — unblock PPO Phase 1 by making the trainer-side compute
-paths arch-aware. Then launch Phase 1.
-═══════════════════════════════════════════════════════════════════════════════
-
-**Where we are (Session 49 wrap):**
-- BC v10 e3 = #1 all-time at Elo 1135.9 [1123, 1151], +16 over legacy peak.
-  3 epochs trained on RunPod A100; e4-e5 didn't happen because a stop+resume
-  cycle re-provisioned the pod onto a fresh container without our Network
-  Volume mounted (Container Disk doesn't follow pod hosts). All 4 ckpts
-  (epoch_000-003) saved locally; final ladder JSON saved.
-- Tried smoking PPO from epoch_003.pt → caught a deep arch-dispatch gap:
-  trainer-side `InferenceBatcher` + `ppo.py` update + `mp_collect_v2/v3` +
-  `rl_pipeline` all hardcode the legacy `PokeTransformer`'s staged
-  decomposition (`forward_spatial` / `action_encoder` / `policy_head`).
-  New `TransformerBattlePolicy` only exposes monolithic `forward()`.
-  Crash is `'TransformerBattlePolicy' object has no attribute action_encoder'`.
-- Ran a 3-agent audit and produced **`docs/ARCH_AUDIT.md`** — 22-item
-  punch list across BC (4) / PPO (15) / Eval (3), with file:line citations,
-  severity ranking, and a recommended unblock plan.
-- Already-shipped piece that works: `make_self_play_opponent()` factory in
-  `rl_player.py` + `SelfPlayOpponentTransformer` class. The OPPONENT side
-  of self-play dispatches arch correctly (validated). Trainer side is the
-  blocker.
-
-**What you're doing this session:**
-
-1. **Read first, plan second, code third.** Specifically:
-   - `docs/ARCH_AUDIT.md` cover-to-cover (the §4 punch list IS your work plan)
-   - `docs/PPO_PHASED_TRAINING.md` for Phase 1 spec
-   - `docs/NEXT_SESSION.md` Session 49 wrap section
-   - `docs/RESEARCH.md` §0 for architecture context if needed
-   - `memory/project_vision_scope.md` for the load-bearing scope constraints
-   - `memory/MEMORY.md` for project history + prior decisions
-
-2. **Implement the recommended adapter-method approach** (ARCH_AUDIT.md §2
-   "Key insight"): add `action_encoder()` and `policy_head_compat()` adapter
-   methods to `TransformerBattlePolicy` that wrap its native `_per_action_context`
-   and `ActionHead` to match legacy signatures. ~30 lines on the model vs.
-   ~300 lines of branching across 4 hotspots. Future arch swaps don't need
-   to retouch InferenceBatcher / ppo.py.
-
-3. **Wire the adapter calls through InferenceBatcher + ppo.py** (the 4
-   critical hotspots). The audit names the exact lines:
-   - `inference_batcher.py:131, 184`
-   - `ppo.py:166, 193`
-
-4. **Fix BC-2** (`train_bc.py:267-350` `eval_vs_bots` hardcodes `BattleAgent`).
-   Required for in-loop eval during Phase 1 from the transformer init.
-   ~15 lines, mirror the dispatch pattern from `eval_metamon_competitive.py`.
-
-5. **Smoke + regression test** (NON-OPTIONAL):
-   - 1-iter PPO on `epoch_003.pt` (transformer) at small scale (e.g.
-     `--games-per-iter 20 --max-concurrent 20 --n-iters 1`)
-   - 1-iter PPO on `sp_0229.pt` (legacy) at the same scale — to confirm
-     the refactor didn't break legacy backward compatibility
-   - Both must complete cleanly: real games played, snapshot saved, no NaN
-     in pi_loss / value_loss / kl_div, in-loop eval doesn't crash
-   - **Backward compatibility is non-negotiable** — legacy ckpts (s39 PPO
-     peaks, all the sp_NNNN snapshots, iter_0119) must remain valid PFSP
-     opponents in any future training. The dispatch invariant
-     (`is_transformer_checkpoint`) is what protects this.
-
-6. **Once smoke passes both arches:** launch the actual Phase 1 run per
-   `docs/PPO_PHASED_TRAINING.md`. The launch command was finalized in
-   Session 49 (see Session 49 chat for exact flags) — 210 iters
-   (10 warmup + 200 main), conc=200 (NOT 6 — that's external-opp default;
-   pure self-play uses 200-250 per user), `--pool-anchors epoch_003.pt`,
-   eval-interval 20, eval-team-set metamon-competitive, lr=3e-5, lam=0.95,
-   ent=0.02 with adaptive entropy, terminal reward, snapshot-interval 5,
-   --servers 9000,9000,9000,9000 (4-wave on one battle_server, validated
-   pattern from Session 42).
-
-7. **Anchor sample-weight floor** (raised in Session 49 → DEFER): user
-   chose to skip the floor for Phase 1 and watch smart_avg for drift.
-   Current `--pool-anchors` only pins pool MEMBERSHIP, not sampling weight
-   (PFSP weight `(1-wr)²` decays as we beat the anchor). If smart_avg
-   craters mid-Phase-1 while internal win-rate climbs, that's drift signal
-   → add a min-weight floor (~1 hr) for Phase 2.
-
-**What can wait (deferred from audit):**
-- mp_collect_v2/v3, rl_pipeline arch-dispatch (Phase 1 doesn't use --mp
-  or --pipeline; future scaling does)
-- eval_h2h_v8.py, eval_report_v8.py, eval_vs_external_pool.py legacy
-  cleanup (no Phase 1 impact)
-- Deduplicating dim-expansion logic (cosmetic; harmless duplication)
-- `train_rl.py` `--use-transformer` flag (Phase 1 uses --init-from, not
-  scratch training)
+Elite play is about long-horizon planning, opponent modeling, risk-adjusted
+decision making, and squeezing every fractional advantage from
+type/STAB/effectiveness/speed/items/abilities/positioning.
 
 ═══════════════════════════════════════════════════════════════════════════════
-BEST PRACTICES — re-read before each non-trivial decision
+WHERE PHASE 1 V3 STANDS (started Session 50, end of session)
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Lessons paid for in prior sessions (don't repeat):**
+**Phase 1 v3 launched 2026-05-06 23:16 UTC (3rd attempt)** with optimizations:
+```
+--init-from data/models/bc/v10_cloud_gen9/epoch_003.pt
+--device cuda --servers 9000-9007 --fp16 --mp --mp-workers 8
+--games-per-iter 1600 --max-concurrent 200
+--n-iters 200 --warmup-iters 20 --lr 1e-5 --grad-accum 1
+--reward-style terminal --adaptive-entropy
+```
 
-1. **Read docs + code BEFORE estimating scope.** Session 49 burned an
-   evening because I called PPO Phase 1 "30 min smoke + launch" based on
-   grep matches; reality was a 6.5 hr refactor uncovered only by smoke.
-   The codebase is bigger than your grep cache. Trust line-cited audits,
-   not first-impression reads.
+**TF32 + cudnn.benchmark are now in `train_rl.py` module top** (parity with
+`train_bc.py`). `--fp16` enabled at launch. NO `--opponent-device cpu`
+(tried Session 50 — broke at production scale due to CPU forward latency
+exceeding WS keepalive; see cookbook §3h). NO `--compile` (broken for new
+arch — see §3i).
 
-2. **Verify before recommending from memory.** A memory record naming a
-   function/flag is a claim about a past moment, not current state.
-   `is_transformer_checkpoint()` originally false-matched legacy because
-   both arches share `spatial.*`/`temporal.*` prefixes — the discriminator
-   is `tokenizer.`/`switch_encoder.`/`action_head.` only. If memory says
-   X exists, grep for it before promising it works.
+Run dir: `data/models/rl_v10/ppo_phase1_v3_cloud/selfplay_v9_<timestamp>/`
+R2 sync at `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/`
 
-3. **Smoke ALWAYS before launching long runs.** Session 49's smoke caught
-   a bug that would have wasted 40+ hours of self-play if launched blind.
-   The smoke is non-optional even when "it should just work." Also smoke
-   on BOTH arches when changes touch the dispatch — legacy regression is
-   the silent killer.
+**Expected**: ~12-15 min/iter steady (post-warmup). Total ~40-72 hr / **~$60-150**.
+Range is wide because warmup iters (0-19) are slower (~30-45 min/iter)
+since only value_head trains but full 5 PPO epochs run regardless.
 
-4. **Concurrency for self-play is 200-250, not 6.** The "6" in old docs
-   was for runs WITH external opponents (FP/MM subprocess limits). Pure
-   self-play has been 200-250 historically per user. Check user before
-   trusting doc-default conc values.
+**First eval at iter 19** (smart_avg vs SH/SmartDmg/Tactical/Strategic on
+metamon-competitive 16-team set). Should be ≥67% (BC baseline). If lower,
+investigate; if at/above, training is healthy, multi-gen prep proceeds.
 
-5. **Cloud: Network Volume, not Container Disk.** Pause/resume on the
-   same host preserves Container Disk; stop/start can land on a different
-   host and your `/workspace` is gone (104 GB memmap and all). Documented
-   in `CLOUD_RUNBOOK.md §9` after Session 49 lost a partial run this way.
-
-6. **Don't rush refactors under time pressure.** "Just ship it tonight"
-   is the pattern that produces next session's surprise gaps. Better to
-   stop at a clean breakpoint and resume fresh.
-
-7. **Backward compat is a hard constraint, not a nice-to-have.** Legacy
-   PPO ckpts (s39 peaks, all sp_NNNN snapshots, iter_0119) must remain
-   loadable as PFSP opponents in every future run. The legacy
-   `BattleAgent` / `SelfPlayOpponent` classes must keep working unchanged.
-   Adding new dispatch is fine; replacing legacy paths is not.
-
-**Scope-respecting habits:**
-
-- Before any refactor, ask: "does this work for doubles? for randoms with
-  levels? for gen 4? for 11M-param vs 100M-param models?" If not, surface
-  the tradeoff before shipping.
-- Anything format-specific must come from `cfg.format_config` (the
-  `FormatConfig` infra exists from Session 34's refactor). Don't hardcode
-  `team_size=6`, `n_actions=9`, `n_moves=4`.
-- Anything gen-specific must be a per-gen lookup (move banks, ability
-  lookups, item tokenizers) even if only gen9 is currently populated.
-
-**Tone / cadence:**
-
-- Be terse. The user values direct technical responses over hedging.
-- State results and decisions directly; user-facing text is for relevant
-  updates, not internal deliberation.
-- When uncertain, say so explicitly — don't fake confidence.
-- Honest takes are valued, especially when they push back on user
-  assumptions or your own prior recommendation.
+**To check status now**:
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+  "tail -F /workspace/logs/ppo_phase1_v3.log" | \
+  grep --line-buffered -E "Iter [0-9]+: W/L|EVAL|smart_avg|FATAL|Snapshot"
+```
 
 ═══════════════════════════════════════════════════════════════════════════════
-OPERATIONAL REFERENCE — flags, files, quirks
+SESSION 51 (THIS SESSION) — MULTI-GEN PREP TASK LIST
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Phase 1 launch command (final, post-refactor)**
+The goal for this session is **multi-gen prep** — get all the engineering
+work done so multi-gen training can launch cleanly. Phase 1 v3 in flight is
+the V1 validation gate; do not block on it.
+
+### Engineering work (likely the main session)
+
+#### A. Pipeline+mp overlap proper fix (~2-3 days)
+
+The `--mp --pipeline` combo currently silently no-ops for bg overlap.
+Diagnosed Session 50 as GPU contention: when bg cmd processing runs
+parallel to main's `optimizer.step()`, worker CUDA forwards stall and
+don't recover after main finishes.
+
+**Fix design**: centralized inference server. Workers send obs to a single
+GPU process (queues forwards on appropriate CUDA streams, arbitrating with
+main's compute). Avoids parallel GPU contention. Saves ~$200-300 over a
+multi-gen run (5-7 weeks compute) where the savings compound.
+
+Implementation outline:
+- New file `mp_centralized_inference.py` (or extend `mp_disk_collect.py`)
+- Workers send obs via numpy arrays through stdlib Queue (no torch tensor
+  IPC — that's the SemLock issue Session 50 fixed via Pipes)
+- Inference server dispatches to GPU on a low-priority CUDA stream so main
+  optimizer.step() takes priority
+- Workers buffer requests, await response Future
+- Pause/resume protocol DOESN'T work (workers can't progress mid-iter when
+  paused; tested Session 50)
+
+Reference: `docs/MP_DISK_REDESIGN.md` for current architecture; `metamon`
+uses AsyncVectorEnv + disk-backed (different approach but informs design);
+`ps-ppo` (Nebraskinator's GitHub) uses Ray actors with centralized
+inference (closer to what we need).
+
+#### B. Warmup speedup (~30 min)
+
+PPO update during warmup currently runs 5 epochs × 1600 episodes × full
+backward through all params, even though only `value_head` updates. Each
+warmup iter wastes ~25 min on unused gradient compute.
+
+**Fix**: when `in_warmup` is True in `train_rl.py`:
+1. Pass `epochs=1` to `ppo_update` instead of `args.ppo_epochs` (5 → 1)
+2. In `ppo_update`, wrap backbone forward in `torch.no_grad()` + `.detach()`
+   when only value_head trains. Backward stops at the cut, ~50% saving.
+
+Saves ~$15-25 over a 20-warmup-iter run. Bigger win for multi-gen runs
+where warmup repeats per phase.
+
+#### C. torch.compile fix for new arch (~1 day)
+
+The `--compile` flag in `train_rl.py:612` targets `model.forward_spatial`
+which only exists on legacy `PokeTransformer`. New `TransformerBattlePolicy`
+doesn't have that method, so `--compile` silently fails.
+
+**Fix**:
+- Compile `tokenizer + spatial + temporal` separately on new arch
+- Validate forward output equivalence (compiled vs uncompiled, fp16, on
+  identical seeded inputs — small max abs diff acceptable)
+- Document in cookbook
+
+Saves ~10-25% per iter. Multi-gen lever.
+
+#### D. Multi-gen architectural changes (~1-2 weeks)
+
+Per `docs/MULTIGEN_FEASIBILITY.md` (Phase 3a-d):
+
+**3a Foundation (~1-1.5 weeks)**:
+1. **Gen-id token in `TransformerBattlePolicy`** (~30-50 LOC):
+   ```python
+   # In __init__:
+   self.gen_embed = nn.Embedding(10, cfg.d_model)  # gens 0-9
+   # In forward:
+   gen_id = batch.get("gen_id")  # (B,) long
+   gen_token = self.gen_embed(gen_id).unsqueeze(1)
+   seq = torch.cat([actor_t, critic_t, trans_t, gen_token, ...], dim=1)
+   ```
+2. **Gen-aware feature pipeline** in `make_features` (`features.py`):
+   - Add `gen_id` to batch dict (from `battle.gen` poke-env attr)
+   - Gate gen-specific features (Tera type only gen 9; Z-moves only gen 7;
+     Mega only gens 6-7; Dynamax only gen 8)
+3. **Per-gen procedural teambuilder** (`team_generator.py`):
+   - `team_generator.py:477` already has `gen` field
+   - Filter species/movesets/items by `gen_added <= gen`
+   - Gen-specific viability (no Mega stones in gen 8+)
+
+**3b Data scale (~2 weeks)**:
+4. Pull replay corpora from HuggingFace `jakegrigsby/metamon-raw-replays`
+   for gens 6, 7, 8 at ≥1500 ELO (gens 5-9 dumps 2014-2024 in
+   `raw_data/pokemon_usage/`)
+5. Multi-gen `replay_to_memmap` (already mostly gen-aware via
+   `_parse_gen_from_format`)
+6. **BC v11 multi-gen retrain** — ~5-7 days A100 compute, 5 epochs at
+   B=48 fp16. ~$10-15 cost. Validate per-gen smart_avg holds.
+
+**3c PPO multi-gen (~1-2 weeks)**:
+7. Per-iter format selection (mix gens within one PPO run)
+8. Per-gen eval (smart_avg-per-gen tracking)
+9. PFSP per-gen pool optionally separated
+
+**3d Production quality (~1-2 weeks)**:
+10. Per-gen bot tuning (smart bots may need updates per gen)
+11. Per-gen procedural team validation
+12. Multi-gen evaluation harness
+
+### Validation work — DO NOT SKIP for any substantive change
+
+Session 50 caught 5 bugs through validation (V9RLPlayer kwarg, return-tuple
+shape, opp_records format, mp+pipeline GPU contention, --opp-cpu WS
+keepalive timeout). Each would have wasted 40+ hours in production. Validate
+small-scale (~$1-3 cloud) BEFORE committing to production runs (~$60-150).
+
+**6-test pattern** in `docs/PPO_CLOUD_COOKBOOK.md` §5 — full details there.
+Quick reference for THIS session's work:
+
+**For pipeline+mp redesign (TODO #1)**:
+- Test 1: logits identity — inference server's forward output matches centralized inference (max abs diff < 1e-3)
+- Test 3: numerical equivalence — mp+pipeline iter-line metrics match `--pipeline only` baseline within 2σ noise (`|wr_diff| < 5%`, `|pi_loss_diff| < 0.05`, `|v_loss_diff| < 0.3`, `|kl_diff| < 0.01`)
+- Test 4: 5-iter sustained — no NaN, no drift, smart_avg ≥ BC baseline
+- Test 6: failure recovery — worker death AND inference server death scenarios
+
+**For torch.compile fix for new arch (TODO #2)**:
+- Test 1: compiled vs uncompiled forward output equivalence (allow max 1e-2 diff for fused-kernel numerical noise)
+- Test 4: 5-iter sustained, no NaN, v_loss not exploding
+
+**For warmup `epochs=1` (deferred TODO #3a)** if you take it on:
+- Test 4: 5-iter run, compare v_loss trajectory at iter 4 between epochs=5 (current) and epochs=1. Trajectory should be similar; if v_loss flat at iter 4 in epochs=1, value_head is undertrained
+- Test 1 logits won't catch this; only sustained run does
+
+**For multi-gen architectural changes (TODO #4-6)**:
+- Test 1 per gen (forward equivalence within each gen)
+- Cross-gen: feed same battle state with different gen_id tokens → output should differ
+- Sustained run per gen (5 iters at games=200, conc=20)
+- BC v11 multi-gen retrain: per-gen smart_avg ≥ gen-9-only baseline within 5pp
+
+**Pre-launch acceptance for any production run**:
+- All required tests above pass
+- No NaN in any metric across small-scale 5-iter sustained
+- Workers shut down cleanly at end
+- smart_avg at iter 4 of sustained ≥ BC baseline (67% for v10 e3)
+- For pipeline+mp specifically: numerical equivalence to baseline must hold
+
+**What to look for in iter line metrics during production**:
+- `pi_loss`: small magnitude. Negative (improving) or positive (warmup, doesn't matter).
+- `v_loss`: descending over iters, especially warmup
+- `entropy` in [0.65, 0.95] (adaptive on)
+- `kl` < target_kl=0.03 typically; >0.05 consistently = too aggressive
+- `wr` vs anchor: ~50% early, rising to 60-80% post-warmup
+- `responded=N/N`: 8/8 healthy. <8 = some workers died (acceptable if 1-2; >2 is concerning)
+
+NaN signals = FATAL, abort + diagnose. Common causes: lr too high, reward shaping bug, kl explosion (recent kl climbing).
+
+Reuse Session 50 test scripts on pod (don't recreate):
+`/tmp/test_A_sustained.sh`, `/tmp/test_Bmp.sh`, `/tmp/test_Bpipe.sh`,
+`/tmp/test_C_pipe_mp.sh`, `/tmp/test_D_killworker.sh`,
+`/tmp/test_n4_small.sh`, `/tmp/test_n8_small.sh`
+
+═══════════════════════════════════════════════════════════════════════════════
+HOW TO RUN THINGS (commands by task)
+═══════════════════════════════════════════════════════════════════════════════
+
+### Cloud pod connection
 
 ```bash
+# Current pod (likely terminated by start of Session 51 — check first)
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
+```
+
+If pod is gone, provision a new one per `docs/PPO_CLOUD_COOKBOOK.md` §9.
+
+### Local invocations
+
+```bash
+# Working dir
+cd C:/Users/raiad/OneDrive/Desktop/team_builder
+
+# Start a battle_server (Windows / git-bash)
+node \
+  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
+  2>&1 | tee logs/battle_server.log
+
+# Run a smoke test locally (small scale, 6GB GPU works fine)
+cd pokemon-ai-starter/pokemon-ai/src
 python train_rl.py \
   --init-from data/models/bc/v10_cloud_gen9/epoch_003.pt \
   --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
-  --device cuda --servers 9000,9000,9000,9000 --fp16 \
-  --games-per-iter 200 --max-concurrent 200 \
-  --n-iters 210 --warmup-iters 10 \
-  --lr 3e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
-  --grad-accum 1 \
-  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
-  --eval-interval 20 --eval-team-set metamon-competitive --eval-games 200 \
-  --snapshot-interval 5 \
-  --early-stop --early-stop-patience 3 \
+  --device cuda --servers 9000 --fp16 \
+  --games-per-iter 20 --max-concurrent 10 \
+  --n-iters 1 --warmup-iters 0 \
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --grad-accum 1 \
   --procedural-teams C:/Users/raiad/OneDrive/Desktop/team_builder/raw_data/pokemon_usage/2024-04 \
-  --out-dir data/models/rl_v10/ppo_phase1
+  --out-dir data/models/rl_v10/local_smoke
 ```
 
-Notes on the flags:
-- `--init-from <BC ckpt>` — start PPO from BC weights. Phase 1 uses transformer
-  e3 (Elo 1135.9). For legacy regression test use `data/models/rl_v9/_init_sp_0229/snapshot_0229.pt`.
-- `--pool-anchors <BC ckpt>` — pins the BC ckpt in the PFSP pool forever
-  (never pruned). Sample weight follows standard PFSP `(1-wr)²`, so as PPO beats
-  the anchor, weight decays; this is intentional for Phase 1 — see "anchor decision"
-  below.
-- `--servers 9000,9000,9000,9000` — **4-wave parallelism on a single battle_server**
-  (validated Session 42, not 4 separate battle_servers). Spin up ONE
-  `battle_server.js` listening on port 9000 and put 9000 four times in this list;
-  poke-env distributes connections across 4 internal "lanes" to that one server.
-- `--max-concurrent 200` — for **pure self-play only**. The "6" in some older docs
-  is for runs with external FP/MM subprocess opponents (subprocess limits the
-  parallelism). Self-play has no such cap. 200-250 is the validated user standard.
-- `--lr 3e-5` — **mandatory**. 1e-4 has diverged in 3 iters in every prior attempt
-  (S39, S43). Don't override.
-- `--reward-style terminal` — Session 43+ validated. Was `dense` in earlier runs;
-  `terminal` is the current default.
-- `--lam 0.95 --ent-coef 0.02` — Session 39 validated, set the smart_avg=64% peak.
-- `--adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95`
-  — Session 43+ safeguard. Auto-adjusts `ent_coef` to keep policy entropy
-  in [0.65, 0.95]. Prevents the entropy collapse seen in Exp 1 / S43-first-attempt.
-- `--win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50` —
-  consider adding for Phase 1; Session 39 validated. Forgets old data in PFSP
-  weighting, so a snapshot you crushed 50 iters ago doesn't keep getting weight=0
-  forever after you regress on it.
-- `--snapshot-interval 5` — save snapshot every 5 iters; with 210 iters total
-  that's ~42 self-snapshots in the pool by the end (well past the 15-member
-  pool cap, so PFSP curation kicks in via `--pool-max-current-run`).
-- `--eval-interval 20 --eval-games 200 --eval-team-set metamon-competitive` —
-  in-loop bot eval every 20 iters, 200 games × 4 smart bots = 800 games per eval,
-  ~3.5pt SE. **Metamon-competitive (16 curated Smogon teams) is the default —
-  the legacy 70-team random pool has a 51pt smart_avg spread (TEAM_AX 81.5%
-  vs TEAM_AR 30.5%) which dominates real signal as noise.** See Session 43
-  retrospective for the experiment that proved this.
-- `--procedural-teams <dir>` — path to Smogon usage stats for procedural team
-  generation during *training* collection. Validated path for gen9ou:
-  `raw_data/pokemon_usage/2024-04`. Distinct from eval teams (which use
-  `--eval-team-set`).
-- `--early-stop --early-stop-patience 3` — stops if 3 consecutive eval intervals
-  show savg regression past threshold from best rm3. Saves compute on a stalled run.
+### Cloud bootstrap (fresh A100 pod, full setup)
 
-**Anchor decision (Session 49 — defer floor for Phase 1)**
-
-`--pool-anchors` only pins POOL MEMBERSHIP. Sample weight in PFSP is still
-`(1-wr)²`. As PPO beats the anchor (`wr → 0.7+`), anchor weight decays
-(`(0.3)² = 0.09` → `(0.2)² = 0.04`). That's roughly 7% sample share at iter 50,
-3% at iter 100. The user's intent ("don't forget human play") is partially
-served by this natural decay (anchor stays sampled in the early-mid window when
-PPO is closest to BC and the gradient signal vs human-style matters most).
-
-**Decision: skip the floor mechanism for Phase 1, watch smart_avg for drift.**
-If smart_avg craters mid-Phase-1 while internal win-rate climbs, that's the
-drift signal — react then by adding a min-weight floor (~1 hr code change).
-A defensible floor would be ~15% sample share for anchors (double the
-all-equal share at pool=15).
-
-**External opponents (Phase 2+, NOT Phase 1)**
-
-Phase 1 is self-play only. Later phases add external opponents via
-`--external-adapters <yaml>`. YAMLs live in `pokemon-ai-starter/pokemon-ai/src/`:
-- `external_adapters_smoke.yaml` — minimal smoke (1 mcts adapter)
-- `external_adapters_all3_smoke.yaml` — 3 adapters smoke (mcts + foulplay + metamon)
-- `external_adapters_curated.yaml` — curated for training
-- `external_adapters_full_pool.yaml` — the full Session 42 pool (mcts + 4 FP +
-  4 MM variants)
-- `external_opponents_example.yaml` — reference example
-
-For Phases 2-4 you'll need:
-- `battle_server.js` running on port 9000 (Node 20)
-- `foul_play_venv` for FP subprocesses (separate venv because of dep conflicts)
-- `metamon_venv` for MM subprocesses (separate venv, vendored poke-env 0.8.3)
-- See Session 42-43 protocol fixes documented in `docs/EXTERNAL_OPPONENTS_PHASE2.md`
-
-**Battle server startup (Windows / git-bash)**
+See `docs/PPO_CLOUD_COOKBOOK.md` §9 for canonical commands. Summary:
 
 ```bash
-node \
-  C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src/battle_server.js \
-  2>&1 | tee C:/Users/raiad/OneDrive/Desktop/team_builder/logs/external/battle_server.log
+# 1. Repo + Python deps + libcudnn + Node 20 + npm + awscli
+# 2. R2 credentials in scripts/r2_env.local.sh (gitignored — recreate from local)
+# 3. Sync data from R2 (BC ckpt, procedural teams)
+# 4. scp from local: vocab/*.json, lookup/move_flags_v1.pt, eval teams
+# 5. Start 8 battle_servers (ports 9000-9007)
+# 6. ulimit -n 65536 + verify /dev/shm space
+# 7. Pre-flight checklist from cookbook §1
+# 8. Launch
 ```
 
-Single server on port 9000 is enough — 4-wave parallelism in poke-env is what
-distributes the load. For Phase 2+ with external adapters, the subprocesses
-each connect to the same port 9000.
+### Production launch (Phase 1 v4 / multi-gen / etc.)
 
-**Cloud (RunPod + Cloudflare R2) — full reference: `docs/CLOUD_RUNBOOK.md` (786 lines)**
-
-⚠️ **NEW (Session 49) — Network Volume is MANDATORY for any run > 1 epoch.**
-Container Disk does NOT survive `podStop+podResume` if the pod re-provisions
-on a different host. We lost a partial BC run this way. Attach a Network Volume
-in the RunPod console (Storage → Network Volume) and mount at `/workspace`.
-
-R2 credentials live in:
-`pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh` (gitignored — file is
-real but never committed). Source it before any aws s3 command:
-```bash
-source pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
-aws s3 ls s3://team-builder-data/datasets/human_v8_100k/ \
-  --endpoint-url $S3_ENDPOINT_URL
-# should list 23 files totaling ~104 GB
-```
-
-R2 layout (verified Session 48):
-- Endpoint: `https://86facaf13d3491bbc167027863b2f114.r2.cloudflarestorage.com`
-- Bucket: `team-builder-data`
-- Memmap prefix: `datasets/human_v8_100k/` — 23 files, ~104 GB
-- Keys auto-loaded by `cloud_setup.sh` on the pod
-
-RunPod API key: stored in user's environment (referenced in Session 49
-chat history if you need it; don't re-paste in code or commits).
-
-Cloud bootstrap workflow (per `CLOUD_RUNBOOK.md §3`):
-1. RunPod console → deploy pod with A100 SXM 80GB ($1.50/hr) + Network Volume
-2. SSH in → `bash cloud_setup.sh` (clones code, installs venv, downloads memmap from R2)
-3. Source `r2_env.local.sh` once on pod (handled by cloud_setup.sh)
-4. Launch training → `nohup python train_bc.py --use-transformer --compile ... &`
-5. After each epoch: `scp <pod>:/workspace/.../epoch_NNN.pt ./local/` for ladder eval
-6. When done: `podTerminate` (NOT just stop — see Network Volume warning)
+Use canonical command from `docs/PPO_CLOUD_COOKBOOK.md` TL;DR. The current
+production config (lr=1e-5, grad-accum=1, mp+N=8, conc=200, opp_device=cpu,
+TF32+cudnn.benchmark autoselected) is what we ship.
 
 ═══════════════════════════════════════════════════════════════════════════════
-START HERE
+DATA / LOOKUP TABLES — where each lives
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. `cat docs/ARCH_AUDIT.md` cover-to-cover
-2. `cat docs/PPO_PHASED_TRAINING.md`
-3. `cat memory/project_vision_scope.md` (if memory loads it)
-4. Walk down ARCH_AUDIT.md §4 punch list in order
-5. After step 5 of the punch list (smoke both arches), launch Phase 1
+| Component | Local path | Pod path | R2 path |
+|---|---|---|---|
+| BC ckpt v10 e3 | `pokemon-ai-starter/pokemon-ai/src/data/models/bc/v10_cloud_gen9/epoch_003.pt` | same | `s3://team-builder-data/models/bc/v10_cloud_gen9/` |
+| Phase 1 v3 outputs | (R2 only) | `data/models/rl_v10/ppo_phase1_v3_cloud/` | `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/` |
+| Vocab (5 JSON) | `pokemon-ai-starter/pokemon-ai/src/data/vocab/` | same | (gitignored, scp from local) |
+| Move flags lookup | `pokemon-ai-starter/pokemon-ai/src/data/lookup/move_flags_v1.pt` | same | (gitignored, scp from local) |
+| Procedural teams (2024-04 month) | `raw_data/pokemon_usage/2024-04/` (256 files) | `/workspace/raw_data/pokemon_usage/2024-04/` | `s3://team-builder-data/raw_data/pokemon_usage/2024-04/` |
+| All Smogon usage stats (2014-2024) | `raw_data/pokemon_usage/<YYYY-MM>/` | (sync as needed) | (could upload for multi-gen) |
+| Eval teams metamon-competitive | `metamon_cache/teams/competitive/gen9ou/` (16 teams) | `/workspace/metamon_cache/teams/competitive/gen9ou/` | (gitignored, scp from local) |
+| Pokedex / moves / items / abilities | `raw_data/pokemon/`, `raw_data/items/items.csv` (with gen_added), `raw_data/movesets/moves.csv` (with gen_added) | (sync if needed for multi-gen) | (could upload) |
+| HuggingFace replay corpora | (download fresh per-gen) | (download per-gen) | n/a |
 
-End-of-session deliverable: Phase 1 PPO running cleanly from
-`epoch_003.pt`, generating snapshots every 5 iters, smart_avg eval every
-20 iters logging to JSON. If anything blocks launch, document the new
-gap clearly in NEXT_SESSION.md so Session 51 doesn't rediscover it.
+For multi-gen: per `MULTIGEN_FEASIBILITY.md`, ~80% of needed data already exists.
+The big remaining piece is per-gen replay corpora from HuggingFace.
+
+═══════════════════════════════════════════════════════════════════════════════
+CARRY-OVER PRACTICES (lessons paid for in prior sessions)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. **Read docs + code BEFORE estimating scope.** Sessions 49 + 50 both burned
+   evenings on "should be a quick fix" estimates. Trust line-cited audits.
+
+2. **Verify before recommending from memory.** Memory is a snapshot, not
+   current state. Grep for functions/flags before promising they work.
+
+3. **Smoke ALWAYS before launching long runs.** Session 50 caught multiple
+   bugs that would have wasted 40+ hr each (V9RLPlayer kwarg, return-tuple
+   shape, opp_records format, mp+pipeline GPU contention). The 6-test
+   pattern in cookbook §5 is non-optional.
+
+4. **`--mp` is transformer-only.** Legacy `BattleAgent` ckpts (sp_NNNN) work
+   as PFSP opponents (factory dispatches via `is_transformer_checkpoint`)
+   but cannot be `--init-from` for `--mp`.
+
+5. **Cloud: Network Volume MANDATORY for runs > 1 epoch.** Container Disk
+   doesn't survive `podStop+podResume` if pod re-provisions on a different
+   host. Lost a partial BC run this way (Session 49).
+
+6. **Don't rush refactors under time pressure.** "Just ship tonight" is the
+   pattern that produces next session's surprise gaps.
+
+7. **Backward compat is a hard constraint.** Legacy ckpts must remain loadable
+   as PFSP opponents. The factory-dispatch invariant protects this.
+
+8. **Cloud-only bug discovery**: many bugs (SemLock race, GPU contention,
+   heartbeat starvation) only reproduce on Linux + RunPod. Schedule cloud
+   debug time when context is fresh — these don't reproduce locally.
+
+═══════════════════════════════════════════════════════════════════════════════
+KEY DOCS BY TOPIC (current vs historical)
+═══════════════════════════════════════════════════════════════════════════════
+
+**Authoritative (read these first)**:
+- `docs/PPO_CLOUD_COOKBOOK.md` — single ref for cloud PPO runs (Session 50+)
+- `docs/MP_DISK_REDESIGN.md` — mp-disk architecture
+- `docs/MULTIGEN_FEASIBILITY.md` — multi-gen scope (gen 6+)
+- `docs/CLOUD_RUNBOOK.md` §1-10 — BC training (§11 superseded, see cookbook)
+- `docs/PPO_PHASED_TRAINING.md` — phased curriculum spec
+- `memory/MEMORY.md` — project memory, current state
+
+**Historical (correct for their era; don't use for current decisions)**:
+- `docs/PHASE1_POSTMORTEM.md` — Session 50 lr=3e-5 failure analysis
+- `docs/PHASE1_DIAGNOSIS_REPORT.md` — Session 50 lr ablation matrix
+- `docs/PHASE1_INVESTIGATION_PLAN.md` — Session 50 hypothesis tests
+- `docs/PHASE1_V2_CLOUD_CHECKLIST.md` — v2 launch (killed; replaced by v3)
+- `docs/ARCH_AUDIT.md` — Session 49 arch audit (mostly resolved)
+- `docs/STATUS.md`, `docs/RESEARCH.md` — long-form session/research history
+
+**Code source-of-truth for behavioral questions**: when docs and code
+disagree, trust the code. Use `git log`/`git blame` for recent context.
+
+═══════════════════════════════════════════════════════════════════════════════
+ACTIVE TODOs (multi-gen prep, in priority order)
+═══════════════════════════════════════════════════════════════════════════════
+
+**HIGH (do this session)**:
+- [ ] A. Pipeline+mp redesign (centralized inference server) — ~2-3 days
+- [ ] B. Warmup speedup (epochs=1 + torch.no_grad backbone) — ~30 min
+- [ ] C. torch.compile fix for new arch — ~1 day
+- [ ] D1. Gen-id token in TransformerBattlePolicy — ~half day
+- [ ] D2. Gen-aware feature pipeline (gen_id in batch + gen-specific
+  feature gating for Mega/Z/Dynamax/Tera) — ~1 day
+- [ ] D3. Per-gen procedural teambuilder (filter by gen_added) — ~half day
+
+**MEDIUM (likely next session after)**:
+- [ ] D4. Multi-gen replay corpus assembly (HuggingFace pull, gen 6/7/8) —
+  compute-heavy
+- [ ] D5. Multi-gen `replay_to_memmap` (already mostly gen-aware)
+- [ ] D6. **BC v11 multi-gen retrain** — A100 80GB, ~5-7 days, ~$10-15
+
+**LOW (after BC v11 lands)**:
+- [ ] E1. PPO multi-gen run setup
+- [ ] E2. Per-gen eval bots (validate smart bots work in older gens)
+- [ ] E3. Per-gen evaluation harness (smart_avg-per-gen tracking)
+
+═══════════════════════════════════════════════════════════════════════════════
+START HERE FOR THIS SESSION
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Check Phase 1 v3 status:
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+     "grep '^\\[' /workspace/logs/ppo_phase1_v3.log | tail -5"
+   ```
+   If running: don't disrupt, work on prep tasks
+   If finished: pull final.pt + evals.json from R2, analyze
+
+2. Pick task A (pipeline+mp redesign) as the headline work — biggest win
+   for multi-gen. Spec it carefully, validate at small scale, then scale up.
+
+3. While engineering, multi-gen feasibility doc may need updates as you
+   discover more — keep `docs/MULTIGEN_FEASIBILITY.md` current.
+
+4. Update `docs/PPO_CLOUD_COOKBOOK.md` if you find anything not yet captured.
+
+5. After BC v11 multi-gen retrain (when it happens), do a multi-gen smoke
+   for gen 6 + 7 + 8 + 9 PPO before committing to long run.
+
+If stuck or context-loaded, ask user — don't assume from prior session
+beyond what's documented here.

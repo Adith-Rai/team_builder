@@ -16,11 +16,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import os
 import random
 import traceback
 from typing import Dict, List, Optional
+
+# Used in ppo_update to conditionally apply torch.no_grad() during warmup
+# (when only value_head trains, skipping autograd tape on frozen backbone).
+_nullcontext = contextlib.nullcontext
 
 import numpy as np
 import torch
@@ -110,6 +115,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                   epochs: int = 3, clip_eps: float = 0.2, ent_coef: float = 0.02,
                   vf_coef: float = 0.5, max_grad_norm: float = 0.5,
                   target_kl: float = 0.02, grad_accum: int = 1,
+                  in_warmup: bool = False,
                   ) -> dict:
     """PPO update with distributional value loss + KL early stopping (ps-ppo style).
     No KL penalty term — instead stops PPO epochs early if policy changes too much.
@@ -168,9 +174,13 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                     return vals
 
                 mega = {k: _stack_field(k) for k in ep["feat_batches"][0].keys()}
-                spatial_out, all_summaries = model.forward_spatial(mega)
-                # Arch-aware action context (see arch_compat.py).
-                action_ctx = call_action_encoder(model, mega, spatial_out)
+                # Warmup optimization: skip autograd through frozen backbone +
+                # policy. Backward stops at value_head's input (the only thing
+                # being trained). Saves ~50% on update wall-time during warmup.
+                _backbone_ctx = torch.no_grad() if in_warmup else _nullcontext()
+                with _backbone_ctx:
+                    spatial_out, all_summaries = model.forward_spatial(mega)
+                    action_ctx = call_action_encoder(model, mega, spatial_out)
                 legal_all = mega["legal_mask"]
 
                 # --- Sequential temporal + heads ---
@@ -186,21 +196,24 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                     if summary_buf.shape[1] > 200:
                         summary_buf = summary_buf[:, -200:]
 
-                    temporal_ctx = model.temporal(summary_buf)
-                    actor_out = spatial_out[t, 0, :]
-                    critic_out = spatial_out[t, 1, :]
-                    act_ctx = action_ctx[t]
+                    # Backbone + policy path: in warmup, no_grad to skip autograd
+                    # tape (policy is frozen; logits used only for KL/entropy
+                    # stats, not for gradient).
+                    with _backbone_ctx:
+                        temporal_ctx = model.temporal(summary_buf)
+                        actor_out = spatial_out[t, 0, :]
+                        critic_out = spatial_out[t, 1, :]
+                        act_ctx = action_ctx[t]
 
-                    at = torch.cat([actor_out, temporal_ctx.squeeze(0)], dim=-1)
-                    at_exp = at.unsqueeze(0).expand(9, -1)
-                    pi_input = torch.cat([at_exp, act_ctx], dim=-1)
-                    # Arch-aware policy/value heads. Returns (9,) and (1, v_bins)
-                    # respectively; legacy and transformer share the underlying
-                    # MLP shape so post-MLP arithmetic is unchanged.
-                    logits = call_policy_logits(model, pi_input)
-                    logits = logits.masked_fill(legal_all[t] < 0.5, -100.0)
+                        at = torch.cat([actor_out, temporal_ctx.squeeze(0)], dim=-1)
+                        at_exp = at.unsqueeze(0).expand(9, -1)
+                        pi_input = torch.cat([at_exp, act_ctx], dim=-1)
+                        logits = call_policy_logits(model, pi_input)
+                        logits = logits.masked_fill(legal_all[t] < 0.5, -100.0)
                     all_logits.append(logits)
 
+                    # Value path: gradient flows through value_head only (its
+                    # input critic_out + temporal_ctx are detached if in warmup).
                     vi = torch.cat([critic_out, temporal_ctx.squeeze(0)], dim=-1)
                     vl = call_value_logits(model, vi.unsqueeze(0)).squeeze(0)
                     all_vlogits.append(vl)
