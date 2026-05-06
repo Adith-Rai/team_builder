@@ -57,14 +57,18 @@ try:
 except Exception:
     pass
 
-# Forkserver chosen over spawn: faster startup, no CUDA re-init cost
-# per worker, supports persistent worker pool across iters. Workers
-# initialize CUDA fresh in their own process (not inherited from parent).
-# Windows fallback to spawn — --mp is cloud-only Linux but allow import.
+# Spawn chosen over forkserver after Session 50 testing: forkserver hits a
+# CPython 3.11 multiprocessing.resource_tracker race when spawning N>=4
+# workers (SemLock files unlinked before children open them →
+# FileNotFoundError in SemLock._rebuild). Spawn is slightly slower per
+# child (~3-5s for fresh python init) but bypasses the shared
+# resource_tracker entirely. With persistent workers across iters, the
+# spawn cost is paid ONCE per run (~25-40s for N=8).
 try:
-    _MP_CTX = mp_torch.get_context('forkserver')
-except (ValueError, OSError):
     _MP_CTX = mp_torch.get_context('spawn')
+except (ValueError, OSError):
+    # Last resort fallback (shouldn't happen — spawn is universal)
+    _MP_CTX = mp_torch.get_context('fork')
 
 
 # =============================
@@ -88,33 +92,55 @@ def shutdown_workers():
 # =============================
 
 class WorkerManager:
-    """Owns the N forkserver workers. Tracks heartbeats. Respawns on
-    death/hang. Caps consecutive respawns to avoid toxic-state loops."""
+    """Owns the N spawn workers. Tracks heartbeats. Respawns on
+    death/hang. Caps consecutive respawns to avoid toxic-state loops.
 
-    HEARTBEAT_TIMEOUT_S = 60.0      # worker silent this long → respawn
+    Uses mp.Pipe (no SemLock) for ctrl direction and a single shared
+    mp.Queue for results. This avoids the CPython 3.11 + RunPod-container
+    SemLock unlink race that fires on N>=4 with per-worker mp.Queue."""
+
+    # Heartbeat tolerance: model load on first iter can take 30-60s when N
+    # workers concurrently load a 240MB ckpt from disk; bump to 120s to be
+    # safe. Workers send acks BEFORE model load, so this is mostly a safety net.
+    HEARTBEAT_TIMEOUT_S = 120.0
     RESPAWN_CAP = 3                 # >this respawns in 5 iters → mark dead
     RESPAWN_WINDOW_ITERS = 5
 
     def __init__(self, n_workers: int):
         self.n = n_workers
         self.workers: Dict[int, mp_torch.Process] = {}
-        self.ctrl_queues: Dict[int, Any] = {}
-        self.result_queue = _MP_CTX.Queue()
+        # Per-worker pipes both directions: ctrl (parent→worker) + result (worker→parent).
+        # All Pipes are FD-based, NO SemLock anywhere → no resource_tracker race
+        # at high N. mp.connection.wait() in main multiplexes across all result pipes.
+        self.ctrl_pipes: Dict[int, Any] = {}    # parent end of ctrl direction
+        self.result_pipes: Dict[int, Any] = {}  # parent end of result direction
         self.last_heartbeat: Dict[int, float] = {}
-        self.respawn_history: Dict[int, List[int]] = {}  # wid -> list of iters when respawned
-        self.dead_workers: set = set()  # exceeded RESPAWN_CAP
+        self.respawn_history: Dict[int, List[int]] = {}
+        self.dead_workers: set = set()
 
     def spawn(self, worker_id: int):
-        """Fresh forkserver worker. Worker enters its main loop reading ctrl_queue."""
-        ctrl_q = _MP_CTX.Queue()
+        """Fresh spawn worker. Communicates exclusively via Pipes (no SemLock).
+
+        Pipe(duplex=False) returns (reader, writer):
+        - ctrl direction (parent→worker): parent writes, worker reads
+        - result direction (worker→parent): worker writes, parent reads
+        """
+        # ctrl: parent → worker. parent_end=writer, worker_end=reader.
+        ctrl_reader, ctrl_writer = _MP_CTX.Pipe(duplex=False)
+        # result: worker → parent. parent_end=reader, worker_end=writer.
+        result_reader, result_writer = _MP_CTX.Pipe(duplex=False)
         proc = _MP_CTX.Process(
             target=_worker_main,
-            args=(worker_id, ctrl_q, self.result_queue),
+            args=(worker_id, ctrl_reader, result_writer),
             daemon=False,
         )
         proc.start()
+        # Close worker's ends in parent process (held only by worker)
+        ctrl_reader.close()
+        result_writer.close()
         self.workers[worker_id] = proc
-        self.ctrl_queues[worker_id] = ctrl_q
+        self.ctrl_pipes[worker_id] = ctrl_writer       # parent writes here
+        self.result_pipes[worker_id] = result_reader   # parent reads here
         self.last_heartbeat[worker_id] = time.time()
 
     def respawn(self, worker_id: int, iter_n: int) -> bool:
@@ -143,10 +169,13 @@ class WorkerManager:
                 if p.is_alive():
                     p.kill()
                     p.join(timeout=2.0)
-        # Drain any leftover ctrl queue (no longer relevant)
+        # Close the old pipes (worker is dead; nothing else reads them).
         try:
-            while True:
-                self.ctrl_queues[worker_id].get_nowait()
+            self.ctrl_pipes[worker_id].close()
+        except Exception:
+            pass
+        try:
+            self.result_pipes[worker_id].close()
         except Exception:
             pass
 
@@ -187,11 +216,15 @@ class WorkerManager:
 # Worker entry point (forkserver child)
 # =============================
 
-def _worker_main(worker_id: int, ctrl_queue, result_queue):
-    """Forkserver child entrypoint.
+def _worker_main(worker_id: int, ctrl_pipe, result_pipe):
+    """Spawn child entrypoint.
+
+    Both `ctrl_pipe` and `result_pipe` are child ends of mp.Pipes.
+    All IPC is FD-based — NO SemLock anywhere. This sidesteps the CPython
+    multiprocessing resource_tracker race at N>=4.
 
     Worker stays alive across iters; reloads weights on demand. Sends
-    heartbeats every 30s, posts done/error per iter to result_queue.
+    heartbeats every 30s, posts done/error per iter to result_pipe.
     """
     import warnings
     warnings.filterwarnings("ignore")
@@ -204,7 +237,7 @@ def _worker_main(worker_id: int, ctrl_queue, result_queue):
     except Exception:
         pass
 
-    # Local imports — keep forkserver init light.
+    # Local imports — keep init light.
     import torch as _torch
     import logging
     logging.basicConfig(level=logging.WARNING)
@@ -221,26 +254,31 @@ def _worker_main(worker_id: int, ctrl_queue, result_queue):
 
     def _send_heartbeat(iter_n: int, n_done: int, n_total: int):
         try:
-            result_queue.put({
+            result_pipe.send({
                 "status": "heartbeat",
                 "worker_id": worker_id,
                 "iter_n": iter_n,
                 "n_games_done": n_done,
                 "n_games_total": n_total,
                 "ts": time.time(),
-            }, timeout=2.0)
-        except Exception:
+            })
+        except (BrokenPipeError, OSError):
             pass
 
     while True:
-        # Wait for next ctrl msg (with periodic heartbeat during idle)
+        # Wait for next ctrl msg via Pipe (with periodic heartbeat during idle).
+        # Pipe.poll(timeout) blocks up to timeout for incoming data; recv()
+        # then returns the actual message.
         try:
-            cmd = ctrl_queue.get(timeout=30.0)
-        except Empty:
-            _send_heartbeat(iter_n=-1, n_done=0, n_total=0)
-            continue
+            if not ctrl_pipe.poll(timeout=30.0):
+                _send_heartbeat(iter_n=-1, n_done=0, n_total=0)
+                continue
+            cmd = ctrl_pipe.recv()
+        except (EOFError, BrokenPipeError) as e:
+            print(f"[worker {worker_id}] ctrl_pipe closed: {e}", flush=True)
+            break
         except Exception as e:
-            print(f"[worker {worker_id}] ctrl_queue.get failed: {e}", flush=True)
+            print(f"[worker {worker_id}] ctrl_pipe.recv failed: {e}", flush=True)
             break
 
         if cmd.get("cmd") == "shutdown":
@@ -250,19 +288,22 @@ def _worker_main(worker_id: int, ctrl_queue, result_queue):
             continue
 
         iter_n = cmd["iter_n"]
+        # Immediate ack-heartbeat so main knows we got the cmd; model load
+        # below can take 30-60s with N>=4 concurrent disk reads.
+        _send_heartbeat(iter_n=iter_n, n_done=0, n_total=cmd.get("n_games", 0))
         try:
-            _do_collect_iter(state, worker_id, cmd, result_queue, _send_heartbeat)
+            _do_collect_iter(state, worker_id, cmd, result_pipe, _send_heartbeat)
         except Exception as e:
             tb = traceback.format_exc()
             try:
-                result_queue.put({
+                result_pipe.send({
                     "status": "error",
                     "worker_id": worker_id,
                     "iter_n": iter_n,
                     "exc_type": type(e).__name__,
                     "exc_msg": str(e),
                     "traceback": tb,
-                }, timeout=5.0)
+                })
             except Exception:
                 pass
             # Worker exits on error → manager respawns next iter
@@ -270,7 +311,7 @@ def _worker_main(worker_id: int, ctrl_queue, result_queue):
             return
 
 
-def _do_collect_iter(state, worker_id, cmd, result_queue, heartbeat_fn):
+def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
     """Execute one iter's collect inside a worker process.
 
     Reuses existing collect_v9 single-process logic — workers ARE
@@ -359,7 +400,7 @@ def _do_collect_iter(state, worker_id, cmd, result_queue, heartbeat_fn):
     os.replace(tmp_path, traj_path)
 
     # Post done.
-    result_queue.put({
+    result_pipe.send({
         "status": "done",
         "worker_id": worker_id,
         "iter_n": iter_n,
@@ -372,7 +413,7 @@ def _do_collect_iter(state, worker_id, cmd, result_queue, heartbeat_fn):
         "n_forfeit_losses": n_fft_l,
         "wr_per_opp": wr_per_opp,
         "elapsed_s": elapsed_s,
-    }, timeout=10.0)
+    })
 
 
 def _is_transformer_arch(model) -> bool:
@@ -520,9 +561,23 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
             pass
 
     async def _heartbeat_during_collect():
+        # Periodic in-worker status: how many battles active/finished. Helps
+        # diagnose pipeline+mp hangs (vs slow forward vs zero progress).
+        loop_counter = 0
         while True:
             heartbeat_fn(iter_n=iter_n, n_done=n_done, n_total=n_games)
-            await asyncio.sleep(30.0)
+            # Probe player(s) created so far for live battle counts
+            try:
+                # Workers create players inside _play_vs_opp; we can't reach them
+                # here. Instead, log prof state of the InferenceBatcher.
+                if hasattr(batcher, '_prof_total_requests'):
+                    print(f"[worker {worker_id} t+{loop_counter*15}s] "
+                          f"infer_reqs={batcher._prof_total_requests} "
+                          f"n_done={n_done}/{n_games}", flush=True)
+            except Exception:
+                pass
+            loop_counter += 1
+            await asyncio.sleep(15.0)
 
     async def _main():
         hb_task = asyncio.create_task(_heartbeat_during_collect())
@@ -659,9 +714,13 @@ def mp_disk_collect_sync(
     global _GLOBAL_MANAGER
     if _GLOBAL_MANAGER is None:
         _GLOBAL_MANAGER = WorkerManager(n_workers=n_workers)
+        # Pace the spawns: at N>=4, simultaneous forkserver spawns race the
+        # resource_tracker → SemLock._rebuild FileNotFoundError in children.
+        # 0.5s between spawns avoids the race; total startup overhead is
+        # ~4-8s for N=8 workers, amortized over the whole run.
         for wid in range(n_workers):
             _GLOBAL_MANAGER.spawn(wid)
-        # Brief grace period for forkserver to spin up
+            time.sleep(0.5)
         time.sleep(2.0)
 
     t_start = time.time()
@@ -711,55 +770,72 @@ def mp_disk_collect_sync(
             "device": str(device),
             "rng_seed": rng_seed,
         }
-        _GLOBAL_MANAGER.ctrl_queues[wid].put(cmd, timeout=5.0)
+        # Pipe.send is blocking-but-fast (no timeout API); fine for small msgs
+        _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
         cmds_sent.append(wid)
 
-    # 4. Watchdog loop: collect results, monitor heartbeats, respawn dead
+    # 4. Watchdog loop: multiplex result_pipes via mp.connection.wait.
+    # All Pipes are FD-backed; wait() does select/poll on the FDs directly.
+    from multiprocessing.connection import wait as mp_wait
     expected_responses = len(cmds_sent)
     received_responses = 0
     results: List[dict] = []
-    # Generous timeout: 4× expected collect time. Worst case Test A was
-    # 1219s for 1500 games; with N=8 workers we expect ~150s/worker, so
-    # 4×150 + 5min buffer = ~14min ceiling.
     expected_collect_s = max(300.0, n_games / max(n_alive, 1) * 2.0)
     deadline = time.time() + 4.0 * expected_collect_s
 
+    # Map from connection object back to worker_id for fast lookup
+    pipes_to_wid = {_GLOBAL_MANAGER.result_pipes[wid]: wid for wid in cmds_sent}
+
     while received_responses < expected_responses and time.time() < deadline:
-        try:
-            msg = _GLOBAL_MANAGER.result_queue.get(timeout=10.0)
-        except Empty:
-            # Run health check
+        ready = mp_wait(list(pipes_to_wid.keys()), timeout=10.0)
+        if not ready:
+            # Health check on idle tick
             unhealthy = _GLOBAL_MANAGER.health_check()
             for wid, reason in unhealthy:
                 if wid in cmds_sent:
                     print(f"[mp-disk] iter {iter_n}: worker {wid} {reason}; "
                           f"respawning, dropping its slice.", flush=True)
                     _GLOBAL_MANAGER.respawn(wid, iter_n)
-                    expected_responses -= 1  # this worker won't post for THIS iter
+                    expected_responses -= 1
+                    # Old pipe is invalidated; replace map entry
+                    pipes_to_wid = {_GLOBAL_MANAGER.result_pipes[w]: w
+                                     for w in cmds_sent
+                                     if w not in _GLOBAL_MANAGER.dead_workers}
             continue
 
-        wid = msg.get("worker_id")
-        status = msg.get("status")
-
-        if status == "heartbeat":
-            _GLOBAL_MANAGER.last_heartbeat[wid] = msg.get("ts", time.time())
-            continue
-
-        # done or error → counts as response
-        received_responses += 1
-
-        if status == "done":
-            # Confirm iter_n matches (defensive)
-            if msg.get("iter_n") != iter_n:
-                print(f"[mp-disk] WARN: stale msg from worker {wid} for "
-                      f"iter {msg.get('iter_n')} (current={iter_n}); ignoring.",
-                      flush=True)
+        for conn in ready:
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError) as e:
+                # Worker closed pipe (likely crashed). Respawn.
+                wid = pipes_to_wid.get(conn)
+                print(f"[mp-disk] iter {iter_n}: worker {wid} pipe closed: {e}; "
+                      f"respawning.", flush=True)
+                if wid is not None and wid in cmds_sent:
+                    _GLOBAL_MANAGER.respawn(wid, iter_n)
+                    expected_responses -= 1
                 continue
-            results.append(msg)
-        elif status == "error":
-            print(f"[mp-disk] iter {iter_n}: worker {wid} error: "
-                  f"{msg.get('exc_msg')}\n{msg.get('traceback', '')}", flush=True)
-            _GLOBAL_MANAGER.respawn(wid, iter_n)
+
+            wid = msg.get("worker_id")
+            status = msg.get("status")
+
+            if status == "heartbeat":
+                _GLOBAL_MANAGER.last_heartbeat[wid] = msg.get("ts", time.time())
+                continue
+
+            received_responses += 1
+
+            if status == "done":
+                if msg.get("iter_n") != iter_n:
+                    print(f"[mp-disk] WARN: stale msg from worker {wid} for "
+                          f"iter {msg.get('iter_n')} (current={iter_n}); ignoring.",
+                          flush=True)
+                    continue
+                results.append(msg)
+            elif status == "error":
+                print(f"[mp-disk] iter {iter_n}: worker {wid} error: "
+                      f"{msg.get('exc_msg')}\n{msg.get('traceback', '')}", flush=True)
+                _GLOBAL_MANAGER.respawn(wid, iter_n)
 
     # If we hit the deadline with stragglers, log + continue with what we have
     if received_responses < expected_responses:
@@ -845,8 +921,10 @@ class MPDiskBgCollector:
         if _GLOBAL_MANAGER is None:
             _GLOBAL_MANAGER = WorkerManager(
                 n_workers=args_dict.get("n_workers", 8))
+            # Paced spawns to avoid resource_tracker race (see mp_disk_collect_sync).
             for wid in range(_GLOBAL_MANAGER.n):
                 _GLOBAL_MANAGER.spawn(wid)
+                time.sleep(0.5)
             time.sleep(2.0)
 
         # Save weights
@@ -888,7 +966,7 @@ class MPDiskBgCollector:
                 "device": str(device),
                 "rng_seed": random.randint(0, 1_000_000),
             }
-            _GLOBAL_MANAGER.ctrl_queues[wid].put(cmd, timeout=5.0)
+            _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
 
         self._kicked_off = True
         self._iter_n = iter_n
@@ -915,17 +993,18 @@ class MPDiskBgCollector:
 
 
 def _wait_for_iter_results(iter_n: int, cmds_sent: List[int]) -> Tuple:
-    """Drain result_queue for an iter. Same logic as in mp_disk_collect_sync
+    """Multiplex result_pipes for an iter. Same logic as mp_disk_collect_sync
     step 4-6, factored out for use by both sync + bg paths."""
+    from multiprocessing.connection import wait as mp_wait
     expected = len(cmds_sent)
     received = 0
     results: List[dict] = []
     deadline = time.time() + 60.0 * 30  # 30 min hard ceiling per iter
+    pipes_to_wid = {_GLOBAL_MANAGER.result_pipes[wid]: wid for wid in cmds_sent}
 
     while received < expected and time.time() < deadline:
-        try:
-            msg = _GLOBAL_MANAGER.result_queue.get(timeout=10.0)
-        except Empty:
+        ready = mp_wait(list(pipes_to_wid.keys()), timeout=10.0)
+        if not ready:
             unhealthy = _GLOBAL_MANAGER.health_check()
             for wid, reason in unhealthy:
                 if wid in cmds_sent:
@@ -933,18 +1012,31 @@ def _wait_for_iter_results(iter_n: int, cmds_sent: List[int]) -> Tuple:
                           f"respawning.", flush=True)
                     _GLOBAL_MANAGER.respawn(wid, iter_n)
                     expected -= 1
+                    pipes_to_wid = {_GLOBAL_MANAGER.result_pipes[w]: w
+                                     for w in cmds_sent
+                                     if w not in _GLOBAL_MANAGER.dead_workers}
             continue
 
-        if msg.get("status") == "heartbeat":
-            _GLOBAL_MANAGER.last_heartbeat[msg.get("worker_id")] = time.time()
-            continue
+        for conn in ready:
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError):
+                wid = pipes_to_wid.get(conn)
+                if wid is not None and wid in cmds_sent:
+                    _GLOBAL_MANAGER.respawn(wid, iter_n)
+                    expected -= 1
+                continue
 
-        received += 1
-        if msg.get("status") == "done" and msg.get("iter_n") == iter_n:
-            results.append(msg)
-        elif msg.get("status") == "error":
-            print(f"[mp-disk] iter {iter_n}: worker error: "
-                  f"{msg.get('exc_msg')}", flush=True)
+            if msg.get("status") == "heartbeat":
+                _GLOBAL_MANAGER.last_heartbeat[msg.get("worker_id")] = time.time()
+                continue
+
+            received += 1
+            if msg.get("status") == "done" and msg.get("iter_n") == iter_n:
+                results.append(msg)
+            elif msg.get("status") == "error":
+                print(f"[mp-disk] iter {iter_n}: worker error: "
+                      f"{msg.get('exc_msg')}", flush=True)
             _GLOBAL_MANAGER.respawn(msg.get("worker_id"), iter_n)
 
     # Read traj files. opp_records format = {path: [wins, games]} per collect_v9.
