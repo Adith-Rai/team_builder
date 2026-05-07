@@ -245,7 +245,7 @@ User mentioned in Session 50 cont. that if CIS lands quickly they may
 re-init Phase 1 v3 from a snapshot — that re-init would automatically
 get these B2 fixes too.
 
-Estimated work: ~1 hour, **DONE Session 50 cont.** (commit a7… ?).
+Estimated work: ~1 hour, **DONE Session 50 cont.** (commit `997fa32`).
 
 #### C. torch.compile fix for new arch (~1 day)
 
