@@ -119,12 +119,19 @@ class WorkerManager:
     mp.Queue for results. This avoids the CPython 3.11 + RunPod-container
     SemLock unlink race that fires on N>=4 with per-worker mp.Queue."""
 
-    # Heartbeat tolerance: under heavy disk contention (multiple parallel
-    # mp processes on same pod), 8-worker model loads can stretch to
-    # several minutes. 300s ceiling. Workers send ack-heartbeat on cmd
-    # receipt and during async collect; this is the safety net for the
-    # blocking gap between cmd recv and asyncio loop entry.
-    HEARTBEAT_TIMEOUT_S = 300.0
+    # Heartbeat tolerance. Bumped to 600s in Session 51 cont. after Phase 1 v3
+    # iter 17 had ALL 8 workers go stale-heartbeat simultaneously when the
+    # PFSP pool grew to 3 ckpts at once (snapshot_0015 just saved). With 8
+    # workers each loading a NEW 240MB opp ckpt from disk simultaneously
+    # (3.8 GB concurrent reads), the blocking torch.load() call inside
+    # _play_vs_opp blocked the asyncio loop for 5+ minutes per worker;
+    # heartbeats inside the async coroutine couldn't fire and ALL workers
+    # got respawned despite being alive and making progress. Iter 17 ended
+    # with 0 trajectories - PPO update FATAL - run hung in shutdown
+    # cleanup. 600s tolerance + the new heartbeat-from-liveness-thread fix
+    # (see _liveness_loop below) together prevent the catastrophic mass
+    # respawn while still detecting actually-dead workers within 10 min.
+    HEARTBEAT_TIMEOUT_S = 600.0
     RESPAWN_CAP = 3                 # >this respawns in 5 iters → mark dead
     RESPAWN_WINDOW_ITERS = 5
 
@@ -393,6 +400,15 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
     # Liveness probe thread: prints worker status every 5s INDEPENDENTLY
     # of asyncio loop. If asyncio is dead, this thread keeps printing,
     # which lets us distinguish "asyncio dead" from "worker fully dead".
+    #
+    # MITIGATION (Session 51 cont., 2026-05-07 iter 17 hang): this thread
+    # ALSO fires heartbeats now, not just stdout prints. When workers hit a
+    # blocking torch.load() on a new opp ckpt at iter boundary (5+ min in
+    # the iter 17 incident), the asyncio-loop heartbeat coroutine can't run.
+    # This thread runs in its own OS thread, releases the GIL during sleep,
+    # and reaches result_pipe.send (which is thread-safe via internal lock).
+    # So heartbeats fire even when asyncio is fully blocked. The async
+    # heartbeat coroutine still fires too; this thread is the safety net.
     import threading
     _liveness_state = {"alive": True, "n_done": 0, "n_total": n_games}
     def _liveness_loop():
@@ -402,6 +418,11 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
                 print(f"[w{worker_id} LIVE +{i*5}s iter={iter_n}] "
                       f"n_done={_liveness_state['n_done']}/{_liveness_state['n_total']}",
                       flush=True)
+                # Heartbeat from THIS THREAD - decoupled from asyncio.
+                # Pipe.send is thread-safe in CPython (internal lock).
+                heartbeat_fn(iter_n=iter_n,
+                             n_done=_liveness_state["n_done"],
+                             n_total=_liveness_state["n_total"])
             except Exception:
                 pass
             i += 1
@@ -899,9 +920,17 @@ def mp_disk_collect_sync(
             "rng_seed": rng_seed,
             "amp_dtype": amp_dtype,  # picked up by worker via precision_config.set_amp_dtype
         }
-        # Pipe.send is blocking-but-fast (no timeout API); fine for small msgs
+        # Pipe.send is blocking-but-fast (no timeout API); fine for small msgs.
+        # MITIGATION (Session 51 cont.): stagger by 0.25s per worker so that
+        # all 8 workers don't hit disk simultaneously when loading new opp
+        # ckpts at iter boundaries. Without staggering, 8 concurrent 240MB
+        # disk reads + page-cache contention can stall workers for 5+ min,
+        # which triggered the iter 17 mass-stale-heartbeat hang. Total added
+        # latency: ~2s for N=8 workers, negligible vs ~16 min/iter collect.
         _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
         cmds_sent.append(wid)
+        if i + 1 < len(alive):
+            time.sleep(0.25)
 
     # 4. Watchdog loop: multiplex result_pipes via mp.connection.wait.
     # All Pipes are FD-backed; wait() does select/poll on the FDs directly.
@@ -1096,7 +1125,10 @@ class MPDiskBgCollector:
                 "rng_seed": random.randint(0, 1_000_000),
                 "amp_dtype": args_dict.get("amp_dtype"),  # bf16 plumbing for bg path
             }
+            # Stagger same as sync path - see mp_disk_collect_sync for rationale.
             _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
+            if i + 1 < len(alive):
+                time.sleep(0.25)
 
         self._kicked_off = True
         self._iter_n = iter_n
