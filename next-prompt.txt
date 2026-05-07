@@ -65,9 +65,17 @@ arch — see §3i).
 Run dir: `data/models/rl_v10/ppo_phase1_v3_cloud/selfplay_v9_<timestamp>/`
 R2 sync at `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/`
 
-**Expected**: ~12-15 min/iter steady (post-warmup). Total ~40-72 hr / **~$60-150**.
-Range is wide because warmup iters (0-19) are slower (~30-45 min/iter)
-since only value_head trains but full 5 PPO epochs run regardless.
+**Empirical (Phase 1 v3 iter 0 + 1)**:
+- Iter 0 warmup: collect=822s + update=1686s = 41.8 min
+- Iter 1 warmup: collect=815s + update=1733s = 42.5 min
+- Warmup is consistently ~42 min/iter (no_grad saved only ~7% — autograd
+  auto-elides frozen-path graph, our explicit no_grad was mostly redundant)
+- Steady-state estimate post-warmup: ~20-25 min/iter when KL early-stop fires
+- **Real cost: ~74-89 hr / $110-135 ballpark** (20 warmup × 42 + 180 main × ~22)
+
+**Honest take (Session 50)**: `--mp` infrastructure provides ~15-30% saving
+over pipeline-only at this scale — moderate, not dramatic. Phase 1 v3 doesn't
+benefit much from mp itself; the win is multi-gen scale + CIS enablement.
 
 **First eval at iter 19** (smart_avg vs SH/SmartDmg/Tactical/Strategic on
 metamon-competitive 16-team set). Should be ≥67% (BC baseline). If lower,

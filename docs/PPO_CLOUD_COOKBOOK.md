@@ -368,20 +368,25 @@ NaN signals (FATAL — abort and diagnose):
 
 ### Per-iter timing (RunPod A100 80GB)
 
-| Config | games | iter 0 | iter 1+ steady |
+| Config | games | iter 0 | iter 1+ |
 |---|---|---|---|
-| `--pipeline` only (Test A) | 1500, conc=500 | 30 min | 30 min |
+| `--pipeline` only (Test A) | 1500, conc=500 | 30 min (collect 1219s + update 600s, sequential) | ~20 min steady (pipeline overlap saves update time) |
 | `--mp` only (Test A) | 200, conc=20 | ~6 min | ~8-12 min (with pool growth) |
-| `--mp` only (extrapolated production) | 1600, conc=200, N=8 | ~13-14 min | ~12-13 min |
-| `--mp --pipeline` (broken) | — | iter 0 OK, iter 1 hang | — |
+| **`--mp` only Phase 1 v3 production (warmup, opt-stack on)** | 1600, conc=200, N=8 | **collect 822s + update 1686s = 41.8 min** | iter 1 also 42.5 min (warmup) |
+| `--mp` only Phase 1 v3 (post-warmup, est) | same | — | ~20-25 min/iter (collect ~13 min + update ~5-10 min when KL early-stop fires) |
+| `--mp --pipeline` (broken; bg overlap deadlocks) | — | iter 0 OK, iter 1 hang | (use `--mp` alone until CIS lands; see CENTRALIZED_INFERENCE_DESIGN.md) |
 
-### 200-iter cost projection
+**Honest observation (Session 50)**: at production scale (games=1600), `--mp` infrastructure provides ~15-30% wall-time saving over pipeline-only — moderate, not the dramatic speedup originally projected. The dominant cost is the PPO update phase which scales linearly with episodes regardless of mp/pipeline. Warmup specifically is slow because all 5 PPO epochs run even though only `value_head` trains (warmup `no_grad` saved only ~7.5% — autograd auto-elides frozen-path graph already, my redundant explicit no_grad helped less than predicted). Real mp wins are downstream: failure recovery, scaling N>8, enabling CIS for multi-gen.
+
+### 200-iter cost projection (Phase 1 v3 empirical baseline)
 
 | Config | Wall time | Cost ($1.50/hr) |
 |---|---|---|
-| `--mp` only @ games=1600 | 40-45 hr | **$60-70** |
-| `--pipeline` only | ~100 hr | $150 |
-| `--mp --pipeline` (if fixed) | ~33 hr | $50 |
+| **`--mp` only @ games=1600 (Phase 1 v3 actual)** | **~74-89 hr** (20 warmup × 42 min + 180 main × 20-25 min) | **~$110-135** |
+| `--pipeline` only @ games=1500 (extrapolated from Test A) | ~67 hr (iter 0=30min sequential, iter 1+=20min with overlap) | ~$100 |
+| `--mp --pipeline` (when CIS lands) | ~50-60 hr (CIS enables real overlap) | ~$75-90 (multi-gen target) |
+
+**Key insight**: `--mp` only is roughly equivalent in wall-time to `--pipeline` only at this scale. mp's real ROI is at multi-gen scale (5-7 weeks) where 15-20% saving = $200-400 over the full run, AND when CIS adds proper pipeline overlap on top.
 
 ---
 
