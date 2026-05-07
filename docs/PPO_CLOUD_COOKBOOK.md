@@ -315,7 +315,7 @@ The fix has small overhead: ~1.5s × ~10 opps × N workers (parallel) / N parall
 | `--lam` | `0.95` | GAE lambda. Session 39 validated. |
 | `--ent-coef` | `0.02` | Session 39 validated. With adaptive-entropy active, this is just the starting point. |
 | `--target-kl` | `0.03` (default) | KL early stop threshold. Validated. |
-| `--grad-accum` | **`1`** | **Mandatory.** Values >1 caused stability issues historically (per docs). |
+| `--grad-accum` | **`1`** (default) | "Mandatory" claim from Session 31 docs is not solidly supported. The grad_accum=10 test that flagged stability happened alongside FP16 NaN fixes + lr-restart issues + snapshot-pool pollution, not in isolation. AND on legacy MLP arch at lr=1e-4. **Re-testing grad_accum=4 at lr=1e-5 on transformer arch is in TODO §B1.6** — could give 5-15% wall + cleaner gradients. Until then, default to 1 for safety. |
 | `--reward-style` | `terminal` | Session 43+ validated. Was `dense` earlier. |
 | `--adaptive-entropy-low/high` | `0.65 / 0.95` | Session 43 safeguards entropy collapse. |
 | `--win-rate-mode` | `ema` | Forgets old data in PFSP weighting; prevents stuck weights when policy beats old snapshot. |
