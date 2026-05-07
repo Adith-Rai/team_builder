@@ -97,25 +97,32 @@ Diagnosed Session 50 as GPU contention: when bg cmd processing runs
 parallel to main's `optimizer.step()`, worker CUDA forwards stall and
 don't recover after main finishes.
 
-**Fix design**: centralized inference server. Workers send obs to a single
-GPU process (queues forwards on appropriate CUDA streams, arbitrating with
-main's compute). Avoids parallel GPU contention. Saves ~$200-300 over a
-multi-gen run (5-7 weeks compute) where the savings compound.
+**Formal design doc**: **`docs/CENTRALIZED_INFERENCE_DESIGN.md`** — read
+this. Has architecture diagram, 4-phase implementation plan, validation
+plan with acceptance criteria, design decisions to make (flag naming,
+weight sync, IPC type, CUDA stream priority), risk table with
+mitigations.
 
-Implementation outline:
-- New file `mp_centralized_inference.py` (or extend `mp_disk_collect.py`)
-- Workers send obs via numpy arrays through stdlib Queue (no torch tensor
-  IPC — that's the SemLock issue Session 50 fixed via Pipes)
-- Inference server dispatches to GPU on a low-priority CUDA stream so main
-  optimizer.step() takes priority
-- Workers buffer requests, await response Future
-- Pause/resume protocol DOESN'T work (workers can't progress mid-iter when
-  paused; tested Session 50)
+Quick summary: dedicated GPU process (CIS) arbitrates all worker
+inference. Main runs `optimizer.step` on HIGH-priority CUDA stream;
+CIS runs forwards on LOW-priority stream. CUDA scheduler honors
+priority — main gets GPU first, CIS fills gaps. No deadlock because
+CIS forwards always make progress, just slower during update windows.
 
-Reference: `docs/MP_DISK_REDESIGN.md` for current architecture; `metamon`
-uses AsyncVectorEnv + disk-backed (different approach but informs design);
-`ps-ppo` (Nebraskinator's GitHub) uses Ray actors with centralized
-inference (closer to what we need).
+Phases (each ~half-day to 1 day):
+1. Skeleton: 1 worker → CIS → 1 worker, sync, validate logits identity
+2. Batching + N=4 workers, sustained 5-iter
+3. Weight sync + low-priority CUDA stream
+4. Re-enable pipeline overlap, production smoke
+
+Saves ~$200-300 over a multi-gen run (5-7 weeks compute).
+
+References: `docs/MULTIPROCESS_COLLECTION.md` (Session 32 original concept —
+right architecture but predates Session 50 fixes); `ps-ppo`
+(Nebraskinator's GitHub) uses Ray actors with centralized inference —
+similar pattern, different IPC layer; Metamon's AMAGO uses
+AsyncVectorEnv + disk-backed (different approach but informs failure
+modes).
 
 #### B. Warmup speedup (~30 min)
 
@@ -355,7 +362,8 @@ KEY DOCS BY TOPIC (current vs historical)
 
 **Authoritative (read these first)**:
 - `docs/PPO_CLOUD_COOKBOOK.md` — single ref for cloud PPO runs (Session 50+)
-- `docs/MP_DISK_REDESIGN.md` — mp-disk architecture
+- `docs/MP_DISK_REDESIGN.md` — mp-disk architecture (current `--mp` impl)
+- `docs/CENTRALIZED_INFERENCE_DESIGN.md` — CIS design (multi-gen prep)
 - `docs/MULTIGEN_FEASIBILITY.md` — multi-gen scope (gen 6+)
 - `docs/CLOUD_RUNBOOK.md` §1-10 — BC training (§11 superseded, see cookbook)
 - `docs/PPO_PHASED_TRAINING.md` — phased curriculum spec

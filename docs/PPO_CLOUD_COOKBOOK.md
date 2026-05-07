@@ -176,7 +176,7 @@ Worst-case loss bound on pod death: 5 min of progress.
 
 **Current workaround**: `--mp --pipeline` silently treats as `--mp` only (no-op for bg overlap). See `train_rl.py:_start_background_collection`.
 
-**Real fix (deferred to multi-gen prep)**: redesign as centralized inference server (workers send obs to single GPU process, which queues forwards on appropriate CUDA streams). ~2-3 day project. Saves $200-300 over multi-gen run vs $10-15 on Phase 1.
+**Real fix (deferred to multi-gen prep)**: redesign as centralized inference server. **Formal spec at `docs/CENTRALIZED_INFERENCE_DESIGN.md`** — phased implementation, validation plan, risk table. ~2-3 day project. Saves $200-300 over multi-gen run vs $10-15 on Phase 1.
 
 ### 3d. SelfPlayOpponent factory dispatch
 
@@ -404,7 +404,7 @@ NaN signals (FATAL — abort and diagnose):
 
 ### Multi-gen prep (next major work session — engineering throughput wins)
 
-1. **mp+pipeline redesign** (~2-3 day engineering project): centralized inference server. Workers send obs to single GPU process, queues forwards on low-priority CUDA streams (arbitrating with main's optimizer.step). Fixes both the GPU-contention deadlock (§3c) AND unlocks safer opp_device options (§3h). Saves $200-300 over a multi-gen run.
+1. **mp+pipeline redesign** (~2-3 day engineering project): centralized inference server. **Formal design: `docs/CENTRALIZED_INFERENCE_DESIGN.md`**. Workers send obs (numpy) to a single GPU process, which queues forwards on low-priority CUDA streams (arbitrating with main's optimizer.step on high-priority). Fixes both the GPU-contention deadlock (§3c) AND unlocks safer opp_device options (§3h). Saves $200-300 over a multi-gen run. Phased implementation (4 phases, each ~half-1 day) documented in design doc.
 
 2. **`torch.compile` fix for new arch** (~1 day): current `--compile` flag at `train_rl.py:612` targets `model.forward_spatial` which only exists on legacy `PokeTransformer`. New arch has `tokenizer + spatial + temporal` instead. Need to compile each module separately + validate forward output equivalence (compiled vs uncompiled, fp16, on identical seeded inputs). ~10-25% speedup per iter. Multi-gen lever.
 
