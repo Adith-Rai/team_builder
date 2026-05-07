@@ -439,6 +439,12 @@ For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 we
    - 3a. ✅ **DONE Session 50**: `torch.no_grad()` around backbone + policy forward in warmup. `ppo.py:ppo_update` accepts `in_warmup` arg. Saves ~50% on warmup update wall-time. ~$10-15 saved per 20-warmup-iter run.
    - 3b. (deferred) `epochs=1` during warmup (vs `args.ppo_epochs=5`). Additional 5x fewer optimizer steps. Defer until validated that `value_head` quality is preserved at fewer epochs.
 
+3.5 **mp_disk_collect memory hygiene** (~30 min, low risk — Phase 1 v3 finding):
+   - 3.5a. **`mp_disk_collect.py:535`** uses `weights_only=False` for opp ckpt loading. Local code (`eval_elo_ladder.py`, `model_transformer.py:726`) uses `weights_only=True`. With `False`, full ckpt incl. AdamW optimizer state (~480 MB per ckpt) is loaded into per-worker `opp_cache`. Saves ~480 MB × 3 cached × 8 workers = **~11 GB RSS**. Per worker drops 2.9 GB → ~1.4 GB.
+   - 3.5b. Audit other patterns vs local (see `docs/diag/mp_memory_audit.md` once async agent completes). Check for missing `del`/`gc.collect`/`empty_cache` between iters, missing `torch.no_grad()` blocks in batcher, optimizer state lurking in cached opp models.
+   - 3.5c. Validate: 1-iter mp smoke + RSS comparison. Expect worker total RSS to drop from ~23 GB to ~12 GB. Iter time should NOT change (memory ≠ time at this scale).
+   - **Why it didn't matter for Phase 1 v3**: 23 GB RSS on a 2 TB host is fine. But it caps `--mp-workers` at ~30 before OOM, and CIS implementation needs the headroom.
+
 ### Multi-gen architectural work (per `MULTIGEN_FEASIBILITY.md`)
 
 4. **Gen-id token** in `TransformerBattlePolicy` (~half day): `nn.Embedding(10, d_model)` for gens 0-9, concat into spatial sequence.
@@ -463,8 +469,69 @@ For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 we
 | #1 pipeline+mp redesign | ~25-30% iter time | $30-45 | $200-300 |
 | #2 torch.compile new arch | ~10-25% per iter | $15-25 | $100-200 |
 | #3 warmup speedup | ~75% on warmup phase | $15-25 | $50-100 |
+| #3.5 mp memory hygiene | ~11 GB RSS, no time saving | $0 (RAM headroom only) | enables higher N for CIS |
 | #4-6 gen-id + features | (enables multi-gen) | n/a | needed |
 | #7-9 corpus + BC v11 | (enables multi-gen) | n/a | needed |
+
+---
+
+## 8.5. RSS / iter-time watcher (cross-session diagnostic)
+
+Phase 1 v3 had iter time grow 41 → 51 min over iters 0-7 before plateauing.
+A bash watcher records main + worker RSS, GPU mem at end of each iter so
+we can detect leaks vs allocator-settling vs cuDNN-autotuning.
+
+### Setup (one-time per pod bootstrap)
+
+The watcher scripts live at `scripts/diag/`:
+- `scripts/diag/rss_watcher.sh` — the watcher (tails log, captures RSS)
+- `scripts/diag/rss_launcher.sh` — kills any existing watcher then nohups it
+
+```bash
+# scp + launch
+scp -i ~/.ssh/id_ed25519 -P <pod-port> scripts/diag/rss_watcher.sh \
+  root@<pod-ip>:/workspace/scripts/rss_watcher.sh
+scp -i ~/.ssh/id_ed25519 -P <pod-port> scripts/diag/rss_launcher.sh \
+  root@<pod-ip>:/workspace/scripts/rss_launcher.sh
+ssh -i ~/.ssh/id_ed25519 -p <pod-port> root@<pod-ip> \
+  "chmod +x /workspace/scripts/rss_*.sh && /workspace/scripts/rss_launcher.sh"
+```
+
+Watcher script edits to make per-pod:
+- `LOG=/workspace/logs/<your_run>.log` — match the actual log path
+- `MAIN_PID=<trainer_pid>` — find via `ps aux | grep train_rl.py` after launch
+
+### Reading the watcher (cross-session)
+
+The watcher writes to `/workspace/logs/rss_watcher.log` on the pod. To
+fetch in any session:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p <pod-port> root@<pod-ip> \
+  "cat /workspace/logs/rss_watcher.log" \
+  > docs/diag/rss_watcher_log_<run_name>.txt
+```
+
+Each line format:
+`HH:MM:SS iter=N main_rss_mb=X workers_total_mb=Y gpu_used_mb=Z workers_each_kb=[a,b,c,...]`
+
+### Acceptance criteria for "leak confirmed"
+
+Comparing two consecutive iter records:
+- Main RSS grows by >300 MB → confirmed main-side leak
+- Any worker RSS grows by >150 MB → confirmed worker-side leak
+- Stable RSS (±50 MB) → not a memory leak; iter time growth is from disk/cudnn/fragmentation
+
+### Phase 1 v3 result (recorded for reference)
+
+| Iter | Main RSS | Workers total | GPU |
+|---|---|---|---|
+| 6 (initial diag) | 10.6 GB | 23.2 GB | 20.7 GB |
+| 7 (watcher) | 10.4 GB | 23.0 GB | 20.9 GB |
+
+RSS slightly DOWN. Iter time growth was front-loaded cuDNN benchmark
+autotuning + allocator fragmentation, not a leak. Plateaued ~50-51 min/iter
+through warmup. Full record: `docs/diag/rss_watcher_log_phase1_v3.md`.
 
 ---
 

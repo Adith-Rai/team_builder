@@ -98,6 +98,34 @@ ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
   grep --line-buffered -E "Iter [0-9]+: W/L|EVAL|smart_avg|FATAL|Snapshot"
 ```
 
+**RSS / iter-time watcher (running on pod)**:
+A bash watcher records main+worker RSS, GPU mem at end of each iter.
+Started Session 50 cont. when iter time was growing 41 → 51 min over
+iters 0-7. Watcher data confirmed RSS is stable (not a leak); growth
+was front-loaded cuDNN autotuning + allocator settling and plateaued.
+
+```bash
+# Fetch latest watcher log to local
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+  "cat /workspace/logs/rss_watcher.log" \
+  > docs/diag/rss_watcher_log_phase1_v3.txt
+
+# Check the watcher process is alive on pod
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+  "ps -ef | grep rss_watcher | grep -v grep"
+
+# Restart watcher if it died (e.g., after a pod stop+resume)
+scp -i ~/.ssh/id_ed25519 -P 47913 scripts/diag/rss_watcher.sh \
+  root@195.26.233.30:/workspace/scripts/rss_watcher.sh
+scp -i ~/.ssh/id_ed25519 -P 47913 scripts/diag/rss_launcher.sh \
+  root@195.26.233.30:/workspace/scripts/rss_launcher.sh
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
+  "chmod +x /workspace/scripts/rss_*.sh && /workspace/scripts/rss_launcher.sh"
+```
+
+Watcher details + acceptance criteria for "leak confirmed":
+`docs/diag/rss_watcher_log_phase1_v3.md`
+
 ═══════════════════════════════════════════════════════════════════════════════
 SESSION 51 (THIS SESSION) — MULTI-GEN PREP TASK LIST
 ═══════════════════════════════════════════════════════════════════════════════
@@ -155,6 +183,29 @@ warmup iter wastes ~25 min on unused gradient compute.
 
 Saves ~$15-25 over a 20-warmup-iter run. Bigger win for multi-gen runs
 where warmup repeats per phase.
+
+#### B2. mp_disk_collect memory hygiene fixes (~30 min, low risk)
+
+Phase 1 v3 worker RSS is 2.9 GB each × 8 = 23 GB; iter time grew 41→51 min
+over iters 0-7 then plateaued. RSS watcher data showed no growth between
+iters — so not a leak — but `mp_disk_collect.py` is missing memory hygiene
+patterns present in local code paths. Specific fixes:
+
+1. **`mp_disk_collect.py:535`**: change `weights_only=False` →
+   `weights_only=True` for opp ckpt loading. Local `eval_elo_ladder.py` and
+   `model_transformer.py:726` use `weights_only=True`. With `False`, full
+   ckpt incl. AdamW optimizer state (480 MB per ckpt) is loaded into
+   `opp_cache`. Saves ~480 MB × 3 cached × 8 workers = **~11 GB RSS**.
+
+2. **Audit other patterns**: see `docs/diag/mp_memory_audit.md` (created
+   end of Session 50 cont., when async agent finished). Likely additional
+   small wins around `del` patterns, `torch.no_grad()` placement,
+   `model.eval()` confirmation.
+
+3. **Validate**: smoke 1-iter mp run with the fix; confirm worker RSS drops.
+
+Saves ~$5-15 on Phase 1 alone if applied to next run. Multi-gen lever:
+~$50-100 saved over a long run, plus headroom for larger N (workers).
 
 #### C. torch.compile fix for new arch (~1 day)
 
