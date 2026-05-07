@@ -3,7 +3,7 @@
 # MAIN_PID resolved dynamically each iter so the watcher survives
 # trainer kill+restart cycles (e.g., post-iter-9 leak-fix restart in
 # Session 50 cont.) without producing stale data.
-LOG=/workspace/logs/ppo_phase1_v3.log
+LOG=/workspace/logs/ppo_phase1_v3_resumed.log
 OUT=/workspace/logs/rss_watcher.log
 
 echo "=== watcher started at $(date) ===" >> $OUT

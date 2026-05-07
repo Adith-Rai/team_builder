@@ -13,8 +13,12 @@ Read in this exact order before doing anything:
 2. **`memory/project_vision_scope.md`** — load-bearing project goals
 3. **§ THE GOAL** below — re-read every time you make a decision
 4. **`docs/PPO_CLOUD_COOKBOOK.md`** — single authoritative cloud-runs reference
-5. **`docs/MULTIGEN_FEASIBILITY.md`** — multi-gen architecture scoping (gen 6+)
-6. **`docs/MP_DISK_REDESIGN.md`** — mp-disk implementation reference
+   - **§3j POKE_LOOP threading model** is the gotcha that hung the
+     mp_disk leak fix. Internalize before touching ANY code that
+     creates poke-env Players in a sequential `await` pattern.
+5. **`docs/diag/mp_memory_audit.md`** — what we fixed and why (Session 50 cont.)
+6. **`docs/MULTIGEN_FEASIBILITY.md`** — multi-gen architecture scoping (gen 6+)
+7. **`docs/MP_DISK_REDESIGN.md`** — mp-disk implementation reference
 
 ═══════════════════════════════════════════════════════════════════════════════
 THE GOAL — re-read every time you make a decision
@@ -55,6 +59,21 @@ WHERE PHASE 1 V3 STANDS (started Session 50, end of session)
 --n-iters 200 --warmup-iters 20 --lr 1e-5 --grad-accum 1
 --reward-style terminal --adaptive-entropy
 ```
+
+**Phase 1 v3 RESUMED 2026-05-07 09:54 UTC** after iter 9 cutover for
+memory leak fix + warmup-end (Session 50 cont.):
+```
+--resume data/models/rl_v10/ppo_phase1_v3_smoke/.../snapshot_0010.pt
+--device cuda --servers 9000-9007 --fp16 --mp --mp-workers 8
+--games-per-iter 1600 --max-concurrent 200 --opponent-device cuda
+--n-iters 190 --warmup-iters 0 --lr 1e-5 --grad-accum 1
+--reward-style terminal --adaptive-entropy --early-stop --eval-interval 10
+--out-dir data/models/rl_v10/ppo_phase1_v3_resumed
+```
+Resumed at iter 11 with the validated memory hygiene fixes (commit
+`bedcbc3`) live. Run dir: `data/models/rl_v10/ppo_phase1_v3_resumed/`.
+Log: `/workspace/logs/ppo_phase1_v3_resumed.log`. Watcher tracks new
+log path. ~190 iters × ~15-25 min/iter = ~50-80 hr remaining.
 
 **TF32 + cudnn.benchmark are now in `train_rl.py` module top** (parity with
 `train_bc.py`). `--fp16` enabled at launch. NO `--opponent-device cpu`
@@ -208,6 +227,46 @@ v3 burn ~$13-18 of zero-progress compute.
 **Saves**: ~$13-18 per 200-iter run; ~$50-100 over a multi-gen 5-7 week
 run with multiple phase warmups.
 
+#### B1.6. Update-phase optimization options (Session 50 cont. finding)
+
+Phase 1 v3 update phase is the current bottleneck for total iter time.
+Empirical Phase 1 v3 numbers:
+
+| Phase | Update wall-time |
+|---|---|
+| Warmup iter 0 | 28.1 min (5 epochs all run) |
+| Warmup iter 9 | 36.6 min (creep from cuDNN re-tuning + allocator) |
+| First post-warmup (smoke iter 10) | 41.5 min (cuDNN re-tunes for full backward graph) |
+| Steady-state estimate (iter 12+) | 5-15 min (KL early-stop fires at epoch 1-2 of 5) |
+
+What's already done (Session 50):
+- TF32 + cudnn.benchmark module-top — ~4-7% saving
+- Warmup `no_grad` wrapper around backbone — ~7% (autograd already auto-elided)
+- KL early-stop (target_kl × 1.5 = 0.045) — saves 60-80% post-warmup when policy moves
+- fp16 mixed precision — VRAM + 10-15% wall-time saving
+
+What's NOT yet investigated. Worth experimenting with in next session:
+
+| Optimization | Expected impact | Cost | Notes |
+|---|---|---|---|
+| `torch.compile` fix for new arch | 10-25% per backward | ~1 day | Already in TODO §C |
+| **bf16 vs fp16 trial** | 0-5% wall + safer numerics | ~30 min flag work + 1-iter benchmark | bf16 = same Tensor Core speed as fp16, no GradScaler overhead, fp32 range. On Ampere most modern frameworks default to bf16 over fp16. Very low risk to try. |
+| **Flash attention** | 10-30% on attention layers | needs torch ≥2.3 or rebuild w/ flash-attn package | Big potential win since we have transformer attention everywhere. Currently emitting "1Torch was not compiled with flash attention" warning at startup. |
+| **Adaptive epoch count** | 30-40% on first-post-warmup iter | ~2 hours | When KL is small after epoch 1, skip remaining epochs even before early-stop threshold. Avoids the 41-min first-post-warmup overhead. |
+| Fused AdamW (`torch.optim.AdamW(fused=True)`) | 3-7% on optimizer.step | ~10 min | Trivial flag flip, A100 supports it. |
+| Channels-last memory layout | 5-15% on conv (we have few) | refactor | Probably not worth for our arch. |
+| Gradient checkpointing | ~30% wall trade-off, 50% VRAM saving | ~1 day | We're not VRAM-bound, so net negative. Skip. |
+
+**The biggest single win is `--mp --pipeline` via CIS** (§A above) — it
+hides update wall-time entirely behind next iter's collect, making
+update wall-time effectively invisible. That's ~50% iter-time saving.
+Update-phase micro-optimizations are second-tier; CIS is first.
+
+**Order of operations recommended**: torch.compile fix (validated easy
+win) → bf16 trial (cheap experiment) → CIS (big architectural win) →
+flash attention (requires torch upgrade so do it after CIS settles) →
+adaptive epoch count (last; depends on observed steady-state behavior).
+
 **Don't conflate** the slight v_loss upward drift at iters 6-8 with
 "warmup not done" — it's two confounders (pool growth at iter 5; asyncio
 listener leak from missing fix 3.5b causing scheduler latency). Fix 3.5b
@@ -223,11 +282,20 @@ iters — so not a leak — but `mp_disk_collect.py` is missing memory hygiene
 patterns present in local code paths. Specific fixes:
 
 **Status (Session 50 cont., 2026-05-07)**: fixes 3.5a/b/c are
-**APPLIED** to `mp_disk_collect.py` and committed. Each has an inline
-`MEMORY HYGIENE` comment at the application site with file:line refs
-to the local pattern it mirrors. Validation against a 5-iter mp smoke
-run is the only remaining step — see `docs/diag/mp_memory_audit.md`
-for the implementation table and validation plan.
+**APPLIED + VERIFIED** to `mp_disk_collect.py`.
+- First attempt (commit `997fa32`) hung the smoke at +13 min into
+  iter 10 because `_cancel_listener(...).cancel()` is fire-and-forget
+  across threads (POKE_LOOP runs in a separate thread; see cookbook
+  §3j). Without yielding wall-clock time, sequential per-matchup
+  cancels overwhelmed POKE_LOOP.
+- Revised fix (commit `bedcbc3`) adds `await asyncio.sleep(1.5)` after
+  `_cancel_listener + del player, opponent`. Smoke v2 passed cleanly:
+  iter 10 finished W/L 703/897, v_loss 2.7995, all workers done
+  n_done=200/200, snapshot_0010.pt saved, workers shut down cleanly.
+- Each fix has an inline `MEMORY HYGIENE` comment with file:line refs
+  to the local pattern it mirrors + Phase 1 v3 incident reference.
+- Phase 1 v3 production now running 190 iters from snapshot_0010 with
+  these fixes live (run dir: `data/models/rl_v10/ppo_phase1_v3_resumed`).
 
 **Read first**: `docs/diag/mp_memory_audit.md` — audit agent compared
 local code paths against `mp_disk_collect.py` and found 5 missing
@@ -261,22 +329,20 @@ N>8 workers and CIS implementation headroom.
 4. PlayerPool refactor with live-instance teardown (`eval_elo_ladder.py:280-313`)
 5. `del all_trajs, bundle` BEFORE result_pipe.send (line 425-428 reorder)
 
-**Validation** (only step remaining for B2): the running Phase 1 v3 is
-on the OLD code path. To validate the fixes:
-- Option A (cheap): kick off a 5-iter mp smoke against the current pod
-  with the new code. ~4 hr / ~$6. Compare iter-time vs Phase 1 v3
-  watcher data (`docs/diag/rss_watcher_log_phase1_v3.md`). Acceptance:
-  iter time stays flat (not 41 → 51 → ...) AND worker RSS drops from
-  2.9 GB to ~1.0-1.3 GB.
-- Option B (defer to multi-gen): just trust the fixes — they're
-  all low-risk pattern-mirror changes from validated local code. Run
-  validation as part of the first multi-gen smoke.
+**Validation: ✅ DONE Session 50 cont.**
+- 1-iter cloud smoke from snapshot_0009 with new code (commit `bedcbc3`)
+- Smoke v2 passed: iter 10 finished W/L 703/897, v_loss 2.7995, all
+  workers reached n_done=200/200, snapshot_0010 saved, workers shut
+  down cleanly, 64 "Listen interrupted by" messages = expected (8
+  workers × 8 cancels each, fired correctly per design)
+- Phase 1 v3 production resumed from snapshot_0010 with all fixes live
+  (run dir `data/models/rl_v10/ppo_phase1_v3_resumed`, log
+  `/workspace/logs/ppo_phase1_v3_resumed.log`, watcher tracks the new
+  log path). 190 iters to go.
 
-User mentioned in Session 50 cont. that if CIS lands quickly they may
-re-init Phase 1 v3 from a snapshot — that re-init would automatically
-get these B2 fixes too.
-
-Estimated work: ~1 hour, **DONE Session 50 cont.** (commit `997fa32`).
+Estimated work: ~3 hours total (audit + first attempt + diagnosis +
+revised fix + smoke + production launch). **DONE** (commits `997fa32`
+hung version, `bedcbc3` working version).
 
 #### C. torch.compile fix for new arch (~1 day)
 

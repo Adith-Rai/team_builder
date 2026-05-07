@@ -13,11 +13,22 @@ memory pressure).
 
 | Fix | Status | mp_disk_collect.py location |
 |---|---|---|
-| 3.5a Strip opp ckpt | ✅ **APPLIED** | `_run_collect_in_worker` ~line 528 |
-| 3.5b Cancel listener + del + sleep | ✅ **APPLIED (revised after smoke hang)** | `_run_collect_in_worker` ~line 594 |
-| 3.5c Per-opp empty_cache | ✅ **APPLIED** | `_run_collect_in_worker` ~line 658 |
+| 3.5a Strip opp ckpt | ✅ **APPLIED + verified** (smoke v2, iter 10 completed cleanly) | `_run_collect_in_worker` ~line 528 |
+| 3.5b Cancel listener + del + sleep(1.5s) | ✅ **APPLIED + VERIFIED** (commit `bedcbc3` — smoke v2 passed where v1 hung) | `_run_collect_in_worker` ~line 594 |
+| 3.5c Per-opp empty_cache | ✅ **APPLIED + verified** (smoke v2) | `_run_collect_in_worker` ~line 658 |
 | 3.5d PlayerPool refactor | ⏸️ deferred (medium risk) | n/a |
 | 3.5e Reorder del all_trajs | ⏸️ deferred (marginal) | n/a |
+
+**Smoke v2 validation (2026-05-07 09:29 UTC, iter 10):**
+- Iter 10 completed: W/L 703/897 (43.9%), v_loss 2.7995, kl 0.0398
+- collect=939s (15.65 min) — same as Phase 1 v3 baseline
+- update=2491s (41.5 min) — first-post-warmup iter overhead
+  (cuDNN re-tuning fresh graph; subsequent iters expected ~5-15 min)
+- 64 "Listen interrupted by" messages logged (8 workers × 8 cancels each)
+  — these are the cancellations firing as designed, NOT errors
+- All 8 workers reached n_done=200/200 cleanly
+- Workers shut down cleanly at end of iter
+- snapshot_0010.pt saved successfully
 
 ### 3.5b implementation history
 
@@ -48,10 +59,10 @@ block at the application site explaining WHY, with file:line back-refs
 to the local pattern it mirrors. The module-level docstring also flags
 this for future maintainers.
 
-**Validation pending**: needs a 5-iter mp smoke run against current
-Phase 1 v3 launch config to confirm the iter-time creep flattens. Phase
-1 v3 in flight uses the OLD code path; if user re-inits from a snapshot
-(per their hint), the new code path will apply.
+**Validation: ✅ COMPLETE** (smoke v2, 2026-05-07 09:29 UTC). See the
+"Smoke v2 validation" block at top of this file. Phase 1 v3 production
+is now running 190 iters from snapshot_0010 with the validated fixes
+live (commit `bedcbc3`).
 
 **Five fixes, sorted by impact:**
 

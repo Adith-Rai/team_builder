@@ -28,10 +28,22 @@ python train_rl.py \
   --out-dir data/models/rl_v10/<run_name>
 ```
 
-**Empirical (Phase 1 v3, Session 50)**: warmup iters 0-19 land at ~42-52 min/iter
-(collect ~14-16 min + update ~28-35 min, all 5 PPO epochs run since KL early-stop
-disabled while only value_head trains). Post-warmup steady-state estimate
-~20-25 min/iter (KL early-stop reduces update phase). Total run ~74-100 hr.
+**Empirical (Phase 1 v3, Session 50)**: warmup iters 0-9 landed at 42-52 min/iter
+(collect ~14-16 min + update ~28-37 min, all 5 PPO epochs run since KL early-stop
+disabled while only value_head trains). The update phase crept upward iter-over-iter
+(28 → 37 min) due to cuDNN allocator fragmentation + autotuning of new shapes.
+
+**First-post-warmup iter (smoke v2 iter 10, validated)**: 57 min total
+(collect 15.7 + update 41.5). The update is longer than warmup-iter average
+because it's the first iter where the FULL backward graph runs (gradient
+flows through value_head AND policy_head AND backbone; warmup had only
+value_head trainable, with `no_grad` blocking the rest). cuDNN re-tunes
+kernels for the fresh graph → one-time overhead.
+
+**Post-warmup steady-state estimate**: ~15-25 min/iter once KL early-stop
+fires regularly (typically iter 12+ when policy is moving). Update drops
+to ~5-15 min as early-stop fires at epoch 1-2 of 5. Total Phase 1 v3
+production run ~70-95 hr.
 
 **`--warmup-iters` revised: 5 not 20.** Phase 1 v3 v_loss curve showed value
 head fully converged at iter 3-5 (Δ < 0.005 by iter 4); subsequent iters
@@ -261,6 +273,38 @@ the plumbing works. Just don't use at production conc.
 
 **Status**: known issue. Real fix needs ~1 day to compile `tokenizer + spatial + temporal` separately + validate. Listed as multi-gen prep in §8. **Don't pass `--compile` until fixed.**
 
+### 3j. POKE_LOOP threading model — CRITICAL for any code creating poke-env Players
+
+**This is the gotcha that hung mp_disk_collect's first leak-fix attempt** (commit `997fa32`, then fixed in `bedcbc3`). Read this before touching any code that creates/destroys poke-env Players.
+
+`PSClient._listening_coroutine` is **NOT an asyncio.Task in your event loop.** It's a `concurrent.futures.Future` representing a coroutine running in `POKE_LOOP` — poke-env's GLOBAL event loop, which lives in a **separate thread** spawned at module import.
+
+```python
+# poke_env/ps_client/ps_client.py:90
+self._listening_coroutine = asyncio.run_coroutine_threadsafe(
+    self.listen(), POKE_LOOP
+)
+```
+
+Implications:
+
+1. **`_listening_coroutine.cancel()` is fire-and-forget across threads.** It returns immediately; the actual cancellation happens asynchronously in POKE_LOOP. The websocket close (in `async with ws.connect(...)` cleanup) and TCP shutdown also happen there.
+
+2. **In single-process pipeline (`rl_collection.py`):** the `asyncio.gather(*coros)` pattern provides natural yield points between coroutines, giving POKE_LOOP enough wall-clock time to drain cancellations + ws-closes between matchups. `_cancel_listener` works fine.
+
+3. **In `mp_disk_collect.py`:** opps run **sequentially** inside each worker (`await _play_vs_opp` one at a time). Without an explicit yield, POKE_LOOP backs up on listener cleanups while we're already creating new ws connections for the next matchup → **POKE_LOOP overload → worker hangs at 99% CPU**.
+
+**The fix (commit `bedcbc3`)**: add `await asyncio.sleep(1.5)` after `_cancel_listener(...) + del player, opponent` in `_play_vs_opp`. Gives POKE_LOOP wall-clock time to drain the cancellation + close the websocket before next matchup creates a new connection.
+
+**Rule for future code**: any sequential code path in this codebase that creates poke-env Players AND calls `_cancel_listener` MUST yield wall-clock time afterward. The `asyncio.gather` pattern is fine without this; sequential `await` is not.
+
+**Where this matters going forward**:
+- CIS implementation (planned multi-gen prep) — workers may handle ws differently; double-check threading model when writing CIS worker code
+- Any new collection mode (e.g., async iter pipeline) — same rule
+- Multi-gen format-switching code that creates new Players per format — same rule
+
+The fix has small overhead: ~1.5s × ~10 opps × N workers (parallel) / N parallel = ~15s/iter total. Negligible vs the ~$30-50/run leak it prevents.
+
 ---
 
 ## 4. Hyperparameters (validated for transformer arch + lr=1e-5)
@@ -464,10 +508,14 @@ For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 we
    - ⏸️ 3.5d. (deferred, medium risk) PlayerPool refactor with live-instance teardown
    - ⏸️ 3.5e. (deferred, marginal) Reorder `del all_trajs, bundle` before result_pipe.send
 
-   **Validation pending**: running Phase 1 v3 is on the OLD code path. Either:
-   (A) 5-iter mp smoke against current pod with new code (~$6); or
-   (B) defer validation to first multi-gen smoke. User may re-init Phase 1 v3
-   from a snapshot if CIS lands quickly — that would auto-pick up these fixes.
+   **Validation: ✅ COMPLETE** (smoke v2 at iter 10, 2026-05-07).
+   - First attempt (commit `997fa32`) hung — diagnosed root cause as
+     POKE_LOOP threading (see §3j). Fix added `await asyncio.sleep(1.5)`
+     after `_cancel_listener + del player, opponent` (commit `bedcbc3`).
+   - Smoke v2 passed: iter 10 finished W/L 703/897, v_loss 2.7995,
+     all 8 workers reached n_done=200/200, snapshot_0010.pt saved,
+     workers shut down cleanly.
+   - Phase 1 v3 production resumed from snapshot_0010 with fixes live.
 
 ### Multi-gen architectural work (per `MULTIGEN_FEASIBILITY.md`)
 
