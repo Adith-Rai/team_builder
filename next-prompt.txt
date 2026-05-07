@@ -365,19 +365,31 @@ Estimated work: ~3 hours total (audit + first attempt + diagnosis +
 revised fix + smoke + production launch). **DONE** (commits `997fa32`
 hung version, `bedcbc3` working version).
 
-#### C. torch.compile fix for new arch (~1 day)
+#### C. torch.compile fix for new arch ✅ DONE Session 51 (2026-05-07)
 
-The `--compile` flag in `train_rl.py:612` targets `model.forward_spatial`
-which only exists on legacy `PokeTransformer`. New `TransformerBattlePolicy`
-doesn't have that method, so `--compile` silently fails.
+**The earlier doc claim was wrong.** `forward_spatial` DOES exist on
+`TransformerBattlePolicy` (model_transformer.py:1992) and is used in
+production. The actual blockers were:
+1. **Env**: torch 2.2.x + triton 3.0.0 on the pod was a version mismatch.
+   Fix: `pip install triton==2.2.0`.
+2. **Path 1 (single-method compile) was incomplete** — wrapping just
+   `forward_spatial` covers ~40-60% of the inference path; temporal stack
+   + action/value heads stay uncompiled.
 
-**Fix**:
-- Compile `tokenizer + spatial + temporal` separately on new arch
-- Validate forward output equivalence (compiled vs uncompiled, fp16, on
-  identical seeded inputs — small max abs diff acceptable)
-- Document in cookbook
+**Path 2 shipped**: per-submodule compile of `tokenizer / spatial /
+temporal / action_head / value_head` with `mode="default", dynamic=True`,
+`_dynamo.config.suppress_errors=True` (B=1 fallback). Coverage ~90+%.
 
-Saves ~10-25% per iter. Multi-gen lever.
+**Measured**: 1.12-1.25× full forward speedup (synthetic B=8 fp16 A100);
+backward equivalence PASS; B=1..256 all handled. See cookbook §3i for
+full diagnostic + production config.
+
+Tier 1 also shipped Session 51:
+- Fused AdamW autodetected on Ampere+ (3-7% on optimizer.step)
+- `--bf16` flag (mutex with `--fp16`) via `precision_config.py` global
+  helper. bf16 = same Ampere Tensor Core speed as fp16 + fp32 dynamic
+  range (no -1e9 mask overflow). Affects collect path only; PPO update
+  remains fp32 (separate optimization, see §B1.6).
 
 #### D. Multi-gen architectural changes (~1-2 weeks)
 

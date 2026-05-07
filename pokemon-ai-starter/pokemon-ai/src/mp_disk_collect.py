@@ -347,6 +347,15 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
     server_url = cmd["server_url"]
     rs_cfg = cmd["rs_cfg"]
     fp16 = cmd.get("fp16", True)
+    # bf16/fp16/fp32 selection: each worker is a separate Python interpreter, so
+    # the global amp dtype must be set on the worker side too. Main passes a
+    # string ("fp16"/"bf16"/"fp32") in the cmd dict; we translate + set here
+    # BEFORE any forward call. See precision_config.py docstring.
+    try:
+        from precision_config import set_amp_dtype, parse_amp_dtype
+        set_amp_dtype(parse_amp_dtype(cmd.get("amp_dtype")))
+    except Exception:
+        pass  # legacy callers without amp_dtype field fall back to fp16 bool
     turn_cap = cmd.get("turn_cap", 300)
     battle_format = cmd.get("battle_format", "gen9ou")
     procedural_teams_path = cmd.get("procedural_teams_path")
@@ -816,6 +825,7 @@ def mp_disk_collect_sync(
     iter_n: int,
     n_workers: int = 8,
     rng_seed: Optional[int] = None,
+    amp_dtype: Optional[str] = None,  # "fp16"|"bf16"|"fp32"|None
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter collect using N workers + disk traj.
 
@@ -887,6 +897,7 @@ def mp_disk_collect_sync(
             "device": str(device),
             "opponent_device": opponent_device,  # workers load opp ckpt on this device
             "rng_seed": rng_seed,
+            "amp_dtype": amp_dtype,  # picked up by worker via precision_config.set_amp_dtype
         }
         # Pipe.send is blocking-but-fast (no timeout API); fine for small msgs
         _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
@@ -1083,6 +1094,7 @@ class MPDiskBgCollector:
                 "procedural_teams_path": args_dict.get("teambuilder_path"),
                 "device": str(device),
                 "rng_seed": random.randint(0, 1_000_000),
+                "amp_dtype": args_dict.get("amp_dtype"),  # bf16 plumbing for bg path
             }
             _GLOBAL_MANAGER.ctrl_pipes[wid].send(cmd)
 

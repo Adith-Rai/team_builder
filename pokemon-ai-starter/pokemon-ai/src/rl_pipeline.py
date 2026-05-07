@@ -24,6 +24,8 @@ from poke_env.player import Player
 from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
 
+from precision_config import autocast_ctx
+
 from features import make_features, MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM
 from model import PokeTransformer
 from ppo import Trajectory, _cancel_listener
@@ -140,7 +142,7 @@ class InferenceServer:
 
         mega = self._stack_obs_to_device([r[2] for r in infer_requests])
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.fp16):
+        with torch.no_grad(), autocast_ctx(self.fp16):
             t0 = time.time()
 
             spatial_out, summaries = model.forward_spatial(mega)

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from poke_env.player import Player
 from features import make_features
+from precision_config import autocast_ctx
 from model_transformer import (
     TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
 )
@@ -122,7 +123,7 @@ class BattleAgentTransformer(Player):
         history = self._get_history(btag)
 
         # Forward pass.
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.fp16):
+        with torch.no_grad(), autocast_ctx(self.fp16):
             out = self.model(batch, history=history)
 
         # Update history (always float32 for stable accumulation).

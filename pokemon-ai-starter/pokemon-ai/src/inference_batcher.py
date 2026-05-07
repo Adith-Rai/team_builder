@@ -21,6 +21,7 @@ from arch_compat import (
     get_v_support,
 )
 from model import PokeTransformer
+from precision_config import autocast_ctx
 
 
 class InferenceBatcher:
@@ -124,7 +125,7 @@ class InferenceBatcher:
         # Stack batch dicts: (1, ...) -> (N, ...)
         mega = self._stack_batches([r[0] for r in requests])
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.fp16):
+        with torch.no_grad(), autocast_ctx(self.fp16):
             # Phase 1: Batched spatial
             spatial_out, summaries = model.forward_spatial(mega)  # (N, 16, D), (N, D)
 

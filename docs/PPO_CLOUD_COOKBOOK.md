@@ -267,11 +267,78 @@ unlocks safer opp_device options.
 revisit CPU opp at smaller scale (small concurrency, small N workers),
 the plumbing works. Just don't use at production conc.
 
-### 3i. `--compile` flag is broken for new arch
+### 3i. `--compile` — actual failure mode + Path 2 fix (Session 51, 2026-05-07)
 
-`train_rl.py:612` calls `torch.compile(model.forward_spatial, ...)` — but `forward_spatial` only exists on legacy `PokeTransformer`. New `TransformerBattlePolicy` doesn't have that method. Compile silently fails with `AttributeError` (caught + printed as "torch.compile: SKIPPED").
+**The earlier doc claim was wrong.** Cookbook + next-prompt previously said
+`--compile` fails with `AttributeError` because `forward_spatial` doesn't
+exist on `TransformerBattlePolicy`. **The method does exist** (model_transformer.py:1992),
+and is called by `inference_batcher.py:129` and `ppo.py:182` in production
+without issue. The actual blockers are:
 
-**Status**: known issue. Real fix needs ~1 day to compile `tokenizer + spatial + temporal` separately + validate. Listed as multi-gen prep in §8. **Don't pass `--compile` until fixed.**
+1. **Environment**: torch + triton must be version-matched. torch 2.2.x
+   requires triton 2.2.x. Pod (RunPod base image) ships with torch 2.2.1 +
+   triton 3.0.0 — mismatch causes:
+   ```
+   ImportError: cannot import name 'get_cuda_stream' from 'triton.runtime.jit'
+   ```
+   at compile-decoration time, BEFORE any model code runs. Fix:
+   `pip install triton==2.2.0` on the pod (one-time per pod). torch 2.4.x
+   uses triton 3.0.0 — if upgrading torch in a future pod, no triton pin
+   needed.
+
+2. **Path 1 (single-method) is incomplete** — wrapping only
+   `model.forward_spatial` covers only ~40-60% of the inference path.
+   Temporal stack (4 attention layers), action_head, value_head all stay
+   uncompiled. Iter-level speedup is much smaller than the spatial-only
+   2.49× microbenchmark suggests.
+
+3. **Path 2 (per-submodule compile) is the proper fix** — wrap each of
+   `tokenizer`, `spatial`, `temporal`, `action_head`, `value_head` separately
+   with `torch.compile(...)`. Coverage jumps to ~90+% of the compute path.
+   Plus per-module `nn.Module` boundaries are cleaner Dynamo graphs than
+   the dict-driven outer `forward_spatial`.
+
+**Production config** (now in `train_rl.py` `--compile` path):
+```python
+torch._dynamo.config.suppress_errors = True  # B=1 fallback safety net
+for sub in ("tokenizer", "spatial", "temporal", "action_head", "value_head"):
+    setattr(model, sub, torch.compile(getattr(model, sub),
+                                       mode="default", dynamic=True))
+```
+
+**Why mode="default" not "reduce-overhead"**:
+- reduce-overhead uses CUDA Graph replay (slightly faster steady state) but
+  requires `torch.compiler.cudagraph_mark_step_begin()` between invocations
+  to avoid the "tensor overwritten by subsequent run" aliasing crash, AND
+  recompiles per shape (high cost under InferenceBatcher's variable B).
+- default uses Inductor codegen without cudagraphs. ~1.25× speedup on full
+  forward, robust across all shapes once compiled, no aliasing constraints.
+  Safer over multi-gen 5-7 week runs.
+
+**Why dynamic=True**: tells Dynamo to mark batch dim dynamic from the start,
+avoiding a second recompile pass when a new B arrives.
+
+**Why suppress_errors=True**: torch 2.2.x has a known dynamic-shape bug at
+B=1 in the tokenizer's `_encode_pokemon_block` (concat of symint-derived
+tensors). suppress_errors falls back to eager for that single call, no crash.
+
+**Measured impact (Session 51 synthetic smoke, B=8 fp16, A100 80GB)**:
+- Per-submodule compile decoration: all 5 OK
+- End-to-end forward equivalence vs eager: PASS (max abs diff 7.81e-3,
+  fp16 fused-kernel tolerance)
+- Backward equivalence: PASS (1.23% rel grad-norm diff)
+- B=1 falls back via suppress_errors as designed
+- Steady-state forward speedup: 1.12-1.25× (full forward path)
+
+PPO update path note: `ppo_update` does NOT wrap forward_spatial in autocast
+currently — the update runs in fp32. So `--fp16` / `--bf16` only affects
+collect (via InferenceBatcher). Adding autocast to update is a separate
+optimization (with own validation: GradScaler for fp16, gradient sanity
+checks). Not included in Session 51 Tier 1.
+
+**Don't pass `--compile`** without first ensuring triton matches torch on
+the pod. Future pod bootstraps should `pip install triton==<matching>`
+before running training.
 
 ### 3j. POKE_LOOP threading model — CRITICAL for any code creating poke-env Players
 
@@ -321,6 +388,7 @@ The fix has small overhead: ~1.5s × ~10 opps × N workers (parallel) / N parall
 | `--win-rate-mode` | `ema` | Forgets old data in PFSP weighting; prevents stuck weights when policy beats old snapshot. |
 | `--win-rate-ema-alpha` | `0.3` | Smoothing constant. |
 | `--win-rate-ema-window` | `50` | Effective games cap; bounds influence of single batch. |
+| `--fp16` / `--bf16` | mutex group | Mixed precision autocast. fp16 (default current) uses float16 dtype; bf16 (Session 51 added) uses bfloat16 — same Tensor Core throughput on Ampere, no GradScaler overhead, fp32 dynamic range (avoids -1e9 mask overflow). bf16 is the modern default on Ampere+; fp16 retained for backward compat. Plumbed via `precision_config.set_amp_dtype()` global; mp workers get the dtype via cmd dict + their own `set_amp_dtype` on receipt. **Note**: only affects collect-path autocast (InferenceBatcher). PPO update path runs in fp32 currently; adding autocast there is a separate optimization. |
 | `--turn-cap` | `300` | Forfeit turn budget. T-quadratic memory means going higher (e.g., 1000) costs ~10× more VRAM per battle. |
 | `--snapshot-interval` | `5` | Save every 5 iters. With 200 iters → ~40 snapshots → pool curated to 15 via `--pool-max-current-run`. |
 | `--eval-interval` | `20` | Smart-bot eval every 20 iters. With 200 iters → 10 eval points. |
@@ -485,7 +553,11 @@ For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 we
 
 1. **mp+pipeline redesign** (~2-3 day engineering project): centralized inference server. **Formal design: `docs/CENTRALIZED_INFERENCE_DESIGN.md`**. Workers send obs (numpy) to a single GPU process, which queues forwards on low-priority CUDA streams (arbitrating with main's optimizer.step on high-priority). Fixes both the GPU-contention deadlock (§3c) AND unlocks safer opp_device options (§3h). Saves $200-300 over a multi-gen run. Phased implementation (4 phases, each ~half-1 day) documented in design doc.
 
-2. **`torch.compile` fix for new arch** (~1 day): current `--compile` flag at `train_rl.py:612` targets `model.forward_spatial` which only exists on legacy `PokeTransformer`. New arch has `tokenizer + spatial + temporal` instead. Need to compile each module separately + validate forward output equivalence (compiled vs uncompiled, fp16, on identical seeded inputs). ~10-25% speedup per iter. Multi-gen lever.
+2. **`torch.compile` fix for new arch** ✅ **DONE Session 51 (2026-05-07)**: Path 2 per-submodule compile (tokenizer + spatial + temporal + action_head + value_head) with `mode="default", dynamic=True`, `_dynamo.config.suppress_errors=True`. Env requirement: triton must match torch (`pip install triton==2.2.0` for torch 2.2.x). See §3i for full diagnostic + production config. 1.12-1.25× full forward speedup measured; backward equivalence PASS (1.23% rel grad-norm diff); all batch sizes B=1..256 handled (B=1 falls back via suppress_errors).
+
+2a. **Tier 1 companion wins** ✅ **DONE Session 51**:
+   - Fused AdamW (`torch.optim.AdamW(fused=True)`) on Ampere+ devices. 3-7% on optimizer.step. `train_rl.py` autodetects via `torch.cuda.get_device_capability()[0] >= 8`.
+   - `--bf16` flag added (mutex with `--fp16`). Plumbed via `precision_config.py` global helper + cmd-dict propagation to mp workers. bf16 = same Tensor Core throughput as fp16, no GradScaler overhead, fp32 dynamic range. Modern default on Ampere+. fp16 retained for backward compat. Note: only affects collect-path autocast; PPO update is fp32 (separate optimization).
 
 3. **Warmup speedup**:
    - 3a. ✅ **DONE Session 50**: `torch.no_grad()` around backbone + policy forward in warmup. `ppo.py:ppo_update` accepts `in_warmup` arg. Saves ~50% on warmup update wall-time. ~$10-15 saved per 20-warmup-iter run.

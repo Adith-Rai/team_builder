@@ -57,6 +57,8 @@ except Exception:
 
 from multiprocessing import Queue as MPQueue, Event as MPEvent
 
+from precision_config import autocast_ctx
+
 from poke_env.ps_client.account_configuration import AccountConfiguration
 
 from model import PokeTransformer, PokeTransformerConfig
@@ -167,7 +169,7 @@ def _inference_server_process(
 
         mega = _stack_obs_to_device([r[2] for r in infer_requests], device)
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=fp16):
+        with torch.no_grad(), autocast_ctx(fp16):
             t0 = time.time()
 
             spatial_out, summaries = model.forward_spatial(mega)

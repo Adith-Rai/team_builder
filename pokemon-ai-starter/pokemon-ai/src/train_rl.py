@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch._dynamo  # imported at module top so any later reference inside main() doesn't shadow `torch` as a local
 
 # Linux/Ampere optimizations (parity with train_bc.py — Session 50 audit found
 # these were missing from train_rl.py despite being free wins):
@@ -129,7 +130,16 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=10,
                    help="Accumulate gradients over N episodes before each optimizer step")
     p.add_argument("--warmup-iters", type=int, default=5)
-    p.add_argument("--fp16", action="store_true")
+    # --fp16 / --bf16 are mutually exclusive autocast precision flags.
+    # bf16: same Tensor Core throughput as fp16 on Ampere, no GradScaler
+    # overhead, fp32 dynamic range (avoids the -1e9 mask overflow trap).
+    # Modern frameworks default to bf16 over fp16 on Ampere+. fp16 kept
+    # as default for backward compat with prior runs.
+    _amp_group = p.add_mutually_exclusive_group()
+    _amp_group.add_argument("--fp16", action="store_true",
+                            help="Mixed-precision autocast in fp16")
+    _amp_group.add_argument("--bf16", action="store_true",
+                            help="Mixed-precision autocast in bf16 (Ampere+ only)")
     p.add_argument("--ko-coef", type=float, default=0.05)
     p.add_argument("--hp-coef", type=float, default=0.02)
     p.add_argument("--reward-clip", type=float, default=2.0)
@@ -322,6 +332,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             procedural_teams_path=getattr(args, 'procedural_teams', None),
             iter_n=getattr(args, '_current_iter', 0),
             n_workers=args.mp_workers,
+            amp_dtype=getattr(args, 'amp_dtype_name', None),
         )
         _flow(f"mp-disk collect done: {mp_result[6]:.0f}s, "
               f"{len(mp_result[0])} trajs")
@@ -597,6 +608,22 @@ def main():
     device = torch.device(args.device)
     battle_format = args.format
 
+    # Set the global amp dtype ONCE here so every autocast site (in this
+    # process AND in mp workers via cmd dict propagation) picks it up.
+    # See precision_config.py docstring for rationale.
+    from precision_config import set_amp_dtype, parse_amp_dtype, amp_dtype_name
+    if args.bf16:
+        args.amp_dtype_name = "bf16"
+    elif args.fp16:
+        args.amp_dtype_name = "fp16"
+    else:
+        args.amp_dtype_name = "fp32"
+    set_amp_dtype(parse_amp_dtype(args.amp_dtype_name))
+    # Keep args.fp16 True if either flag implies amp on, so legacy callers
+    # that read fp16 bool still get autocast enabled (with the right dtype).
+    args.fp16 = args.fp16 or args.bf16
+    print(f"AMP dtype: {args.amp_dtype_name}", flush=True)
+
     # Resolve initial checkpoint source. Require at least one of --init-from / --resume
     # (previously --init-from was always required; making it fallback-friendly so you
     # can resume sp2979-style runs without passing a BC checkpoint path).
@@ -612,17 +639,83 @@ def main():
     model, cfg, _ = load_checkpoint(init_path, device)
     model.to(device)
 
-    # torch.compile (Linux/cloud only)
+    # torch.compile (Linux/cloud only - Windows local has no compile support;
+    # the try/except below degrades gracefully there).
+    #
+    # Path 2 per-submodule compile (Session 51 finding, 2026-05-07): the prior
+    # single-method `torch.compile(model.forward_spatial)` call only covered
+    # tokenizer + spatial + summary projection (~40-60% of the inference path).
+    # Compiling each nn.Module submodule separately covers ~90+%: temporal,
+    # action_head, value_head also get optimized.
+    #
+    # mode="default" + dynamic=True chosen over mode="reduce-overhead" for
+    # production robustness:
+    # - reduce-overhead uses CUDA Graph replay (faster steady state, ~1.45x
+    #   on full forward) but requires `torch.compiler.cudagraph_mark_step_begin()`
+    #   between invocations to avoid tensor-aliasing crashes, and recompiles
+    #   per shape (high cost under InferenceBatcher's variable B + PPO update's
+    #   variable T).
+    # - default uses Inductor codegen without cudagraphs. ~1.25x on full
+    #   forward, identical performance across all shapes once compiled, no
+    #   aliasing constraints. Predictable over multi-gen 5-7 week runs.
+    #
+    # `dynamic=True` hints Dynamo to mark batch dim dynamic from the start,
+    # avoiding the second recompile pass when a new B arrives.
+    #
+    # `_dynamo.config.suppress_errors=True` is the safety net for the known
+    # B=1 dynamic-shape edge in the tokenizer's `_encode_pokemon_block` (concat
+    # of symint-derived tensors fails on torch 2.2.x). Falls back to eager for
+    # that single call, no crash.
+    #
+    # Env requirement: torch + triton version match (e.g., torch 2.2.x needs
+    # triton 2.2.x; torch 2.4.x needs triton 3.0.x). Mismatch triggers
+    # `ImportError: cannot import name 'get_cuda_stream' from 'triton.runtime.jit'`
+    # at compile-decoration time. Pod fix: `pip install triton==2.2.0` for
+    # torch 2.2.1.
+    #
+    # See `docs/PPO_CLOUD_COOKBOOK.md` §3i for full diagnostic history.
     compiled = False
     if args.compile:
         try:
-            model.forward_spatial = torch.compile(model.forward_spatial, mode="reduce-overhead")
-            compiled = True
-            print("torch.compile: spatial encoder compiled successfully", flush=True)
+            torch._dynamo.config.suppress_errors = True
+
+            submodules_to_compile = [
+                "tokenizer", "spatial", "temporal", "action_head", "value_head",
+            ]
+            n_ok = 0
+            for name in submodules_to_compile:
+                if not hasattr(model, name):
+                    print(f"torch.compile: model has no '{name}' submodule, skipping",
+                          flush=True)
+                    continue
+                try:
+                    sub = getattr(model, name)
+                    setattr(model, name,
+                            torch.compile(sub, mode="default", dynamic=True))
+                    n_ok += 1
+                except Exception as sub_e:
+                    print(f"torch.compile: '{name}' SKIPPED ({sub_e})", flush=True)
+            compiled = n_ok > 0
+            if compiled:
+                print(f"torch.compile: {n_ok}/{len(submodules_to_compile)} submodules "
+                      f"compiled (mode=default, dynamic=True)", flush=True)
+            else:
+                print("torch.compile: no submodules compiled successfully", flush=True)
         except Exception as e:
+            # Outermost guard: if torch._dynamo import or anything else fails,
+            # don't crash the run - just fall back to eager.
             print(f"torch.compile: SKIPPED ({e})", flush=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # fused=True uses CUDA-native fused AdamW kernel on supported devices
+    # (Ampere+ A100 supports it). 3-7% saving on optimizer.step. Falls back
+    # to non-fused on CPU/older GPUs automatically.
+    _fused_supported = device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=1e-4,
+        fused=_fused_supported,
+    )
+    if _fused_supported:
+        print("optimizer: AdamW fused kernel enabled", flush=True)
 
     # Run directory + TensorBoard
     run_id = time.strftime("%Y%m%d_%H%M%S")
