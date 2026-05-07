@@ -254,6 +254,8 @@ What's NOT yet investigated. Worth experimenting with in next session:
 | **Flash attention** | 10-30% on attention layers | needs torch ≥2.3 or rebuild w/ flash-attn package | Big potential win since we have transformer attention everywhere. Currently emitting "1Torch was not compiled with flash attention" warning at startup. |
 | **Adaptive epoch count** | 30-40% on first-post-warmup iter | ~2 hours | When KL is small after epoch 1, skip remaining epochs even before early-stop threshold. Avoids the 41-min first-post-warmup overhead. |
 | Fused AdamW (`torch.optim.AdamW(fused=True)`) | 3-7% on optimizer.step | ~10 min | Trivial flag flip, A100 supports it. |
+| **Re-test `grad_accum > 1`** | 5-15% (fewer optimizer steps + cleaner gradients) | ~30 min | Currently 1 because old runs at >1 had instability on legacy MLP. Worth re-testing on current transformer arch. With 1600 episodes/iter × 5 epochs = 8000 optimizer steps; grad_accum=4 would 4× reduce that, plus lower per-step variance. |
+| **Transition-level minibatching** (refactor) | 10-25% on update wall + better convergence | ~1-2 days | Currently we update one episode at a time (variable T=50-300 per episode). Standard PPO uses fixed minibatches of 256-1024 transitions across episodes. Refactor needs careful temporal-context handling per-transition. Bigger lift but unlocks proper Tensor Core utilization on A100. |
 | Channels-last memory layout | 5-15% on conv (we have few) | refactor | Probably not worth for our arch. |
 | Gradient checkpointing | ~30% wall trade-off, 50% VRAM saving | ~1 day | We're not VRAM-bound, so net negative. Skip. |
 
