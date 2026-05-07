@@ -315,7 +315,7 @@ The fix has small overhead: ~1.5s × ~10 opps × N workers (parallel) / N parall
 | `--lam` | `0.95` | GAE lambda. Session 39 validated. |
 | `--ent-coef` | `0.02` | Session 39 validated. With adaptive-entropy active, this is just the starting point. |
 | `--target-kl` | `0.03` (default) | KL early stop threshold. Validated. |
-| `--grad-accum` | **`1`** (default) | "Mandatory" claim from Session 31 docs is not solidly supported. The grad_accum=10 test that flagged stability happened alongside FP16 NaN fixes + lr-restart issues + snapshot-pool pollution, not in isolation. AND on legacy MLP arch at lr=1e-4. **Re-testing grad_accum=4 at lr=1e-5 on transformer arch is in TODO §B1.6** — could give 5-15% wall + cleaner gradients. Until then, default to 1 for safety. |
+| `--grad-accum` | **`1`** (default) | "Mandatory" claim from Session 31 docs is not solidly supported. The grad_accum=10 test happened alongside FP16 NaN fixes + lr-restart issues + snapshot-pool pollution, not in isolation. AND on legacy MLP arch at lr=1e-4. **Critical context**: `grad_accum=1` is 48× below published practice — Metamon batches 48 episodes per forward, ps-ppo batches 256-2048 transitions per gradient. We've been training in a needlessly-noisy regime. **Re-test target is 16-48, not timid 4** — see TODO §B1.6. Wall savings small (~4-5%); convergence-quality savings large (10-30% iter-count). Default still 1 until smoke validates higher; binary-search 16 → 32 → 48 vs 8 → 4 fallback. |
 | `--reward-style` | `terminal` | Session 43+ validated. Was `dense` earlier. |
 | `--adaptive-entropy-low/high` | `0.65 / 0.95` | Session 43 safeguards entropy collapse. |
 | `--win-rate-mode` | `ema` | Forgets old data in PFSP weighting; prevents stuck weights when policy beats old snapshot. |
