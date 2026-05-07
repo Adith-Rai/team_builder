@@ -254,8 +254,8 @@ What's NOT yet investigated. Worth experimenting with in next session:
 | **Flash attention** | 10-30% on attention layers | needs torch ≥2.3 or rebuild w/ flash-attn package | Big potential win since we have transformer attention everywhere. Currently emitting "1Torch was not compiled with flash attention" warning at startup. |
 | **Adaptive epoch count** | 30-40% on first-post-warmup iter | ~2 hours | When KL is small after epoch 1, skip remaining epochs even before early-stop threshold. Avoids the 41-min first-post-warmup overhead. |
 | Fused AdamW (`torch.optim.AdamW(fused=True)`) | 3-7% on optimizer.step | ~10 min | Trivial flag flip, A100 supports it. |
-| **Re-test `grad_accum`, target 16-48 (Metamon-equivalent)** | ~4-5% wall + 10-30% iter-count saving (cleaner gradients → fewer iters to same quality) | ~30 min smoke per value | **Baseline grad_accum=1 is 48× below published practice** — Metamon ships at batch=48 sequences per forward (effective grad_accum=48). ps-ppo batches 256-2048 transitions per gradient. Our `grad_accum=1` puts us in a needlessly-noisy regime. The Session 31 "stability issue" finding that locked us at 1 was on legacy MLP at lr=1e-4 alongside concurrent FP16 NaN fixes — un-isolated. Binary-search: test grad_accum=16 first; if stable, try 32 or 48. If not, drop to 8. Skip timid grad_accum=4 step. NOTE: pure wall-time saving from grad_accum alone is small (~4-5%) — the real win is convergence quality (10-30% fewer iters to reach same eval), which compounds at multi-gen scale ($200-500 saving over 5-7 weeks). |
-| **Transition-level minibatching** (refactor) | 10-25% on update wall + better convergence + likely allows higher lr | ~1-2 days | Currently we update one episode at a time (variable T=50-300 turns per forward, batch dim ~1). Metamon does episode-padded batching (48 episodes per forward); ps-ppo (stateless) does pure transition-level (256-2048 transitions per forward). Both use proper Tensor Core utilization. Our episode-at-a-time path leaves Tensor Cores underused at small T. Refactor needs careful temporal-context handling per-transition (option A: episode-padded with attention masks; option B: chunk-based with K consecutive turns; option C: pre-cache temporal embeddings then mix freely). This SUBSUMES the grad_accum win + adds Tensor Core speedup. |
+| **Transition-level minibatching** (refactor) — ⏬ LAST-RESORT TIER | 10-25% on update wall + cleaner gradients (subsumes grad_accum benefit) | ~1-2 days refactor + 10-20 iters validation + eval | Currently we update one episode at a time (variable T=50-300 turns per forward, batch dim ~1). Metamon does episode-padded batching (48 episodes per forward); ps-ppo (stateless) batches 256-2048 transitions per gradient. We're 48× below published practice. **EPISODE BOUNDARIES ARE PRESERVED** in any sensible refactor: temporal stack still sees sequential turns from ONE episode; only loss/gradient computation mixes across episodes. Three implementation options (A: episode-padded with attention masks; B: chunk-based with K consecutive turns; C: pre-cached temporal embeddings then mix freely). **Do this ONLY if wall time is still painful after Tier-1/2 wins below have shipped** — `torch.compile` fix + bf16 trial + flash attn + CIS+pipeline. If those land and wall-time becomes acceptable, this can stay deferred. Conversely, if wall-time becomes excellent, the validation cost is cheap enough to test anyway. |
+| **Re-test `grad_accum > 1`** standalone — ⏬ LAST-RESORT TIER, **only as part of the transition-level refactor above** | ~4-5% wall + 10-30% iter-count saving | 10-20 iters validation + eval (~$15-25, NOT 30 min smoke — quality regression is silent) | Standalone grad_accum experiment is **NOT recommended** — Session 31 record suggests grad_accum=10 produced a *weaker battler* (silent quality regression), not a crash. Hard to detect without long validation. Don't reopen the lr question alongside (hold lr=1e-5 constant). Only test grad_accum>1 as the validation step of the transition-level minibatching refactor (ensures the same code path Metamon/ps-ppo use). Solo grad_accum tweak with current code is too risky for too small a wall-time payoff. |
 | Channels-last memory layout | 5-15% on conv (we have few) | refactor | Probably not worth for our arch. |
 | Gradient checkpointing | ~30% wall trade-off, 50% VRAM saving | ~1 day | We're not VRAM-bound, so net negative. Skip. |
 
@@ -264,10 +264,29 @@ hides update wall-time entirely behind next iter's collect, making
 update wall-time effectively invisible. That's ~50% iter-time saving.
 Update-phase micro-optimizations are second-tier; CIS is first.
 
-**Order of operations recommended**: torch.compile fix (validated easy
-win) → bf16 trial (cheap experiment) → CIS (big architectural win) →
-flash attention (requires torch upgrade so do it after CIS settles) →
-adaptive epoch count (last; depends on observed steady-state behavior).
+**Order of operations recommended**:
+
+**Tier 1 — Cheap, high-confidence (do first):**
+1. `torch.compile` fix for new arch — known win, ~1 day
+2. bf16 trial — 30 min, cheap experiment, possible 0-5% + safer numerics
+3. Fused AdamW flag — 10 min, trivial flip
+
+**Tier 2 — Architectural, biggest leverage (do for multi-gen):**
+4. CIS + pipeline overlap — the headline ~50% wall saving via overlap
+5. Flash attention — needs torch ≥2.3, do after CIS settles, ~10-30%
+
+**Tier 3 — Last resort, only if wall-time still bad after Tier 1+2:**
+6. Adaptive epoch count — depends on observed steady-state behavior
+7. Transition-level minibatching refactor — 1-2 day refactor, only if
+   wall-time is still painful. Subsumes grad_accum win.
+8. Standalone grad_accum>1 — **NOT recommended on its own** (silent
+   quality regression risk per Session 31). Only as part of the
+   transition-level refactor.
+
+**Do not reopen the lr question** during any of these experiments.
+Hold lr=1e-5 (the painstakingly-validated value) constant. Don't
+compound experiments with lr ablation — the convergence from earlier
+sessions was hard-won.
 
 **Don't conflate** the slight v_loss upward drift at iters 6-8 with
 "warmup not done" — it's two confounders (pool growth at iter 5; asyncio
