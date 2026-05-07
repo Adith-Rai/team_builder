@@ -62,6 +62,189 @@ New design eliminates cross-process tensor IPC entirely. Each worker owns its mo
 └────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## Three levels of parallelism (mental model for this codebase)
+
+Both `--pipeline` (single-process) and `--mp` (multi-process) use parallelism, just at different levels. Understanding which is which prevents the "is this faster than that" confusion.
+
+| Level | What | `--pipeline` mode | `--mp` mode |
+|---|---|---|---|
+| **L1** Concurrent battles within one matchup | `--max-concurrent` (e.g., 200 simultaneous battles for one player vs one opponent) | Yes (200) | Yes (200, **per worker**) |
+| **L2** Concurrent matchups within a process | `asyncio.gather([opp1, opp2, ...])` running multiple opps interleaved in the same loop | **Parallel** (gather across opps in a wave) | **Sequential** per worker (`for opp in opps: await play_vs_opp(opp)`) |
+| **L3** Concurrent processes | Distinct Python processes each running their own asyncio loop | N/A — single process | **Parallel** (8 forkserver-spawned workers) |
+
+**Key insight**: `--mp` moves Level 2 parallelism to Level 3. Same total simultaneous matchups; different organization. With `mp-workers=8` and `conc=200`, we have 8 workers × 200 concurrent battles = **1600 globally concurrent battles** at peak collect — same as a single-process gather across 8 opps × 200 battles each. The throughput is similar; what differs is where the parallelism comes from.
+
+Why move L2→L3:
+1. **Failure isolation.** If one worker crashes (poke-env hiccup, asyncio error), other 7 keep running. Single-process gather kills the whole iter on one bad coroutine without `return_exceptions=True` plumbing everywhere.
+2. **GIL avoidance for CPU-bound coordination.** Battle simulation is largely GPU-waiting (so GIL release helps), but asyncio scheduling, message parsing, ws read/write are GIL-serialized in single-process. mp gives each worker its own interpreter.
+3. **Simpler per-worker state.** One asyncio loop, one batcher, one model copy on GPU, one trajectories list. No "which traj belongs to which gather'd matchup" debugging.
+
+What we LOSE by going to L3:
+- Cross-process IPC complexity (mitigated by JSON-only ctrl/result + disk traj transfer)
+- 8× model copy on GPU (640 MB on A100 — fine)
+- Process spawn overhead (~5s/iter for forkserver — fine)
+
+What we DON'T lose:
+- Effective parallelism. L1 + L3 ≈ L1 + L2 in total concurrent battles.
+
+---
+
+## Full mp_disk flow (one iter, end to end)
+
+For Phase 1 v3 config (`games_per_iter=1600`, `mp_workers=8`, `conc=200`, pool=2):
+
+```
+ITER N starts (main process):
+│
+├─ Main writes weights to /tmp/weights_iterN.pt (atomic rename)
+├─ Main sends "collect_iter" cmd to each worker via per-worker ctrl_pipe
+│   {iter_n: N, weights_path: ".../weights_iterN.pt", n_games: 200,
+│    max_concurrent: 200, opp_pool: [...], rs_cfg: {...}, ...}
+│
+├─ All 8 workers receive cmd in PARALLEL (Level 3)
+│   │
+│   ├─ Worker w0 (parallel with w1..w7):
+│   │   ├─ If weights_path differs from cached: load_checkpoint() new model on GPU
+│   │   ├─ Worker assigned 200 games (= 1600 / 8)
+│   │   ├─ PFSP-sample n_per_opp = [100, 100] across pool=2 opps
+│   │   ├─ Build train teambuilder once
+│   │   ├─ Build per-worker InferenceBatcher (private to this worker)
+│   │   │
+│   │   ├─ Matchup 1: vs opp_1 (anchor BC ckpt)  ← Level 2 SEQUENTIAL
+│   │   │   ├─ Load opp ckpt to opp_cache (LRU cap=3, stripped to
+│   │   │   │  {model_state, model_config, arch} per fix 3.5a)
+│   │   │   ├─ Create V9RLPlayer + SelfPlayOpponentTransformer
+│   │   │   ├─ player.battle_against(opponent, n_battles=100)
+│   │   │   │   └─ asyncio runs 100 battles at conc=100  (Level 1 PARALLEL)
+│   │   │   │       Each battle: ws to battle_server, get obs,
+│   │   │   │       send to batcher, await action, send move
+│   │   │   ├─ Extract trajectories + W/L counts
+│   │   │   ├─ player.reset_battles(); opponent.reset_battles()
+│   │   │   ├─ _cancel_listener(player); _cancel_listener(opponent)
+│   │   │   ├─ del player, opponent
+│   │   │   ├─ await asyncio.sleep(1.5)  ← drain POKE_LOOP (fix 3.5b)
+│   │   │   └─ gc.collect(); empty_cache()  (fix 3.5c)
+│   │   │
+│   │   └─ Matchup 2: vs opp_2 (sp_0009)  ← starts after matchup 1 fully done
+│   │       └─ Same lifecycle as matchup 1
+│   │
+│   ├─ Worker pickles all_trajs + bundle to /tmp/traj_w0_iterN.pkl.gz
+│   ├─ Sends {"status": "ok", "worker_id": 0, "iter_n": N, "traj_path": ..., "n_games_done": 200, "wr_per_opp": {...}, "n_forfeit_wins": ..., "n_forfeit_losses": ...} via result_pipe
+│   └─ Loops back, awaits next ctrl_pipe cmd (or shutdown)
+│
+├─ Main waits for all 8 result_pipe replies (multiplexed via mp.connection.wait)
+│   ├─ Heartbeat tracker watches for stale workers (300s tolerance)
+│   ├─ WorkerManager respawns dead workers (cap 3 in 5-iter window)
+│   └─ Aggregates all 8 (W, L, wr_per_opp, forfeit counts)
+│
+├─ Main reads 8 traj.pkl.gz files from /tmp → 1600 trajectories total
+├─ Main builds PPO episodes from trajs (single-threaded)
+├─ Main runs ppo_update on combined trajs (foreground; uses GPU)
+│   ├─ 5 epochs × 1600 episodes × forward+backward
+│   ├─ KL early-stop fires when KL > target_kl × 1.5 = 0.045
+│   └─ Optimizer.step + scheduler.step + grad clip
+│
+├─ Main updates PFSP win-rates dict (EMA-smoothed)
+├─ Main saves snapshot if iter % snapshot_interval == 0
+└─ Iter N+1 begins ↑
+```
+
+**Peak resource use during collect**:
+- Compute: 8 workers × 100 concurrent battles each = 800 in-flight battles globally
+  (each battle has 1 game state + queued obs in batcher; batcher fires when
+  batch ≥ min_batch=8 or timeout 15ms)
+- VRAM: ~20 GB (8 main models + 8 batches in flight + LRU opp caches)
+- Disk: 8 traj.pkl.gz files written at iter end (~50-200 MB each, depends on game length)
+
+**Peak resource use during update** (workers idle, waiting):
+- Compute: 1 main process × 1 GPU model × backward pass
+- VRAM: ~5-15 GB (model + optimizer state + batch + activations)
+- Workers idle on ctrl_pipe.recv() — minimal CPU/RAM
+
+---
+
+## Full pipeline flow (single-process, `--pipeline` only) — for comparison
+
+For Phase 1 v2-style config (`games_per_iter=1500`, `conc=500`, `n_servers=8`):
+
+```
+ITER 0 (cold start):
+│
+├─ Main thread runs collect_v9 in foreground (asyncio + battle_servers)
+│   ├─ For each wave (size = n_servers = 8):
+│   │   ├─ Spawn coros for opps in this wave
+│   │   ├─ asyncio.gather(*coros)
+│   │   │   ├─ Coro 1 (opp_1): conc=500 battles in parallel  (L1 + L2 BOTH parallel)
+│   │   │   ├─ Coro 2 (opp_2): conc=500 battles in parallel
+│   │   │   ├─ ... (up to n_servers per wave)
+│   │   │   └─ All running interleaved in the SAME asyncio loop
+│   │   ├─ When all wave coros done, cleanup
+│   │   └─ ALL share the SAME InferenceBatcher (one batcher per wave)
+│   └─ Returns 1500 trajectories
+│
+├─ Build PPO episodes
+│
+├─ BEFORE STARTING UPDATE → bg_collector.start(model, ...):
+│   ├─ deepcopy(model) → bg thread gets its own GPU model
+│   ├─ collect_model.eval() → no_grad, forward only
+│   ├─ Launch threading.Thread() with target=_run
+│   └─ Thread creates its own asyncio loop, calls collect_v9 for iter 1
+│
+├─ Main does ppo_update on iter 0's data:
+│   │   GPU is now SHARED:
+│   │     ├─ Main: forward + backward + optimizer.step (own model)
+│   │     └─ Bg thread: forward only (deepcopied model)
+│   │   CUDA stream scheduler interleaves them; PyTorch GIL release
+│   │   during torch ops lets both make progress
+│   │
+│   └─ Update completes
+│
+└─ bg_collector.join() → waits for thread's iter 1 collect
+    Returns iter 1 trajectories (or close to done)
+
+ITER 1+:
+├─ Skip foreground collect (iter 1 trajs in hand from bg thread)
+├─ bg_collector.start(model, ...) for iter 2
+├─ ppo_update on iter 1's data (overlapped with bg thread doing iter 2 collect)
+└─ join + repeat
+```
+
+**Pipeline math**:
+- Without pipeline: iter time = collect + update (sequential)
+- With pipeline: iter time = max(collect, update) (overlapped)
+- Saving per iter: min(collect, update)
+
+For Phase 1 v3-equivalent config: collect ~14 min, update post-warmup ~5-10 min → pipeline saves ~5-10 min/iter. Pipeline doesn't help during warmup (bg uses deepcopied model that quickly becomes stale relative to value head's rapid changes).
+
+**Two threads sharing one GPU**:
+- Two model copies via `deepcopy` (~480 MB extra VRAM, fine)
+- CUDA scheduler interleaves forward/backward across streams
+- GIL releases during torch ops let both make progress
+- Python-level work (asyncio, ws parsing) does serialize on GIL — <5% of time, doesn't dominate
+
+---
+
+## Why mp+pipeline currently no-ops (and CIS is the fix)
+
+When `--mp --pipeline` is set, the bg collection logic tries to send inference requests during main's update phase, but:
+- mp workers each have their own GPU model (per-worker copy)
+- Main also has its own GPU model and is doing optimizer.step
+- Workers' CUDA forwards stall waiting for GPU; no priority arbitration
+- Eventually deadlock — workers stuck, main can't proceed past update
+
+CIS (`docs/CENTRALIZED_INFERENCE_DESIGN.md`) fixes this by adding a dedicated inference process with **low-priority CUDA stream** (set via `torch.cuda.Stream(priority=-1)`). Main's update runs on high-priority stream; CIS forwards run on low-priority. CUDA scheduler honors priority — main always wins, CIS fills the gaps. No deadlock because CIS forwards always make progress (just slower during update windows).
+
+CIS also lets workers SHARE one model on GPU (instead of 8 copies), which:
+- Frees VRAM (~5 GB → 0.6 GB for 8 workers)
+- Better GPU utilization (CIS batches across workers' simultaneous requests)
+- Enables higher mp-workers without VRAM concern
+
+**This is the long-term direction.** Per-worker-GPU mp_disk is the stepping stone we're on now.
+
+---
+
 ### Why per-worker GPU model (and not central inference)?
 
 GPU contention managed by CUDA scheduler — multi-process forwards on the same A100 interleave on its 108 SMs efficiently. We measured 7% GPU util in single-process mode; per-worker GPU forwards should bring this up to 30-50% (rough estimate; exact number doesn't matter as long as wall-clock drops).
