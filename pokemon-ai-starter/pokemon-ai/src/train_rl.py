@@ -234,6 +234,14 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     ckpt = torch.load(args.resume, map_location=device, weights_only=False)
     resume_state = ckpt["model_state_dict"]
 
+    # Strip torch.compile's `_orig_mod.` prefix if present. Snapshots saved
+    # from a compile-wrapped model carry this prefix (each wrapped submodule
+    # has its parameters under self._orig_mod.*). Resume always targets a
+    # fresh, un-wrapped model (compile is applied AFTER this function returns,
+    # see main()), so keys must match the un-prefixed form. Mirrors the same
+    # strip in load_checkpoint at ppo.py:397.
+    resume_state = {k.replace("._orig_mod.", "."): v for k, v in resume_state.items()}
+
     # Handle dim expansion for checkpoints from before type_eff features
     _expand_targets = ["move_net.mlp.0.weight", "switch_mlp.0.weight"]
     for key in list(resume_state.keys()):
@@ -639,72 +647,13 @@ def main():
     model, cfg, _ = load_checkpoint(init_path, device)
     model.to(device)
 
-    # torch.compile (Linux/cloud only - Windows local has no compile support;
-    # the try/except below degrades gracefully there).
-    #
-    # Path 2 per-submodule compile (Session 51 finding, 2026-05-07): the prior
-    # single-method `torch.compile(model.forward_spatial)` call only covered
-    # tokenizer + spatial + summary projection (~40-60% of the inference path).
-    # Compiling each nn.Module submodule separately covers ~90+%: temporal,
-    # action_head, value_head also get optimized.
-    #
-    # mode="default" + dynamic=True chosen over mode="reduce-overhead" for
-    # production robustness:
-    # - reduce-overhead uses CUDA Graph replay (faster steady state, ~1.45x
-    #   on full forward) but requires `torch.compiler.cudagraph_mark_step_begin()`
-    #   between invocations to avoid tensor-aliasing crashes, and recompiles
-    #   per shape (high cost under InferenceBatcher's variable B + PPO update's
-    #   variable T).
-    # - default uses Inductor codegen without cudagraphs. ~1.25x on full
-    #   forward, identical performance across all shapes once compiled, no
-    #   aliasing constraints. Predictable over multi-gen 5-7 week runs.
-    #
-    # `dynamic=True` hints Dynamo to mark batch dim dynamic from the start,
-    # avoiding the second recompile pass when a new B arrives.
-    #
-    # `_dynamo.config.suppress_errors=True` is the safety net for the known
-    # B=1 dynamic-shape edge in the tokenizer's `_encode_pokemon_block` (concat
-    # of symint-derived tensors fails on torch 2.2.x). Falls back to eager for
-    # that single call, no crash.
-    #
-    # Env requirement: torch + triton version match (e.g., torch 2.2.x needs
-    # triton 2.2.x; torch 2.4.x needs triton 3.0.x). Mismatch triggers
-    # `ImportError: cannot import name 'get_cuda_stream' from 'triton.runtime.jit'`
-    # at compile-decoration time. Pod fix: `pip install triton==2.2.0` for
-    # torch 2.2.1.
-    #
-    # See `docs/PPO_CLOUD_COOKBOOK.md` §3i for full diagnostic history.
+    # NOTE: torch.compile() is applied AFTER `_resume_from_checkpoint` (see
+    # below near line ~820). Wrapping submodules with torch.compile rewrites
+    # their state_dict keys to include `_orig_mod.` - if compile happens
+    # BEFORE resume, the resume's `load_state_dict(strict=True)` fails on
+    # snapshots saved without that prefix (the typical case for production
+    # snapshots). Caught Session 51 cont. on the iter-14 cutover relaunch.
     compiled = False
-    if args.compile:
-        try:
-            torch._dynamo.config.suppress_errors = True
-
-            submodules_to_compile = [
-                "tokenizer", "spatial", "temporal", "action_head", "value_head",
-            ]
-            n_ok = 0
-            for name in submodules_to_compile:
-                if not hasattr(model, name):
-                    print(f"torch.compile: model has no '{name}' submodule, skipping",
-                          flush=True)
-                    continue
-                try:
-                    sub = getattr(model, name)
-                    setattr(model, name,
-                            torch.compile(sub, mode="default", dynamic=True))
-                    n_ok += 1
-                except Exception as sub_e:
-                    print(f"torch.compile: '{name}' SKIPPED ({sub_e})", flush=True)
-            compiled = n_ok > 0
-            if compiled:
-                print(f"torch.compile: {n_ok}/{len(submodules_to_compile)} submodules "
-                      f"compiled (mode=default, dynamic=True)", flush=True)
-            else:
-                print("torch.compile: no submodules compiled successfully", flush=True)
-        except Exception as e:
-            # Outermost guard: if torch._dynamo import or anything else fails,
-            # don't crash the run - just fall back to eager.
-            print(f"torch.compile: SKIPPED ({e})", flush=True)
 
     # fused=True uses CUDA-native fused AdamW kernel on supported devices
     # (Ampere+ A100 supports it). 3-7% saving on optimizer.step. Falls back
@@ -814,6 +763,72 @@ def main():
     if args.resume:
         start_iter, snapshot_pool = _resume_from_checkpoint(
             args, model, optimizer, snapshot_pool, device)
+
+    # torch.compile (Linux/cloud only - Windows local has no compile support;
+    # the try/except below degrades gracefully there). Applied AFTER resume
+    # because torch.compile wraps modules with `_orig_mod.` prefix in their
+    # state_dict; loading a non-prefixed checkpoint into a wrapped model
+    # fails with strict=True. See note near `compiled = False` above.
+    #
+    # Path 2 per-submodule compile (Session 51 finding, 2026-05-07): the prior
+    # single-method `torch.compile(model.forward_spatial)` call only covered
+    # tokenizer + spatial + summary projection (~40-60% of the inference path).
+    # Compiling each nn.Module submodule separately covers ~90+%: temporal,
+    # action_head, value_head also get optimized.
+    #
+    # mode="default" + dynamic=True chosen over mode="reduce-overhead" for
+    # production robustness:
+    # - reduce-overhead uses CUDA Graph replay (faster steady state, ~1.45x
+    #   on full forward) but requires `torch.compiler.cudagraph_mark_step_begin()`
+    #   between invocations to avoid tensor-aliasing crashes, and recompiles
+    #   per shape (high cost under InferenceBatcher's variable B + PPO update's
+    #   variable T).
+    # - default uses Inductor codegen without cudagraphs. ~1.25x on full
+    #   forward, identical performance across all shapes once compiled, no
+    #   aliasing constraints. Predictable over multi-gen 5-7 week runs.
+    #
+    # `dynamic=True` hints Dynamo to mark batch dim dynamic from the start,
+    # avoiding the second recompile pass when a new B arrives.
+    #
+    # `_dynamo.config.suppress_errors=True` is the safety net for the known
+    # B=1 dynamic-shape edge in the tokenizer's `_encode_pokemon_block` (concat
+    # of symint-derived tensors fails on torch 2.2.x). Falls back to eager for
+    # that single call, no crash.
+    #
+    # Env requirement: torch + triton version match (torch 2.2.x needs triton
+    # 2.2.x; torch 2.4.x needs triton 3.0.x). Mismatch triggers `ImportError:
+    # cannot import name 'get_cuda_stream' from 'triton.runtime.jit'` at
+    # compile-decoration time. Pod fix: `pip install triton==2.2.0` for
+    # torch 2.2.1. See `docs/PPO_CLOUD_COOKBOOK.md` §3i for full history.
+    if args.compile:
+        try:
+            torch._dynamo.config.suppress_errors = True
+            submodules_to_compile = [
+                "tokenizer", "spatial", "temporal", "action_head", "value_head",
+            ]
+            n_ok = 0
+            for name in submodules_to_compile:
+                if not hasattr(model, name):
+                    print(f"torch.compile: model has no '{name}' submodule, skipping",
+                          flush=True)
+                    continue
+                try:
+                    sub = getattr(model, name)
+                    setattr(model, name,
+                            torch.compile(sub, mode="default", dynamic=True))
+                    n_ok += 1
+                except Exception as sub_e:
+                    print(f"torch.compile: '{name}' SKIPPED ({sub_e})", flush=True)
+            compiled = n_ok > 0
+            if compiled:
+                print(f"torch.compile: {n_ok}/{len(submodules_to_compile)} submodules "
+                      f"compiled (mode=default, dynamic=True)", flush=True)
+            else:
+                print("torch.compile: no submodules compiled successfully", flush=True)
+        except Exception as e:
+            # Outermost guard: if torch._dynamo import or anything else fails,
+            # don't crash the run - just fall back to eager.
+            print(f"torch.compile: SKIPPED ({e})", flush=True)
 
     # External opponents — appended AFTER resume so resumed pool state stays clean
     # (resume loads only local snapshot paths; externals are re-instantiated each
