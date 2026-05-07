@@ -77,6 +77,16 @@ R2 sync at `s3://team-builder-data/models/rl_v10/ppo_phase1_v3_cloud/`
 over pipeline-only at this scale — moderate, not dramatic. Phase 1 v3 doesn't
 benefit much from mp itself; the win is multi-gen scale + CIS enablement.
 
+**The actual cost-saving target was always `--mp --pipeline` together**
+(true bg overlap). Currently silently no-op'd due to GPU contention deadlock
+between worker forwards and main's `optimizer.step()`. Real fix is CIS
+(centralized inference server) — see Section A below. Post-CIS estimate:
+~$50-75 vs current ~$110-135 for 200 iters. **THIS IS WHY mp matters** —
+not as a Phase 1 win, but as the infrastructure layer that unlocks pipeline
+overlap once CIS lands. User mentioned in Session 50: if CIS lands quickly
+they may abandon current Phase 1 v3 run and re-init from a snapshot to get
+the cost benefit on the remaining iters.
+
 **First eval at iter 19** (smart_avg vs SH/SmartDmg/Tactical/Strategic on
 metamon-competitive 16-team set). Should be ≥67% (BC baseline). If lower,
 investigate; if at/above, training is healthy, multi-gen prep proceeds.

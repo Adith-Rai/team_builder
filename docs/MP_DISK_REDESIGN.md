@@ -68,6 +68,20 @@ GPU contention managed by CUDA scheduler — multi-process forwards on the same 
 
 Central inference (option A in design discussion) requires sending obs to a central process. Even with numpy-IPC bypassing the mmap issue, pickle CPU overhead on 75K req/iter would eat into the speedup. Per-worker keeps inference inside a single process, no IPC needed during collect.
 
+> **Update (Session 50, post-Phase-1-v3 launch)**: this design doc was
+> written under the assumption that `--mp` alone would deliver dramatic
+> speedup. Empirically it provides only ~15-30% wall-time saving over
+> `--pipeline` alone at production scale. The actual cost-saving win
+> requires `--mp --pipeline` together with proper bg overlap, which
+> deadlocks in the current per-worker-GPU design (workers' CUDA forwards
+> stall during main's `optimizer.step()`). The decision NOT to do central
+> inference is being reconsidered — see
+> `docs/CENTRALIZED_INFERENCE_DESIGN.md`. Per-worker GPU is correct for
+> getting `--mp` alone to work; CIS is needed to unlock `--mp --pipeline`
+> together. The pickle cost concern was overstated: numpy IPC at 75K
+> req/iter is ~3-5 ms total, far less than the ~25 min/iter saving from
+> bg overlap.
+
 VRAM budget on A100 80GB:
 - Main: model + optimizer + scheduler ≈ 320 MB
 - 8 workers × main model ≈ 640 MB

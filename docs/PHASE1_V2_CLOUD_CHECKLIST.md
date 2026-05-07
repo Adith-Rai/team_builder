@@ -173,14 +173,16 @@ nohup python train_rl.py \
 
 ### Optional: with `--mp` for max throughput
 
-If you set up 8 battle_servers, you can use the just-refactored `--mp` for ~3x more throughput:
+**OUTDATED (Session 50)**: original framing here claimed `--mp` ≈ 3x throughput
+and `--mp --pipeline` together gives ~3-5 min/iter. **Both wrong at production
+scale.** Empirical Phase 1 v3 numbers:
+- `--mp` alone @ games=1600 → ~42 min/iter (warmup), ~20-25 min/iter steady — roughly equivalent to `--pipeline` alone
+- `--mp --pipeline` together → currently silently no-op'd (GPU contention deadlock; see cookbook §3c)
 
-```
---mp --servers 9000,9001,9002,9003,9004,9005,9006,9007 \
---max-concurrent 200 --games-per-iter 4000
-```
-
-(Note: `--mp --pipeline` together activates `MPPipelineCollector` — designed combination, not exclusive. They were corrected here in Session 50 cont.) Numerical equivalence proven; runtime untested at scale. Worth doing if you want a much faster iter cadence (~3-5 min/iter) at the cost of slightly more setup and zero local validation data.
+The real cost-saving target is `--mp --pipeline` post-CIS implementation
+(`docs/CENTRALIZED_INFERENCE_DESIGN.md`); estimated ~$50-75 vs ~$110 for
+`--mp` alone over 200 iters. **Use `PPO_CLOUD_COOKBOOK.md` for current
+canonical setup — this section is preserved for history only.**
 
 ## Phase 7 — Monitor (passive, ~25-35 hr)
 

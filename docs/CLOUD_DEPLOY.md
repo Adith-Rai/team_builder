@@ -1,3 +1,10 @@
+> **⚠️ DEPRECATED (Session 50)** — this doc is from Session 33, refers to old
+> `rl_train_v9.py` script and pre-mp-disk architecture. **For current cloud
+> PPO setup use [`PPO_CLOUD_COOKBOOK.md`](PPO_CLOUD_COOKBOOK.md).** Specifically,
+> the claim that `--mp` is dramatically faster than single-process is wrong
+> at current scale — see cookbook §6 for empirical numbers (mp ≈ pipeline
+> alone; the real win is `--mp --pipeline` together, post-CIS).
+
 # Cloud Deployment Guide (Session 33 final — post-Elo measurement)
 
 ## STATUS: Cloud is GATED on a successful BC scaling experiment first. Don't burn cloud money on the current architecture.

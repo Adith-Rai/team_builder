@@ -28,13 +28,21 @@ python train_rl.py \
   --out-dir data/models/rl_v10/<run_name>
 ```
 
-Expected: ~12-15 min/iter steady (post-warmup). Warmup iters (0-19) are
-slower (~30 min/iter) because all 5 PPO epochs run even though only
-value_head trains — see §8 Active TODOs for warmup-speedup engineering.
+**Empirical (Phase 1 v3, Session 50)**: warmup iters 0-19 land at ~42 min/iter
+(collect ~14 min + update ~28 min, all 5 PPO epochs run since KL early-stop
+disabled while only value_head trains). Post-warmup steady-state estimate
+~20-25 min/iter (KL early-stop reduces update phase). Total run ~74-89 hr.
 
-**Cost**: ~$80-150 for 200 iters on A100 SXM 80GB depending on KL early-stop
-behavior in main phase + warmup overhead. (Original $60-70 estimate was
-optimistic; actual range observed Session 50.)
+**Cost**: **~$110-135** for 200 iters on A100 SXM 80GB. Earlier $60-70
+estimate was based on extrapolating sub-scale `--mp` Test A numbers and
+was wrong — at games=1600 the update phase dominates, regardless of mp/pipeline.
+
+**Important framing**: `--mp` alone is roughly cost-equivalent to `--pipeline`
+alone at Phase 1 scale (~$110-135 vs ~$100). The actual cost-saving win is
+`--mp --pipeline` together with proper bg overlap — currently no-op'd until
+CIS lands (see `docs/CENTRALIZED_INFERENCE_DESIGN.md`). Post-CIS target is
+~$50-75 for 200 iters. Until then, mp is groundwork (failure recovery, N>8
+scaling, multi-gen prep), not a Phase 1 dollar win.
 
 ---
 
@@ -136,9 +144,12 @@ Worst-case loss bound on pod death: 5 min of progress.
 
 | Run type | Flags | Why |
 |---|---|---|
-| Phase 1 production | `--mp --mp-workers 8` | 4× faster collect than pipeline-only at production scale |
+| Phase 1 production (Session 50) | `--mp --mp-workers 8` | Roughly equivalent wall-time to `--pipeline` only at this scale; chosen for failure recovery + N>8 scaling + CIS prep, not for raw speed |
+| **Multi-gen target (post-CIS)** | `--mp --pipeline --mp-workers 8` | Real overlap → ~$50-75 vs ~$110 for `--mp` alone over 200 iters (the actual cost-saving win) |
 | Local 6GB GPU smoke | `--pipeline` (no `--mp`) | mp not supported on CPU; pipeline gives modest speedup |
 | Numerical baseline | (no flags) | Slowest but simplest reference |
+
+**Honest framing**: at production scale (games=1600), `--mp` alone provides only ~15-30% wall-time saving over `--pipeline` alone (Session 50 empirical). The dramatic speedup we wanted comes from `--mp --pipeline` together once CIS ships — that's the real cost-saving target. mp by itself is groundwork.
 
 ---
 
@@ -376,7 +387,18 @@ NaN signals (FATAL — abort and diagnose):
 | `--mp` only Phase 1 v3 (post-warmup, est) | same | — | ~20-25 min/iter (collect ~13 min + update ~5-10 min when KL early-stop fires) |
 | `--mp --pipeline` (broken; bg overlap deadlocks) | — | iter 0 OK, iter 1 hang | (use `--mp` alone until CIS lands; see CENTRALIZED_INFERENCE_DESIGN.md) |
 
-**Honest observation (Session 50)**: at production scale (games=1600), `--mp` infrastructure provides ~15-30% wall-time saving over pipeline-only — moderate, not the dramatic speedup originally projected. The dominant cost is the PPO update phase which scales linearly with episodes regardless of mp/pipeline. Warmup specifically is slow because all 5 PPO epochs run even though only `value_head` trains (warmup `no_grad` saved only ~7.5% — autograd auto-elides frozen-path graph already, my redundant explicit no_grad helped less than predicted). Real mp wins are downstream: failure recovery, scaling N>8, enabling CIS for multi-gen.
+**Honest observation (Session 50)** — read this carefully, it shapes priorities:
+
+`--mp` alone provides only ~15-30% wall-time saving over `--pipeline` alone at production scale. **mp by itself is NOT the win** — it's roughly equivalent to pipeline-only (~$110-135 vs ~$100 for 200 iters). Warmup `no_grad` was also disappointing (~7% saved; autograd auto-elides frozen-path graph anyway). TF32+cudnn.benchmark saved ~4% on collect (which is mostly battle_server-bound, not GPU).
+
+**The real target is `--mp --pipeline` with proper bg overlap** (currently no-op'd due to GPU contention deadlock — cookbook §3c). Once CIS lands (`docs/CENTRALIZED_INFERENCE_DESIGN.md`), pipeline overlap actually works → ~$50-75 for 200 iters at this scale. **That's the cost-saving over generic pipeline.** Until then, mp infrastructure is groundwork, not a Phase 1 win.
+
+What mp DOES enable that pipeline-only can't:
+- Failure recovery (worker crash doesn't kill run; pipeline-only is single-process)
+- N>8 scaling (pipeline-only capped at 1 Python event loop)
+- CIS architecture (multi-process inference server arbitrating GPU access)
+
+For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 weeks): mp+CIS saves $200-400+ over generic pipeline.
 
 ### 200-iter cost projection (Phase 1 v3 empirical baseline)
 
