@@ -184,6 +184,37 @@ warmup iter wastes ~25 min on unused gradient compute.
 Saves ~$15-25 over a 20-warmup-iter run. Bigger win for multi-gen runs
 where warmup repeats per phase.
 
+#### B1.5. Drop `--warmup-iters 20` → 5 in default config (Phase 1 v3 finding)
+
+Phase 1 v3 v_loss curve showed warmup effectively done at iter 3-5:
+```
+iter 0: 3.430 (init)        iter 5: 2.749 (Δ -0.005, noise)
+iter 1: 2.877 (Δ -0.553)    iter 6: 2.765 (Δ +0.015, pool drift)
+iter 2: 2.771 (Δ -0.106)    iter 7: 2.769 (Δ +0.005)
+iter 3: 2.757 (Δ -0.014)    iter 8: 2.775 (Δ +0.006)
+iter 4: 2.755 (Δ -0.002)
+```
+
+**Empirical**: 3-5 iters sufficient. Our 20 was 2-4× what published work
+uses (Metamon: 5-10; VGC-Bench: 5). Remaining 14 warmup iters in Phase 1
+v3 burn ~$13-18 of zero-progress compute.
+
+**Fix options for future runs**:
+- Simple: change cookbook canonical command to `--warmup-iters 5`
+- Adaptive (better): early-warmup-exit when Δv_loss < 0.05 for 2
+  consecutive iters. ~30 LOC in `train_rl.py` warmup-exit check.
+  Trades complexity for safety on bigger arches that may need longer.
+
+**Saves**: ~$13-18 per 200-iter run; ~$50-100 over a multi-gen 5-7 week
+run with multiple phase warmups.
+
+**Don't conflate** the slight v_loss upward drift at iters 6-8 with
+"warmup not done" — it's two confounders (pool growth at iter 5; asyncio
+listener leak from missing fix 3.5b causing scheduler latency). Fix 3.5b
+should reduce the drift; warmup itself was complete.
+
+---
+
 #### B2. mp_disk_collect memory hygiene fixes (~30 min, low risk)
 
 Phase 1 v3 worker RSS is 2.9 GB each × 8 = 23 GB; iter time grew 41→51 min

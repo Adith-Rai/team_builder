@@ -16,7 +16,7 @@ python train_rl.py \
   --fp16 --mp --mp-workers 8 \
   --games-per-iter 1600 --max-concurrent 200 \
   --opponent-device cpu \
-  --n-iters 200 --warmup-iters 20 \
+  --n-iters 200 --warmup-iters 5 \
   --lr 1e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
   --grad-accum 1 \
   --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
@@ -28,10 +28,18 @@ python train_rl.py \
   --out-dir data/models/rl_v10/<run_name>
 ```
 
-**Empirical (Phase 1 v3, Session 50)**: warmup iters 0-19 land at ~42 min/iter
-(collect ~14 min + update ~28 min, all 5 PPO epochs run since KL early-stop
+**Empirical (Phase 1 v3, Session 50)**: warmup iters 0-19 land at ~42-52 min/iter
+(collect ~14-16 min + update ~28-35 min, all 5 PPO epochs run since KL early-stop
 disabled while only value_head trains). Post-warmup steady-state estimate
-~20-25 min/iter (KL early-stop reduces update phase). Total run ~74-89 hr.
+~20-25 min/iter (KL early-stop reduces update phase). Total run ~74-100 hr.
+
+**`--warmup-iters` revised: 5 not 20.** Phase 1 v3 v_loss curve showed value
+head fully converged at iter 3-5 (Δ < 0.005 by iter 4); subsequent iters
+were noise + pool-drift tracking. Original 20 was a "safe default" with
+no empirical backing. Saves ~$13-18 per 200-iter run, ~$50-100 over a
+multi-gen run with phase warmups. Adaptive early-warmup-exit when
+Δv_loss < 0.05 for 2 consecutive iters is the more robust option for
+multi-gen — see TODO #B1.5 in next-prompt.txt.
 
 **Cost**: **~$110-135** for 200 iters on A100 SXM 80GB. Earlier $60-70
 estimate was based on extrapolating sub-scale `--mp` Test A numbers and
