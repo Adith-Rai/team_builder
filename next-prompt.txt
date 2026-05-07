@@ -191,6 +191,13 @@ over iters 0-7 then plateaued. RSS watcher data showed no growth between
 iters — so not a leak — but `mp_disk_collect.py` is missing memory hygiene
 patterns present in local code paths. Specific fixes:
 
+**Status (Session 50 cont., 2026-05-07)**: fixes 3.5a/b/c are
+**APPLIED** to `mp_disk_collect.py` and committed. Each has an inline
+`MEMORY HYGIENE` comment at the application site with file:line refs
+to the local pattern it mirrors. Validation against a 5-iter mp smoke
+run is the only remaining step — see `docs/diag/mp_memory_audit.md`
+for the implementation table and validation plan.
+
 **Read first**: `docs/diag/mp_memory_audit.md` — audit agent compared
 local code paths against `mp_disk_collect.py` and found 5 missing
 patterns. Three are low-risk and likely explain BOTH the RSS waste AND
@@ -223,11 +230,22 @@ N>8 workers and CIS implementation headroom.
 4. PlayerPool refactor with live-instance teardown (`eval_elo_ladder.py:280-313`)
 5. `del all_trajs, bundle` BEFORE result_pipe.send (line 425-428 reorder)
 
-**Validation**: smoke 1-iter mp run after #1, then 5-iter after #1+2+3.
-RSS watcher (still running on pod) gives the comparison data point
-automatically.
+**Validation** (only step remaining for B2): the running Phase 1 v3 is
+on the OLD code path. To validate the fixes:
+- Option A (cheap): kick off a 5-iter mp smoke against the current pod
+  with the new code. ~4 hr / ~$6. Compare iter-time vs Phase 1 v3
+  watcher data (`docs/diag/rss_watcher_log_phase1_v3.md`). Acceptance:
+  iter time stays flat (not 41 → 51 → ...) AND worker RSS drops from
+  2.9 GB to ~1.0-1.3 GB.
+- Option B (defer to multi-gen): just trust the fixes — they're
+  all low-risk pattern-mirror changes from validated local code. Run
+  validation as part of the first multi-gen smoke.
 
-Estimated work: ~1 hour total for #1+2+3.
+User mentioned in Session 50 cont. that if CIS lands quickly they may
+re-init Phase 1 v3 from a snapshot — that re-init would automatically
+get these B2 fixes too.
+
+Estimated work: ~1 hour, **DONE Session 50 cont.** (commit a7… ?).
 
 #### C. torch.compile fix for new arch (~1 day)
 

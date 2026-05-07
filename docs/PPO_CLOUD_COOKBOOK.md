@@ -439,25 +439,27 @@ For Phase 1 itself: roughly break-even with pipeline-only. For multi-gen (5-7 we
    - 3a. ✅ **DONE Session 50**: `torch.no_grad()` around backbone + policy forward in warmup. `ppo.py:ppo_update` accepts `in_warmup` arg. Saves ~50% on warmup update wall-time. ~$10-15 saved per 20-warmup-iter run.
    - 3b. (deferred) `epochs=1` during warmup (vs `args.ppo_epochs=5`). Additional 5x fewer optimizer steps. Defer until validated that `value_head` quality is preserved at fewer epochs.
 
-3.5 **mp_disk_collect memory hygiene** (~1 hour total, low risk — Phase 1 v3 finding):
+3.5 **mp_disk_collect memory hygiene** ✅ **APPLIED Session 50 cont.** (low risk — Phase 1 v3 finding):
    Audit results: `docs/diag/mp_memory_audit.md`. Five fixes ranked by impact;
-   three are low-risk and likely BOTH save RSS AND flatten the iter-time creep:
-   - 3.5a. **Strip opp ckpt to {model_state_dict, model_config, arch}** after load
-     at `mp_disk_collect.py:535-536`. Mirror the pattern at `eval_elo_ladder.py:201-216`.
-     Switch `weights_only=False` → `True` AND drop optimizer/scheduler/snapshot_pool fields.
-     Saves ~1.4 GB/worker × 8 = ~11 GB RSS.
-   - 3.5b. **Cancel websocket listener + del player/opponent** at `mp_disk_collect.py:587-591`.
-     Mirror the pattern at `ppo.py:353-360` (helper) used by `rl_collection.py:458-463`,
+   three high-confidence low-risk fixes are now in `mp_disk_collect.py`.
+   The module docstring flags this for future maintainers.
+   - ✅ 3.5a. **Strip opp ckpt to {model_state_dict, model_config, arch}** after load.
+     Mirrors `eval_elo_ladder.py:201-216`. Saves ~1.4 GB/worker × 8 = ~11 GB RSS.
+   - ✅ 3.5b. **Cancel websocket listener + del player/opponent** at end of `_play_vs_opp`.
+     Mirrors `ppo.py:353-360` helper used by `rl_collection.py:458-463`,
      `eval_elo_ladder.py:320-327`. Without this, 40-100 stale asyncio tasks accumulate
-     over 7 iters → asyncio scheduler tax. **This is the most likely cause of the
-     41→51 min iter time creep** (watcher showed RSS stable; the cost is asyncio overhead).
-   - 3.5c. **Per-opp `gc.collect() + empty_cache()`** at `mp_disk_collect.py:585-591`.
-     Local pattern at `eval_diag.py:101-102`, `eval_report_v8.py:104`. Reduces
-     cudaMalloc fragmentation across 6-15 opp matchups per iter.
-   - 3.5d. (deferred, medium risk) PlayerPool refactor with live-instance teardown
-   - 3.5e. (deferred, marginal) Reorder `del all_trajs, bundle` before result_pipe.send
-   - **Validation**: 1-iter mp smoke after 3.5a; 5-iter mp smoke after 3.5a+b+c.
-     RSS watcher already running gives the comparison data automatically.
+     over 7 iters → asyncio scheduler tax. **Likely root cause of the 41→51 min
+     iter time creep** (RSS watcher showed memory stable; the cost is asyncio overhead).
+   - ✅ 3.5c. **Per-opp `gc.collect() + empty_cache()`** after each opp matchup.
+     Mirrors `eval_diag.py:101-102`, `eval_report_v8.py:104`. Reduces cudaMalloc
+     fragmentation across 6-15 opp matchups per iter.
+   - ⏸️ 3.5d. (deferred, medium risk) PlayerPool refactor with live-instance teardown
+   - ⏸️ 3.5e. (deferred, marginal) Reorder `del all_trajs, bundle` before result_pipe.send
+
+   **Validation pending**: running Phase 1 v3 is on the OLD code path. Either:
+   (A) 5-iter mp smoke against current pod with new code (~$6); or
+   (B) defer validation to first multi-gen smoke. User may re-init Phase 1 v3
+   from a snapshot if CIS lands quickly — that would auto-pick up these fixes.
 
 ### Multi-gen architectural work (per `MULTIGEN_FEASIBILITY.md`)
 

@@ -21,6 +21,20 @@ Constraints:
   unchanged), NaN guards (ppo_update unchanged), KL early stop, adaptive
   entropy, EMA win-rate, perm aug, reward clipping, turn cap.
 
+Memory hygiene (Session 50 cont., 2026-05-07):
+After Phase 1 v3 cloud run showed iter time growing 41 -> 51 min over 7
+warmup iters, an audit (docs/diag/mp_memory_audit.md) found three
+patterns present in local code paths but missing from this file. All
+three are now applied in `_play_vs_opp`:
+  3.5a opp ckpt strip after load   -> _run_collect_in_worker:528-549
+  3.5b cancel listener + del       -> _run_collect_in_worker:594-612
+  3.5c per-opp empty_cache         -> _run_collect_in_worker:614-621
+The listener-cancel fix (3.5b) is the LIKELY ROOT CAUSE of the iter-time
+creep — RSS watcher (scripts/diag/rss_watcher.sh) confirmed memory was
+stable; the cost is asyncio scheduler overhead from accumulated stale
+tasks. ANY new code path here that creates poke-env Players MUST cancel
+their listeners before letting them go out of scope.
+
 Public API:
 - mp_disk_collect_sync(...): synchronous one-iter collect. Drop-in for
   collect_v9 in train_rl.py:_collect_data when args.mp is set.
@@ -531,8 +545,26 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
                 lru = min(opp_cache.items(), key=lambda kv: kv[1]["last_used"])[0]
                 del opp_cache[lru]
             # Load opp ckpt onto opponent_device (cpu reduces GPU contention
-            # when N workers + main all share one A100)
-            cached_ckpt = torch.load(opp_path, map_location=opponent_device, weights_only=False)
+            # when N workers + main all share one A100).
+            #
+            # MEMORY HYGIENE (Session 50 audit, docs/diag/mp_memory_audit.md
+            # fix #3.5a): the saved ckpt dict contains AdamW optimizer state
+            # (~480 MB for our 240 MB transformer), scheduler state, snapshot
+            # pool list, and other training metadata that the opponent does
+            # not need at inference. Strip to the three fields read by
+            # BattleAgentTransformer.__init__ (model_state_dict, model_config,
+            # arch) BEFORE caching. Pattern mirrors eval_elo_ladder.py:201-216
+            # (load_ckpt_cached). Saves ~480 MB per cached ckpt ×
+            # opp_cache_max=3 × N workers (~11 GB at N=8). Without this,
+            # opp_cache pins optimizer state across iters until LRU eviction.
+            full = torch.load(opp_path, map_location=opponent_device, weights_only=False)
+            cached_ckpt = {
+                "model_state_dict": full["model_state_dict"],
+                "model_config": full.get("model_config", {}),
+                "arch": full.get("arch", "transformer"),
+            }
+            del full
+            gc.collect()
             opp_cache[opp_path] = {"ckpt": cached_ckpt, "last_used": time.time()}
 
         opponent = make_self_play_opponent(
@@ -589,6 +621,37 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
             opponent.reset_battles()
         except EnvironmentError:
             pass
+
+        # MEMORY HYGIENE (Session 50 audit, docs/diag/mp_memory_audit.md
+        # fix #3.5b): cancel poke-env websocket listener tasks before
+        # letting player/opponent go out of scope. Without this, the
+        # asyncio loop pins them as strong refs (the listener coroutine
+        # is a running task), and gc.collect() cannot reclaim. Over 7
+        # iters with 6-15 opps each, 40-100 stale listener tasks
+        # accumulate -> asyncio scheduler has to walk them every turn
+        # -> measurable iter-time tax. This is the LIKELY ROOT CAUSE of
+        # the 41 -> 51 min iter-time creep observed in Phase 1 v3 warmup
+        # (RSS watcher showed memory stable; the cost is asyncio
+        # scheduler overhead, not memory pressure).
+        # Mirrors ppo.py:_cancel_listener helper used by
+        # rl_collection.py:458-463 and eval_elo_ladder.py:320-327.
+        try:
+            from ppo import _cancel_listener
+            _cancel_listener(player)
+            _cancel_listener(opponent)
+        except Exception:
+            pass
+        del player, opponent
+
+        # MEMORY HYGIENE (Session 50 audit fix #3.5c): per-opp gc +
+        # cuda empty_cache reduces cudaMalloc fragmentation that
+        # accumulates across 6-15 opp matchups per iter. Without this,
+        # the only cleanup is at iter end (line 646-648), which is too
+        # coarse. Mirrors eval_diag.py:101-102 and
+        # eval_elo_ladder.py:488-490.
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     async def _heartbeat_during_collect():
         # Periodic in-worker status: how many battles active/finished. Helps

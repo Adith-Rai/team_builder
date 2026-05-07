@@ -9,6 +9,26 @@ time growing 41 → 51 min over iters 0-7 of warmup.
 explain via RSS alone (the creep is asyncio listener accumulation, not
 memory pressure).
 
+## Implementation status (Session 50 cont., 2026-05-07)
+
+| Fix | Status | mp_disk_collect.py location |
+|---|---|---|
+| 3.5a Strip opp ckpt | ✅ **APPLIED** | `_run_collect_in_worker` ~line 528-549 |
+| 3.5b Cancel listener + del | ✅ **APPLIED** | `_run_collect_in_worker` ~line 594-612 |
+| 3.5c Per-opp empty_cache | ✅ **APPLIED** | `_run_collect_in_worker` ~line 614-621 |
+| 3.5d PlayerPool refactor | ⏸️ deferred (medium risk) | n/a |
+| 3.5e Reorder del all_trajs | ⏸️ deferred (marginal) | n/a |
+
+Each fix has an inline `MEMORY HYGIENE (Session 50 audit ...)` comment
+block at the application site explaining WHY, with file:line back-refs
+to the local pattern it mirrors. The module-level docstring also flags
+this for future maintainers.
+
+**Validation pending**: needs a 5-iter mp smoke run against current
+Phase 1 v3 launch config to confirm the iter-time creep flattens. Phase
+1 v3 in flight uses the OLD code path; if user re-inits from a snapshot
+(per their hint), the new code path will apply.
+
 **Five fixes, sorted by impact:**
 
 ---
