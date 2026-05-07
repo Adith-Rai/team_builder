@@ -13,11 +13,35 @@ memory pressure).
 
 | Fix | Status | mp_disk_collect.py location |
 |---|---|---|
-| 3.5a Strip opp ckpt | ✅ **APPLIED** | `_run_collect_in_worker` ~line 528-549 |
-| 3.5b Cancel listener + del | ✅ **APPLIED** | `_run_collect_in_worker` ~line 594-612 |
-| 3.5c Per-opp empty_cache | ✅ **APPLIED** | `_run_collect_in_worker` ~line 614-621 |
+| 3.5a Strip opp ckpt | ✅ **APPLIED** | `_run_collect_in_worker` ~line 528 |
+| 3.5b Cancel listener + del + sleep | ✅ **APPLIED (revised after smoke hang)** | `_run_collect_in_worker` ~line 594 |
+| 3.5c Per-opp empty_cache | ✅ **APPLIED** | `_run_collect_in_worker` ~line 658 |
 | 3.5d PlayerPool refactor | ⏸️ deferred (medium risk) | n/a |
 | 3.5e Reorder del all_trajs | ⏸️ deferred (marginal) | n/a |
+
+### 3.5b implementation history
+
+**First attempt (commit 997fa32, 2026-05-07 ~05:00 UTC)**: just
+`_cancel_listener(player); _cancel_listener(opponent); del player,
+opponent`. **Hung the smoke at iter 10** with workers stuck at 99% CPU
+after a cluster of "Listen interrupted by" CRITICAL messages.
+
+**Root cause**: `PSClient._listening_coroutine` is a
+`concurrent.futures.Future` running in POKE_LOOP (a separate thread),
+NOT an asyncio.Task. `cancel()` is fire-and-forget across threads.
+`rl_collection.py:458-463` uses the same cancel pattern but its opps
+run via `asyncio.gather` which gives POKE_LOOP natural yield points.
+`mp_disk_collect.py` runs opps sequentially per worker, so without an
+explicit yield, POKE_LOOP backs up on listener cleanups while we're
+already creating new websocket connections for the next matchup
+→ deadlock.
+
+**Revised fix (Session 50 cont., 2026-05-07 ~08:30 UTC)**: same
+cancel + del, plus `await asyncio.sleep(1.5)` after the del. The sleep
+gives POKE_LOOP wall-clock time to propagate the cancellation +
+close the underlying websocket before the next matchup starts.
+Overhead: 1.5s × ~10 opps × N workers / N parallel = ~15s/iter total.
+Negligible vs the ~$30-50/run leak cost it prevents.
 
 Each fix has an inline `MEMORY HYGIENE (Session 50 audit ...)` comment
 block at the application site explaining WHY, with file:line back-refs

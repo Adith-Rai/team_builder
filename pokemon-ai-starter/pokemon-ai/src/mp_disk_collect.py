@@ -26,14 +26,20 @@ After Phase 1 v3 cloud run showed iter time growing 41 -> 51 min over 7
 warmup iters, an audit (docs/diag/mp_memory_audit.md) found three
 patterns present in local code paths but missing from this file. All
 three are now applied in `_play_vs_opp`:
-  3.5a opp ckpt strip after load   -> _run_collect_in_worker:528-549
-  3.5b cancel listener + del       -> _run_collect_in_worker:594-612
-  3.5c per-opp empty_cache         -> _run_collect_in_worker:614-621
-The listener-cancel fix (3.5b) is the LIKELY ROOT CAUSE of the iter-time
-creep — RSS watcher (scripts/diag/rss_watcher.sh) confirmed memory was
-stable; the cost is asyncio scheduler overhead from accumulated stale
-tasks. ANY new code path here that creates poke-env Players MUST cancel
-their listeners before letting them go out of scope.
+  3.5a opp ckpt strip after load   -> _run_collect_in_worker (~line 528)
+  3.5b cancel listener + del       -> _run_collect_in_worker (~line 594)
+  3.5c per-opp empty_cache         -> _run_collect_in_worker (~line 658)
+
+CRITICAL — fix 3.5b implementation note:
+PSClient._listening_coroutine is a concurrent.futures.Future running in
+POKE_LOOP (a separate thread), NOT an asyncio.Task. cancel() is
+fire-and-forget across threads. rl_collection.py uses asyncio.gather
+which gives POKE_LOOP natural yield points; mp_disk_collect runs opps
+sequentially, so we MUST `await asyncio.sleep(...)` after the cancel
+for POKE_LOOP to drain. First implementation without the sleep caused
+worker hangs at iter 10 (POKE_LOOP backed up). ANY new code path here
+that creates poke-env Players MUST cancel their listeners AND yield
+wall-clock time before creating new ones, or the workers will hang.
 
 Public API:
 - mp_disk_collect_sync(...): synchronous one-iter collect. Drop-in for
@@ -622,17 +628,28 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
         except EnvironmentError:
             pass
 
-        # MEMORY HYGIENE (Session 50 audit, docs/diag/mp_memory_audit.md
-        # fix #3.5b): cancel poke-env websocket listener tasks before
-        # letting player/opponent go out of scope. Without this, the
-        # asyncio loop pins them as strong refs (the listener coroutine
-        # is a running task), and gc.collect() cannot reclaim. Over 7
-        # iters with 6-15 opps each, 40-100 stale listener tasks
-        # accumulate -> asyncio scheduler has to walk them every turn
-        # -> measurable iter-time tax. This is the LIKELY ROOT CAUSE of
-        # the 41 -> 51 min iter-time creep observed in Phase 1 v3 warmup
-        # (RSS watcher showed memory stable; the cost is asyncio
-        # scheduler overhead, not memory pressure).
+        # MEMORY HYGIENE (Session 50 audit fix #3.5b, REVISED 2026-05-07):
+        # Cancel poke-env websocket listeners + del player/opponent so
+        # asyncio loop doesn't pin them via the still-running listener
+        # task (without this, 40-100 stale tasks accumulate over 7
+        # iters -> asyncio scheduler tax = the 41->51 min iter-time
+        # creep observed in Phase 1 v3 warmup).
+        #
+        # CRITICAL: PSClient._listening_coroutine is a
+        # concurrent.futures.Future running in POKE_LOOP (a separate
+        # thread), NOT an asyncio.Task. cancel() is fire-and-forget
+        # across threads. The first attempt at this fix (commit
+        # 997fa32 / 2026-05-07 ~05:00 UTC) cancelled and immediately
+        # started the next matchup -> POKE_LOOP backed up on async
+        # listener cleanup + websocket.close() while we were creating
+        # new ws connections for the next opp -> worker hung at 99%
+        # CPU at iter 10 of post-snapshot smoke. rl_collection.py uses
+        # the same cancel pattern but in asyncio.gather (parallel) which
+        # provides natural yield points; mp_disk_collect runs opps
+        # sequentially, so we MUST manually yield wall-clock time after
+        # each cancel for POKE_LOOP to drain. The 1.5s sleep is
+        # negligible overhead (~15s/iter total at N=8 workers) vs the
+        # ~$30-50 leak cost it prevents.
         # Mirrors ppo.py:_cancel_listener helper used by
         # rl_collection.py:458-463 and eval_elo_ladder.py:320-327.
         try:
@@ -643,12 +660,19 @@ def _run_collect_in_worker(*, model, device, worker_id, iter_n, n_games,
             pass
         del player, opponent
 
+        # Wall-clock yield: lets POKE_LOOP (another thread) finish
+        # propagating the cancellation + closing the underlying
+        # websocket before the next matchup creates a new connection.
+        # Without this, sequential per-matchup pattern overwhelms
+        # POKE_LOOP and worker hangs.
+        await asyncio.sleep(1.5)
+
         # MEMORY HYGIENE (Session 50 audit fix #3.5c): per-opp gc +
         # cuda empty_cache reduces cudaMalloc fragmentation that
-        # accumulates across 6-15 opp matchups per iter. Without this,
-        # the only cleanup is at iter end (line 646-648), which is too
-        # coarse. Mirrors eval_diag.py:101-102 and
-        # eval_elo_ladder.py:488-490.
+        # accumulates across 6-15 opp matchups per iter. Placed AFTER
+        # the asyncio.sleep so any objects whose cleanup is pending in
+        # POKE_LOOP have settled before we GC. Mirrors
+        # eval_diag.py:101-102 and eval_elo_ladder.py:488-490.
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
