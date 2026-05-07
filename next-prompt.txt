@@ -155,32 +155,44 @@ the V1 validation gate; do not block on it.
 
 ### Engineering work (likely the main session)
 
-#### A. Pipeline+mp overlap proper fix (~2-3 days)
+#### A. Pipeline+mp overlap (CIS) — Phases 1-3 ✅ DONE Session 51, Phase 4 deferred
 
 The `--mp --pipeline` combo currently silently no-ops for bg overlap.
 Diagnosed Session 50 as GPU contention: when bg cmd processing runs
 parallel to main's `optimizer.step()`, worker CUDA forwards stall and
 don't recover after main finishes.
 
-**Formal design doc**: **`docs/CENTRALIZED_INFERENCE_DESIGN.md`** — read
-this. Has architecture diagram, 4-phase implementation plan, validation
-plan with acceptance criteria, design decisions to make (flag naming,
-weight sync, IPC type, CUDA stream priority), risk table with
-mitigations.
+**Formal design doc**: **`docs/CENTRALIZED_INFERENCE_DESIGN.md`**.
+**Implementation**: `pokemon-ai-starter/pokemon-ai/src/mp_centralized_collect.py`.
+**Tests**: `scripts/diag/test_cis_phase{1,2,3}.py`.
 
-Quick summary: dedicated GPU process (CIS) arbitrates all worker
-inference. Main runs `optimizer.step` on HIGH-priority CUDA stream;
-CIS runs forwards on LOW-priority stream. CUDA scheduler honors
-priority — main gets GPU first, CIS fills gaps. No deadlock because
-CIS forwards always make progress, just slower during update windows.
+Phase status (Session 51, 2026-05-07):
+1. ✅ **Phase 1 skeleton**: CIS subprocess + numpy IPC + single-worker sync.
+   Test: 100 batches B=8 fp16 logits identity → bit-exact (0.0 max abs diff).
+2. ✅ **Phase 2 batching**: CISServer + per-worker CISClientHandle, mp.Pipe
+   per worker, multiplex via mp.connection.wait, accumulate min_batch=8 OR
+   15ms timeout, fire batched forward, dispatch per-request slices.
+   Test: 4 workers × 30 reqs B=8 → fp16 max abs diff 7.81e-3 (1 fp16 ULP at
+   log scale, expected from cross-worker batching); fp32 control 5.72e-6
+   (proves logic correct).
+3. ✅ **Phase 3 weight reload**: atomic file write + reload signal +
+   load_state_dict on CIS side. CRITICAL fix: mirror load_checkpoint's
+   `_orig_mod.` prefix strip — without it, strict=False silently masks
+   compiled-state-dict key mismatches → half-loaded model. Test caught
+   this on first attempt; fix verified bit-exact A→perturbed→A round-trip.
+4. ⏸️ **Phase 4 (deferred)**: re-enable mp+pipeline overlap in
+   `train_rl.py:_start_background_collection`, integrate CIS with worker
+   collect loop (workers pipe obs to CIS instead of running own GPU model),
+   CUDA stream priority (main HIGH, CIS LOW). Touches train_rl.py main
+   loop + ppo.py update + mp_disk_collect's worker code. ~$200-300 saving
+   over multi-gen 5-7 week run; needs careful design + sustained 5-iter
+   validation, NOT to be rushed.
 
-Phases (each ~half-day to 1 day):
-1. Skeleton: 1 worker → CIS → 1 worker, sync, validate logits identity
-2. Batching + N=4 workers, sustained 5-iter
-3. Weight sync + low-priority CUDA stream
-4. Re-enable pipeline overlap, production smoke
-
-Saves ~$200-300 over a multi-gen run (5-7 weeks compute).
+Quick architectural recap: dedicated GPU process (CIS) arbitrates all
+worker inference. Main runs `optimizer.step` on HIGH-priority CUDA stream;
+CIS runs forwards on LOW-priority stream. CUDA scheduler honors priority
+— main gets GPU first, CIS fills gaps. No deadlock because CIS forwards
+always make progress, just slower during update windows.
 
 References: `docs/MULTIPROCESS_COLLECTION.md` (Session 32 original concept —
 right architecture but predates Session 50 fixes); `ps-ppo`
@@ -188,6 +200,24 @@ right architecture but predates Session 50 fixes); `ps-ppo`
 similar pattern, different IPC layer; Metamon's AMAGO uses
 AsyncVectorEnv + disk-backed (different approach but informs failure
 modes).
+
+**Phase 4 next-session plan**:
+1. Add `--cis` flag to argparse (mutually exclusive with `--mp`'s current
+   per-worker-GPU mode; both code paths coexist during transition).
+2. New `mp_centralized_collect_sync(...)` that mirrors
+   `mp_disk_collect_sync(...)`'s signature but routes worker inference
+   through CIS instead of per-worker GPU models.
+3. Worker entrypoint: receives ctrl cmd → no model load → runs poke-env
+   battles → for each turn extract feat_dict → numpy serialize → CIS
+   handle.infer() → numpy logits → action selection → action to
+   battle_server. POKE_LOOP rule: any sequential `_cancel_listener`
+   pattern needs `await asyncio.sleep(1.5)` (cookbook §3j).
+4. Main loop wires CIS into `_start_background_collection`:
+   re-enable bg overlap (currently no-op), CIS forwards run on
+   `torch.cuda.Stream(priority=-1)`, main optimizer.step on default.
+5. Validation: 6-test pattern (cookbook §5b), focus on Test 1 (logits
+   identity vs --pipeline only), Test 4 (5-iter sustained), Test 6
+   (failure recovery: kill CIS / kill worker mid-iter).
 
 #### B. Warmup speedup (~30 min)
 
@@ -623,10 +653,14 @@ disagree, trust the code. Use `git log`/`git blame` for recent context.
 ACTIVE TODOs (multi-gen prep, in priority order)
 ═══════════════════════════════════════════════════════════════════════════════
 
-**HIGH (do this session)**:
-- [ ] A. Pipeline+mp redesign (centralized inference server) — ~2-3 days
+**HIGH (next session)**:
+- [x] ✅ A. Pipeline+mp CIS — Phases 1-3 done Session 51 (commit 50d4e80a);
+      Phase 4 (production integration of CIS into mp_disk_collect's worker
+      loop + re-enable bg overlap + CUDA stream priority) deferred to a
+      focused next session. See §A above for Phase 4 plan.
+- [x] ✅ C. torch.compile per-submodule fix done Session 51 (commit d5f500b8)
+- [x] ✅ Tier 1 companions: fused AdamW + --bf16 flag done Session 51
 - [ ] B. Warmup speedup (epochs=1 + torch.no_grad backbone) — ~30 min
-- [ ] C. torch.compile fix for new arch — ~1 day
 - [ ] D1. Gen-id token in TransformerBattlePolicy — ~half day
 - [ ] D2. Gen-aware feature pipeline (gen_id in batch + gen-specific
   feature gating for Mega/Z/Dynamax/Tera) — ~1 day
