@@ -193,7 +193,14 @@ N_PER_POKEMON  = 17
 # 11  speed-field (tailwind + trick room)
 # 12  mechanics (tera/mega/z/dmax availability + trapped/force_switch/opp_revealed_frac)
 # 13  progression (turn + alive counts)
-N_BATTLE_STATE = 14
+# 14  gen (multi-gen token, Session 51 D1) - one nn.Embedding lookup keyed
+#     on `batch["gen_id"]`. Tells the model which gen this turn is from
+#     so it can condition on per-gen mechanics (Mega gen 6-7, Z gen 7,
+#     Dynamax gen 8, Tera gen 9). Default at inference is
+#     `cfg.format_config.gen`. Per-gen feature gating lives downstream
+#     in `make_features` (D2 work). NOT compatible with BC v10 ckpts -
+#     architecture changed; multi-gen runs use a fresh BC v11 retrain.
+N_BATTLE_STATE = 15
 # K=4 summary scratch tokens (per §3.2 / §4.2; bumped from K=2 in Session 47
 # Postscript H to match Metamon Small's recipe and lift per-turn output to
 # 4×d_model=1024-dim feeding the temporal stack).
@@ -224,7 +231,8 @@ TT_OPP_SCREENS = 24
 TT_SPEED_FIELD = 25  # tailwind us/opp + trick room (speed-tier modifiers)
 TT_MECHANICS   = 26  # one-time-use resources: tera/mega/z/dmax + trapped/force_switch/opp_revealed
 TT_PROGRESSION = 27  # turn count + alive counts (game-progression info)
-N_TOKEN_TYPES = 28
+TT_GEN         = 28  # multi-gen token (Session 51 D1) - lookup from gen_embed
+N_TOKEN_TYPES = 29
 
 # Per-Pokemon: where each of the 17 token types maps in the 17-token block.
 _PER_POKEMON_TT = (
@@ -251,7 +259,8 @@ PS_SLOT_SPEED_FIELD    = 8
 PS_SLOT_MECHANICS      = 9
 PS_SLOT_PROGRESSION    = 10
 PS_SLOT_SUMMARY        = 11
-N_BATTLE_STATE_SLOTS = 12
+PS_SLOT_GEN            = 12   # Session 51 D1: multi-gen token slot
+N_BATTLE_STATE_SLOTS = 13
 
 
 def n_pokemon(fmt: FormatConfig) -> int:
@@ -1047,6 +1056,14 @@ class Tokenizer(nn.Module):
         self.actor_token   = nn.Parameter(torch.randn(d) * cfg.init_std)
         self.critic_token  = nn.Parameter(torch.randn(d) * cfg.init_std)
         self.summary_scratch = nn.Parameter(torch.randn(N_SUMMARY, d) * cfg.init_std)
+        # Session 51 D1: per-gen embedding. 10 slots cover gens 0-9
+        # (0 reserved for "unknown / multi-mix"; gens 1-9 use actual gen
+        # number). Looked up by `batch["gen_id"]` (B,) long tensor; if
+        # absent, the forward path falls back to `cfg.format_config.gen`.
+        # Gens 1-5 are out of project scope per docs/MULTIGEN_FEASIBILITY.md
+        # but the embedding allocates slots for them anyway so the model
+        # can be extended without an arch change.
+        self.gen_embed = nn.Embedding(10, d)
 
         # ---- Position / type / slot embeddings (§3.3) ----
         self.type_id_embed       = nn.Embedding(N_TOKEN_TYPES,                   d)
@@ -1160,7 +1177,12 @@ class Tokenizer(nn.Module):
             ps.append(bs(p_slot))
             ms.append(0)
 
-        # 6 .. 6 + 2*team*N_PER_POKEMON: per-Pokemon attribute blocks
+        # 14: gen token (Session 51 D1)
+        tt.append(TT_GEN)
+        ps.append(bs(PS_SLOT_GEN))
+        ms.append(0)
+
+        # 15 .. 15 + 2*team*N_PER_POKEMON: per-Pokemon attribute blocks
         for p in range(2 * team):
             for offset, t_id in enumerate(_PER_POKEMON_TT):
                 tt.append(t_id)
@@ -1500,13 +1522,24 @@ class Tokenizer(nn.Module):
 
         scratch = self.summary_scratch.unsqueeze(0).expand(B, N_SUMMARY, d)
 
+        # Session 51 D1: gen token. Looked up from `batch["gen_id"]` if present,
+        # else falls back to the cfg's format_config.gen (broadcast across B).
+        # Default ensures backward compat with single-gen training where
+        # callers don't bother to set gen_id.
+        gen_id = batch.get("gen_id")
+        if gen_id is None:
+            gen_id = torch.full((B,), self.cfg.format_config.gen,
+                                dtype=torch.long, device=all_poke.device)
+        gen_t = self.gen_embed(gen_id).unsqueeze(1)                              # (B, 1, d)
+
         # Order MUST match _build_position_ids: actor, critic, transition,
-        # our_threat, opp_threat, 9 field tokens, then per-Pokemon block, then
-        # summary scratch.
+        # our_threat, opp_threat, 9 field tokens, gen, then per-Pokemon block,
+        # then summary scratch.
         seq = torch.cat([
             actor_t, critic_t, trans_t,
             our_threat_t, opp_threat_t,
             field_seq,
+            gen_t,
             all_poke,
             scratch,
         ], dim=1)
@@ -1886,7 +1919,8 @@ class TransformerBattlePolicy(nn.Module):
         # Cache the position constants we need at forward time.
         fmt = cfg.format_config
         self._n_tokens = total_tokens(fmt)
-        self._our_active_move_start = N_BATTLE_STATE + _FIRST_MOVE_OFFSET   # 14+13=27
+        # 15+13=28 with the gen token added at index 14 (Session 51 D1).
+        self._our_active_move_start = N_BATTLE_STATE + _FIRST_MOVE_OFFSET
         self._our_bench_start = N_BATTLE_STATE + N_PER_POKEMON              # first bench Pokemon
         self._n_pokemon = n_pokemon(fmt)
         self._n_actions = fmt.n_actions
