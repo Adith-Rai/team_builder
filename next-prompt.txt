@@ -8,9 +8,9 @@ Then load `memory/project_cis_4_3_design.md` — **CIS Phase 4.3 a/b/c + 4.4 SHI
 
 Also load `memory/feedback_cis_thread_safety.md` — async-dispatch pattern is now the prod default. Per-handle Lock retained for parent-side reload calls (sync, rare). Don't conflate the two paths.
 
-First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy through iter 26 (W/L 54%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on H2H gauntlet + Network Volume in parallel. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, plan Phase 2 launch with --cis --pipeline + bf16 + Phase 4.4. If failed: diagnose, relaunch only after RCA.
+First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy through iter 28 (W/L ~53-54%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on STEP 2 (CIS worker respawn) as headline + STEP 6 (H2H gauntlet) and STEP 7 (Network Volume) as parallel side work. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, then move to STEP 3 (Tier 3) + STEP 5 (Phase 2 launch with full speed stack). If failed: diagnose, relaunch only after RCA.
 
-Headline work for next session: **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam ($0, ~3-4 hrs). Phase 1 v3 finishing in ~5-7 days; we'll need this for the iter-200 elite-ceiling measurement. Plus **Network Volume verification** on prod pod (10 min, $0). Plus optional **Tier 3 design study** — read `metamon_ref/metamon/rl/metamon_to_amago.py` for the sequence-batched-PPO-with-temporal-stack pattern (Metamon's MetamonAMAGODataset + AMAGOExperiment shows our temporal architecture maps cleanly; reference batch shape is `RLData(obs={K:(L+1,...)}, actions=(L,A), rews=(L,1), dones=(L,1))` with pad_mask). Don't START implementing Tier 3 yet — let Phase 1 v3 finish first.
+Headline work for next session: **CIS worker respawn (Phase 4.5)** — the last piece needed before Phase 2 can safely launch with `--cis --pipeline`. Without watchdog/respawn, a worker death mid-iter wastes ~50 min of compute. Port the proven `--mp` watchdog pattern (heartbeat-from-OS-thread + 600s tolerance + paced respawn) to CIS workers. ~1 day dev + ~$1-2 A100 validation. After that: Tier 3 transition-level minibatching is the headline (~1.5-2 wks dev + 20-iter A/B), the actual remaining big lever (~4-10× update speedup). Reference: `metamon_ref/metamon/rl/metamon_to_amago.py` for the right batch shape (sequence-batched with pad_mask). Don't START Tier 3 until Phase 1 v3 finishes.
 
 If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter) and S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer) are both wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
 
@@ -33,17 +33,21 @@ through iter 22 + iter 23 in update at S53 end (iter 19 EVAL:
 smart_avg=69%, passed ≥67% baseline gate); status TBD now — first
 action below covers it.
 
-Headline work for THIS session is **CIS lock refactor (Phase 4.4 —
-async-with-req_id-dispatch)** (§D STEP 2). Replaces the per-handle Lock
-with async dispatch: each submit assigns a unique req_id, multiple
-threads send concurrently behind a SEND-only lock, single recv-loop
-demultiplexes responses to per-req_id futures. Removes the IPC
-serialization that capped CIS at ~50% GPU utilization. Expected to
-recover the ~5pp gap from projected savings (26% → 30%+ at production
-scale). ~2-3 hrs implementation, ~$1-2 A100 validation.
-Then **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam ($0, ~3-4 hrs).
-Then **Network Volume verification** on prod pod (10 min, $0). Match the
-bar of S51/S52/S53 carefully-shipped work.
+Headline work for THIS session is **CIS worker respawn (Phase 4.5)**
+(§D STEP 2). Last piece needed before Phase 2 can safely launch with
+`--cis --pipeline`. Worker watchdog/respawn — port the proven `--mp`
+heartbeat-from-OS-thread + 600s tolerance + paced respawn pattern to
+CIS workers. ~1 day dev + ~$1-2 A100 validation.
+
+After that: **Tier 3 transition-level minibatching** is the headline
+(~1.5-2 wks dev + 20-iter A/B validation). The actual remaining big
+lever — ~4-10× update speedup if quality holds. Reference:
+`metamon_ref/metamon/rl/metamon_to_amago.py` for sequence-batched-PPO
+with-temporal-stack. Don't start until Phase 1 v3 finishes.
+
+Parallel side work (zero-GPU, hours not days): **H2H gauntlet wiring**
+(STEP 6, ~3-4 hrs), **Network Volume verification** (STEP 7, ~10 min).
+Match the bar of S51/S52/S53 carefully-shipped work.
 
 If you read NOTHING else, read these SEVEN things:
 
@@ -136,13 +140,14 @@ the 14-token state_dict. A respawned worker from the new code would crash
 on `load_state_dict` mismatch. Wait for production to complete OR be
 explicitly killed before pulling.
 
-**B2. DO NOT use `--cis` in production until Phase 4.3 lands** (see §D).
-CIS Phase 4.3 a/b/c shipped + production-validated in S53. Pool-mirror
-multi-slot (real PFSP routing), bg overlap re-enabled, prod-scale wall-time
-A/B confirmed ~26% saving vs `--mp`. **Production keeps using `--mp` until
-Phase 1 v3 finishes** (HEAD on prod pod locked at `251cd14a`; CIS 4.3
-breaks compatibility with the iter-22+ snapshot). For Phase 2 launch:
-defer to post-Phase-4.4 lock refactor to capture the full ~30%+ saving.
+**B2. CIS state (FYI — no action item, just don't get confused).**
+CIS Phase 4.3 a/b/c + 4.4 shipped + prod-validated in S53. Pool-mirror
+multi-slot, bg overlap re-enabled, async-with-req_id-dispatch (Phase 4.4
+replaced the per-handle Lock). Production-scale measured ~30% wall-time
+saving vs `--mp`. **Production keeps using `--mp` until Phase 1 v3
+finishes** (HEAD on prod pod locked at `251cd14a`; CIS 4.3+4.4 break
+compatibility with the iter-22+ snapshot). Phase 2 launch will use
+`--cis --pipeline --bf16` (after CIS worker respawn lands — see §D).
 
 **B3. DO NOT change two variables at once during A/B comparisons.** Phase 1 v3
 compiled run uses `--fp16` deliberately (not `--bf16`) so the compile A/B
@@ -169,33 +174,25 @@ test_*.py` patterns.
 mitigations are live. Per-worker GPU model is correct for the current
 production design. CIS is a SEPARATE path behind a SEPARATE flag.
 
-**B8. DO NOT reach for Tier 3 optimizations until Tier 1 + Tier 2 are all
-shipped.** Specifically:
+**B8. DO NOT do `grad_accum > 1` standalone.** Session 31 record suggests
+`grad_accum=10` produced a *weaker battler* — silent quality regression,
+NOT a crash. Hard to detect without 10-20 iters + eval. Pure wall-time
+saving from `grad_accum` alone is ~4-5%, dwarfed by the regression risk.
+Tier 3 (transition-level minibatching, see §D STEP 3) SUBSUMES the
+grad_accum benefit and uses the same batching pattern validated by
+Metamon (sequence-batched with pad_mask, see metamon_to_amago.py).
 
-- **`--grad-accum 1` is mandatory for production.** Don't experiment with
-  `grad_accum > 1` standalone. Session 31 record suggests `grad_accum=10`
-  produced a *weaker battler* — silent quality regression, NOT a crash.
-  Hard to detect without 10-20 iters + eval. Pure wall-time saving from
-  `grad_accum` alone is ~4-5%, dwarfed by the regression risk.
-- The right path forward is **transition-level minibatching** (refactor
-  to batch like Metamon's 48 episodes/forward or ps-ppo's 256-2048
-  transitions/gradient — we're 48× below published practice). The refactor
-  SUBSUMES the grad_accum benefit and uses the same code path published
-  work has validated. Three implementation options sketched in old
-  `next-prompt §B1.6` (now archived in git history at commit `2c7d97fc`):
-  (A) episode-padded with attention masks; (B) chunk-based with K
-  consecutive turns; (C) pre-cached temporal embeddings then mix freely.
-- **Episode boundaries MUST be preserved** in any sensible refactor:
-  temporal stack still sees sequential turns from ONE episode; only
-  loss/gradient computation mixes across episodes.
-- **DO NOT** reopen the `lr` question alongside any grad_accum / batching
-  experiment. Hold `lr=1e-5` constant. Compounding two unknowns silently
-  ruins the comparison.
-- **DO ONLY** if wall-time is still painful after Tier 1+2 wins ship
-  (`--compile` + bf16 + flash attn + CIS+pipeline). If those land and
-  wall-time becomes acceptable, transition-level minibatching can stay
-  deferred indefinitely. If wall-time becomes excellent, the validation
-  cost becomes cheap enough to test anyway.
+**For Tier 3 itself** when you ship it (post-Phase-1-v3):
+- **Episode boundaries MUST be preserved** — temporal stack still sees
+  sequential turns from ONE episode; only loss computation mixes across
+  episodes via per-position masking.
+- **Reference: Metamon's MetamonAMAGODataset._process_data** — they form
+  RLData with `(B episodes, L_max turns, ...)` shape + pad_mask.
+- **DO NOT bundle with other unknowns**. Hold `lr=1e-5` constant.
+  Hold compile/bf16/CIS settings constant during Tier 3 A/B.
+- **Validation gate**: 20-iter cloud A/B vs current arch, smart_avg +
+  Elo deltas must hold. Quality regression is the failure mode that
+  matters; wall-time saving is meaningless if the model gets weaker.
 
 **B9. DO NOT reopen the lr question.** lr=1e-5 was hard-won through a
 4-point ablation (Session 50). Confirmed by the compiled run hitting 50%
@@ -207,12 +204,16 @@ returns False/0 for unavailable mechanics in each gen. Adding belt-and-
 suspenders gating is dead weight — the data layer enforces correctness.
 This was investigated in D2; the right answer was to NOT add the gate.
 
-**B11. DO NOT remove the per-handle Lock from CISClientHandle.** It's
-load-bearing for thread-safe IPC under concurrent submits (player + opp
-batches overlap in any worker with `max_concurrent>0`). mp.Pipe.send is
-not byte-atomic. See `memory/feedback_cis_thread_safety.md`. The proper
-long-term replacement is async-with-req_id-dispatch (deferred); until
-that ships, the lock stays.
+**B11. DO NOT remove the thread-safety in CISClientHandle.** S53 shipped
+Phase 4.4 async-with-req_id-dispatch as the production path. The Phase 4.3
+per-handle Lock is retained as the SYNC fallback (used by parent-side
+handles in `CISServer` for occasional reload calls). mp.Pipe.send is not
+byte-atomic — both paths exist for a reason. See
+`memory/feedback_cis_thread_safety.md`. **Critical gotcha**: worker procs
+must NOT start the recv_loop until they receive their first `collect_iter`
+cmd — otherwise they race with parent's reload reads and steal reload
+responses → "invalid load key" UnpicklingError. `_cis_worker_main` defers
+`start_recv_loop()` to handle this.
 
 **B12. DO NOT reopen "dual-slot CIS" (slot 0 = player, slot 1 = active
 opp).** S53 found it doesn't compose with asyncio.gather opp concurrency
@@ -226,8 +227,9 @@ pool). See §K dead paths + `memory/project_cis_4_3_design.md`.
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-At S53 end: iter 22 complete + iter 23 in PPO update. ~178 iters to go
-to iter 200 target, ~7 days remaining at $1.50/hr (~$254 to completion).
+At S53 end: iter 28 complete + iter 29 in collect (next eval iter).
+~170 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
+(~$240 to completion).
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -247,31 +249,39 @@ Mitigations: heartbeat (600s timeout, 0.25s stagger, liveness-thread heartbeat)
 **S53-measured iter trajectory** (compiled, post-heartbeat-fix):
 
 ```
-Iter 15: collect=909s  update=2174s  W/L 761/839 (47.6%)  kl=0.0384  pool=2
-Iter 16: collect=959s  update=2195s  W/L 804/796 (50.2%)  kl=0.0379  pool=2  ← first 50%+
-Iter 17: collect=964s  update=2243s  W/L 832/768 (52.0%)  kl=0.0379  pool=2
-Iter 18: collect=963s  update=2347s  W/L 842/758 (52.6%)  kl=0.0384  pool=2
-Iter 19: collect=971s  update=3197s  W/L 878/721 (54.9%)  kl=0.0408  pool=2  ← peak; eval included
-Iter 20: collect=1051s update=2346s  W/L 755/844 (47.2%)  kl=0.0398  pool=3  ← dipped (pool grew)
-Iter 21: collect=1067s update=3215s  W/L 858/741 (53.7%)  kl=0.0415  pool=3  ← long update (variance)
-Iter 22: collect=1061s update=2337s  W/L 860/739 (53.8%)  kl=0.0392  pool=3
-Iter 23 was in update phase at end of S53.
+Iter 15: collect=909s  update=2174s  W/L 761/839 (47.6%)  pool=2
+Iter 16: collect=959s  update=2195s  W/L 804/796 (50.2%)  pool=2  ← first 50%+
+Iter 17: collect=964s  update=2243s  W/L 832/768 (52.0%)  pool=2
+Iter 18: collect=963s  update=2347s  W/L 842/758 (52.6%)  pool=2
+Iter 19: collect=971s  update=3197s  W/L 878/721 (54.9%)  pool=2  ← eval; smart_avg=69%
+Iter 20: collect=1051s update=2346s  W/L 755/844 (47.2%)  pool=3  ← dipped (pool grew)
+Iter 21: collect=1067s update=3215s  W/L 858/741 (53.7%)  pool=3
+Iter 22: collect=1061s update=2337s  W/L 860/739 (53.8%)  pool=3
+Iter 23: collect=1063s update=2372s  W/L 890/709 (55.7%)  pool=3
+Iter 24: collect=1071s update=2351s  W/L 901/698 (56.3%)  pool=3  ← peak so far
+Iter 25: collect=1145s update=2225s  W/L 830/770 (51.9%)  pool=4  ← dipped (pool grew)
+Iter 26: collect=1117s update=2318s  W/L 863/736 (54.0%)  pool=4
+Iter 27: collect=1153s update=2277s  W/L 852/748 (53.2%)  pool=4
+Iter 28+ was in collect at end of S53.
 ```
 
 **Compile gain confirmed**: iter 14 (uncompiled) was 4423s total; avg
-post-compile no-eval iter is ~3300s. **~25% steady-state speedup, 30%
-peak.** No regression from compile path.
+post-compile no-eval iter is ~3380s. **~24% steady-state speedup.**
+No regression from compile path.
 
-**Heartbeat mitigations confirmed**: 8 iters across pool growth boundary
-(iter 19→20 pool 2→3) without any worker respawn or stale-heartbeat.
+**Heartbeat mitigations confirmed**: 14 iters across two pool growth
+boundaries (iter 19→20 pool 2→3 + iter 24→25 pool 3→4) without any
+worker respawn or stale-heartbeat. Pool growth produces a single-iter
+dip in W/L (47.2% at iter 20, 51.9% at iter 25) that recovers within
+1-2 iters as the model adapts to harder PFSP opps.
 
 **Iter 19 EVAL (passed)**:
 ```
 SH=66%, SmartDmg=68%, Tactical=68%, Strategic=76%, smart_avg=69%
 ```
 Above the ≥67% BC v10 baseline gate. Strategic at 76% is unusually high
-— typically the hardest bot. Could indicate PPO learned strategic patterns
-during selfplay, or noise. Iter 29 eval will be more interpretable.
+— typically the hardest bot. Iter 29 eval is the next interpretable
+data point (eval-interval=10).
 
 **Diagnostic-signal reminder** (load `feedback_diagnostic_signals.md`):
 the per-worker `LIVE +Ns iter=N] n_done=X/200` counter is broken/lagging.
@@ -296,22 +306,102 @@ What to look for:
 - `FATAL` or `stale_heartbeat` → run is in trouble; diagnose before touching anything
 - Iter 19 EVAL line → smart_avg should be ≥67%
 
-**STEP 2: H2H gauntlet wiring vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0, SESSION 54 HEADLINE)
-Rationale: Phase 1 v3 hits iter 200 in ~5-7 days. We need the "elite?"
-signal then — smart_avg vs basic bots is necessary but insufficient. H2H
-against published bots (Kakuna from Metamon, SmallRL, Minikazam) is the
-actual ceiling measurement.
+## SPEED TRACK — these unlock the multi-million-trajectory goal
 
-`eval_h2h_gauntlet.py` exists per §H. "Wiring" means:
-- Find published bot weights/code (HF? GitHub releases? request from authors)
-- Adapt their inference adapter to our `make_self_play_opponent` factory
-- Run small validation gauntlet locally (10-20 games per opp)
-- Document setup in cookbook for the iter 200 eval pipeline
+User's framing: speed gates everything. The "elite measurement" + "infra
+hygiene" items only become useful when training throughput is high
+enough to make runs affordable. Speed work first, ops on the side.
 
-Code-only work, no GPU compute. Strategic frame says this is multi-gen-
-AGNOSTIC infra → ship + validate on gen 9 baseline now.
+**STEP 2: CIS worker respawn** (~1 day dev + ~$1-2 A100 validation, SESSION 54 HEADLINE)
+Rationale: Phase 2 will use `--cis --pipeline --bf16`. CIS workers don't
+yet have a watchdog/respawn mechanism — if a worker dies mid-iter, the
+iter is lost (~50 min of wasted compute at production scale). For a 5-7
+day Phase 2 run, this WILL happen at least once and probably more.
 
-**STEP 3: Network Volume verification on prod pod** (~10 min, $0)
+The `--mp` watchdog pattern is already shipped (S51) and proven through
+Phase 1 v3's pool-growth boundaries. Port the same heartbeat-from-OS-thread
++ 600s tolerance + paced respawn pattern to CIS workers.
+
+**Files**:
+- `mp_centralized_collect.py:_cis_worker_main` — currently no liveness
+  thread; add one mirroring `mp_disk_collect.py`'s pattern
+- `mp_centralized_collect.py:_ensure_cis_global` — add a respawn manager
+  similar to `_GLOBAL_MANAGER` in mp_disk
+- Expand `_cis_wait_results_and_aggregate` to detect dead workers via
+  health_check, respawn cleanly, decrement expected count
+
+**Validation**: cookbook §5 Test 6 — kill -9 a CIS worker mid-iter,
+verify watchdog respawns, iter completes, subsequent iters normal. Run
+against `test_cis_phase4_3c_walltime.py` config (N=8, conc=200, games=400).
+
+**STEP 3: Tier 3 transition-level minibatching** (~1.5-2 weeks dev + 20-iter cloud A/B validation)
+Rationale: this is THE remaining big lever. PPO update phase is currently
+bound by per-episode batching (~48 episodes/forward). Published practice
+(ps-ppo, Metamon) uses 256-2048 transitions/gradient — we're 48× below.
+Estimated: **4-10× update speedup** if quality holds. For 5M trajectories,
+this is the difference between ~70 days and ~22-30 days post-CIS.
+
+**Reference: Metamon's source.** `metamon_ref/metamon/rl/metamon_to_amago.py`
+shows the right batch shape for transformer-temporal-with-on-policy-PPO:
+- `MetamonAMAGODataset._process_data`: forms RLData with variable-length
+  episodes, shape `(obs={K:(L+1,...)}, actions=(L,A), rews=(L,1), dones=(L,1))`
+- `MetamonAMAGOExperiment.edit_actor_mask` / `edit_critic_mask`: pad_mask
+  + missing_action_mask combine to mask loss terms per `(B, L, G, _)` batch
+- `MetamonTstepEncoder` (line 477) and AMAGO's traj_encoder confirm our
+  spatial + temporal split maps directly to their tstep + traj encoder
+
+**Implementation approach**: borrow the batch SHAPE from Metamon (sequence
+of variable-length episodes, padded to L_max in batch, masked loss).
+Don't borrow the algorithm — they use V-trace (off-policy with experience
+replay), we stay strict on-policy PPO. Just bigger batches per forward.
+
+**The work**:
+- Reshape PPO update path from per-turn `(B, ...)` to per-episode `(B, L, ...)`
+- Causal masking in temporal attention (no future-info leak)
+- PPO loss per-timestep with pad_mask zeroing padding positions
+- Trajectory storage refactor: per-turn dicts → `(B, L, ...)` tensors per episode
+
+**Acceptance gates** (don't ship if any fail):
+- Tests 1-3 + Test 4 sustained still PASS bit-exact
+- 20-iter A/B vs current arch on cloud: smart_avg + Elo deltas hold
+  within ±2pp (silent quality regression is THE failure mode)
+- Wall-time saving: ≥3× on update phase at production scale
+
+**STEP 4: `torch.compile(train_step)`** (~2-3 days, BUNDLE WITH STEP 3)
+Rationale: ~10-15% additional saving on update phase by fusing forward
++ backward + optimizer step into one graph. Per-submodule forward
+compile is already shipped (S51, Path 2); the train_step compile fuses
+the boundaries.
+
+**Why bundled with Tier 3**: `torch.compile` is shape-sensitive.
+Variable batch shapes cause recompiles that eat the win. Tier 3's
+fixed `(B, L_max)` shape gives compile what it needs. Standalone
+train_step compile on the current per-turn variable-shape path would
+fight against shape changes — net loss likely.
+
+**STEP 5: Phase 2 launch with full speed stack** (~5-7 days, ~$200-300)
+After STEPs 2-4 land + parallel ops items (STEP 6+7), launch Phase 2:
+`--cis --pipeline --bf16` + Phase 4.4 async-dispatch + Tier 3 + train_step
+compile. Relaunch from Phase 1 v3's final.pt or last clean snapshot.
+Target wall-time: ~10-15 min/iter (vs current 55 min). Target cost:
+$200-300 for 200 iters (vs current $275).
+
+## OPS TRACK — parallel side work, $0 GPU, hours not days
+
+These can be done concurrently with Speed Track. They become useful AT
+Phase 2 launch but don't block earlier work.
+
+**STEP 6: H2H gauntlet wiring vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0)
+`eval_h2h_gauntlet.py` already exists. "Wiring" = downloading 3 bot
+weights/code + writing 3 small adapter classes for our
+`make_self_play_opponent` factory + small local validation gauntlet.
+
+Becomes the "are we elite?" signal we don't have today. smart_avg ≥67%
+vs basic bots is necessary but insufficient — H2H against published bots
+is the actual ceiling measurement. Needed at Phase 1 v3 iter 200 final
+eval AND throughout Phase 2 to track elite-ness over time.
+
+**STEP 7: Network Volume verification on prod pod** (~10 min verify, ~30 min migrate if needed)
 Critical infra debt. Before any future relaunch (Phase 2 or otherwise)
 we MUST have Network Volume — `MEMORY.md` warns "S49 lost a BC run to
 stop+resume on Container Disk." Verify whether prod pod's `/workspace`
@@ -321,107 +411,26 @@ is on Network Volume or Container Disk:
 ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
 ```
 
-If Container Disk: don't pause/stop the prod pod. Plan migration for
-Phase 2 launch (provision new pod with Network Volume, copy snapshots
-+ R2 backup).
+If Container Disk: don't pause/stop the prod pod (current Phase 1 v3 is
+fine — continuous run, no pause planned). Plan Phase 2 launch with a new
+pod that has Network Volume from spawn.
 
-**STEP 4 (defer until Phase 1 v3 finishes): Tier 3 design study**
-Read `metamon_ref/metamon/rl/metamon_to_amago.py` carefully for the
-sequence-batched-PPO-with-temporal-stack pattern. Specifically:
-- `MetamonAMAGODataset._process_data` — see how they form RLData with
-  variable-length episodes (`obs={K:(L+1,...)}, actions=(L,A), ...`)
-- `MetamonAMAGOExperiment.edit_actor_mask` / `edit_critic_mask` — see
-  how pad_mask + missing_action_mask combine to mask loss terms per
-  (B, L, G, _) batch shape
-- `MetamonTstepEncoder` (line 477) and traj_encoder usage — confirms
-  our spatial+temporal split maps to AMAGO's tstep_encoder + traj_encoder
-- AMAGO uses experience replay + V-trace (off-policy). For our strict
-  on-policy PPO, we BORROW the batch shape but NOT the algorithm.
-  Estimate: ~1.5-2 weeks dev once Phase 1 v3 finishes. Validation: 20-iter
-  cloud A/B vs current.
+## DEFER — multi-gen-SPECIFIC, only when multi-gen is the next move
 
-**STEP 3: H2H gauntlet vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0)
-Rationale: Phase 1 v3 hits iter 200 in ~7 days. We need the "elite?"
-signal to evaluate the final model. smart_avg vs basic bots is necessary
-but insufficient — H2H against published bots is the actual ceiling
-measurement.
+Per `project_strategic_frame.md`: multi-gen-SPECIFIC infra is JIT before
+multi-gen launch, NOT shipped-and-cold. None of the below blocks Phase 2
+(which stays gen-9-only). Pick these up only when Phase 2 + H2H gauntlet
+shows we're at the gen-9 ceiling and ready to go horizontal.
 
-`eval_h2h_gauntlet.py` already exists per §H. "Wiring" means:
-- Find published bot weights (HF? GitHub releases? request from authors)
-- Adapt their inference adapter to our `make_self_play_opponent` factory
-- Run small validation gauntlet locally (10-20 games per opp)
-- Document setup in cookbook for the iter 200 eval pipeline
-
-Strategic frame says this is multi-gen-AGNOSTIC infra → ship + validate
-on gen 9 baseline now. Per `project_strategic_frame.md`.
-
-**STEP 4: Network Volume verification on prod pod** (~10 min, $0)
-Critical infra debt. Before any future relaunch (Phase 2 or otherwise)
-we MUST have Network Volume — `MEMORY.md` warns "S49 lost a BC run to
-stop+resume on Container Disk." Verify whether prod pod's `/workspace`
-is on Network Volume or Container Disk:
-
-```
-ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
-```
-
-If Container Disk: don't pause/stop the prod pod. Plan migration for
-Phase 2 launch (provision new pod with Network Volume, copy snapshots
-+ R2 backup).
-
-**STEP 3: Multi-gen data path** (~1-2 weeks of compute, $10-20)
-
-This is what the project actually needs. D1-D3 (the architectural
-foundation) are done. What remains:
-
-- **D4 HuggingFace replay corpus pull** (compute-heavy, multi-GB).
-  Source: `jakegrigsby/metamon-raw-replays` filtered by gen + ≥1500 ELO.
-  Per-gen counts (from MULTIGEN_FEASIBILITY.md):
-    - Gen 6 (ORAS): ~50k-100k replays
-    - Gen 7 (SUMO/USUM): ~50k-150k replays
-    - Gen 8 (SS): ~30k-80k replays
-    - Gen 9 (SV): already have 100k cleaned
-  Total: ~250k-400k replays across 4 gens. Storage ~300-400 GB on cloud.
-  Cost: ~$5 cloud download time + storage rent.
-- **D5 Multi-gen `replay_to_memmap` validation**. The script is already
-  gen-aware via `_parse_gen_from_format` (validated Session 51, see
-  `scripts/diag/test_d3_per_gen_teambuilder.py` for the pattern). Run
-  it for gens 6/7/8 against the new corpora.
-- **D6 BC v11 multi-gen retrain**. A100 80GB, 5 epochs at B=48 fp16,
-  ~5-7 days, ~$10-15 cost. New `data/models/bc/v11_multigen/`.
-  Validation: per-gen smart_avg ≥ gen-9-only baseline within 5pp.
-  Only AFTER this can multi-gen PPO begin.
-
-**STEP 4: PPO multi-gen run setup** (~1-2 weeks training, $400-600)
-
-- E1: per-iter format selection (mix gens within one PPO run, sample
-  gen per game), per-gen PFSP pool curation
-- E2 partial done — smart bots construct cleanly for gens 6/7/8/9 (Session 51).
-  Real-battle validation per gen still needed (~1 hour cloud time per gen).
-- E3: per-gen evaluation harness — extends `eval_diag.py` /
-  `eval_metamon_competitive.py` to track smart_avg-per-gen separately
-
-**STEP 5 (lower priority, do AFTER multi-gen lands)**:
-- ~~**Flash attention**~~ — DONE in S52 (no action). torch's nn.TransformerEncoder
-  auto-uses SDP since 2.0; SDP picks best backend automatically. SpatialTransformer's
-  arbitrary `poke_mask` blocks flash kernel anyway → falls back to mem_efficient.
-  See `feedback_bf16_autocast_gating.md`. Don't re-investigate.
-- ~~**bf16 production switch + autocast on PPO update**~~ — SHIPPED in S52
-  (commit `fb2127a3`). bf16 ALSO enables autocast on update path (gated bf16-only
-  because fp16 backward without GradScaler underflows). fp16 update path
-  unchanged. `--bf16` is now recommended in cookbook + argparse help. Validation
-  cycle: next post-Phase-1-v3 relaunch with `--bf16` will be the cloud validation.
-  Don't re-investigate. fp16 production stays --fp16 to match in-flight snapshot.
-- **Warmup speedup** (B from old TODO list, ~30 min): epochs=1 + no_grad
-  during warmup. ~$15-25 saved per 20-warmup-iter run. Bigger win on
-  multi-gen with phase warmups.
-- **H2H gauntlet vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, no cloud cost) —
-  needed for "are we elite?" signal that smart_avg can't give us. Wires
-  `eval_h2h_gauntlet.py` to published bots. Important for the gen-9-vertical
-  "ceiling" measurement before Phase 1 v3 final eval.
-- **Network Volume verification on production pod** (~10 min) — per memory,
-  S49 lost a BC run to stop+resume on Container Disk. Must confirm before
-  any future relaunch. Cheap to verify.
+- **D4 HuggingFace replay corpus pull** (gens 6/7/8, ~$5, ~300-400 GB)
+- **D5 Multi-gen `replay_to_memmap` validation** (script is gen-aware
+  per `_parse_gen_from_format`, just needs running on new corpora)
+- **D6 BC v11 multi-gen retrain** (A100 80GB, 5 epochs, ~5-7 days, ~$10-15)
+- **E1 per-iter format selection** (mix gens within one PPO run)
+- **E2 per-gen real-battle smart bot validation** (1 hr cloud per gen)
+- **E3 per-gen evaluation harness** (extends `eval_diag.py`)
+- **Warmup speedup** (epochs=1 + no_grad during warmup, ~$15-25 saved
+  per 20-warmup-iter run; bigger win on multi-gen with phase warmups)
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -657,13 +666,17 @@ reducing ent_coef in response. This is normal; don't try to "fix" it.
 §J0. SESSION 53 — GAINS, METRICS, NON-ACTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Gains (6+ commits + 2 memory files, all on origin/master)**:
+**Gains (8 commits + 2 memory files, all on origin/master)**:
 - `92caecd3` CIS Phase 4.3a: pool-mirror multi-slot + Tests 1-3
 - `3accb9fd` Per-handle Lock around pipe IPC + Path/random imports + Test 4
 - `475b32d1` CIS Phase 4.3b: CISBgCollector + bg overlap re-enable
 - `4f0a292f` CIS Phase 4.3c: small-scale wall-time A/B (22.8% saving)
+- `5b6fbdc6` next-prompt: Session 54 handoff
 - `1fca242a` docs: incorporate prod-scale 4.3c results + remove stale CIS-pending statements
+- `3cd924cb` test_cis_phase4_3c_walltime: add --cis-min-batch CLI flag
 - `4d901830` CIS Phase 4.4: async-with-req_id-dispatch (~20% collect speedup, prod-scale measured)
+- `02c2f3c9` docs: Phase 4.4 outcome + S54 priorities
+- `b4e60bce` diag: pad_bc_v10_to_d1d2_arch script (BC v10 → current arch warm init)
 - Production-scale 4.3c + 4.4 on A100 measured. Pre-refactor (4.3) GPU at
   ~48% util lock-bound, iter 0 collect = 649s. Post-refactor (4.4) GPU
   saturating, iter 0 collect = 520s (-20%).
@@ -698,16 +711,23 @@ producing silent training corruption. Two resolutions:
   `mp_centralized_collect.py`. Caused NameError surfaces in 4.3b
   orchestrator path that wasn't exercised before.
 
-**Pre-existing CIS thread-safety issue surfaced + fixed**: Test 4's first
-end-to-end run hit `_pickle.UnpicklingError: invalid load key` + Broken
-pipe. Root cause: `mp.Pipe.send` is not byte-atomic across threads;
-concurrent submits from one worker (player + opp at minimum) corrupted
-the pickle stream. Fix: per-handle `threading.Lock` wrapping each
-(send, poll, recv) cycle. Tests 1-3 + 4 + 4.3b/c all pass with lock in
-place. **Cost**: serializes IPC within a worker handle. **Confirmed at
-production scale (S53)**: GPU peaks at ~48% utilization, lock is the
-throughput bottleneck. Phase 4.4 async-with-req_id-dispatch refactor is
-the next priority. See `feedback_cis_thread_safety.md`.
+**Pre-existing CIS thread-safety issue surfaced + fixed (twice)**:
+- First fix (Phase 4.3): Test 4's first end-to-end run hit
+  `_pickle.UnpicklingError: invalid load key` + Broken pipe. Root cause:
+  `mp.Pipe.send` is not byte-atomic across threads; concurrent submits
+  from one worker (player + opp at minimum) corrupted the pickle stream.
+  Fix: per-handle `threading.Lock` wrapping each (send, poll, recv) cycle.
+- Second issue surfaced when Phase 4.4 was being added: worker's recv-loop
+  thread races with PARENT's `cis_handles[wid].reload()` reads. Both
+  processes have read access to the same resp pipe (parent uses for slot
+  reloads; worker for inference). If worker's recv_thread starts at
+  __init__ time, it eats parent's reload responses → "invalid load key"
+  on parent. Fix: `_cis_worker_main` constructs handle with
+  `start_recv=False`, calls `cis_handle.start_recv_loop()` only on first
+  `collect_iter` cmd (by which time parent's reload window has closed).
+  Parent-side handles in `CISServer` keep `start_recv=False` permanently
+  → use the SYNC lock-based path. Two-mode class for two callsites.
+- Both fixes shipped + prod-validated. See `feedback_cis_thread_safety.md`.
 
 **Production observations from S53**:
 - Phase 1 v3 healthy through iter 22, iter 23 in update at S53 end
@@ -811,8 +831,8 @@ These have been investigated and rejected. Don't waste cycles re-walking:
   of the path. Path 2 (per-submodule, all 5 modules) is the right answer.
   Don't revert.
 - **Standalone `grad_accum > 1`**: Session 31 record suggests silent
-  quality regression. Don't experiment without the transition-level
-  minibatching refactor (Tier 3, last resort).
+  quality regression. Don't experiment standalone — Tier 3 (transition-
+  level minibatching, §D STEP 3) SUBSUMES it via batch shape change.
 - **`lr=3e-5`**: caused regression on transformer arch. lr=1e-5 won the
   Session 50 4-point ablation. Hold it.
 - **Explicit per-gen feature gating in code**: investigated Session 51 D2.
@@ -829,10 +849,16 @@ These have been investigated and rejected. Don't waste cycles re-walking:
   with **pool-mirror slots** (1 player + K opp slots, K=pool size).
   Don't reopen this — pool-mirror is strictly better at every axis
   except GPU memory (which is trivial: ~3% of 80GB at K=16).
-- **Removing the per-handle Lock in CISClientHandle**: the lock is
-  load-bearing for concurrent IPC correctness (see
-  `feedback_cis_thread_safety.md`). Don't remove without replacing
-  with async-with-req_id-dispatch. mp.Pipe.send is not byte-atomic.
+- **Removing CISClientHandle thread-safety**: BOTH paths in the code are
+  load-bearing. Async-with-req_id-dispatch (Phase 4.4, default in
+  workers) handles concurrent IPC; the per-handle Lock (Phase 4.3,
+  retained in CISServer parent-side) handles serial reload calls.
+  See `feedback_cis_thread_safety.md`. mp.Pipe.send is not byte-atomic;
+  one path or the other is required.
+- **Worker-side recv_loop starting at __init__ time**: races with
+  parent's reload reads on the same pipe → "invalid load key"
+  UnpicklingError. `_cis_worker_main` MUST defer `start_recv_loop()`
+  until first `collect_iter` cmd is received. Don't move it earlier.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -866,14 +892,16 @@ to find the relevant commit + read its message for context.
 1. Read `memory/MEMORY.md` "Current State" section.
 2. Read this entire file. Yes, all of it. It's not that long.
 3. Run the production status check (§E).
-4. If production is healthy: pick STEP 2 from §D (CIS Phase 4.3) as
-   your headline work. Plan it. Discuss the plan with the user before
-   coding.
+4. If production is healthy: pick STEP 2 from §D (CIS worker respawn)
+   as your headline work. Plan it. Discuss the plan with the user before
+   coding. STEP 6 (H2H gauntlet) and STEP 7 (Network Volume) can run
+   in parallel — code-only side work, $0 GPU.
 5. If production has FATAL or stale-heartbeat: diagnose first.
    `feedback_iter17_heartbeat_hang.md` is the diagnostic playbook.
-6. If production is done (all 186 iters): pull final.pt, run full eval
-   suite (`eval_diag.py` + `eval_metamon_competitive.py`), document
-   final smart_avg + Elo + W/L. Then plan the multi-gen launch.
+6. If production is done (iter 200 reached): pull final.pt, run full eval
+   suite (`eval_diag.py` + `eval_metamon_competitive.py` + H2H gauntlet
+   if wired), document final smart_avg + Elo + per-bot + H2H. Then
+   move to STEP 3 (Tier 3) + STEP 5 (Phase 2 launch with full speed stack).
 7. Don't start coding before step 4-or-5-or-6's outcome is clear.
 
 If you find yourself confused or context-loaded: ASK THE USER. Do not

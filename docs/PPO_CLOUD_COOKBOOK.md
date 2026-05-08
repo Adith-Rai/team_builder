@@ -218,7 +218,7 @@ Worst-case loss bound on pod death: 5 min of progress.
 
 **Current behavior**: `--mp --pipeline` still silently treats as `--mp` only (no-op for bg overlap; see `train_rl.py:_start_background_collection`). Don't use the combo.
 
-**Solution shipped in Session 51 (CIS Phases 1-4.2, behind `--cis` flag — NOT YET production-ready, see §3k for status)**: centralized inference server holds the only GPU model + runs forwards on a low-priority CUDA stream while main's optimizer.step runs on default priority. CUDA scheduler arbitrates — main wins, CIS fills gaps, no deadlock. See `docs/CENTRALIZED_INFERENCE_DESIGN.md` for design and `docs/SESSION51_NOTES.md` for what's done vs deferred. Bg-overlap re-enable for `--cis --pipeline` is Phase 4.3 (next session).
+**Solution shipped in Session 51-53 (CIS Phases 1-4.4, behind `--cis` flag — production-validated, see §3l for status)**: centralized inference server holds K+1 model slots (1 player + K opp) + runs forwards on a low-priority CUDA stream while main's optimizer.step runs on default priority. CUDA scheduler arbitrates — main wins, CIS fills gaps, no deadlock. Pool-mirror multi-slot for real PFSP per-opp routing. Async-with-req_id-dispatch (Phase 4.4) removes IPC serialization → ~30% wall-time saving vs `--mp` at production scale (measured S53 on A100). See `docs/CENTRALIZED_INFERENCE_DESIGN.md` for design.
 
 ### 3d. SelfPlayOpponent factory dispatch
 
@@ -454,7 +454,7 @@ on a low-priority CUDA stream; workers pipe obs via numpy IPC.
 | `--lam` | `0.95` | GAE lambda. Session 39 validated. |
 | `--ent-coef` | `0.02` | Session 39 validated. With adaptive-entropy active, this is just the starting point. |
 | `--target-kl` | `0.03` (default) | KL early stop threshold. Validated. |
-| `--grad-accum` | **`1`** | Keep at 1 until the larger transition-level minibatching refactor lands. Standalone grad_accum>1 experiments are NOT recommended: Session 31 record suggests grad_accum=10 produced a *weaker battler* (silent quality regression, hard to detect without 10-20 iters + eval). Pure wall-time saving from grad_accum alone is ~4-5%. The right path is the transition-level refactor that batches like Metamon (48 episodes/forward) or ps-ppo (256-2048 transitions/gradient) — that's where the proper fix lives. **See next-prompt §B1.6 Tier 3 for the full plan; do everything else first.** Hold lr=1e-5 constant in any future grad_accum experiments. |
+| `--grad-accum` | **`1`** | Keep at 1. Standalone `grad_accum>1` is NOT recommended: Session 31 record suggests grad_accum=10 produced a *weaker battler* (silent quality regression, hard to detect without 10-20 iters + eval). Pure wall-time saving from grad_accum alone is ~4-5%. The right path is **Tier 3 transition-level minibatching** (next-prompt §D STEP 3) that batches like Metamon's MetamonAMAGODataset shape — sequence-batched with pad_mask. That refactor SUBSUMES the grad_accum benefit. Hold lr=1e-5 constant in any future batching experiments. |
 | `--reward-style` | `terminal` | Session 43+ validated. Was `dense` earlier. |
 | `--adaptive-entropy-low/high` | `0.65 / 0.95` | Session 43 safeguards entropy collapse. |
 | `--win-rate-mode` | `ema` | Forgets old data in PFSP weighting; prevents stuck weights when policy beats old snapshot. |
@@ -577,7 +577,8 @@ NaN signals (FATAL — abort and diagnose):
 | `--mp` only (Test A) | 200, conc=20 | ~6 min | ~8-12 min (with pool growth) |
 | **`--mp` only Phase 1 v3 production (warmup, opt-stack on)** | 1600, conc=200, N=8 | **collect 822s + update 1686s = 41.8 min** | iter 1 also 42.5 min (warmup) |
 | `--mp` only Phase 1 v3 (post-warmup, est) | same | — | ~20-25 min/iter (collect ~13 min + update ~5-10 min when KL early-stop fires) |
-| `--mp --pipeline` (broken; bg overlap deadlocks) | — | iter 0 OK, iter 1 hang | (use `--mp` alone until CIS lands; see CENTRALIZED_INFERENCE_DESIGN.md) |
+| `--mp --pipeline` (broken; bg overlap deadlocks) | — | iter 0 OK, iter 1 hang | (use `--cis --pipeline` instead — Phases 4.3+4.4 shipped S53, ~30% saving vs `--mp`; see §3l + CENTRALIZED_INFERENCE_DESIGN.md) |
+| `--cis --pipeline` Phases 4.3+4.4 (shipped S53, prod-validated) | 400, conc=200, N=8 | iter 0 collect=520s @ ~50% GPU util saturation | At full prod (1600 games): max(~32min collect, 38min update) = ~38 min/iter, **~30% saving vs `--mp`**. Phase 2 launches with this stack. |
 
 **Honest observation (Session 50)** — read this carefully, it shapes priorities:
 
