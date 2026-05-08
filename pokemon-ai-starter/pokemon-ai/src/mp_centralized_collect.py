@@ -54,6 +54,7 @@ import os
 import sys
 import time
 import traceback
+from contextlib import nullcontext as _nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -483,6 +484,28 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                 pass
         return
 
+    # CUDA stream priority (Phase 4.2): CIS forwards run on a LOW-priority
+    # stream so when main process does optimizer.step on the default
+    # (HIGH-priority) stream, CUDA scheduler honors priority - main gets
+    # GPU first, CIS fills gaps. This is the KEY mechanism that makes
+    # --pipeline overlap work without GPU contention deadlock (cookbook
+    # §3c). Without priority, both compete unmanaged.
+    #
+    # Negative priorities = lower priority (closer to 0 = higher). Default
+    # stream is priority 0; -1 is below default. On RunPod A100 the actual
+    # scheduler honor depends on driver/CUDA version - if priorities are
+    # ignored, CIS still works (just doesn't get the contention benefit).
+    cis_low_pri_stream: Optional["torch.cuda.Stream"] = None
+    if device.type == "cuda":
+        try:
+            cis_low_pri_stream = torch.cuda.Stream(device=device, priority=-1)
+            print(f"[CIS-multi] low-priority CUDA stream created (priority=-1)",
+                  flush=True)
+        except Exception as e:
+            print(f"[CIS-multi] WARN low-priority stream creation failed: {e} - "
+                  f"using default stream (no scheduler arbitration)", flush=True)
+            cis_low_pri_stream = None
+
     # Send ready to each worker's resp pipe so each handle gets a clean signal.
     for w in worker_resp_writers:
         try:
@@ -539,7 +562,14 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             stacked = _stack_numpy_batches([p[3] for p in pending])
             torch_batch = numpy_dict_to_torch(stacked, device)
 
-            with torch.no_grad(), autocast_ctx(fp16):
+            # Phase 4.2: run forward on LOW-priority CUDA stream so main
+            # process's optimizer.step gets first dibs on the GPU. The
+            # `with torch.cuda.stream(...)` ctx is a no-op if stream is None
+            # (CPU device or stream creation failed at startup).
+            _stream_ctx = (torch.cuda.stream(cis_low_pri_stream)
+                           if cis_low_pri_stream is not None
+                           else _nullcontext())
+            with torch.no_grad(), autocast_ctx(fp16), _stream_ctx:
                 if not any_history or not _have_arch_compat:
                     # Simple path: history-free or arch_compat unavailable.
                     out = model(torch_batch)

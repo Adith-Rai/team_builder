@@ -173,9 +173,16 @@ def parse_args():
                         "N forkserver workers, each with own GPU model copy + own "
                         "InferenceBatcher; trajectories written to /tmp at iter end. "
                         "Cloud-only, transformer arch only. See docs/MP_DISK_REDESIGN.md.")
+    p.add_argument("--cis", action="store_true",
+                   help="Use centralized inference server (mp_centralized_collect.py). "
+                        "Single CIS subprocess holds the GPU model; N workers pipe "
+                        "obs to CIS via numpy IPC, no per-worker model copy. Unlocks "
+                        "real --pipeline overlap via CUDA stream priority (main HIGH, "
+                        "CIS LOW). Mutually exclusive with --mp. Cloud-only, "
+                        "transformer arch only. See docs/CENTRALIZED_INFERENCE_DESIGN.md.")
     p.add_argument("--mp-workers", type=int, default=8,
-                   help="Number of mp-disk workers when --mp is set (default 8 for "
-                        "RunPod A100 80GB; tune down for smaller VRAM).")
+                   help="Number of mp-disk OR cis workers when --mp/--cis is set "
+                        "(default 8 for RunPod A100 80GB; tune down for smaller VRAM).")
     p.add_argument("--mp-cache-size", type=int, default=3,
                    help="Per-worker LRU cache size for opponent ckpts (default 3).")
     p.add_argument("--batch-timeout-ms", type=float, default=15,
@@ -317,6 +324,34 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         result = pending_collection
         _flow(f"unpacked pre-collected: {len(result[0])} trajs, {result[4]} steps")
         return result
+
+    if getattr(args, 'cis', False):
+        # --cis routes to centralized inference server (mp_centralized_collect.py).
+        # Workers don't own a model; CIS is the single GPU model holder.
+        # See docs/CENTRALIZED_INFERENCE_DESIGN.md.
+        from mp_centralized_collect import mp_centralized_collect_sync
+        model.eval()
+        _flow(f"starting CIS collection (n_workers={args.mp_workers})")
+        cis_result = mp_centralized_collect_sync(
+            model, device, server_pool,
+            n_games=args.games_per_iter,
+            max_concurrent=args.max_concurrent,
+            snapshot_pool=snapshot_pool,
+            fp16=args.fp16,
+            reward_shaper_cfg=rs_cfg,
+            temp_range=(args.temp_min, args.temp_max),
+            opponent_device=args.opponent_device,
+            win_rates=win_rates,
+            turn_cap=args.turn_cap,
+            battle_format=battle_format,
+            procedural_teams_path=getattr(args, 'procedural_teams', None),
+            iter_n=getattr(args, '_current_iter', 0),
+            n_workers=args.mp_workers,
+            amp_dtype=getattr(args, 'amp_dtype_name', None),
+        )
+        _flow(f"cis collect done: {cis_result[6]:.0f}s, "
+              f"{len(cis_result[0])} trajs")
+        return cis_result
 
     if getattr(args, 'mp', False):
         # --mp now routes to disk-backed implementation (mp_disk_collect.py).
@@ -616,6 +651,13 @@ def main():
     device = torch.device(args.device)
     battle_format = args.format
 
+    # --mp and --cis are mutually exclusive collect strategies.
+    if getattr(args, "mp", False) and getattr(args, "cis", False):
+        raise SystemExit("ERROR: --mp and --cis are mutually exclusive. "
+                         "--mp = per-worker GPU model (mp_disk_collect.py); "
+                         "--cis = centralized inference server "
+                         "(mp_centralized_collect.py). Pick one.")
+
     # Set the global amp dtype ONCE here so every autocast site (in this
     # process AND in mp workers via cmd dict propagation) picks it up.
     # See precision_config.py docstring for rationale.
@@ -875,8 +917,10 @@ def main():
     print(f"Init: {args.init_from} | Format: {battle_format} | Run: {run_dir}")
     print(f"Iters: {args.n_iters}, Games/iter: {args.games_per_iter}, Concurrent: {args.max_concurrent}")
     print(f"gamma={args.gamma}, lam={args.lam}, ent={args.ent_coef}, target_kl={args.target_kl}, grad_accum={args.grad_accum}")
+    _collect_mode = "CIS" if args.cis else ("MP" if args.mp else "SYNC")
     print(f"FP16: {'ON' if args.fp16 else 'OFF'}, Compile: {'ON' if compiled else 'OFF'}, "
-          f"Pipeline: {'ON' if args.pipeline else 'OFF'}, Device: {device}")
+          f"Pipeline: {'ON' if args.pipeline else 'OFF'}, Collect: {_collect_mode}, "
+          f"Device: {device}")
     print(f"Snapshot pool: {len(snapshot_pool)} checkpoints\n", flush=True)
 
     # Register this run (fire-and-forget)
