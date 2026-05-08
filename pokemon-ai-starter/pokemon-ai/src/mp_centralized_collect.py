@@ -763,7 +763,10 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
             if cmd == "ping":
                 try:
-                    worker_resp_writers[widx].send({"status": "ok"})
+                    resp = {"status": "ok"}
+                    if req.get("req_id") is not None:
+                        resp["req_id"] = req.get("req_id")
+                    worker_resp_writers[widx].send(resp)
                 except Exception:
                     closed_workers.add(widx)
                 continue
@@ -821,15 +824,20 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                            "slot": slot,
                            "missing_keys": missing[:5],
                            "unexpected_keys": unexpected[:5]}
+                    if req.get("req_id") is not None:
+                        msg["req_id"] = req.get("req_id")
                     worker_resp_writers[widx].send(msg)
                 except Exception as e:
                     tb = traceback.format_exc()
                     try:
-                        worker_resp_writers[widx].send({
+                        err_msg = {
                             "status": "error",
                             "exc_msg": f"reload failed: {e}",
                             "traceback": tb,
-                        })
+                        }
+                        if req.get("req_id") is not None:
+                            err_msg["req_id"] = req.get("req_id")
+                        worker_resp_writers[widx].send(err_msg)
                     except Exception:
                         closed_workers.add(widx)
                 continue
@@ -890,44 +898,173 @@ class CISClientHandle:
     CISClientHandles can call .infer() concurrently from different threads
     or processes; CIS multiplexes via mp.connection.wait.
 
-    Thread safety: within a single handle (one pipe pair), concurrent
-    threads MUST be serialized — mp.Pipe.send is not byte-atomic across
-    threads, and resp_reader.recv() can return another thread's response
-    if not serialized. We hold a per-handle lock around each send+recv
-    pair, so requests across threads execute one-at-a-time on the pipe.
-    Cross-handle (cross-worker) concurrency is preserved — each worker's
-    handle has its own pipe pair and lock. Cross-thread within a worker
-    serializes IPC; that's a known cost vs. the alternative async-with-
-    req_id-dispatch design (deferred, see CIS thread-safety TODO)."""
+    Phase 4.4 (S54): async-with-req_id-dispatch. Each request gets a
+    monotonically-assigned req_id. Multiple threads send concurrently
+    behind a SEND-only lock (~us-scale critical section). A single
+    recv-loop thread per handle reads responses off the pipe and
+    demultiplexes them to per-req_id futures. Each caller awaits its
+    own future. Removes the per-handle Lock that Phase 4.3 introduced
+    — that lock was correct but capped throughput at 1-in-flight per
+    handle (~50% GPU utilization at production scale, S53 measured).
 
-    def __init__(self, req_writer, resp_reader, worker_idx: int):
+    Concurrency model:
+    - Multiple threads can call infer/reload/ping in parallel
+    - send_lock is held only across pickle+send (~tens of microseconds)
+    - recv-loop demuxes responses, sets per-req_id futures
+    - Cross-handle (cross-worker) concurrency unchanged — each worker has
+      its own pipe pair + own recv-loop"""
+
+    def __init__(self, req_writer, resp_reader, worker_idx: int,
+                 start_recv: bool = True):
         import threading as _threading
+        import itertools as _itertools
         self.req_writer = req_writer
         self.resp_reader = resp_reader
         self.worker_idx = worker_idx
-        self._lock = _threading.Lock()
+
+        # Phase 4.4 async-dispatch state.
+        self._send_lock = _threading.Lock()  # cheap atomic enqueue
+        self._next_req_id = _itertools.count(1)  # 0 reserved for legacy/None
+        self._pending: Dict[int, Any] = {}  # Dict[int, Future]
+        self._pending_lock = _threading.Lock()
+        self._stopped = False
+        self._recv_thread: Optional[_threading.Thread] = None
+        if start_recv:
+            self.start_recv_loop()
+
+    def start_recv_loop(self) -> None:
+        """Start the response dispatcher thread. Called by CISServer.spawn()
+        AFTER consuming the initial 'ready' message — otherwise the recv
+        loop would steal it from spawn()'s direct resp_reader.recv() call.
+        Idempotent: safe to call once; subsequent calls are no-ops."""
+        import threading as _threading
+        if self._recv_thread is not None:
+            return
+        self._recv_thread = _threading.Thread(
+            target=self._recv_loop,
+            name=f"CISClientHandle-recv-{self.worker_idx}",
+            daemon=True,
+        )
+        self._recv_thread.start()
+
+    def _recv_loop(self) -> None:
+        """Single thread per handle that polls resp_reader + dispatches
+        responses to per-req_id futures. Exits when pipe closes (EOF)
+        or shutdown() is called."""
+        while not self._stopped:
+            try:
+                # Short poll so shutdown can take effect quickly.
+                if not self.resp_reader.poll(timeout=0.1):
+                    continue
+                resp = self.resp_reader.recv()
+            except (EOFError, BrokenPipeError, OSError) as e:
+                # Pipe closed. Fail all pending and exit.
+                self._fail_all_pending(
+                    RuntimeError(f"CIS pipe closed (worker {self.worker_idx}): "
+                                 f"{type(e).__name__}")
+                )
+                return
+            except Exception as e:
+                # Unexpected error; fail all pending and exit.
+                self._fail_all_pending(e)
+                return
+
+            req_id = resp.get("req_id") if isinstance(resp, dict) else None
+            if req_id is None:
+                # Untagged response (e.g., legacy callers). Drop with warn.
+                # All Phase 4.4+ requests carry req_id, so this is rare.
+                print(f"[CIS-handle {self.worker_idx}] WARN untagged response "
+                      f"dropped: {resp!r}", flush=True)
+                continue
+
+            with self._pending_lock:
+                fut = self._pending.pop(req_id, None)
+            if fut is None:
+                # Future was likely cleaned up due to caller timeout.
+                # Discard the response.
+                continue
+            if not fut.done():
+                fut.set_result(resp)
+
+    def _fail_all_pending(self, exc: BaseException) -> None:
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(exc)
+
+    def _send_with_future(self, msg: Dict[str, Any]) -> "concurrent.futures.Future":
+        """Assign req_id, register future, atomically send msg. Returns
+        the future the caller should await."""
+        from concurrent.futures import Future as _Future
+        req_id = next(self._next_req_id)
+        msg["req_id"] = req_id
+        fut: "_Future" = _Future()
+        with self._pending_lock:
+            self._pending[req_id] = fut
+        try:
+            with self._send_lock:
+                self.req_writer.send(msg)
+        except Exception:
+            # Send failed; remove future + propagate.
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            raise
+        return fut
+
+    def _await_future(self, fut, timeout_s: float, op: str) -> Dict[str, Any]:
+        """Block until future resolves. Drop pending entry on timeout
+        so a late response doesn't leak memory."""
+        from concurrent.futures import TimeoutError as _FutTimeout
+        try:
+            return fut.result(timeout=timeout_s)
+        except _FutTimeout:
+            # Find the req_id and drop it from _pending.
+            with self._pending_lock:
+                stale_ids = [rid for rid, f in self._pending.items() if f is fut]
+                for rid in stale_ids:
+                    self._pending.pop(rid, None)
+            raise TimeoutError(f"CIS {op} (worker {self.worker_idx}) "
+                               f"response not received within {timeout_s}s")
+
+    def _sync_send_recv(self, msg: Dict[str, Any], timeout_s: float,
+                         op: str) -> Dict[str, Any]:
+        """Lock-based send+recv for handles that did NOT start_recv_loop().
+        Used by parent-process handles in CISServer (rare reload calls
+        between iters; no concurrency on the parent side). Worker-side
+        handles always go through the async-dispatch path."""
+        with self._send_lock:
+            self.req_writer.send(msg)
+            if not self.resp_reader.poll(timeout=timeout_s):
+                raise TimeoutError(f"CIS {op} (worker {self.worker_idx}) "
+                                   f"response not received within {timeout_s}s")
+            resp = self.resp_reader.recv()
+        return resp
 
     def infer(self, numpy_batch: Dict[str, Any], timeout_s: float = 30.0,
               req_id: Optional[int] = None,
               history: Optional[np.ndarray] = None,
               history_lens: Optional[np.ndarray] = None,
               slot: int = 0) -> Dict[str, np.ndarray]:
-        msg = {"cmd": "infer", "batch": numpy_batch, "slot": int(slot)}
-        if req_id is not None:
-            msg["req_id"] = req_id
+        # `req_id` kwarg accepted for back-compat with Phase 4.3 callers
+        # (tests that passed explicit req_ids); ignored — Phase 4.4
+        # assigns its own req_id internally for the dispatcher to demux.
+        msg: Dict[str, Any] = {"cmd": "infer", "batch": numpy_batch,
+                                "slot": int(slot)}
         if history is not None:
             msg["history"] = history
         if history_lens is not None:
             msg["history_lens"] = history_lens
-        # Serialize the send+recv pair so concurrent threads don't
-        # interleave bytes on the pipe (corrupts pickle stream) or steal
-        # each other's responses. See class docstring.
-        with self._lock:
-            self.req_writer.send(msg)
-            if not self.resp_reader.poll(timeout=timeout_s):
-                raise TimeoutError(f"CIS infer (worker {self.worker_idx}) "
-                                   f"response not received within {timeout_s}s")
-            resp = self.resp_reader.recv()
+        if self._recv_thread is not None:
+            # Async-dispatch path (worker-side handles).
+            fut = self._send_with_future(msg)
+            resp = self._await_future(fut, timeout_s, "infer")
+        else:
+            # Sync lock-based path (parent-side handles in CISServer; no
+            # recv-thread because parent does its own resp_reader.recv()
+            # for the initial 'ready' signal + occasional reload calls).
+            resp = self._sync_send_recv(msg, timeout_s, "infer")
         status = resp.get("status")
         if status == "ok":
             return resp["out"]
@@ -938,11 +1075,11 @@ class CISClientHandle:
 
     def ping(self, timeout_s: float = 5.0) -> bool:
         try:
-            with self._lock:
-                self.req_writer.send({"cmd": "ping"})
-                if not self.resp_reader.poll(timeout=timeout_s):
-                    return False
-                resp = self.resp_reader.recv()
+            if self._recv_thread is not None:
+                fut = self._send_with_future({"cmd": "ping"})
+                resp = self._await_future(fut, timeout_s, "ping")
+            else:
+                resp = self._sync_send_recv({"cmd": "ping"}, timeout_s, "ping")
             return resp.get("status") == "ok"
         except Exception:
             return False
@@ -955,24 +1092,30 @@ class CISClientHandle:
 
         slot selects which model slot to reload (default 0 = player slot).
         Phase 4.3a adds K opp slots; orchestrator reloads slot 1..K with
-        PFSP pool ckpts at iter start."""
-        with self._lock:
-            self.req_writer.send({"cmd": "reload", "weights_path": weights_path,
-                                  "slot": int(slot)})
-            if not self.resp_reader.poll(timeout=timeout_s):
-                raise TimeoutError(f"CIS reload (worker {self.worker_idx}) "
-                                   f"response not received within {timeout_s}s")
-            resp = self.resp_reader.recv()
+        PFSP pool ckpts at iter start. Phase 4.4 routes through async
+        dispatch (worker-side) or sync lock (parent-side)."""
+        msg = {"cmd": "reload", "weights_path": weights_path, "slot": int(slot)}
+        if self._recv_thread is not None:
+            fut = self._send_with_future(msg)
+            resp = self._await_future(fut, timeout_s, "reload")
+        else:
+            resp = self._sync_send_recv(msg, timeout_s, "reload")
         if resp.get("status") == "ok":
             return resp
         raise RuntimeError(f"CIS reload error: {resp.get('exc_msg')}\n"
                            f"{resp.get('traceback','')}")
 
     def shutdown(self) -> None:
+        # Mark stopped first so recv_loop exits cleanly when pipe closes.
+        self._stopped = True
         try:
-            self.req_writer.send({"cmd": "shutdown"})
+            with self._send_lock:
+                self.req_writer.send({"cmd": "shutdown"})
         except Exception:
             pass
+        # Fail any still-pending futures so callers don't hang.
+        self._fail_all_pending(RuntimeError(
+            f"CIS handle (worker {self.worker_idx}) shutting down"))
 
 
 class CISServer:
@@ -1035,13 +1178,20 @@ class CISServer:
         for w in worker_resp_writers:
             w.close()
 
-        # Build handles + wait for ready on each
+        # Build handles WITHOUT starting their recv threads — parent-side
+        # handles use the sync lock-based path (only used for occasional
+        # reload calls between iters; no concurrency on parent side). The
+        # async-dispatch recv-thread is started ONLY in worker procs (where
+        # concurrent battles share one handle and need demuxing). See
+        # _cis_worker_main, which constructs fresh handles with default
+        # start_recv=True.
         self._handles = []
         for i in range(self.n_workers):
             self._handles.append(CISClientHandle(
                 req_writer=worker_req_writers[i],
                 resp_reader=worker_resp_readers[i],
                 worker_idx=i,
+                start_recv=False,  # parent-side: stay in sync mode
             ))
 
         # Block until each handle's resp pipe receives "ready"
@@ -1267,10 +1417,17 @@ def _cis_worker_main(worker_id: int, ctrl_pipe, result_pipe,
     logging.basicConfig(level=logging.WARNING)
 
     # Reconstruct handle from inherited pipe ends.
+    # CRITICAL: do NOT start the recv_thread here. Parent's CISServer also
+    # holds (read) end of the same resp pipe and uses it for reload calls
+    # at iter start. If worker's recv_thread starts now, it RACES with
+    # parent's reload reads — worker steals reload responses, parent gets
+    # corrupted recv ("invalid load key"). Defer recv_loop start until
+    # the first collect_iter cmd arrives (by then parent's reloads done).
     cis_handle = CISClientHandle(
         req_writer=cis_req_writer,
         resp_reader=cis_resp_reader,
         worker_idx=worker_id,
+        start_recv=False,
     )
 
     # Worker-local state survives across iters.
@@ -1305,6 +1462,10 @@ def _cis_worker_main(worker_id: int, ctrl_pipe, result_pipe,
             break
         if cmd.get("cmd") != "collect_iter":
             continue
+
+        # First collect_iter received: parent's reload-window has closed.
+        # Safe to start the recv_loop now (idempotent across iters).
+        state["cis_handle"].start_recv_loop()
 
         iter_n = cmd["iter_n"]
         _send_heartbeat(iter_n=iter_n, n_done=0, n_total=cmd.get("n_games", 0))
