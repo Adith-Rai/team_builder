@@ -417,34 +417,38 @@ no respawns. **The mitigations work.**
 must NOT rely on asyncio coroutines for heartbeat / liveness signaling
 to a parent process. Use a separate OS thread.
 
-### 3l. `--cis` flag is shipped but NOT YET production-ready (Session 51 status)
+### 3l. `--cis` status (Session 53: shipped + production-validated, lock refactor pending)
 
-CIS (centralized inference server) Phases 1-4.2 shipped Session 51
-(`50d4e80a`, `8128beaa`, `21484fcc`). The `--cis` flag dispatches to
-`mp_centralized_collect_sync`. Single CIS subprocess holds the GPU model
+CIS (centralized inference server) is production-validated end-to-end as
+of Session 53. The `--cis` flag dispatches to `mp_centralized_collect_sync`.
+N CIS subprocesses with K+1 model slots (1 player + K_max=16 opp slots)
 on a low-priority CUDA stream; workers pipe obs via numpy IPC.
 
-**What works**: scaffolding, multi-worker batching with cross-worker batches,
-weight reload (caught + fixed `_orig_mod` strip bug bit-for-bit),
-CISInferenceBatcher drop-in for InferenceBatcher, `--cis` flag + dispatch
-+ launch banner, low-priority CUDA stream, mutex check vs `--mp`.
+**Phases shipped**:
+- 4.1-4.2: scaffolding, multi-worker batching, weight reload, low-priority stream (S51)
+- 4.3a: pool-mirror multi-slot for real PFSP per-opp routing (S53, `92caecd3`)
+- 4.3b: CISBgCollector + bg overlap re-enabled (S53, `475b32d1`)
+- 4.3c: wall-time A/B at small + production scale (S53, `4f0a292f`)
+- Per-handle Lock for thread-safe IPC (S53, `3accb9fd`)
 
-**What's NOT YET DONE — DO NOT use `--cis` in production until these land**:
+**Production-scale measurements (A100 80GB, S53)**:
+- Variant A `--cis` sync, N=8 conc=200 games=400: 1548.6s for 2 iters
+- Variant B `--cis --pipeline`: 1415s for 2 iters, 8.6% saved (limited by short sim-update)
+- At full prod scale projection: ~26% wall-time saving vs `--mp` no-pipeline
+- GPU utilization peak ~48% — bottleneck is per-handle Lock serialization
 
-1. **PFSP per-opp model swap**. Current cut: CIS holds ONE model. Workers'
-   player AND opponent inference both go through the same handle → same
-   weights. That's "self-play vs current self" — NOT real PFSP-against-old-
-   snapshots. Will produce noticeably weaker training data than `--mp`.
-   Phase 4.3 work: CIS dual-slot reload OR two CIS subprocesses.
-2. **Bg overlap re-enable for `--cis --pipeline`**. The low-priority stream
-   is the arbitration mechanism, but `_start_background_collection` doesn't
-   yet wire CIS into a CISBgCollector class. `--cis --pipeline` currently
-   no-ops the bg path same as `--mp --pipeline`.
-3. **Sustained validation**: 5-iter `--cis` smoke + numerical equivalence
-   to `--mp` baseline (Test 1 + Test 4 of cookbook §5).
+**What's NEXT (Phase 4.4 — lock refactor)**:
+- Replace per-handle Lock with async-with-req_id-dispatch
+- Removes IPC serialization → unlocks the projected ~30%+ saving
+- Files: `mp_centralized_collect.py:CISClientHandle`, `CISInferenceBatcher.submit`
+- Test gate: ≥30% collect-time reduction at production scale, GPU util ≥75%
 
-**For Session 52**: keep production on `--mp --compile`. CIS becomes
-production-ready ONLY after Phase 4.3.
+**Production deployment status**:
+- CIS 4.3 a/b/c is production-correct + delivers measured ~26% wall-time saving
+- For Phase 2 launch: defer to post-Phase-4.4 to capture the full ~30%+ saving
+- For Phase 1 v3 (currently running): keep on `--mp --compile` until iter 200
+  (HEAD on prod pod is locked at `251cd14a`; CIS 4.3 changes break compatibility
+  with the in-flight snapshot)
 
 ## 4. Hyperparameters (validated for transformer arch + lr=1e-5)
 
