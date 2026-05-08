@@ -1,35 +1,42 @@
 pre prompt :
 
-Read `next-prompt.txt` top to bottom — it's the Session 53 boot doc with everything you need. The "if you read nothing else" list at the top names SEVEN required-reading items in order — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard for this project: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
+Read `next-prompt.txt` top to bottom — it's the Session 54 boot doc. The "if you read nothing else" list at the top names SEVEN required-reading items in order — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
 
-Then load `memory/project_strategic_frame.md` (#6) — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive, don't second-guess. This frame is locked.
+Then load `memory/project_strategic_frame.md` — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive. Frame is locked.
 
-Then load `memory/project_cis_4_3_design.md` (#7) — design choices already discussed end of S52. Dual-slot Option (i), int slot index API, Tests 1-3 are the load-bearing correctness gates. Re-confirm the open questions with me (dev location, scope, etc.) but don't re-debate the resolved ones.
+Then load `memory/project_cis_4_3_design.md` — **CIS Phase 4.3 a/b/c shipped in S53**. Pool-mirror multi-slot (NOT dual-slot per S52 memo — that didn't compose with asyncio.gather opp concurrency). All Tests 1-3 + Test 4 sustained + 4.3b BG overlap + small-scale 4.3c wall-time A/B PASS. Production-scale 4.3c on A100 NOT YET DONE (~$3-5, 30-60 min, ~30-35% projected wall-time saving).
 
-First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy as of S52 end (iter 18 in update); status TBD now. If still running: don't disturb it, work on CIS 4.3 in parallel. If wrapped: pull final.pt, run full eval suite, document Elo + smart_avg, then plan next steps (Phase 2 with new infra likely; Phase 1 v3 alone is NOT elite — see strategic frame). If failed: diagnose first, relaunch only after RCA.
+Also load `memory/feedback_cis_thread_safety.md` — per-handle Lock pattern. Don't remove without replacing with async-with-req_id-dispatch. mp.Pipe.send is not byte-atomic.
 
-Headline work this session is CIS Phase 4.3a — dual-slot CIS for PFSP correctness. This is THE load-bearing piece for affordable gen 9 experimentation + multi-gen feasibility. Plan it carefully + talk it through with me before coding. Tests 1-3 (slot identity, reload round-trip, batch partition) are non-negotiable correctness gates.
+First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy at iter 22+ (W/L 53.8%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on STEP 2-4 in parallel. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, plan Phase 2 launch with new CIS+pipeline infra. If failed: diagnose, relaunch only after RCA.
 
-If you find yourself going in half-informed, ASK ME — don't guess. S52's worker almost killed a healthy production run because of a misread counter; the "ask, don't guess" pattern caught it. `memory/feedback_ask_when_uncertain.md` has the why.
+Headline work this session is **production-scale 4.3c validation** ($3-5 on a fresh A100, 30-60 min). Confirms the small-scale 22.8% wall-time saving extrapolates to production scale (~30-35% projected). Then **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam (the "elite?" signal we'll need at iter 200 final eval). Plus **Network Volume verification** on prod pod (10 min, $0, infra debt before any future relaunch).
 
-S52 shipped: Tier 2 bf16 (autocast on PPO update gated bf16-only) + flash investigation closed (auto via SDP, no action) + diagnostic signal hierarchy (FLOW lines + battle server logs are truth, n_done counter lies) + strategic frame + CIS 4.3 design + engineering standard. 4 commits, all pushed. HEAD on origin: `81a34a8d`. HEAD on production pod: `251cd14a` (locked — DO NOT pull while Phase 1 v3 is running). Match that bar.
+If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter) and S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer) are both wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
+
+S53 shipped: CIS Phase 4.3 a/b/c (4 commits: `92caecd3`, `3accb9fd`, `475b32d1`, `4f0a292f`) — pool-mirror multi-slot + per-handle Lock + bg overlap re-enable + small-scale wall-time A/B. All pushed to origin. HEAD on origin: `4f0a292f`. HEAD on production pod: `251cd14a` (still locked — DO NOT pull while Phase 1 v3 is running; CIS 4.3 changes the codebase incompatibly with the iter-22+ snapshot). Match the bar.
 
 ═══════════════════════════════════════════════════════════════════════════════
-SESSION 53 BOOT — read top to bottom before doing ANYTHING
+SESSION 54 BOOT — read top to bottom before doing ANYTHING
 ═══════════════════════════════════════════════════════════════════════════════
 
-You are picking up from Session 52 (2026-05-08). Tier 2 bf16 shipped:
-autocast on PPO update path (gated bf16-only), flag default updated,
-canonical command in cookbook switched to --bf16. Flash SDP investigation
-concluded "no action" (auto via torch's SDP since 2.0; SpatialTransformer's
-mask blocks flash kernel anyway). Production Phase 1 v3 was running and
-healthy as of S52 end (iter 18 update completing); status TBD when you
-boot — first action below covers it.
+You are picking up from Session 53 (2026-05-08). **CIS Phase 4.3 a/b/c
+SHIPPED** (4 commits, all pushed to origin). Pool-mirror multi-slot (NOT
+the S52-memo dual-slot — that didn't compose with asyncio.gather opp
+concurrency; honest re-read found pool-mirror was strictly better).
+All Tests 1-3, Test 4 sustained, 4.3b BG overlap, and small-scale 4.3c
+wall-time A/B PASS. Per-handle threading.Lock added to CISClientHandle
+(mp.Pipe.send is not byte-atomic; surfaced by Test 4). Production Phase 1
+v3 was healthy through iter 22 + iter 23 in update at S53 end (iter 19
+EVAL: smart_avg=69%, passed ≥67% baseline gate); status TBD now —
+first action below covers it.
 
-Headline work for THIS session is CIS Phase 4.3 (§D STEP 2). Plan was
-discussed end of S52; we agreed to do dual-slot CIS (Option (i)) with
-slot-tagged infer/reload. Tests 1-3 are the load-bearing correctness
-gates. Match the bar of S51/S52 carefully-shipped work.
+Headline work for THIS session is **production-scale 4.3c validation**
+(§D STEP 2) on a fresh A100 (~$3-5, 30-60 min). Confirms the small-scale
+22.8% wall-time saving extrapolates to ~30-35% at production scale.
+Then **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam ($0, ~3-4 hrs).
+Then **Network Volume verification** on prod pod (10 min, $0). Match the
+bar of S51/S52/S53 carefully-shipped work.
 
 If you read NOTHING else, read these SEVEN things:
 
@@ -192,14 +199,27 @@ returns False/0 for unavailable mechanics in each gen. Adding belt-and-
 suspenders gating is dead weight — the data layer enforces correctness.
 This was investigated in D2; the right answer was to NOT add the gate.
 
+**B11. DO NOT remove the per-handle Lock from CISClientHandle.** It's
+load-bearing for thread-safe IPC under concurrent submits (player + opp
+batches overlap in any worker with `max_concurrent>0`). mp.Pipe.send is
+not byte-atomic. See `memory/feedback_cis_thread_safety.md`. The proper
+long-term replacement is async-with-req_id-dispatch (deferred); until
+that ships, the lock stays.
+
+**B12. DO NOT reopen "dual-slot CIS" (slot 0 = player, slot 1 = active
+opp).** S53 found it doesn't compose with asyncio.gather opp concurrency
+— concurrent opps race on slot 1's reload → silent training corruption.
+S53 replaced with **pool-mirror slots** (slots 1..K mirror the PFSP
+pool). See §K dead paths + `memory/project_cis_4_3_design.md`.
+
 
 ═══════════════════════════════════════════════════════════════════════════════
 §C. CURRENT STATE — what's running + what's at risk
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-Status TBD when you boot — runtime estimate at S52 end was ~50-80 hr to
-iter 200, so may still be running OR wrapped.
+At S53 end: iter 22 complete + iter 23 in PPO update. ~178 iters to go
+to iter 200 target, ~7 days remaining at $1.50/hr (~$254 to completion).
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -209,38 +229,46 @@ Tier 1:    --compile (Path 2 per-submodule), fused AdamW, --fp16
 Mitigations: heartbeat (600s timeout, 0.25s stagger, liveness-thread heartbeat)
 ```
 
-**Production process on pod** (PID changes across iters; use `pgrep -af python.*train_rl`):
+**Production process on pod**:
 
 - Lives in screen `train_compiled` (`screen -r train_compiled` to attach)
 - Latest committed code on pod is `251cd14a` (compile-after-resume fix from S51)
 - DO NOT pull newer commits until run completes — see §B1
-- Local HEAD at S52 end: `fb2127a3` (Tier 2 bf16 — local + origin, NOT on pod)
+- Local + origin HEAD at S53 end: `4f0a292f` (CIS 4.3a/b/c — local + origin, NOT on pod)
 
-**S52-validated iter trajectory** (compiled, post-heartbeat-fix):
+**S53-measured iter trajectory** (compiled, post-heartbeat-fix):
 
 ```
-Iter 15: collect=909s update=2174s, W/L 761/839 (47.6%), kl=0.0384
-Iter 16: collect=959s update=2195s, W/L 804/796 (50.2%), kl=0.0379  ← first 50%+
-Iter 17: collect=964s update=2243s, W/L 832/768 (52.0%), kl=0.0379
-Iter 18 was in update phase at end of Session 52.
+Iter 15: collect=909s  update=2174s  W/L 761/839 (47.6%)  kl=0.0384  pool=2
+Iter 16: collect=959s  update=2195s  W/L 804/796 (50.2%)  kl=0.0379  pool=2  ← first 50%+
+Iter 17: collect=964s  update=2243s  W/L 832/768 (52.0%)  kl=0.0379  pool=2
+Iter 18: collect=963s  update=2347s  W/L 842/758 (52.6%)  kl=0.0384  pool=2
+Iter 19: collect=971s  update=3197s  W/L 878/721 (54.9%)  kl=0.0408  pool=2  ← peak; eval included
+Iter 20: collect=1051s update=2346s  W/L 755/844 (47.2%)  kl=0.0398  pool=3  ← dipped (pool grew)
+Iter 21: collect=1067s update=3215s  W/L 858/741 (53.7%)  kl=0.0415  pool=3  ← long update (variance)
+Iter 22: collect=1061s update=2337s  W/L 860/739 (53.8%)  kl=0.0392  pool=3
+Iter 23 was in update phase at end of S53.
 ```
 
-**Compile gain confirmed**: iter 14 (uncompiled) was 4423s total; iter 15
-(compiled) was 3083s total. **30% per-iter speedup.** ~$50-75 saved over
-the remaining iters at $1.50/hr.
+**Compile gain confirmed**: iter 14 (uncompiled) was 4423s total; avg
+post-compile no-eval iter is ~3300s. **~25% steady-state speedup, 30%
+peak.** No regression from compile path.
 
-**Heartbeat mitigations confirmed**: iters 16/17 successfully grew the
-PFSP pool boundary (the exact stress that broke iter 17 of the original
-run). 8/8 workers responded cleanly, 1598/1600+ trajs, no respawns.
+**Heartbeat mitigations confirmed**: 8 iters across pool growth boundary
+(iter 19→20 pool 2→3) without any worker respawn or stale-heartbeat.
 
-**Diagnostic-signal lesson from S52** (load `feedback_diagnostic_signals.md`):
-the per-worker `LIVE +Ns iter=N] n_done=X/200` counter is broken/lagging
-— stays at 0 even while battles complete. **Use FLOW lines + battle server
-logs at `/tmp/battle_server_900X.log` as truth signals, not n_done.**
+**Iter 19 EVAL (passed)**:
+```
+SH=66%, SmartDmg=68%, Tactical=68%, Strategic=76%, smart_avg=69%
+```
+Above the ≥67% BC v10 baseline gate. Strategic at 76% is unusually high
+— typically the hardest bot. Could indicate PPO learned strategic patterns
+during selfplay, or noise. Iter 29 eval will be more interpretable.
 
-**Eval at iter 19** (`--eval-interval 10`, inherited from resumed run).
-Should hold ≥67% smart_avg vs metamon-competitive bots — that's the BC v10
-baseline. If lower, investigate quality regression from compile.
+**Diagnostic-signal reminder** (load `feedback_diagnostic_signals.md`):
+the per-worker `LIVE +Ns iter=N] n_done=X/200` counter is broken/lagging.
+**Use FLOW lines + battle server logs at `/tmp/battle_server_900X.log`
+as truth signals, not n_done.**
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -260,49 +288,71 @@ What to look for:
 - `FATAL` or `stale_heartbeat` → run is in trouble; diagnose before touching anything
 - Iter 19 EVAL line → smart_avg should be ≥67%
 
-**STEP 2: CIS Phase 4.3** (~1.5-2 days, biggest single remaining lever — SESSION 53 HEADLINE)
-Rationale: real --pipeline overlap = ~50% wall-time saving on multi-gen
-runs ($200-300 savings over 5-7 weeks). The architectural work that's
-been deferred. Won't be production-usable until done.
+**STEP 2: Production-scale 4.3c on A100** (~$3-5, 30-60 min, SESSION 54 HEADLINE)
+Rationale: small-scale 4.3c on dev pod (4090) showed 22.8% wall-time
+saving + 77.3% overlap efficiency, but absolute production numbers
+unproven. Production-scale validation locks in the ~30-35% projection
+before any Phase 2 launch commits to --cis --pipeline.
 
-**Pre-discussed plan from S52** (re-confirm with user before coding):
-- Dev location: open question — local + small cloud test pod recommended
-  (cheaper than another full pod, doesn't disturb Phase 1 v3 production)
-- Scope this session: 4.3a only (dual-slot + Tests 1-3) is safer than
-  trying all of a/b/c in one stretch
-- Slot routing API: int slot index (0=player, 1=opp), default 0 for
-  back-compat with Phase 1 single-slot tests
+**Setup** (~10 min):
+- Spin up A100 80GB community pod (~$1.50/hr)
+- Sync repo at HEAD `4f0a292f`
+- Install: torch 2.2.1 + triton 2.2.0 + poke-env 0.10.0 stack
+- Install Node 20 + battle_server.js (need 8 ports 9000-9007)
+- Sync `data/vocab/`, BC v10 ckpt or compatible (post-D1+D2 arch)
+- Verify with quick `test_cis_phase4_3_slots.py` regression
 
-Sub-pieces in order:
-- **4.3a PFSP per-opp model swap** (~1 day). Critical correctness fix.
-  Current cut: CIS holds ONE model, player AND opp use it → fake PFSP.
-  Two implementation options:
-    (i) CIS dual-slot: one CIS process holds main model + active opp
-        model. Worker tags each request with "player" or "opp"; CIS
-        routes to the right slot. Single weight reload reloads BOTH
-        slots. Lower IPC overhead, more CIS-side complexity.
-    (ii) Two CIS subprocesses: one for player, one for opp. Worker has
-         handles to both. Cleaner isolation, more spawn overhead +
-         double the GPU memory footprint.
-  Recommend (i) — simpler IPC, ~30% less GPU memory. CISServer extends to
-  hold List[model_state]; reload_weights takes a slot index.
-- **4.3b CISBgCollector + bg overlap re-enable** (~half day). Wrapper
-  class with start/join API mirroring MPDiskBgCollector. Then in
-  `train_rl.py:_start_background_collection`, replace the no-op for
-  `args.cis and args.pipeline` with `mp_bg_collector =
-  CISBgCollector(...).start(...)`. Validate the low-priority stream
-  actually arbitrates as expected — measure that worker forwards make
-  progress during main's optimizer.step.
-- **4.3c Sustained smoke** (~1 hour cloud time). 5-iter `--cis --pipeline`
-  at games=200 conc=20 N=4. Required tests (cookbook §5b):
-    - Test 1 (logits identity): CIS forward output matches `--mp`
-      forward output (max abs diff < 1e-3)
-    - Test 4 (5-iter sustained): no NaN, smart_avg ≥ BC baseline
-    - Test 6 (failure recovery): kill -9 a worker mid-iter, kill -9
-      CIS subprocess, verify respawn
+**Test protocol** (~30-45 min):
+- Variant A: `--mp` (no --cis, no --pipeline) — 2 iters at games=1500
+  conc=200 N=8. Time wall-clock per iter. Reference baseline.
+- Variant B: `--cis --pipeline` — same scale, 2 iters. Time wall-clock.
+- Compare: iter time, collect time, update time, total wall-time.
 
-Validation gate before declaring 4.3 done: numerical equivalence to
-`--mp` baseline within 2σ noise on iter line metrics.
+**Acceptance gates** (cookbook §5):
+- Test 5 (wall-time saving): Variant B total < Variant A total.
+  Target: ≥25% per-iter saving (small-scale showed 22.8%; production
+  scale should improve since collect:update ratio is more favorable).
+- Test 6 (failure recovery): kill -9 a worker mid-iter, kill -9 CIS
+  subprocess, verify respawn behavior. **NOTE**: CIS workers don't yet
+  have respawn (Phase 4.2 deferred); this test will reveal if respawn is
+  needed before Phase 2 launch.
+- Numerical equivalence to --mp baseline: iter line metrics
+  (collect/update times excluded) within 2σ noise.
+
+**If Test 5 passes**: CIS production-ready. Plan Phase 2 launch with
+--cis --pipeline + --bf16 (relaunch from final_phase1_v3.pt or last
+snapshot if Phase 1 v3 still running).
+**If Test 5 fails**: investigate (lock contention? stream priority?
+forward latency?), don't launch Phase 2 with --cis until resolved.
+
+**STEP 3: H2H gauntlet vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0)
+Rationale: Phase 1 v3 hits iter 200 in ~7 days. We need the "elite?"
+signal to evaluate the final model. smart_avg vs basic bots is necessary
+but insufficient — H2H against published bots is the actual ceiling
+measurement.
+
+`eval_h2h_gauntlet.py` already exists per §H. "Wiring" means:
+- Find published bot weights (HF? GitHub releases? request from authors)
+- Adapt their inference adapter to our `make_self_play_opponent` factory
+- Run small validation gauntlet locally (10-20 games per opp)
+- Document setup in cookbook for the iter 200 eval pipeline
+
+Strategic frame says this is multi-gen-AGNOSTIC infra → ship + validate
+on gen 9 baseline now. Per `project_strategic_frame.md`.
+
+**STEP 4: Network Volume verification on prod pod** (~10 min, $0)
+Critical infra debt. Before any future relaunch (Phase 2 or otherwise)
+we MUST have Network Volume — `MEMORY.md` warns "S49 lost a BC run to
+stop+resume on Container Disk." Verify whether prod pod's `/workspace`
+is on Network Volume or Container Disk:
+
+```
+ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
+```
+
+If Container Disk: don't pause/stop the prod pod. Plan migration for
+Phase 2 launch (provision new pod with Network Volume, copy snapshots
++ R2 backup).
 
 **STEP 3: Multi-gen data path** (~1-2 weeks of compute, $10-20)
 
@@ -589,43 +639,72 @@ reducing ent_coef in response. This is normal; don't try to "fix" it.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-§J0. SESSION 52 — GAINS, METRICS, NON-ACTIONS
+§J0. SESSION 53 — GAINS, METRICS, NON-ACTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Gains (1 commit + 1 memory file)**:
-- `fb2127a3` Tier 2 bf16: autocast on PPO update path (gated bf16-only) +
-  flag default updates + cookbook canonical command switched to --bf16
+**Gains (4 commits + 2 memory files, all on origin/master)**:
+- `92caecd3` CIS Phase 4.3a: pool-mirror multi-slot + Tests 1-3
+- `3accb9fd` Per-handle Lock around pipe IPC + Path/random imports + Test 4
+- `475b32d1` CIS Phase 4.3b: CISBgCollector + bg overlap re-enable
+- `4f0a292f` CIS Phase 4.3c: small-scale wall-time A/B (22.8% saving)
+- New memory: `feedback_cis_thread_safety.md` (lock pattern + future
+  async-with-req_id-dispatch refactor)
+- Updated memory: `project_cis_4_3_design.md` (DONE not pending)
 
-**Non-actions (deliberate, with rationale)**:
-- **Flash attention** — boot doc said "5-LOC change if SDP works on RunPod."
-  Wrong premise: torch 2.0+ nn.TransformerEncoder auto-uses SDP, which
-  auto-picks best backend. SpatialTransformer's arbitrary `poke_mask` blocks
-  flash kernel → SDP falls back to mem_efficient. We're already getting the
-  best available backend. Don't re-investigate.
-- **`.float()` shim removal** — boot doc / S51 notes anticipated removing
-  ~12 shims around -1e9 masks under bf16. Audit found they're harmless under
-  bf16 (just an unnecessary cast) and removing them adds risk without
-  measurable benefit. Skipped.
+**Architectural change from S52 memo** (CRITICAL — read carefully):
+S52 memo proposed strict 2-slot CIS (slot 0 = player, slot 1 = active opp).
+S53 honest re-read found this **doesn't compose** with the existing
+`asyncio.gather` opp concurrency in `_run_collect_in_worker_cis` —
+concurrent opps on different workers would race on slot 1's reload,
+producing silent training corruption. Two resolutions:
+(a) serialize opps across workers — kills concurrency
+(b) **Pool-mirror slots (Option D, what shipped)** — slot 0 = player,
+    slots 1..K_max=16 mirror the PFSP pool. Each PFSP entry gets a stable
+    slot index. Cross-worker batching preserved per slot. Lazy reload
+    (only when path changes). ~3% of A100 80GB GPU memory at K=16.
 
-**Diagnostic-signal lesson** (CRITICAL, see `feedback_diagnostic_signals.md`):
-S52 boot first-action was the production status check. I misread the
-worker `[wN LIVE +Ns iter=N] n_done=X/200` heartbeat — it stayed at `0/200`
-across all 8 workers for 645+ seconds, which I diagnosed as a hang/respawn
-storm. **The counter is broken/lagging — battles were actually completing
-the whole time.** FLOW lines (`[FLOW HH:MM:SS + Ns]`) and battle server
-logs at `/tmp/battle_server_900X.log` are the truth signals. I almost
-recommended killing a healthy run worth ~$2 of compute. Always check FLOW
-+ battle server logs FIRST when production looks "stuck."
+**Tests + measurements (all PASS)**:
+- Test 1 slot identity (K=2): bit-exact 0.0 max abs diff per slot
+- Test 2A reload round-trip: bit-exact 0.0
+- Test 2B slot isolation (reload slot 1, slot 0 unchanged): bit-exact 0.0
+- Test 3 multi-worker partition (K=3, N=4): 12/12 within fp16 noise (<5e-3)
+- Test 4 sustained smoke (2 iters real battles): 2/2 PASS, real PFSP visible
+- 4.3b BG overlap (start/join semantics, 2 iters): 2/2 PASS
+- 4.3c small-scale wall-time A/B: **22.8% saving, 77.3% overlap efficiency**
 
-**Strategic alignment confirmed**:
-- Phase 1 v3 (gen 9 only) MUST complete cleanly. Vertical-skill ceiling
-  measurement before any horizontal multi-gen scaling.
-- Gen 9 = infra testbed before multi-gen launch. CIS+bf16+flash should ALL
-  be validated on gen 9 before being relied on for the 5-7 wk multi-gen run.
-- Multi-gen-AGNOSTIC infra (CIS, bf16, flash, eval gauntlets, Network
-  Volume): ship + validate on gen 9, daily-use prevents bitrot.
-- Multi-gen-SPECIFIC infra (D4-D6, BC v11, multi-gen PPO): JIT before
-  multi-gen launch with focused validation. Don't ship-and-leave-cold.
+**Latent bugs fixed alongside** (good hygiene):
+- `CISClientHandle.infer` now accepts `history` kwargs. Was broken pre-S53
+  — `submit` was passing `history=` but `infer` didn't accept it. Would
+  have errored on first real V9RLPlayer turn submit.
+- `from pathlib import Path` + `import random` added at module top of
+  `mp_centralized_collect.py`. Caused NameError surfaces in 4.3b
+  orchestrator path that wasn't exercised before.
+
+**Pre-existing CIS thread-safety issue surfaced + fixed**: Test 4's first
+end-to-end run hit `_pickle.UnpicklingError: invalid load key` + Broken
+pipe. Root cause: `mp.Pipe.send` is not byte-atomic across threads;
+concurrent submits from one worker (player + opp at minimum) corrupted
+the pickle stream. Fix: per-handle `threading.Lock` wrapping each
+(send, poll, recv) cycle. Tests 1-3 + 4 + 4.3b/c all pass with lock in
+place. **Cost**: serializes IPC within a worker handle. Production
+testing pending (Phase 4.3c on A100). See `feedback_cis_thread_safety.md`.
+
+**Production observations from S53**:
+- Phase 1 v3 healthy through iter 22, iter 23 in update at S53 end
+- Iter 19 EVAL: smart_avg=69%, passed ≥67% baseline gate
+- W/L peaked at 54.9% (iter 19), dipped to 47.2% at iter 20 (pool grew),
+  recovered to 53.7-53.8% by iter 22. Pool growth is expected stress.
+- Heartbeat mitigations holding through pool growth boundary. No respawns.
+- Avg post-compile no-eval iter: ~3300s = 55 min (-25% vs uncompiled 4423s)
+
+**Wall-time savings projection** (post-CIS-4.3 deployment):
+- Current: ~55 min/iter (--mp, no pipeline). 200 iters ≈ $275.
+- Projected: ~32-35 min/iter (--cis --pipeline + bf16 update).
+  Cross-worker player batching (~30% on collect) + bg overlap (recovers
+  ~all of collect time) + bf16 update autocast (~10-15% on update).
+- **Per-200-iter saving: ~36% wall-time, ~$100.**
+- **Multi-gen 5-7 wk saving: ~$460-630.**
+- Production-scale 4.3c on A100 (Step 2 this session) confirms the numbers.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -709,6 +788,18 @@ These have been investigated and rejected. Don't waste cycles re-walking:
 - **Gigantamax / Doubles formats in V1**: out of scope. Tokenizer asserts
   n_active=1 (singles). Multi-active = future redesign per
   REWRITE_DESIGN.md.
+- **Dual-slot CIS (S52 memo Option (i))**: explicitly tested, doesn't
+  compose. The asyncio.gather opp concurrency in
+  `_run_collect_in_worker_cis` means workers play multiple opps in
+  parallel; with strict 2-slot, concurrent opp inferences race on
+  slot 1's reload causing silent training corruption. S53 replaced
+  with **pool-mirror slots** (1 player + K opp slots, K=pool size).
+  Don't reopen this — pool-mirror is strictly better at every axis
+  except GPU memory (which is trivial: ~3% of 80GB at K=16).
+- **Removing the per-handle Lock in CISClientHandle**: the lock is
+  load-bearing for concurrent IPC correctness (see
+  `feedback_cis_thread_safety.md`). Don't remove without replacing
+  with async-with-req_id-dispatch. mp.Pipe.send is not byte-atomic.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -883,5 +974,5 @@ estimated gains with measured production numbers.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-END SESSION 52 BOOT — good luck
+END SESSION 54 BOOT — good luck
 ═══════════════════════════════════════════════════════════════════════════════
