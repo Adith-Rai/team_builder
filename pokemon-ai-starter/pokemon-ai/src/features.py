@@ -1414,12 +1414,24 @@ def make_features(battle) -> dict:
       legal_mask: np.ndarray (9,) float32
       active_moves: list of 4 dicts (or None for empty slots)
       switch_slots: list of 5 dicts (or None for empty slots)
+      gen: int (battle.gen, used by D1 gen-id token in TransformerBattlePolicy)
     """
     our_pokemon = _encode_team(battle, is_opponent=False)
     opp_pokemon = _encode_team(battle, is_opponent=True)
     field = _encode_field(battle)
     transition = _encode_transition(battle)
     legal_mask, active_moves, switch_slots = _encode_action_slots(battle)
+
+    # Session 51 D2: pass gen through to the model. poke-env Battle exposes
+    # `.gen` as an int (1-9). Defensive: if attribute is missing or invalid,
+    # fall back to 9 (current default singleton in production). The gen-id
+    # token in TransformerBattlePolicy clamps to [0, 9] via Embedding(10, d).
+    try:
+        gen = int(getattr(battle, "gen", 9) or 9)
+        if gen < 0 or gen > 9:
+            gen = 9
+    except (TypeError, ValueError):
+        gen = 9
 
     return {
         "our_pokemon": our_pokemon,
@@ -1429,6 +1441,7 @@ def make_features(battle) -> dict:
         "legal_mask": legal_mask,
         "active_moves": active_moves,
         "switch_slots": switch_slots,
+        "gen": gen,
     }
 
 
@@ -1571,6 +1584,11 @@ def build_turn_batch(feat: dict, device=None, training: bool = False) -> dict:
         # Legal mask
         "legal_mask": _tf(feat["legal_mask"].reshape(1, -1).tolist()),
     }
+
+    # Session 51 D2: gen-id (B=1,) long tensor, consumed by
+    # TransformerBattlePolicy.tokenizer.gen_embed (D1). Default to 9 if
+    # the feat dict didn't carry one (older callers / unit tests).
+    batch["gen_id"] = _t([feat.get("gen", 9)])
 
     # Field banks (dict of tensors)
     fb = feat["field"]["banks"]
