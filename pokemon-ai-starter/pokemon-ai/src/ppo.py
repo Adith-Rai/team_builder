@@ -39,6 +39,7 @@ from arch_compat import (
     get_v_support,
 )
 from model import PokeTransformer, PokeTransformerConfig
+from precision_config import autocast_ctx, get_amp_dtype
 
 
 # =============================
@@ -178,88 +179,96 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 # policy. Backward stops at value_head's input (the only thing
                 # being trained). Saves ~50% on update wall-time during warmup.
                 _backbone_ctx = torch.no_grad() if in_warmup else _nullcontext()
-                with _backbone_ctx:
-                    spatial_out, all_summaries = model.forward_spatial(mega)
-                    action_ctx = call_action_encoder(model, mega, spatial_out)
-                legal_all = mega["legal_mask"]
-
-                # --- Sequential temporal + heads ---
-                all_logits = []
-                all_vlogits = []
-                # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy configs)
-                _d_sum = cfg.d_temporal if cfg.d_temporal is not None else cfg.d_model
-                summary_buf = torch.zeros(1, 0, _d_sum, device=device)
-
-                for t in range(T):
-                    s = all_summaries[t:t+1].unsqueeze(0)
-                    summary_buf = torch.cat([summary_buf, s], dim=1)
-                    if summary_buf.shape[1] > 200:
-                        summary_buf = summary_buf[:, -200:]
-
-                    # Backbone + policy path: in warmup, no_grad to skip autograd
-                    # tape (policy is frozen; logits used only for KL/entropy
-                    # stats, not for gradient).
+                # Autocast on update path: bf16 only. fp16 backward without a
+                # GradScaler underflows on small gradients (we don't use a scaler
+                # by precision_config design); bf16 has fp32 dynamic range so
+                # backward is stable without scaling. fp32 path stays unchanged.
+                _update_amp_ctx = (autocast_ctx()
+                                   if get_amp_dtype() is torch.bfloat16
+                                   else _nullcontext())
+                with _update_amp_ctx:
                     with _backbone_ctx:
-                        temporal_ctx = model.temporal(summary_buf)
-                        actor_out = spatial_out[t, 0, :]
-                        critic_out = spatial_out[t, 1, :]
-                        act_ctx = action_ctx[t]
+                        spatial_out, all_summaries = model.forward_spatial(mega)
+                        action_ctx = call_action_encoder(model, mega, spatial_out)
+                    legal_all = mega["legal_mask"]
 
-                        at = torch.cat([actor_out, temporal_ctx.squeeze(0)], dim=-1)
-                        at_exp = at.unsqueeze(0).expand(9, -1)
-                        pi_input = torch.cat([at_exp, act_ctx], dim=-1)
-                        logits = call_policy_logits(model, pi_input)
-                        logits = logits.masked_fill(legal_all[t] < 0.5, -100.0)
-                    all_logits.append(logits)
+                    # --- Sequential temporal + heads ---
+                    all_logits = []
+                    all_vlogits = []
+                    # Summary buffer dim = resolved d_temporal (falls back to d_model for legacy configs)
+                    _d_sum = cfg.d_temporal if cfg.d_temporal is not None else cfg.d_model
+                    summary_buf = torch.zeros(1, 0, _d_sum, device=device)
 
-                    # Value path: gradient flows through value_head only (its
-                    # input critic_out + temporal_ctx are detached if in warmup).
-                    vi = torch.cat([critic_out, temporal_ctx.squeeze(0)], dim=-1)
-                    vl = call_value_logits(model, vi.unsqueeze(0)).squeeze(0)
-                    all_vlogits.append(vl)
+                    for t in range(T):
+                        s = all_summaries[t:t+1].unsqueeze(0)
+                        summary_buf = torch.cat([summary_buf, s], dim=1)
+                        if summary_buf.shape[1] > 200:
+                            summary_buf = summary_buf[:, -200:]
 
-                logits_seq = torch.stack(all_logits)
-                vlogits_seq = torch.stack(all_vlogits)
+                        # Backbone + policy path: in warmup, no_grad to skip autograd
+                        # tape (policy is frozen; logits used only for KL/entropy
+                        # stats, not for gradient).
+                        with _backbone_ctx:
+                            temporal_ctx = model.temporal(summary_buf)
+                            actor_out = spatial_out[t, 0, :]
+                            critic_out = spatial_out[t, 1, :]
+                            act_ctx = action_ctx[t]
 
-                # NaN check
-                if logits_seq.isnan().any() or vlogits_seq.isnan().any():
-                    print(f"  [WARN] NaN in forward, skip (T={T})", flush=True)
-                    n_skipped_nan += 1
-                    continue
+                            at = torch.cat([actor_out, temporal_ctx.squeeze(0)], dim=-1)
+                            at_exp = at.unsqueeze(0).expand(9, -1)
+                            pi_input = torch.cat([at_exp, act_ctx], dim=-1)
+                            logits = call_policy_logits(model, pi_input)
+                            logits = logits.masked_fill(legal_all[t] < 0.5, -100.0)
+                        all_logits.append(logits)
 
-                # Policy loss
-                lp = F.log_softmax(logits_seq, dim=-1)
-                new_logp = lp.gather(1, actions.unsqueeze(1)).squeeze(1)
-                ratio = torch.exp(new_logp - old_logp)
-                # Track ratio-clip fraction — if consistently high, policy is drifting
-                # too fast per update (Exp 4-style instability signal).
-                with torch.no_grad():
-                    clipped_frac = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item()
-                s1 = ratio * advantages
-                s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
-                pi_loss = -torch.min(s1, s2).mean()
+                        # Value path: gradient flows through value_head only (its
+                        # input critic_out + temporal_ctx are detached if in warmup).
+                        vi = torch.cat([critic_out, temporal_ctx.squeeze(0)], dim=-1)
+                        vl = call_value_logits(model, vi.unsqueeze(0)).squeeze(0)
+                        all_vlogits.append(vl)
 
-                # Entropy
-                probs = F.softmax(logits_seq, dim=-1)
-                entropy = -(probs * lp).sum(-1).mean()
+                    logits_seq = torch.stack(all_logits)
+                    vlogits_seq = torch.stack(all_vlogits)
 
-                # Value loss (distributional two-hot CE with per-step clamping)
-                ret_c = returns.clamp(cfg.v_min, cfg.v_max)
-                vtgt = model.twohot_target(ret_c)
-                v_loss_per_step = -(vtgt * F.log_softmax(vlogits_seq, dim=-1)).sum(-1)
-                v_loss = v_loss_per_step.mean()
+                    # NaN check
+                    if logits_seq.isnan().any() or vlogits_seq.isnan().any():
+                        print(f"  [WARN] NaN in forward, skip (T={T})", flush=True)
+                        n_skipped_nan += 1
+                        continue
 
-                # Approximate KL — check BEFORE applying gradient (ps-ppo style)
-                with torch.no_grad():
-                    approx_kl = (old_logp - lp.gather(1, actions.unsqueeze(1)).squeeze(1)).mean().item()
+                    # Policy loss
+                    lp = F.log_softmax(logits_seq, dim=-1)
+                    new_logp = lp.gather(1, actions.unsqueeze(1)).squeeze(1)
+                    ratio = torch.exp(new_logp - old_logp)
+                    # Track ratio-clip fraction — if consistently high, policy is drifting
+                    # too fast per update (Exp 4-style instability signal).
+                    with torch.no_grad():
+                        clipped_frac = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float().mean().item()
+                    s1 = ratio * advantages
+                    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+                    pi_loss = -torch.min(s1, s2).mean()
 
-                # Per-episode KL gate: skip this episode entirely if policy diverged too much
-                if abs(approx_kl) > target_kl * 5:
-                    n_skipped_kl += 1
-                    continue  # no backward, no step — episode discarded
+                    # Entropy
+                    probs = F.softmax(logits_seq, dim=-1)
+                    entropy = -(probs * lp).sum(-1).mean()
 
-                # Loss: no KL penalty term — early stopping replaces it
-                loss = (pi_loss - ent_coef * entropy + vf_coef * v_loss) / grad_accum
+                    # Value loss (distributional two-hot CE with per-step clamping)
+                    ret_c = returns.clamp(cfg.v_min, cfg.v_max)
+                    vtgt = model.twohot_target(ret_c)
+                    v_loss_per_step = -(vtgt * F.log_softmax(vlogits_seq, dim=-1)).sum(-1)
+                    v_loss = v_loss_per_step.mean()
+
+                    # Approximate KL — check BEFORE applying gradient (ps-ppo style)
+                    with torch.no_grad():
+                        approx_kl = (old_logp - lp.gather(1, actions.unsqueeze(1)).squeeze(1)).mean().item()
+
+                    # Per-episode KL gate: skip this episode entirely if policy diverged too much
+                    if abs(approx_kl) > target_kl * 5:
+                        n_skipped_kl += 1
+                        continue  # no backward, no step — episode discarded
+
+                    # Loss: no KL penalty term — early stopping replaces it
+                    loss = (pi_loss - ent_coef * entropy + vf_coef * v_loss) / grad_accum
 
                 if loss.isnan() or loss.isinf():
                     print(f"  [WARN] NaN/inf loss (pi={pi_loss.item():.4f} v={v_loss.item():.4f}), T={T}, aborting PPO update", flush=True)

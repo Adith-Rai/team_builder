@@ -131,15 +131,16 @@ def parse_args():
                    help="Accumulate gradients over N episodes before each optimizer step")
     p.add_argument("--warmup-iters", type=int, default=5)
     # --fp16 / --bf16 are mutually exclusive autocast precision flags.
-    # bf16: same Tensor Core throughput as fp16 on Ampere, no GradScaler
-    # overhead, fp32 dynamic range (avoids the -1e9 mask overflow trap).
-    # Modern frameworks default to bf16 over fp16 on Ampere+. fp16 kept
-    # as default for backward compat with prior runs.
+    # PREFER --bf16 for new runs (Ampere+ default): same Tensor Core throughput as fp16,
+    # no GradScaler needed (fp32 dynamic range), avoids the -1e9 mask overflow trap.
+    # bf16 also enables autocast on the PPO update path (ppo.py); fp16 update stays
+    # fp32 because fp16 backward without a GradScaler underflows on small gradients.
+    # --fp16 kept for backward compat with in-flight runs (Phase 1 v3).
     _amp_group = p.add_mutually_exclusive_group()
     _amp_group.add_argument("--fp16", action="store_true",
-                            help="Mixed-precision autocast in fp16")
+                            help="Mixed-precision autocast in fp16 (legacy; prefer --bf16)")
     _amp_group.add_argument("--bf16", action="store_true",
-                            help="Mixed-precision autocast in bf16 (Ampere+ only)")
+                            help="Mixed-precision autocast in bf16 (Ampere+; recommended default)")
     p.add_argument("--ko-coef", type=float, default=0.05)
     p.add_argument("--hp-coef", type=float, default=0.02)
     p.add_argument("--reward-clip", type=float, default=2.0)

@@ -13,9 +13,9 @@ python train_rl.py \
   --pool-anchors data/models/bc/v10_cloud_gen9/epoch_003.pt \
   --device cuda \
   --servers 9000,9001,9002,9003,9004,9005,9006,9007 \
-  --fp16 --mp --mp-workers 8 \
+  --bf16 --mp --mp-workers 8 --compile \
   --games-per-iter 1600 --max-concurrent 200 \
-  --opponent-device cpu \
+  --opponent-device cuda \
   --n-iters 200 --warmup-iters 5 \
   --lr 1e-5 --lam 0.95 --ent-coef 0.02 --reward-style terminal \
   --grad-accum 1 \
@@ -27,6 +27,17 @@ python train_rl.py \
   --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
   --out-dir data/models/rl_v10/<run_name>
 ```
+
+**Precision flag updated S52**: prefer `--bf16` over `--fp16` for new runs.
+bf16 has fp32 dynamic range (no `-1e9` mask overflow trap, no GradScaler
+needed) and ALSO enables autocast on the PPO update path (ppo.py); fp16
+update stays fp32 because fp16 backward without a GradScaler underflows on
+small gradients. In-flight Phase 1 v3 production stays on `--fp16` to match
+its trained snapshot — never change precision mid-resume.
+
+**`--opponent-device` updated S50/51**: prefer `cuda` over `cpu`. CPU opp
+broke at production scale (cookbook §3h). CIS Phase 4.3 will further reduce
+GPU contention pressure for opps.
 
 **Empirical (Phase 1 v3, Session 50)**: warmup iters 0-9 landed at 42-52 min/iter
 (collect ~14-16 min + update ~28-37 min, all 5 PPO epochs run since KL early-stop
