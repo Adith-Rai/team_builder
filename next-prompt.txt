@@ -19,17 +19,24 @@ discussed end of S52; we agreed to do dual-slot CIS (Option (i)) with
 slot-tagged infer/reload. Tests 1-3 are the load-bearing correctness
 gates. Match the bar of S51/S52 carefully-shipped work.
 
-If you read NOTHING else, read these SIX things:
+If you read NOTHING else, read these SEVEN things:
 
-1. THE GOAL (§A below) — re-read every time you make a decision
-2. WHAT NOT TO DO (§B below) — costs you money + time if you ignore
-3. CURRENT STATE (§C below) — what's running, what's at risk
-4. PRIORITY-ORDERED TODO (§D below) — what to do, in what order, why
-5. **`memory/project_strategic_frame.md`** — load-bearing strategic
+1. **`memory/feedback_engineering_standard.md`** — THE OPERATING STANDARD.
+   Read FIRST every session. Thoroughly understand code BEFORE touching,
+   read docs to understand what's been tried + why current decisions stand
+   (they were hard-fought, don't re-walk dead paths), NO shortcuts,
+   long-term focus, ship the proper/efficient/correct/stable/long-lasting
+   solution that doesn't need revisiting. Cost discipline = thoroughness,
+   not speed. Don't run up the bill on re-investigated settled questions.
+2. THE GOAL (§A below) — re-read every time you make a decision
+3. WHAT NOT TO DO (§B below) — costs you money + time if you ignore
+4. CURRENT STATE (§C below) — what's running, what's at risk
+5. PRIORITY-ORDERED TODO (§D below) — what to do, in what order, why
+6. **`memory/project_strategic_frame.md`** — load-bearing strategic
    ordering that infra prioritization flows from (vertical-then-horizontal,
    gen-9-as-infra-testbed, multi-gen-AGNOSTIC vs SPECIFIC split). Don't
    re-derive — the user has explicitly aligned on this in S52.
-6. **`memory/project_cis_4_3_design.md`** — load BEFORE coding CIS 4.3.
+7. **`memory/project_cis_4_3_design.md`** — load BEFORE coding CIS 4.3.
    Dual-slot Option (i), int slot index API, Tests 1-3 ordering, with
    rationale. Re-confirm open questions with user; don't re-debate resolved
    ones.
@@ -42,6 +49,13 @@ the section that matches what you're about to touch.
 informed on a load-bearing decision, ASK. Don't guess. Pattern paid off
 in S52 — almost killed a healthy production run because of a misread
 counter; user's "ask me — don't guess" instruction caught it.
+
+**Before any non-trivial change, the workflow is:**
+1. Read the file you're about to change + its callers
+2. Read the docs that reference the area (cookbook, design doc, memory)
+3. Check §K (dead paths) — has this been tried + abandoned?
+4. Check `project_strategic_frame.md` — does this align with strategy?
+5. If load-bearing or non-obvious: surface options + ask before committing
 
 
 ═══════════════════════════════════════════════════════════════════════════════
