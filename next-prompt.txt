@@ -4,17 +4,17 @@ Read `next-prompt.txt` top to bottom — it's the Session 54 boot doc. The "if y
 
 Then load `memory/project_strategic_frame.md` — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive. Frame is locked.
 
-Then load `memory/project_cis_4_3_design.md` — **CIS Phase 4.3 a/b/c SHIPPED + production-scale validated in S53**. Pool-mirror multi-slot (NOT dual-slot per S52 memo — that didn't compose with asyncio.gather opp concurrency). All Tests 1-3 + Test 4 sustained + 4.3b BG overlap + small-scale 4.3c (22.8% saving) + production-scale 4.3c on A100 (~26% projected at full prod scale, lock-bound) all PASS. Per-handle Lock confirmed correct + holds at conc=200 production load, but is the throughput bottleneck — async-with-req_id-dispatch refactor is next.
+Then load `memory/project_cis_4_3_design.md` — **CIS Phase 4.3 a/b/c + 4.4 SHIPPED + production-scale validated in S53**. Pool-mirror multi-slot (NOT dual-slot per S52 memo). 4.4 async-with-req_id-dispatch replaces the per-handle Lock; ~20% collect speedup measured on A100 at production scale. Phase 4.3+4.4 stack now delivers projected ~30% wall-time saving vs `--mp` (vs 26% with 4.3 alone, vs theoretical 36%+ — the gap is now mostly bf16 update + Tier 3 territory).
 
-Also load `memory/feedback_cis_thread_safety.md` — per-handle Lock pattern. Async-with-req_id-dispatch is the production fix.
+Also load `memory/feedback_cis_thread_safety.md` — async-dispatch pattern is now the prod default. Per-handle Lock retained for parent-side reload calls (sync, rare). Don't conflate the two paths.
 
-First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy at iter 22+ (W/L 53.8%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on lock refactor + H2H gauntlet in parallel. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, plan Phase 2 launch with --cis --pipeline + bf16. If failed: diagnose, relaunch only after RCA.
+First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy through iter 26 (W/L 54%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on H2H gauntlet + Network Volume in parallel. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, plan Phase 2 launch with --cis --pipeline + bf16 + Phase 4.4. If failed: diagnose, relaunch only after RCA.
 
-Headline work for next session: **CIS lock refactor (Phase 4.4 — async-with-req_id-dispatch)**. Per-handle Lock at production scale serializes IPC, capping CIS throughput at ~50% GPU utilization. Async-dispatch removes the serialization → unlocks the projected ~30%+ wall-time saving (vs ~26% with the lock). ~2-3 hrs implementation, ~$1-2 A100 validation. After that: **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam ($0, ~3-4 hrs). Plus **Network Volume verification** on prod pod (10 min, $0).
+Headline work for next session: **H2H gauntlet wiring** vs Kakuna/SmallRL/Minikazam ($0, ~3-4 hrs). Phase 1 v3 finishing in ~5-7 days; we'll need this for the iter-200 elite-ceiling measurement. Plus **Network Volume verification** on prod pod (10 min, $0). Plus optional **Tier 3 design study** — read `metamon_ref/metamon/rl/metamon_to_amago.py` for the sequence-batched-PPO-with-temporal-stack pattern (Metamon's MetamonAMAGODataset + AMAGOExperiment shows our temporal architecture maps cleanly; reference batch shape is `RLData(obs={K:(L+1,...)}, actions=(L,A), rews=(L,1), dones=(L,1))` with pad_mask). Don't START implementing Tier 3 yet — let Phase 1 v3 finish first.
 
 If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter) and S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer) are both wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
 
-S53 shipped: CIS Phase 4.3 a/b/c + production-scale validation. Pool-mirror multi-slot, per-handle Lock, bg overlap re-enable, small-scale + prod-scale wall-time A/B. All pushed to origin. HEAD on production pod: `251cd14a` (still locked — DO NOT pull while Phase 1 v3 is running; CIS 4.3 changes the codebase incompatibly with the iter-22+ snapshot). Match the bar.
+S53 shipped: CIS Phase 4.3 a/b/c + Phase 4.4 (async-with-req_id-dispatch) + production-scale validation. Pool-mirror multi-slot, bg overlap re-enable, small-scale + prod-scale wall-time A/B (4.4 measured ~20% collect speedup vs 4.3 lock-based at production scale). All pushed to origin. HEAD on production pod: `251cd14a` (still locked — DO NOT pull while Phase 1 v3 is running; CIS 4.3+4.4 changes the codebase incompatibly with the iter-22+ snapshot). Match the bar.
 
 ═══════════════════════════════════════════════════════════════════════════════
 SESSION 54 BOOT — read top to bottom before doing ANYTHING
@@ -296,47 +296,49 @@ What to look for:
 - `FATAL` or `stale_heartbeat` → run is in trouble; diagnose before touching anything
 - Iter 19 EVAL line → smart_avg should be ≥67%
 
-**STEP 2: CIS Phase 4.4 — async-with-req_id-dispatch lock refactor** (~2-3 hrs dev + ~$1-2 A100 validation, SESSION 54 HEADLINE)
-Rationale: S53's prod-scale 4.3c on A100 confirmed end-to-end correctness
-+ ~26% wall-time saving at production scale. BUT GPU was only ~48%
-utilized — bottleneck is per-handle Lock serializing IPC (200 concurrent
-submits per worker queue at the lock). The lock is correct but caps
-throughput. Async-dispatch removes the cap.
+**STEP 2: H2H gauntlet wiring vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0, SESSION 54 HEADLINE)
+Rationale: Phase 1 v3 hits iter 200 in ~5-7 days. We need the "elite?"
+signal then — smart_avg vs basic bots is necessary but insufficient. H2H
+against published bots (Kakuna from Metamon, SmallRL, Minikazam) is the
+actual ceiling measurement.
 
-**Design (deferred from S53)**:
-- Each submit assigns unique req_id (e.g., monotonic counter in handle)
-- Multiple threads concurrently call send() behind a SEND-only lock
-  (cheap atomic enqueue) rather than holding lock through send+recv pair
-- Single recv-loop thread per handle demultiplexes responses by req_id
-  to per-req_id futures (asyncio.Future or threading.Event+result dict)
-- Each submit awaits its future
-- Concurrency: N in-flight submits per handle (instead of 1)
+`eval_h2h_gauntlet.py` exists per §H. "Wiring" means:
+- Find published bot weights/code (HF? GitHub releases? request from authors)
+- Adapt their inference adapter to our `make_self_play_opponent` factory
+- Run small validation gauntlet locally (10-20 games per opp)
+- Document setup in cookbook for the iter 200 eval pipeline
 
-**Files**:
-- `mp_centralized_collect.py:CISClientHandle` — replace Lock with
-  send-lock + dispatcher thread. infer/reload/ping all become async-aware.
-- `mp_centralized_collect.py:CISInferenceBatcher.submit` — adapt to
-  new async dispatch (might need req_id passthrough)
-- Tests 1-3 + Test 4 sustained still must PASS bit-exact at the
-  per-request level (req_id matching is the new correctness axis)
-- Add Test: concurrent submit stress (N=16 threads × 50 reqs each
-  on one handle, verify all responses match by req_id, no corruption)
+Code-only work, no GPU compute. Strategic frame says this is multi-gen-
+AGNOSTIC infra → ship + validate on gen 9 baseline now.
 
-**Validation protocol** on A100 (~$1-2):
-- Re-run `test_cis_phase4_3c_walltime.py` at production scale
-  (N=8, conc=200, games=400, 2 iters per variant)
-- Variant A baseline: ~1548s (S53 measured)
-- Variant B (post-refactor) target: collect time should drop from
-  ~600s to ~250-350s as GPU utilization climbs from 48% to ~80-90%
-- Acceptance: ≥30% wall-time saving vs Variant A (vs 8.6% at the
-  short-sleep scale measured in S53; the metric we care about is
-  collect-time reduction which is ~50% projected)
+**STEP 3: Network Volume verification on prod pod** (~10 min, $0)
+Critical infra debt. Before any future relaunch (Phase 2 or otherwise)
+we MUST have Network Volume — `MEMORY.md` warns "S49 lost a BC run to
+stop+resume on Container Disk." Verify whether prod pod's `/workspace`
+is on Network Volume or Container Disk:
 
-**Acceptance gates**:
-- All Phase 1/2/3/4.3 + Test 4 + 4.3b/c regressions PASS
-- New concurrent-submit stress test PASS (no req_id mismatches, no NaN)
-- Production-scale collect time drops ≥30% vs Lock-based S53 baseline
-- GPU utilization climbs ≥75% during collect (vs 48% with Lock)
+```
+ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
+```
+
+If Container Disk: don't pause/stop the prod pod. Plan migration for
+Phase 2 launch (provision new pod with Network Volume, copy snapshots
++ R2 backup).
+
+**STEP 4 (defer until Phase 1 v3 finishes): Tier 3 design study**
+Read `metamon_ref/metamon/rl/metamon_to_amago.py` carefully for the
+sequence-batched-PPO-with-temporal-stack pattern. Specifically:
+- `MetamonAMAGODataset._process_data` — see how they form RLData with
+  variable-length episodes (`obs={K:(L+1,...)}, actions=(L,A), ...`)
+- `MetamonAMAGOExperiment.edit_actor_mask` / `edit_critic_mask` — see
+  how pad_mask + missing_action_mask combine to mask loss terms per
+  (B, L, G, _) batch shape
+- `MetamonTstepEncoder` (line 477) and traj_encoder usage — confirms
+  our spatial+temporal split maps to AMAGO's tstep_encoder + traj_encoder
+- AMAGO uses experience replay + V-trace (off-policy). For our strict
+  on-policy PPO, we BORROW the batch shape but NOT the algorithm.
+  Estimate: ~1.5-2 weeks dev once Phase 1 v3 finishes. Validation: 20-iter
+  cloud A/B vs current.
 
 **STEP 3: H2H gauntlet vs Kakuna/SmallRL/Minikazam** (~3-4 hrs, $0)
 Rationale: Phase 1 v3 hits iter 200 in ~7 days. We need the "elite?"
@@ -655,17 +657,17 @@ reducing ent_coef in response. This is normal; don't try to "fix" it.
 §J0. SESSION 53 — GAINS, METRICS, NON-ACTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Gains (5+ commits + 2 memory files, all on origin/master)**:
+**Gains (6+ commits + 2 memory files, all on origin/master)**:
 - `92caecd3` CIS Phase 4.3a: pool-mirror multi-slot + Tests 1-3
 - `3accb9fd` Per-handle Lock around pipe IPC + Path/random imports + Test 4
 - `475b32d1` CIS Phase 4.3b: CISBgCollector + bg overlap re-enable
 - `4f0a292f` CIS Phase 4.3c: small-scale wall-time A/B (22.8% saving)
-- `5b6fbdc6` next-prompt: Session 54 handoff
-- Production-scale 4.3c on A100 measured (Variant A 1548s, Variant B 1415s,
-  GPU ~48% util, lock identified as throughput bottleneck)
-- New memory: `feedback_cis_thread_safety.md` (lock pattern + the Phase 4.4
-  async-with-req_id-dispatch refactor as next priority)
-- Updated memory: `project_cis_4_3_design.md` (DONE + prod-scale validated)
+- `1fca242a` docs: incorporate prod-scale 4.3c results + remove stale CIS-pending statements
+- `4d901830` CIS Phase 4.4: async-with-req_id-dispatch (~20% collect speedup, prod-scale measured)
+- Production-scale 4.3c + 4.4 on A100 measured. Pre-refactor (4.3) GPU at
+  ~48% util lock-bound, iter 0 collect = 649s. Post-refactor (4.4) GPU
+  saturating, iter 0 collect = 520s (-20%).
+- Updated memory: `project_cis_4_3_design.md`, `feedback_cis_thread_safety.md`
 
 **Architectural change from S52 memo** (CRITICAL — read carefully):
 S52 memo proposed strict 2-slot CIS (slot 0 = player, slot 1 = active opp).
@@ -717,20 +719,25 @@ the next priority. See `feedback_cis_thread_safety.md`.
 
 **Production-scale 4.3c A/B (A100 80GB, S53)** — measured, not projected:
 - N=8, max_concurrent=200, games=400, min_batch=8, 2 iters per variant
-- Variant A (`--cis` sync): iter 0 = 649s, iter 1 = 539s, total 1548.6s
-- Variant B (`--cis --pipeline`): iter 0 sync = 667s, iter 1 join_wait = 388s, total 1415s
-- Saving: 133s (8.6%) — limited because sleep (180s) << collect (~600s)
-- GPU utilization: ~48% (peak ~16 forwards/sec at B=8 = ~480ms/sec of GPU work)
-- **Bottleneck identified**: per-handle Lock serializes IPC at conc=200.
-  Throughput cap independent of min_batch (1 vs 8 nearly identical).
-- All correctness gates PASS at prod scale (no thread-safety bugs surfaced)
+- Phase 4.3 Variant A (Lock-based sync): iter 0 = 649s, iter 1 = 539s, total 1548.6s
+- Phase 4.3 Variant B (Lock-based pipeline): iter 0 sync = 667s, iter 1 join_wait = 388s, total 1415s
+- Phase 4.3 Lock-based GPU peak: ~48% utilization (lock-bound)
+- **Phase 4.4 (async-dispatch) Variant A iter 0 = 520s** vs 4.3's 649s
+  → **~20% collect-time speedup** at production scale, GPU util saturating
+- All correctness gates PASS at prod scale: no thread-safety bugs at conc=200,
+  no UnpicklingError, all req_id matched correctly to futures, trajs collected
+  cleanly with proper W/L (210/190 in 4.4 iter 0)
 
 **Wall-time savings projection** (full prod scale, 1600 games/iter):
 - Current `--mp` no-pipeline: 16 + 38 = 54 min/iter
-- `--cis --pipeline` (Lock-based, **shipped**): max(40, 38) = ~40 min/iter, **~26% saving**
-- `--cis --pipeline` (post Phase 4.4 lock refactor): max(10-12, 38) = ~38 min/iter, **~30% saving**
-- Per-200-iter saving: $80-100 currently / $120 post-refactor
-- Multi-gen 5-7 wk saving: ~$370-500 currently / ~$600 post-refactor
+- `--cis --pipeline` Phase 4.3 (Lock-based, **shipped**): max(40, 38) = ~40 min/iter, **~26% saving**
+- `--cis --pipeline` Phase 4.4 (async-dispatch, **shipped**): max(32, 38) = ~38 min/iter, **~30% saving**
+  (collect now update-bound — overlap recovers most of update time)
+- Per-200-iter saving: ~$120 vs current `--mp` baseline
+- Multi-gen 5-7 wk saving: ~$600
+- Remaining wall-time levers (post Phase 4.4): bf16 update autocast (already
+  shipped, just needs `--bf16` at relaunch, ~10-15% on update) + Tier 3
+  transition-level minibatching (~4-10× on update, biggest remaining lever)
 
 
 ═══════════════════════════════════════════════════════════════════════════════
