@@ -236,9 +236,9 @@ and parent timed out. See §K dead paths + `memory/project_cis_4_3_design.md`.
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-At S53 end: iter 28 complete + iter 29 in collect (next eval iter).
-~170 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
-(~$240 to completion).
+At S53 end: iter 30 complete (W/L 48.8%, eval at iter 29 = 60% — drop
+from iter 19's 69%, see analysis below). Iter 31+ in collect. ~168 iters
+to go to iter 200 target, ~6-7 days remaining at $1.50/hr (~$240 to completion).
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -258,39 +258,103 @@ Mitigations: heartbeat (600s timeout, 0.25s stagger, liveness-thread heartbeat)
 **S53-measured iter trajectory** (compiled, post-heartbeat-fix):
 
 ```
-Iter 15: collect=909s  update=2174s  W/L 761/839 (47.6%)  pool=2
-Iter 16: collect=959s  update=2195s  W/L 804/796 (50.2%)  pool=2  ← first 50%+
-Iter 17: collect=964s  update=2243s  W/L 832/768 (52.0%)  pool=2
-Iter 18: collect=963s  update=2347s  W/L 842/758 (52.6%)  pool=2
-Iter 19: collect=971s  update=3197s  W/L 878/721 (54.9%)  pool=2  ← eval; smart_avg=69%
-Iter 20: collect=1051s update=2346s  W/L 755/844 (47.2%)  pool=3  ← dipped (pool grew)
-Iter 21: collect=1067s update=3215s  W/L 858/741 (53.7%)  pool=3
-Iter 22: collect=1061s update=2337s  W/L 860/739 (53.8%)  pool=3
-Iter 23: collect=1063s update=2372s  W/L 890/709 (55.7%)  pool=3
-Iter 24: collect=1071s update=2351s  W/L 901/698 (56.3%)  pool=3  ← peak so far
-Iter 25: collect=1145s update=2225s  W/L 830/770 (51.9%)  pool=4  ← dipped (pool grew)
-Iter 26: collect=1117s update=2318s  W/L 863/736 (54.0%)  pool=4
-Iter 27: collect=1153s update=2277s  W/L 852/748 (53.2%)  pool=4
-Iter 28+ was in collect at end of S53.
+Iter 15: collect=909s  update=2174s  W/L 761/839 (47.6%)  pi=+0.013 ent=1.131 kl=0.038  pool=2
+Iter 16: collect=959s  update=2195s  W/L 804/796 (50.2%)  pi=-0.016 ent=1.127 kl=0.038  pool=2
+Iter 17: collect=964s  update=2243s  W/L 832/768 (52.0%)  pi=-0.035 ent=1.110 kl=0.038  pool=2
+Iter 18: collect=963s  update=2347s  W/L 842/758 (52.6%)  pi=-0.029 ent=1.109 kl=0.038  pool=2
+Iter 19: collect=971s  update=3197s  W/L 878/721 (54.9%)  pi=-0.024 ent=1.082 kl=0.041  pool=2  ← eval; smart_avg=69%
+Iter 20: collect=1051s update=2346s  W/L 755/844 (47.2%)  pi=-0.006 ent=1.077 kl=0.040  pool=3  ← dipped (pool grew)
+Iter 21: collect=1067s update=3215s  W/L 858/741 (53.7%)  pi=-0.028 ent=1.076 kl=0.042  pool=3
+Iter 22: collect=1061s update=2337s  W/L 860/739 (53.8%)  pi=-0.025 ent=1.070 kl=0.039  pool=3
+Iter 23: collect=1063s update=2372s  W/L 890/709 (55.7%)  pi=-0.030 ent=1.035 kl=0.042  pool=3
+Iter 24: collect=1071s update=2351s  W/L 901/698 (56.3%)  pi=-0.042 ent=1.040 kl=0.041  pool=3  ← peak W/L
+Iter 25: collect=1145s update=2225s  W/L 830/770 (51.9%)  pi=-0.026 ent=1.044 kl=0.042  pool=4  ← dipped (pool grew)
+Iter 26: collect=1117s update=2318s  W/L 863/736 (54.0%)  pi=-0.032 ent=1.037 kl=0.042  pool=4
+Iter 27: collect=1153s update=2277s  W/L 852/748 (53.2%)  pi=-0.033 ent=1.032 kl=0.042  pool=4
+Iter 28: collect=1167s update=2370s  W/L 836/764 (52.2%)  pi=-0.018 ent=1.045 kl=0.043  pool=4
+Iter 29: collect=1169s update=2331s  W/L 829/771 (51.8%)  pi=-0.039 ent=1.076 kl=0.043  pool=4  ← eval; smart_avg=60% ← drop
+Iter 30: collect=1282s update=2208s  W/L 780/776 (48.8%)  pi=-0.031 ent=1.095 kl=0.043  pool=4  (44 ties — turn-cap forfeits up vs pool=4)
 ```
 
+**KL early-stop firing every iter** (epoch 2-3 of 5) since ~iter 19 — model
+hitting the trust region wall consistently, taking aggressive policy
+steps each iter. Healthy training signal, not regression.
+
+**Adaptive-entropy ramping ent_coef UP since iter 25** because W/L is
+below the 0.65 band the adaptive-entropy controller targets. Entropy
+trajectory: 1.131 (iter 15) → 1.032 (iter 27, lowest) → 1.095 (iter 30,
+climbing). Controller doing exactly what it's designed for in response
+to the harder PFSP pool.
+
 **Compile gain confirmed**: iter 14 (uncompiled) was 4423s total; avg
-post-compile no-eval iter is ~3380s. **~24% steady-state speedup.**
+post-compile no-eval iter is ~3450s. **~22% steady-state speedup.**
 No regression from compile path.
 
-**Heartbeat mitigations confirmed**: 14 iters across two pool growth
+**Heartbeat mitigations confirmed**: 16+ iters across two pool growth
 boundaries (iter 19→20 pool 2→3 + iter 24→25 pool 3→4) without any
 worker respawn or stale-heartbeat. Pool growth produces a single-iter
-dip in W/L (47.2% at iter 20, 51.9% at iter 25) that recovers within
-1-2 iters as the model adapts to harder PFSP opps.
+dip in W/L (47.2% at iter 20, 51.9% at iter 25) that historically
+recovers within 1-2 iters; iter 30 dipped to 48.8% with pool=4 still
+in effect — recovery uncertain at S53 end (see eval analysis below).
 
 **Iter 19 EVAL (passed)**:
 ```
 SH=66%, SmartDmg=68%, Tactical=68%, Strategic=76%, smart_avg=69%
 ```
-Above the ≥67% BC v10 baseline gate. Strategic at 76% is unusually high
-— typically the hardest bot. Iter 29 eval is the next interpretable
-data point (eval-interval=10).
+Above the ≥67% BC v10 baseline gate.
+
+**Iter 29 EVAL** (S53 end):
+```
+SH=64%, SmartDmg=56%, Tactical=56%, Strategic=62%, smart_avg=60%
+```
+Drop of 9pp vs iter 19. 3 of 4 bots tanked 12-14pp; SH (easiest) least.
+At 60% we're at the borderline of cookbook §N's "60-67% acceptable but
+flat" band, just touching "50-60% concerning" territory.
+
+**Reading WITH the other metrics, NOT in isolation** — the smart_avg drop
+correlates with several things happening simultaneously:
+
+| Metric | iter 19 | iter 29 | iter 30 | Reading |
+|---|---|---|---|---|
+| W/L vs PFSP pool | 54.9% | 51.8% | 48.8% | Pool grew 2→3→4 at iter 19/24 boundaries; W/L below adaptive-entropy band of 0.65 |
+| Entropy | 1.082 | 1.076 | **1.095** | Adaptive-entropy ramping ent_coef UP since iter 25 (W/L < 0.65 → more exploration) |
+| pi_loss | -0.024 | -0.039 | -0.031 | Stable negative — policy still improving in PPO sense |
+| v_loss | 2.570 | 2.500 | 2.467 | **Going down** — value head learning |
+| kl | 0.041 | 0.043 | 0.043 | Stable, KL early-stop firing every iter at epoch 2-3 of 5 |
+| KL early-stop | every iter | yes | yes | Trust region exhausted aggressively — model wants to learn fast |
+
+The pattern is consistent with TWO simultaneous explanations of the
+smart_avg drop, and we cannot distinguish without more data:
+
+(a) **Exploration tradeoff** (benign): pool grew 2→4, W/L dipped below
+the adaptive-entropy band of 0.65, ent_coef ramped up, model plays
+more variably, basic bots punish variability harder than strong PFSP
+opps do. Smart_avg drop = expected cost of more exploration. Should
+recover when W/L ticks back above 0.65 and ent_coef decays.
+
+(b) **PFSP-specialization drift** (concerning): model learning patterns
+that beat snapshot_0024 (its own recent self) but losing the basic-bot
+patterns BC v10 had. Smart_avg drop = real loss of generalization
+that won't recover without intervention.
+
+(c) **Both** — most likely some mix.
+
+**What to watch at iter 39 eval (~10 hrs from S53 end)**:
+- If W/L back above 0.65 + entropy stabilized/dropping + smart_avg ≥60%
+  → exploration interpretation likely; continue
+- If W/L still in 48-55% + entropy still climbing + smart_avg <60%
+  → exploration not paying off; could be either (a) bad pool dynamics
+  or (b) genuine drift; investigate before iter 49
+- If smart_avg <50% → fall back to cookbook §N's abort/rollback path
+  (snapshot_0029 is the latest clean rollback point)
+
+**Honest meta-observation** (S53 lesson): smart_avg alone is misleading
+when adaptive-entropy is active. The "are we elite?" signal is H2H vs
+published bots (Kakuna/SmallRL/Minikazam) — those bots punish lazy
+predictable play, so a model exploring useful new strategies could
+BEAT them while smart_avg drops. **STEP 6 (H2H gauntlet wiring)
+becomes higher leverage** because of this — without it, we're guessing
+about the underlying training quality.
 
 **Diagnostic-signal reminder** (load `feedback_diagnostic_signals.md`):
 the per-worker `LIVE +Ns iter=N] n_done=X/200` counter is broken/lagging.
