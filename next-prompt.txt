@@ -236,9 +236,12 @@ and parent timed out. See §K dead paths + `memory/project_cis_4_3_design.md`.
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-At S53 end: iter 30 complete (W/L 48.8%, eval at iter 29 = 60% — drop
-from iter 19's 69%, see analysis below). Iter 31+ in collect. ~168 iters
-to go to iter 200 target, ~6-7 days remaining at $1.50/hr (~$240 to completion).
+At S53 end: iter 36 complete (W/L 53.5%, recovering from iter 35
+pool-growth dip). W/L peaked at 56.7% (iter 34). Iter 29 eval = 60% —
+drop from iter 19's 69% (deep analysis below confirms exploration
++ specialization, not catastrophic forgetting). Iter 37 in update.
+~163 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
+(~$235 to completion). Iter 39 is next eval data point.
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -274,17 +277,27 @@ Iter 27: collect=1153s update=2277s  W/L 852/748 (53.2%)  pi=-0.033 ent=1.032 kl
 Iter 28: collect=1167s update=2370s  W/L 836/764 (52.2%)  pi=-0.018 ent=1.045 kl=0.043  pool=4
 Iter 29: collect=1169s update=2331s  W/L 829/771 (51.8%)  pi=-0.039 ent=1.076 kl=0.043  pool=4  ← eval; smart_avg=60% ← drop
 Iter 30: collect=1282s update=2208s  W/L 780/776 (48.8%)  pi=-0.031 ent=1.095 kl=0.043  pool=4  (44 ties — turn-cap forfeits up vs pool=4)
+Iter 32: collect=1288s update=1551s  W/L 894/705 (55.9%)  pi=-0.015 ent=1.053 kl=0.041  pool=5  ← W/L recovers above 0.65 band
+Iter 33: collect=1255s update=2249s  W/L 880/720 (55.0%)  pi=-0.045 ent=1.038 kl=0.041  pool=5
+Iter 34: collect=1280s update=2270s  W/L 906/692 (56.7%)  pi=-0.032 ent=1.020 kl=0.043  pool=5  ← new W/L peak
+Iter 35: collect=1314s update=1745s  W/L 682/627 (43.6%)  pi=-0.013 ent=1.017 kl=0.043  pool=6  ← pool grew, 254 ties
+Iter 36: collect=1387s update=2203s  W/L 856/736 (53.5%)  pi=-0.039 ent=1.016 kl=0.044  pool=6  ← already recovering
 ```
 
 **KL early-stop firing every iter** (epoch 2-3 of 5) since ~iter 19 — model
 hitting the trust region wall consistently, taking aggressive policy
 steps each iter. Healthy training signal, not regression.
 
-**Adaptive-entropy ramping ent_coef UP since iter 25** because W/L is
-below the 0.65 band the adaptive-entropy controller targets. Entropy
-trajectory: 1.131 (iter 15) → 1.032 (iter 27, lowest) → 1.095 (iter 30,
-climbing). Controller doing exactly what it's designed for in response
-to the harder PFSP pool.
+**Adaptive-entropy trajectory tells the story**:
+- Ramped UP iter 25-30 (W/L < 0.65 band): 1.044 → 1.095 (controller pushing more exploration)
+- Peaked at iter 30 (1.095) right when smart_avg eval came in low
+- Ramped DOWN iter 32-36 (W/L back above band): 1.053 → 1.016 (controller pulling exploration back)
+- Iter 36 entropy (1.016) is LOWER than iter 27 (1.032 — old low). Exploration burst is over.
+
+This is the adaptive-entropy controller doing exactly what it's designed
+for. The smart_avg drop at iter 29 was the cost of the exploration burst;
+recovery is well underway by iter 36. Iter 39 eval will quantify how much
+recovers.
 
 **Compile gain confirmed**: iter 14 (uncompiled) was 4423s total; avg
 post-compile no-eval iter is ~3450s. **~22% steady-state speedup.**
@@ -355,6 +368,88 @@ predictable play, so a model exploring useful new strategies could
 BEAT them while smart_avg drops. **STEP 6 (H2H gauntlet wiring)
 becomes higher leverage** because of this — without it, we're guessing
 about the underlying training quality.
+
+**Deep playstyle comparison iter 19 vs iter 29** (canonical reference,
+run via `analyze_eval.py --replay-dir ... --deep` on prod replays):
+
+This is the BASELINE for distinguishing real drift from exploration.
+Future evals can be compared against this trajectory. Catastrophic
+forgetting would show fundamentally different patterns; exploration
+shows degraded execution with intact tools.
+
+| Category | iter 19 | iter 29 | Δ | Reading |
+|---|---|---|---|---|
+| **Type knowledge (FLAT)** | | | | Model still has Pokemon/move/type knowledge |
+| SE Hit Ratio (flagged) | 44.6% | 43.1% | -1.5 | Type knowledge intact |
+| Immune Hit Ratio | 11.8% | 11.9% | +0.1 | Stable |
+| Move Waste (used resisted/immune when SE known) | 8.8% | 8.9% | +0.1 | Stable |
+| Status conditions inflicted (tox/par/brn/psn total) | 762 | 723 | -5% | Same status game |
+| Switch Prediction (SE vs prev opp) | 37% | 36% | -1pp | Same anticipation |
+| Recovery Efficiency (useful ≥3 turns) | 70% | 69% | -1pp | Same recovery game |
+| **Switch quality (small drift)** | | | | More noise in switch choices |
+| Good switch (favorable matchup) | 54% | 50% | -4pp | |
+| Bad switch (unfavorable matchup) | 16% | 19% | **+3pp** | Higher entropy → noisier switches |
+| Avg HP at switch | 53% | 55% | +2pp | Switching earlier |
+| **Strategic shift (specialization)** | | | | More hazards + grinding, less direct setup |
+| Setup % | 8.1% | 5.5% | **-2.6pp** | Less direct combat-setup |
+| Hazard % | 7.4% | 10.4% | **+3.0pp** | Stealth Rock count +46%, Spikes +37% |
+| Switch Rate (total) | 21.7% | 24.2% | +2.5pp | More positioning |
+| Voluntary Switch | 11.3% | 13.4% | +2.1pp | More proactive switches |
+| Avg Turns/Game | 32.0 | 34.1 | +2.1 | Longer games |
+| **Combat outcomes (real degradation)** | | | | Pressure / lead WR dropped meaningfully |
+| KO Ratio | 1.37 | 1.14 | -0.23 | Worse trades, still net positive |
+| Momentum dominance | 50% ours | 41% ours | **-9pp** | Real drop in sustained pressure |
+| Lead WR (stays in) | 69% | 60% | -9pp | Opening play tilted |
+| Lead WR (switches) | 75% | 64% | -11pp | Opening play tilted |
+| Endgame WR | 57% | 54% | -3pp | Slightly worse |
+| **RNG variance (not skill)** | | | | |
+| Our crits | 588 | 508 | -14% | Crit luck variance against us |
+| Opp crits | 716 | 767 | +7% | Same direction |
+
+**Same Pokemon usage in both evals**: Gliscor / Ting-Lu / Alomomola /
+Pecharunt / Corviknight in same order, same per-mon move distributions
+(Gliscor still 30% Protect / 20% Knock Off / 19% Spikes; Ting-Lu still
+Earthquake/SR dominant; etc). **Not forgetting — same toolkit, slightly
+different weights.**
+
+**Forgetting signature (NOT seen)**:
+- ✗ SE rate would drop 5-10pp (we see -1.5pp — flat)
+- ✗ Immune rate would spike (flat)
+- ✗ Move waste would jump (flat)
+- ✗ Top Pokemon usage would shift (identical top 5)
+- ✗ Per-mon move distributions would shift (basically identical)
+- ✗ Status game would change fundamentally (-5% total — variance)
+
+**Exploration signature (matches what we see)**:
+- ✓ Switch quality slightly noisier (+3pp bad switches)
+- ✓ Momentum dominance drop (-9pp; explore = give up some pressure)
+- ✓ Lead WR drop (-9pp; opening play hits rigid heuristic patterns harder)
+- ✓ KO Ratio drop (still net positive 1.14)
+- ✓ Strategic-play tilt (+3pp hazards, +2.5pp switching, +2 turns/game)
+
+**Followup support — iter 32-36 trajectory** (S53 end):
+- W/L recovered above 0.65 band (55.9% iter 32, **56.7% iter 34** — new high)
+- Entropy MONOTONICALLY DROPPING since iter 30 (1.095 → 1.016) as
+  adaptive-entropy ramps ent_coef back down. Exploration burst over.
+- Iter 35 pool grew 5→6 (snapshot_0034 added). Single-iter dip to
+  43.6% with 254 ties (turn-cap forfeits) — same pattern as iter 20
+  and 25.
+- Iter 36 already recovering (53.5%).
+
+**For future evals (iter 39, 49, 59...) — track these vs iter 19/29 baseline**:
+- SE rate: should stay in 42-46% (drop below 40% = real concern)
+- Immune rate: should stay in 11-13% (jump above 15% = real concern)
+- Move Waste: should stay in 8-10% (jump above 13% = real concern)
+- Top 5 Pokemon ordering: should stay same (different = team usage drift)
+- Bad switch rate: should stay in 16-22% (jump above 25% = noisy decision making)
+- Momentum dominance: track — drops below 35% = sustained pressure loss
+
+**If smart_avg drops further at iter 39** (e.g., to 50-55% range), check
+the deep metrics above before treating as regression. If type knowledge
++ Pokemon usage hold, it's still exploration. If type knowledge degrades,
+it's actual drift and warrants intervention (lower entropy band, lower lr,
+or auxiliary BC loss on BC's data distribution — NOT KL-to-BC which would
+cap improvement).
 
 **Diagnostic-signal reminder** (load `feedback_diagnostic_signals.md`):
 the per-worker `LIVE +Ns iter=N] n_done=X/200` counter is broken/lagging.
