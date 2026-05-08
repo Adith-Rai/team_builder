@@ -1939,8 +1939,24 @@ def mp_centralized_collect_sync(
         if i + 1 < n_workers:
             time.sleep(0.25)
 
-    # 5. Watchdog loop: collect results
+    # 5+6. Wait for results + aggregate (factored helper, shared with bg path).
+    return _cis_wait_results_and_aggregate(
+        g=g, cmds_sent=cmds_sent, iter_n=iter_n, n_games=n_games,
+        n_alive=n_alive, n_workers=n_workers, t_start=t_start,
+    )
+
+
+def _cis_wait_results_and_aggregate(
+    g: Dict[str, Any], cmds_sent: List[int], iter_n: int,
+    n_games: int, n_alive: int, n_workers: int, t_start: float,
+) -> Tuple[List, int, int, int, int, str, float, Dict]:
+    """Watchdog loop + trajectory aggregation. Used by both sync orchestrator
+    (mp_centralized_collect_sync) and bg orchestrator (CISBgCollector.join).
+    Same return-tuple shape as mp_disk_collect_sync."""
     from multiprocessing.connection import wait as mp_wait
+    import gzip as _gzip
+    import pickle as _pickle
+
     expected = len(cmds_sent)
     received = 0
     results: List[dict] = []
@@ -1969,9 +1985,6 @@ def mp_centralized_collect_sync(
                       f"error: {msg.get('exc_msg')}\n{msg.get('traceback', '')}",
                       flush=True)
 
-    # 6. Aggregate
-    import gzip as _gzip
-    import pickle as _pickle
     all_trajs = []
     total_w = total_l = total_ties = 0
     aggregated_wr: Dict[str, List[int]] = {}
@@ -1993,7 +2006,7 @@ def mp_centralized_collect_sync(
         except Exception as e:
             print(f"[cis-collect] read failure for {traj_path}: {e}", flush=True)
 
-    # Cleanup old files (keep last 2 iters)
+    # Cleanup old traj files (keep last 2 iters).
     threshold = iter_n - 2
     for f in Path("/tmp").glob("traj_cis_w*_iter*.pkl.gz"):
         try:
@@ -2009,6 +2022,168 @@ def mp_centralized_collect_sync(
     opp_name = f"cis(N={n_workers},responded={len(results)})"
     return (all_trajs, total_w, total_l, total_ties, total_steps, opp_name,
             elapsed, aggregated_wr)
+
+
+class CISBgCollector:
+    """Phase 4.3b: Background-mode CIS collect. Mirrors MPDiskBgCollector
+    interface (start, join, running) so train_rl.py's pipeline path can
+    use it as drop-in.
+
+    Re-enables the bg overlap that was no-op'd after the mp+pipeline GPU
+    contention deadlock (see train_rl.py:_start_background_collection
+    pre-Phase-4.3b). The CIS low-priority CUDA stream (Phase 4.2) lets
+    worker forwards make progress on the GPU during main's
+    optimizer.step(), while main gets first-priority access. No more
+    deadlock; collect actually overlaps with update.
+
+    Semantics (same as MPDiskBgCollector): workers always use the LAST
+    FINALIZED weights at iter boundary. Iter K's collect uses weights
+    from iter K-1's update (off-by-1 stale, identical to BackgroundCollector
+    and MPDiskBgCollector — PPO is robust to this 1-iter staleness).
+    """
+
+    def __init__(self):
+        self._kicked_off = False
+        self._iter_n: Optional[int] = None
+        self._cmds_sent: List[int] = []
+        self._t_start = 0.0
+        self._n_games = 0
+        self._n_alive = 0
+        self._n_workers = 0
+        self._g: Optional[Dict[str, Any]] = None
+
+    @property
+    def running(self) -> bool:
+        return self._kicked_off
+
+    def start(self, model, device, server_pool, snapshot_pool, args_dict,
+              win_rates=None, iter_n: int = 0):
+        """Kick off CIS collect for the next iter. Returns immediately;
+        results retrieved via .join(). Same args_dict shape as
+        MPDiskBgCollector.start (which mirrors the sync collect kwargs)."""
+        n_workers = args_dict.get("n_workers", 8)
+        n_games = args_dict["games_per_iter"]
+        max_concurrent = args_dict["max_concurrent"]
+        fp16 = args_dict["fp16"]
+        rs_cfg = args_dict["rs_cfg"]
+        temp_range = args_dict["temp_range"]
+        opponent_device = args_dict.get("opponent_device", str(device))
+        turn_cap = args_dict.get("turn_cap", 300)
+        battle_format = args_dict.get("battle_format", "gen9ou")
+        procedural_teams_path = args_dict.get("teambuilder_path")
+        amp_dtype = args_dict.get("amp_dtype")
+        max_pool_size = args_dict.get("max_pool_size", 16)
+        cis_min_batch = args_dict.get("cis_min_batch", 8)
+        cis_timeout_ms = args_dict.get("cis_timeout_ms", 15)
+        rng_seed = args_dict.get("rng_seed") or random.randint(0, 1_000_000)
+
+        if device.type == "cpu":
+            raise ValueError("CISBgCollector not supported on CPU.")
+
+        # 1. Save weights for CIS to load
+        weights_path = _save_weights_atomic_for_cis(model, iter_n)
+
+        # 2. Init or reuse CIS global
+        g = _ensure_cis_global(
+            weights_path=weights_path, n_workers=n_workers,
+            device=str(device), fp16=fp16, amp_dtype_name=amp_dtype,
+            min_batch=cis_min_batch, timeout_ms=cis_timeout_ms,
+            max_pool_size=max_pool_size,
+        )
+
+        # 3. Slot reload (slot 0 every iter; opp slots only if path changed)
+        n_slots = g["n_slots"]
+        cur_paths = g["current_slot_paths"]
+        pool_slot_map: Dict[str, int] = {}
+        for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
+            slot_idx = i + 1
+            pool_slot_map[opp_path] = slot_idx
+
+        try:
+            g["handles_main_view"][0].reload(weights_path, slot=0, timeout_s=60.0)
+            cur_paths[0] = weights_path
+        except Exception as e:
+            print(f"[cis-bg] WARN slot 0 reload at iter {iter_n}: {e}",
+                  flush=True)
+
+        n_opp_reloaded = 0
+        for opp_path, slot_idx in pool_slot_map.items():
+            if slot_idx >= n_slots:
+                print(f"[cis-bg] WARN opp slot {slot_idx} exceeds "
+                      f"n_slots={n_slots}; raise --max-pool-size", flush=True)
+                continue
+            if cur_paths[slot_idx] == opp_path:
+                continue
+            try:
+                g["handles_main_view"][0].reload(opp_path, slot=slot_idx,
+                                                 timeout_s=60.0)
+                cur_paths[slot_idx] = opp_path
+                n_opp_reloaded += 1
+            except Exception as e:
+                print(f"[cis-bg] WARN slot {slot_idx} reload "
+                      f"({opp_path}): {e}", flush=True)
+        if n_opp_reloaded:
+            print(f"[cis-bg] iter {iter_n}: reloaded {n_opp_reloaded} opp "
+                  f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
+
+        # 4. Build opp_pool message + dispatch
+        opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
+        n_alive = n_workers  # CIS workers don't have respawn yet
+        games_per_worker = n_games // n_alive
+        remainder = n_games % n_alive
+
+        cmds_sent: List[int] = []
+        for i, wid in enumerate(range(n_workers)):
+            worker_n = games_per_worker + (1 if i < remainder else 0)
+            srv_idx = i % len(server_pool)
+            srv = server_pool[srv_idx]
+            srv_url = getattr(srv, 'websocket_url', None) or str(srv)
+            cmd = {
+                "cmd": "collect_iter",
+                "iter_n": iter_n,
+                "n_games": worker_n,
+                "max_concurrent": max_concurrent,
+                "server_url": srv_url,
+                "opp_pool": opp_pool_msg,
+                "pool_slot_map": pool_slot_map,
+                "temp_range": list(temp_range),
+                "opp_temp_range": list(temp_range),
+                "fp16": fp16,
+                "rs_cfg": rs_cfg,
+                "turn_cap": turn_cap,
+                "battle_format": battle_format,
+                "procedural_teams_path": procedural_teams_path,
+                "device": str(device),
+                "opponent_device": opponent_device,
+                "rng_seed": rng_seed,
+                "amp_dtype": amp_dtype,
+            }
+            g["worker_ctrl_pipes"][wid].send(cmd)
+            cmds_sent.append(wid)
+            if i + 1 < n_workers:
+                time.sleep(0.25)
+
+        # Track state for join().
+        self._g = g
+        self._cmds_sent = cmds_sent
+        self._iter_n = iter_n
+        self._n_games = n_games
+        self._n_alive = n_alive
+        self._n_workers = n_workers
+        self._t_start = time.time()
+        self._kicked_off = True
+
+    def join(self) -> Optional[Tuple]:
+        """Block until workers finish; return aggregated result tuple."""
+        if not self._kicked_off:
+            return None
+        result = _cis_wait_results_and_aggregate(
+            g=self._g, cmds_sent=self._cmds_sent, iter_n=self._iter_n,
+            n_games=self._n_games, n_alive=self._n_alive,
+            n_workers=self._n_workers, t_start=self._t_start,
+        )
+        self._kicked_off = False
+        return result
 
 
 def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:

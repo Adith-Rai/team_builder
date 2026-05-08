@@ -409,7 +409,8 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
 
 def _start_background_collection(args, model, device, server_pool, snapshot_pool,
                                   collect_args, bg_collector, mp_bg_collector,
-                                  in_warmup, _flow, external_manager=None):
+                                  in_warmup, _flow, external_manager=None,
+                                  iter_n: int = 0):
     """Kick off background collection for the NEXT iteration (pipeline mode)."""
     if args.mp and args.pipeline and not in_warmup:
         # KNOWN LIMITATION (Session 50): mp+pipeline overlap causes worker
@@ -417,14 +418,25 @@ def _start_background_collection(args, model, device, server_pool, snapshot_pool
         # with main's PPO update. Workers' inference forwards stall when
         # main is doing optimizer.step()-heavy update; deadlock doesn't
         # recover after main finishes. See docs/MP_DISK_REDESIGN.md.
-        # Until a proper fix lands (eg. separate inference workers, pause/
-        # resume on update boundaries, or centralized inference server
-        # arbitrating GPU access), skip bg startup. --mp --pipeline silently
-        # behaves as --mp only. mp-only is fully validated; the cost
-        # difference is ~$15-25 on Phase 1.
-        # Future work: TODO redesign for multi-gen run.
+        # The CIS path (--cis --pipeline) was built to fix this via
+        # centralized inference + low-priority CUDA stream arbitration
+        # (Phase 4.2/4.3). Use --cis instead of --mp when pipeline overlap
+        # is wanted. mp-only is fully validated; --mp --pipeline still
+        # silently behaves as --mp only.
         pass  # no-op; mp_bg_collector stays None
-    elif bg_collector and not in_warmup and not args.mp:
+    elif args.cis and args.pipeline and not in_warmup:
+        # Phase 4.3b: CIS bg overlap re-enabled. CISBgCollector mirrors
+        # MPDiskBgCollector's start/join interface; CIS forwards run on a
+        # low-priority CUDA stream behind main's optimizer.step on the
+        # high-priority default stream. Workers progress during update.
+        if mp_bg_collector is not None and not mp_bg_collector.running:
+            _flow("starting CIS BACKGROUND collection for next iter")
+            mp_bg_collector.start(
+                model, device, server_pool, snapshot_pool, collect_args,
+                win_rates=collect_args.get("win_rates"),
+                iter_n=iter_n,
+            )
+    elif bg_collector and not in_warmup and not args.mp and not args.cis:
         _flow("starting BACKGROUND collection for next iter")
         bg_collector.start(model, device, server_pool, snapshot_pool, collect_args,
                            win_rates=collect_args.get("win_rates"),
@@ -944,7 +956,13 @@ def main():
         "turn_cap": args.turn_cap,
     }
     pending_collection = None
+    # Background collector for --mp/--cis + --pipeline. Mirrors the
+    # BackgroundCollector interface (start, join, running). Phase 4.3b
+    # added the CIS variant; the --mp variant is still no-op'd.
     mp_bg_collector = None
+    if args.cis and args.pipeline:
+        from mp_centralized_collect import CISBgCollector
+        mp_bg_collector = CISBgCollector()
     eval_history = []  # list of eval dicts for early-stopping check
 
     # Pool entries that prune-on-save must NEVER drop: init + anchors. (Layer 5)
@@ -1085,7 +1103,7 @@ def main():
         mp_bg_collector = _start_background_collection(
             args, model, device, server_pool, snapshot_pool,
             collect_args, bg_collector, mp_bg_collector, in_warmup, _flow,
-            external_manager=external_manager)
+            external_manager=external_manager, iter_n=it + 1)
 
         # ---- Eval (runs while background collection is in progress) ----
         best_eval_wr, _, should_stop = _maybe_eval(
