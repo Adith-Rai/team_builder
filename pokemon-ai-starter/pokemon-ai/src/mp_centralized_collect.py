@@ -51,10 +51,12 @@ from __future__ import annotations
 
 import multiprocessing as mp_stdlib
 import os
+import random
 import sys
 import time
 import traceback
 from contextlib import nullcontext as _nullcontext
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -886,12 +888,24 @@ class CISClientHandle:
     """Per-worker view of a CIS server. Holds one (req_writer, resp_reader)
     pipe pair that routes through a single shared CIS subprocess. Multiple
     CISClientHandles can call .infer() concurrently from different threads
-    or processes; CIS multiplexes via mp.connection.wait."""
+    or processes; CIS multiplexes via mp.connection.wait.
+
+    Thread safety: within a single handle (one pipe pair), concurrent
+    threads MUST be serialized — mp.Pipe.send is not byte-atomic across
+    threads, and resp_reader.recv() can return another thread's response
+    if not serialized. We hold a per-handle lock around each send+recv
+    pair, so requests across threads execute one-at-a-time on the pipe.
+    Cross-handle (cross-worker) concurrency is preserved — each worker's
+    handle has its own pipe pair and lock. Cross-thread within a worker
+    serializes IPC; that's a known cost vs. the alternative async-with-
+    req_id-dispatch design (deferred, see CIS thread-safety TODO)."""
 
     def __init__(self, req_writer, resp_reader, worker_idx: int):
+        import threading as _threading
         self.req_writer = req_writer
         self.resp_reader = resp_reader
         self.worker_idx = worker_idx
+        self._lock = _threading.Lock()
 
     def infer(self, numpy_batch: Dict[str, Any], timeout_s: float = 30.0,
               req_id: Optional[int] = None,
@@ -905,11 +919,15 @@ class CISClientHandle:
             msg["history"] = history
         if history_lens is not None:
             msg["history_lens"] = history_lens
-        self.req_writer.send(msg)
-        if not self.resp_reader.poll(timeout=timeout_s):
-            raise TimeoutError(f"CIS infer (worker {self.worker_idx}) "
-                               f"response not received within {timeout_s}s")
-        resp = self.resp_reader.recv()
+        # Serialize the send+recv pair so concurrent threads don't
+        # interleave bytes on the pipe (corrupts pickle stream) or steal
+        # each other's responses. See class docstring.
+        with self._lock:
+            self.req_writer.send(msg)
+            if not self.resp_reader.poll(timeout=timeout_s):
+                raise TimeoutError(f"CIS infer (worker {self.worker_idx}) "
+                                   f"response not received within {timeout_s}s")
+            resp = self.resp_reader.recv()
         status = resp.get("status")
         if status == "ok":
             return resp["out"]
@@ -920,10 +938,12 @@ class CISClientHandle:
 
     def ping(self, timeout_s: float = 5.0) -> bool:
         try:
-            self.req_writer.send({"cmd": "ping"})
-            if not self.resp_reader.poll(timeout=timeout_s):
-                return False
-            return self.resp_reader.recv().get("status") == "ok"
+            with self._lock:
+                self.req_writer.send({"cmd": "ping"})
+                if not self.resp_reader.poll(timeout=timeout_s):
+                    return False
+                resp = self.resp_reader.recv()
+            return resp.get("status") == "ok"
         except Exception:
             return False
 
@@ -936,12 +956,13 @@ class CISClientHandle:
         slot selects which model slot to reload (default 0 = player slot).
         Phase 4.3a adds K opp slots; orchestrator reloads slot 1..K with
         PFSP pool ckpts at iter start."""
-        self.req_writer.send({"cmd": "reload", "weights_path": weights_path,
-                              "slot": int(slot)})
-        if not self.resp_reader.poll(timeout=timeout_s):
-            raise TimeoutError(f"CIS reload (worker {self.worker_idx}) "
-                               f"response not received within {timeout_s}s")
-        resp = self.resp_reader.recv()
+        with self._lock:
+            self.req_writer.send({"cmd": "reload", "weights_path": weights_path,
+                                  "slot": int(slot)})
+            if not self.resp_reader.poll(timeout=timeout_s):
+                raise TimeoutError(f"CIS reload (worker {self.worker_idx}) "
+                                   f"response not received within {timeout_s}s")
+            resp = self.resp_reader.recv()
         if resp.get("status") == "ok":
             return resp
         raise RuntimeError(f"CIS reload error: {resp.get('exc_msg')}\n"
