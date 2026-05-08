@@ -61,6 +61,8 @@ def main():
     p.add_argument("--ports", default="9000,9001")
     p.add_argument("--update-sleep-s", type=float, default=7.0,
                    help="Simulated update phase duration (matches collect time)")
+    p.add_argument("--cis-min-batch", type=int, default=1,
+                   help="CIS batching threshold (1=immediate, 8=production)")
     args = p.parse_args()
 
     print("=== CIS Phase 4.3c small-scale wall-time A/B ===")
@@ -111,7 +113,7 @@ def main():
         procedural_teams_path=None,
         n_workers=args.n_workers,
         amp_dtype=None,
-        cis_min_batch=1,
+        cis_min_batch=args.cis_min_batch,
         cis_timeout_ms=15,
         max_pool_size=args.max_pool_size,
     )
@@ -163,7 +165,7 @@ def main():
         n_workers=args.n_workers,
         amp_dtype=None,
         max_pool_size=args.max_pool_size,
-        cis_min_batch=1,
+        cis_min_batch=args.cis_min_batch,
         cis_timeout_ms=15,
     )
 
