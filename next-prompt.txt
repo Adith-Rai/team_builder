@@ -102,11 +102,33 @@ test_*.py` patterns.
 mitigations are live. Per-worker GPU model is correct for the current
 production design. CIS is a SEPARATE path behind a SEPARATE flag.
 
-**B8. DO NOT reach for Tier 3 optimizations** (transition-level minibatching,
-standalone grad_accum>1) until Tier 1 + Tier 2 wins are all shipped. Per
-cookbook §4 and `next-prompt.txt §B1.6` (since archived). grad_accum>1
-specifically is a SILENT quality regression risk per Session 31. Hold
-`--grad-accum 1`.
+**B8. DO NOT reach for Tier 3 optimizations until Tier 1 + Tier 2 are all
+shipped.** Specifically:
+
+- **`--grad-accum 1` is mandatory for production.** Don't experiment with
+  `grad_accum > 1` standalone. Session 31 record suggests `grad_accum=10`
+  produced a *weaker battler* — silent quality regression, NOT a crash.
+  Hard to detect without 10-20 iters + eval. Pure wall-time saving from
+  `grad_accum` alone is ~4-5%, dwarfed by the regression risk.
+- The right path forward is **transition-level minibatching** (refactor
+  to batch like Metamon's 48 episodes/forward or ps-ppo's 256-2048
+  transitions/gradient — we're 48× below published practice). The refactor
+  SUBSUMES the grad_accum benefit and uses the same code path published
+  work has validated. Three implementation options sketched in old
+  `next-prompt §B1.6` (now archived in git history at commit `2c7d97fc`):
+  (A) episode-padded with attention masks; (B) chunk-based with K
+  consecutive turns; (C) pre-cached temporal embeddings then mix freely.
+- **Episode boundaries MUST be preserved** in any sensible refactor:
+  temporal stack still sees sequential turns from ONE episode; only
+  loss/gradient computation mixes across episodes.
+- **DO NOT** reopen the `lr` question alongside any grad_accum / batching
+  experiment. Hold `lr=1e-5` constant. Compounding two unknowns silently
+  ruins the comparison.
+- **DO ONLY** if wall-time is still painful after Tier 1+2 wins ship
+  (`--compile` + bf16 + flash attn + CIS+pipeline). If those land and
+  wall-time becomes acceptable, transition-level minibatching can stay
+  deferred indefinitely. If wall-time becomes excellent, the validation
+  cost becomes cheap enough to test anyway.
 
 **B9. DO NOT reopen the lr question.** lr=1e-5 was hard-won through a
 4-point ablation (Session 50). Confirmed by the compiled run hitting 50%
@@ -609,6 +631,132 @@ to find the relevant commit + read its message for context.
 If you find yourself confused or context-loaded: ASK THE USER. Do not
 guess. The previous session's worker noted that "going in half-informed"
 is the pattern that costs most.
+
+═══════════════════════════════════════════════════════════════════════════════
+§N. EVAL EXPECTED OUTCOMES — what numbers mean
+═══════════════════════════════════════════════════════════════════════════════
+
+The compiled run hits its first eval at iter 19 (`--eval-interval 10`,
+resumed-run inherits this). Run is 200 games × 4 smart bots = 800 games
+per eval. Standard error ≈ ±3.5% per bot.
+
+**smart_avg = average win rate across all 4 smart bots
+(SimpleHeuristicsPlayer / SmartDamagePlayer / TacticalPlayer /
+StrategicPlayer)**.
+
+| smart_avg range | Interpretation | Action |
+|---|---|---|
+| ≥75% | Strong improvement over BC baseline | Continue, watch for plateau |
+| **≥67%** | **Healthy: at or above BC v10 baseline** | **Continue (this is the target)** |
+| 60-67% | Acceptable but flat — model not learning much vs baseline | Continue, but plan to re-evaluate at iter 29 |
+| 50-60% | Concerning — possible quality regression | **Investigate**: kl trajectory rising? entropy collapse? gradient norms? Compare iter 19 (compiled) to iter 13 (uncompiled baseline) |
+| <50% | Compile broke training quality | **Abort + rollback** to snapshot_0014 + relaunch without `--compile`. Cookbook §3i acceptance was end-to-end equivalence; if eval breaks, the equivalence assumption was wrong |
+
+**BC v10 e3 reference (from Session 49)**: smart_avg ≈ 67%, Elo 1135.9
+(measured, #1 all-time at the time). The compiled PPO run starts from
+snapshot_0014 (already trained 14 PPO iters on top of BC). Expectation
+is smart_avg should be ≥ BC baseline since we have additional training,
+but PPO can plateau or temporarily dip vs BC if exploration gets noisy.
+
+**Per-bot expected ranges** (can vary, these are rough):
+- vs SimpleHeuristicsPlayer (SH): 70-85% (easiest)
+- vs SmartDamagePlayer: 60-80%
+- vs TacticalPlayer: 55-75%
+- vs StrategicPlayer: 55-75% (hardest)
+
+If ONE bot tanks to <50% while others hold, it's specialization (fine).
+If TWO+ bots tank, that's concerning. Cookbook §5e has the kl/pi/v
+trajectory diagnostics for these cases.
+
+**For multi-gen runs (Session 52+)**: smart_avg-per-gen tracking is
+essential. Don't average across gens — each gen has its own difficulty
+calibration. See E3 in §D STEP 4.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+§O. CARRY-OVER PRACTICES (lessons paid for in $$$ + wall-time)
+═══════════════════════════════════════════════════════════════════════════════
+
+Distilled from Sessions 49 / 50 / 50 cont. / 51. Each one cost real money
+or hours when ignored. Don't relearn them.
+
+1. **Read docs + code BEFORE estimating scope.** Sessions 49 + 50 + 51
+   each burned evenings on "should be a quick fix" estimates. Trust
+   line-cited audits. The compile diagnostic took ~2 hours of investigation
+   before the right fix landed; the wrong fix would have been ~1 day.
+
+2. **Verify before recommending from memory.** Memory snapshots are
+   point-in-time, not current state. Grep for functions/flags before
+   promising they work. The "AttributeError on new arch" claim was wrong
+   in three places (cookbook + memory + next-prompt) — believing memory
+   over the code wasted ~1 hour of investigation.
+
+3. **Smoke ALWAYS before launching long runs.** The 6-test pattern in
+   cookbook §5 is non-optional. Session 50 caught 5 bugs (V9RLPlayer
+   kwarg, return-tuple shape, opp_records format, mp+pipeline GPU
+   contention, --opp-cpu WS keepalive). Session 51 caught 3 more
+   (compile-vs-resume order, _orig_mod prefix, heartbeat starvation).
+   Each would have wasted 40+ hr in production.
+
+4. **`--mp` is transformer-only.** Legacy `BattleAgent` ckpts (sp_NNNN)
+   work as PFSP opponents (factory dispatches via
+   `is_transformer_checkpoint`) but cannot be `--init-from` for `--mp`.
+
+5. **Cloud: Network Volume MANDATORY for runs > 1 epoch.** Container
+   Disk doesn't survive `podStop+podResume` if the pod re-provisions on
+   a different host. Lost a partial BC run this way (Session 49). This
+   matters for BC training (long jobs); for PPO production runs we use
+   continuous training without stop/resume so it's lower risk, but new
+   long-running jobs should default to Network Volume.
+
+6. **Don't rush refactors under time pressure.** "Just ship tonight" is
+   the pattern that produces next session's surprise gaps. Session 51's
+   "go ahead with Path 2 properly" was the right call exactly because we
+   refused to ship Path 1's incomplete coverage.
+
+7. **Backward compat is a hard constraint** (until D1 broke it deliberately).
+   Legacy ckpts must remain loadable as PFSP opponents — the
+   `make_self_play_opponent` factory-dispatch invariant protects this.
+   The D1 gen-id token addition deliberately breaks BC v10 → multi-gen
+   model compatibility, which is OK because BC v11 retrains from scratch.
+
+8. **Cloud-only bug discovery**: many bugs (SemLock race, GPU contention,
+   heartbeat starvation, the iter-17 hang) only reproduce on Linux +
+   RunPod + N≥4 workers + production scale. Schedule cloud debug time
+   when context is fresh — these don't reproduce locally.
+
+9. **POKE_LOOP threading rule** (cookbook §3j): any sequential code path
+   in this codebase that creates poke-env Players AND calls
+   `_cancel_listener` MUST yield wall-clock time afterward via
+   `await asyncio.sleep(1.5)`. The `asyncio.gather` pattern is fine
+   without this; sequential `await` is not. Caught the hard way in
+   Session 50 cont. iter 10 hang.
+
+10. **Heartbeat from a separate OS thread, not from asyncio coroutines**
+    (cookbook §3k): when a worker does any blocking syscall (torch.load,
+    big disk read, model copy), the asyncio loop is paused — async
+    heartbeat coroutines can't fire. Liveness signaling MUST come from
+    a thread that runs independent of asyncio. Session 51 iter 17 hang
+    cost 7+ hours before this was fixed.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+§P. COST AWARENESS — read `docs/COST_LEDGER.md`
+═══════════════════════════════════════════════════════════════════════════════
+
+The pod is paid time. Every choice is also a cost choice.
+
+Quick rules:
+- Cloud: $1.50/hr A100 80GB on RunPod
+- Validation smoke at small scale: ~$1-3 each. **Always run before $60+ launch.**
+- Hung run with 0% CPU: still costs $1.50/hr. Diagnose + kill cleanly.
+- Per-iter Phase 1 v3 compiled cost: ~$1.30 per iter (~50 min × $1.50/hr)
+- Multi-gen 5-7 week run estimate: $600-900 (with CIS Phase 4.3 + flash)
+
+Update `docs/COST_LEDGER.md` at the end of each session: hours used,
+$ spent, major outcomes. If a major optimization shipped, replace
+estimated gains with measured production numbers.
+
 
 ═══════════════════════════════════════════════════════════════════════════════
 END SESSION 52 BOOT — good luck
