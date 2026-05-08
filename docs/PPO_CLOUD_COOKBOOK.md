@@ -200,14 +200,14 @@ Worst-case loss bound on pod death: 5 min of progress.
 - Workers send ack-heartbeat IMMEDIATELY on cmd receipt (before slow model load)
 - Liveness probe in separate thread — distinguishes "asyncio dead" from "process dead"
 
-### 3c. mp+pipeline overlap GPU contention
+### 3c. mp+pipeline overlap GPU contention — partially solved by CIS (Session 51)
 
 **Symptom**: `--mp --pipeline` works for iter 0, hangs at iter 1. Workers stall, never recover.
 **Root cause**: when `mp_bg_collector.start()` runs at end of iter K, workers begin processing iter K+1 cmd in PARALLEL with main's PPO update (heavy `optimizer.step()`). GPU contention causes worker CUDA forwards to stall. Stalled forwards don't recover even after main's update finishes.
 
-**Current workaround**: `--mp --pipeline` silently treats as `--mp` only (no-op for bg overlap). See `train_rl.py:_start_background_collection`.
+**Current behavior**: `--mp --pipeline` still silently treats as `--mp` only (no-op for bg overlap; see `train_rl.py:_start_background_collection`). Don't use the combo.
 
-**Real fix (deferred to multi-gen prep)**: redesign as centralized inference server. **Formal spec at `docs/CENTRALIZED_INFERENCE_DESIGN.md`** — phased implementation, validation plan, risk table. ~2-3 day project. Saves $200-300 over multi-gen run vs $10-15 on Phase 1.
+**Solution shipped in Session 51 (CIS Phases 1-4.2, behind `--cis` flag — NOT YET production-ready, see §3k for status)**: centralized inference server holds the only GPU model + runs forwards on a low-priority CUDA stream while main's optimizer.step runs on default priority. CUDA scheduler arbitrates — main wins, CIS fills gaps, no deadlock. See `docs/CENTRALIZED_INFERENCE_DESIGN.md` for design and `docs/SESSION51_NOTES.md` for what's done vs deferred. Bg-overlap re-enable for `--cis --pipeline` is Phase 4.3 (next session).
 
 ### 3d. SelfPlayOpponent factory dispatch
 
@@ -257,10 +257,10 @@ At small scale (games=20, conc=10) the math works, but production scale
 **Conclusion**: keep `--opponent-device cuda` (default). Workers and opps
 both on GPU. Accept the ~15% GPU contention cost for now.
 
-**Real fix (deferred to multi-gen)**: centralized inference server (§3c
-issue's real fix) handles GPU contention properly via stream priority +
-arbitration. That's the project that simultaneously fixes mp+pipeline AND
-unlocks safer opp_device options.
+**Solution path (CIS, Session 51)**: centralized inference server (§3c) handles
+GPU contention via stream priority. Once Phase 4.3 lands and `--cis --pipeline`
+is sustained-validated, the `--opponent-device` choice becomes moot — all
+forwards route through CIS regardless.
 
 **`mp_disk_collect.py` change retained**: workers now actually thread
 `opponent_device` through (it was unused before Session 50). If you ever
@@ -373,6 +373,67 @@ Implications:
 The fix has small overhead: ~1.5s × ~10 opps × N workers (parallel) / N parallel = ~15s/iter total. Negligible vs the ~$30-50/run leak it prevents.
 
 ---
+
+### 3k. Heartbeat starvation at iter boundary (Session 51, Phase 1 v3 iter 17 hang)
+
+**Symptom**: 7-of-8 (then 8-of-8) workers go stale-heartbeat at iter boundary
+when PFSP pool grows to a new size. The mp-disk watchdog respawns them; iter
+ends with reduced (or zero) trajectory data; PPO update FATAL on 0 episodes;
+process hangs in `sys.exit(2) → shutdown_workers()` cleanup. Phase 1 v3
+hung 7+ hours before manual SIGKILL.
+
+**Root cause**: when the pool grows, workers each `torch.load()` a NEW 240MB
+opp ckpt at iter start. 8 concurrent disk reads contend on page cache,
+stretching individual loads past 5 minutes. The synchronous `torch.load`
+blocks the asyncio loop; the async heartbeat coroutine can't fire; main's
+watchdog sees stale heartbeat at 300s.
+
+**Three mitigations (all in `mp_disk_collect.py`, commit `fd88d552`)**:
+
+1. `HEARTBEAT_TIMEOUT_S` 300s → 600s. Iter 16 (which had the same stall
+   pattern but recovered) was ~5 min; 600s gives margin.
+2. Stagger `ctrl_pipe.send` by 0.25s per worker (sync + bg paths). Spreads
+   the 3.8 GB concurrent disk read over 2s instead of all at once.
+3. Liveness thread fires heartbeats too. The existing `_liveness_thread`
+   runs in its own OS thread; extended to call `heartbeat_fn()` every 5s.
+   Heartbeats now fire even when asyncio is fully blocked on a syscall.
+
+**Validated in production**: iter 16 of compiled run (first iter with
+pool=3 after the fix) ran cleanly: 8/8 workers responded, 1598/1600 trajs,
+no respawns. **The mitigations work.**
+
+**Rule for future code**: any blocking syscall inside an asyncio loop
+must NOT rely on asyncio coroutines for heartbeat / liveness signaling
+to a parent process. Use a separate OS thread.
+
+### 3l. `--cis` flag is shipped but NOT YET production-ready (Session 51 status)
+
+CIS (centralized inference server) Phases 1-4.2 shipped Session 51
+(`50d4e80a`, `8128beaa`, `21484fcc`). The `--cis` flag dispatches to
+`mp_centralized_collect_sync`. Single CIS subprocess holds the GPU model
+on a low-priority CUDA stream; workers pipe obs via numpy IPC.
+
+**What works**: scaffolding, multi-worker batching with cross-worker batches,
+weight reload (caught + fixed `_orig_mod` strip bug bit-for-bit),
+CISInferenceBatcher drop-in for InferenceBatcher, `--cis` flag + dispatch
++ launch banner, low-priority CUDA stream, mutex check vs `--mp`.
+
+**What's NOT YET DONE — DO NOT use `--cis` in production until these land**:
+
+1. **PFSP per-opp model swap**. Current cut: CIS holds ONE model. Workers'
+   player AND opponent inference both go through the same handle → same
+   weights. That's "self-play vs current self" — NOT real PFSP-against-old-
+   snapshots. Will produce noticeably weaker training data than `--mp`.
+   Phase 4.3 work: CIS dual-slot reload OR two CIS subprocesses.
+2. **Bg overlap re-enable for `--cis --pipeline`**. The low-priority stream
+   is the arbitration mechanism, but `_start_background_collection` doesn't
+   yet wire CIS into a CISBgCollector class. `--cis --pipeline` currently
+   no-ops the bg path same as `--mp --pipeline`.
+3. **Sustained validation**: 5-iter `--cis` smoke + numerical equivalence
+   to `--mp` baseline (Test 1 + Test 4 of cookbook §5).
+
+**For Session 52**: keep production on `--mp --compile`. CIS becomes
+production-ready ONLY after Phase 4.3.
 
 ## 4. Hyperparameters (validated for transformer arch + lr=1e-5)
 
