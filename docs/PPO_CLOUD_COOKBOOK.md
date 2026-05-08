@@ -437,7 +437,10 @@ on a low-priority CUDA stream; workers pipe obs via numpy IPC.
 - Phase 4.4 async-dispatch, same config: iter 0 collect = 520s, GPU saturating
 - Phase 4.4 + padded BC v10 init (more realistic battle dynamics): iter 0
   collect = 430s, W/L 254/146 (battles end naturally faster ~30-50 turns
-  vs ~150-200 with random init)
+  vs ~150-200 with random init). The padded BC v10 (gen_embed zeroed) is
+  mathematically equivalent to BC v10's training reality (pre-D1+D2, no
+  gen-id token); for gen-9-only training/eval it's a real warm init,
+  NOT a workaround. BC v11 is only needed for actual multi-gen training.
 - At full prod scale (1600 games/iter, projected):
   - `--mp` no-pipeline (current): 16 + 38 = 54 min/iter
   - `--cis --pipeline` Phase 4.3+4.4+4.5 (shipped): max(32, 38) = ~38 min/iter

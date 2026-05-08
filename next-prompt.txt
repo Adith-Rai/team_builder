@@ -402,8 +402,14 @@ fight against shape changes — net loss likely.
 
 **STEP 5: Phase 2 launch with full speed stack** (~5-7 days, ~$200-300)
 After STEPs 2-4 land + parallel ops items (STEP 6+7), launch Phase 2:
-`--cis --pipeline --bf16` + Phase 4.4 async-dispatch + Tier 3 + train_step
-compile. Relaunch from Phase 1 v3's final.pt or last clean snapshot.
+`--cis --pipeline --bf16` + Phase 4.4 async-dispatch + 4.5 ctrl-pipe
++ Tier 3 + train_step compile. **Init from Phase 1 v3's final.pt** (or
+last clean snapshot if final.pt isn't generated). Phase 1 v3 is already
+post-D1+D2 arch with `gen_embed.weight` baked in (initialized at zero,
+never updated since gen_embed contributes a zero vector for the gen-9-only
+training distribution — equivalent to "no gen info", which is what BC v10
+was trained on). BC v11 retrain is NOT needed for Phase 2 since we stay
+gen-9-only; it's only needed when we start multi-gen training (D4-D6).
 Target wall-time: ~10-15 min/iter (vs current 55 min). Target cost:
 $200-300 for 200 iters (vs current $275).
 
@@ -440,13 +446,20 @@ pod that has Network Volume from spawn.
 
 Per `project_strategic_frame.md`: multi-gen-SPECIFIC infra is JIT before
 multi-gen launch, NOT shipped-and-cold. None of the below blocks Phase 2
-(which stays gen-9-only). Pick these up only when Phase 2 + H2H gauntlet
-shows we're at the gen-9 ceiling and ready to go horizontal.
+(which stays gen-9-only — `gen_embed=0` baked into Phase 1 v3 + Phase 2
+ckpts is mathematically equivalent to "no gen info", identical to BC v10's
+training reality). Pick these up only when Phase 2 + H2H gauntlet shows
+we're at the gen-9 ceiling and ready to go horizontal.
 
 - **D4 HuggingFace replay corpus pull** (gens 6/7/8, ~$5, ~300-400 GB)
 - **D5 Multi-gen `replay_to_memmap` validation** (script is gen-aware
   per `_parse_gen_from_format`, just needs running on new corpora)
 - **D6 BC v11 multi-gen retrain** (A100 80GB, 5 epochs, ~5-7 days, ~$10-15)
+  — only when we start training on gens 6/7/8. NOT needed for any gen-9
+  vertical work (Phase 1 v3 → Phase 2 → wave training → FP → gauntlets).
+  `gen_embed.weight` only acquires meaningful values when training data
+  contains multiple gens; until then it stays at zero and the model
+  behaves identically to a pre-D1+D2 BC ckpt for gen-9 inputs.
 - **E1 per-iter format selection** (mix gens within one PPO run)
 - **E2 per-gen real-battle smart bot validation** (1 hr cloud per gen)
 - **E3 per-gen evaluation harness** (extends `eval_diag.py`)

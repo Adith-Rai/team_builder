@@ -1,19 +1,31 @@
 #!/usr/bin/env python
-"""Pad BC v10 ckpt to current (post-D1+D2) arch for use as warm init in
-CIS dev tests where battle quality matters (e.g., wall-time A/B at prod
-scale where random init causes turn-cap forfeits and inflated collect
-time).
+"""Pad BC v10 ckpt to current (post-D1+D2) arch.
+
+Use cases (both fine):
+1. CIS dev tests where realistic battle dynamics matter (e.g., wall-time
+   A/B at prod scale; random init causes turn-cap forfeits).
+2. **Real gen-9 training warm init** (Phase 1 v3 was launched this way;
+   Phase 2 can be too if Phase 1 v3's final.pt isn't available). For
+   gen-9-only training, the padded ckpt is mathematically equivalent to
+   BC v10 — gen_embed=0 means the gen-id token contributes a zero
+   vector, identical to BC v10's training reality (pre-D1+D2, no gen
+   token existed).
+
+NOT a substitute for BC v11. BC v11 is a multi-gen retrain that learns
+non-zero `gen_embed[gen=g]` for each gen; only needed when we start
+training on multi-gen data (gens 6/7/8). For pure gen-9 work, this
+padded ckpt is a real warm init, not a workaround.
 
 Strategy:
 - Load BC v10 state_dict (14-token N_BATTLE_STATE, type_id=28, pokemon_slot=24,
-  no gen_embed).
+  no gen_embed). Strip _orig_mod. prefix from compile-saved keys
+  (ppo.py:load_checkpoint pattern).
 - Construct a fresh post-D1+D2 model with current arch (15-token, type_id=29,
   pokemon_slot=25, with gen_embed.weight).
 - Copy BC v10 keys that exist in both. For shape mismatches, zero-pad the
-  missing rows (so new rows contribute nothing initially → identity to BC v10
-  behavior in gen 9 only).
-- Leave gen_embed.weight at the fresh model's init (it will get zero-padded
-  to act as "no gen info" baseline if we explicitly zero it).
+  missing rows (so new rows contribute nothing → identity to BC v10
+  behavior for gen-9 inputs).
+- Zero-init gen_embed.weight (= "no gen info" = BC v10 training reality).
 - Save as a new ckpt usable by load_checkpoint at HEAD.
 
 Usage:
