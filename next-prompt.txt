@@ -190,9 +190,14 @@ Metamon (sequence-batched with pad_mask, see metamon_to_amago.py).
   RLData with `(B episodes, L_max turns, ...)` shape + pad_mask.
 - **DO NOT bundle with other unknowns**. Hold `lr=1e-5` constant.
   Hold compile/bf16/CIS settings constant during Tier 3 A/B.
-- **Validation gate**: 20-iter cloud A/B vs current arch, smart_avg +
-  Elo deltas must hold. Quality regression is the failure mode that
-  matters; wall-time saving is meaningless if the model gets weaker.
+- **Validation gate**: 29-iter cloud A/B against Phase 1 v3's iter 19+29
+  deep-playstyle baseline (§C reference). Same init (epoch_003), same
+  warmup (10), same hyperparams. Compare via analyze_eval.py --deep at
+  iter 19 + iter 29 of new run. MUST hold: SE rate ±3pp, move waste
+  ±2pp, top-5 Pokemon usage identical ordering, per-mon move dists
+  ±10pp. Quality regression is the failure mode that matters; wall-time
+  saving is meaningless if the model gets weaker. See §D STEP 3 for
+  full validation protocol.
 
 **B9. DO NOT reopen the lr question.** lr=1e-5 was hard-won through a
 4-point ablation (Session 50). Confirmed by the compiled run hitting 50%
@@ -541,11 +546,72 @@ replay), we stay strict on-policy PPO. Just bigger batches per forward.
 - PPO loss per-timestep with pad_mask zeroing padding positions
 - Trajectory storage refactor: per-turn dicts → `(B, L, ...)` tensors per episode
 
-**Acceptance gates** (don't ship if any fail):
-- Tests 1-3 + Test 4 sustained still PASS bit-exact
-- 20-iter A/B vs current arch on cloud: smart_avg + Elo deltas hold
-  within ±2pp (silent quality regression is THE failure mode)
-- Wall-time saving: ≥3× on update phase at production scale
+**Validation protocol — apples-to-apples vs Phase 1 v3** (cost: ~$10-15
+A100, ~6-7 hrs):
+
+After STEPs 2-4 land in code + Tier 3 unit tests pass, run a controlled
+A/B against Phase 1 v3's known baseline. We have FULL deep-playstyle
+data for Phase 1 v3 at iter 19 + iter 29 (canonical reference in §C
+above). Same init + same warmup + same hyperparams = clean signal on
+whether Tier 3 changed training quality.
+
+Run config:
+```
+A100 80GB, second pod (don't disturb Phase 1 v3 prod pod)
+--init-from data/models/bc/v10_cloud_gen9/epoch_003.pt   ← SAME init as Phase 1 v3
+--warmup-iters 10                                          ← SAME warmup
+--n-iters 29                                              ← run to iter 29 (matches eval point)
+--cis --pipeline --bf16                                   ← full speed stack
++ all Phase 4.3-4.5 + Phase 4.4-async + ctrl pipe + CIS respawn
++ Tier 3 batching + train_step compile
+Same lr, target_kl, ent_coef, adaptive-entropy band, etc.
+```
+
+**Acceptance gates — tiered by what matters most**:
+
+| Tier | Metric | Compare against | Acceptance |
+|---|---|---|---|
+| **MUST hold (real degradation = abort)** | SE Hit Ratio | Phase 1 v3 same-iter | within ±3pp |
+| | Move Waste | same-iter | within ±2pp |
+| | Top 5 Pokemon usage ordering | same-iter | identical or ±1 position |
+| | Per-mon move dist (top 3 moves) | same-iter | within ±10pp each |
+| | Tests 1-3 + Test 4 sustained on Tier 3 code | dev pod | bit-exact PASS |
+| **SHOULD hold (training healthy)** | W/L at iter 19 | Phase 1 v3 iter 19 (54.9% pool=2) | ±5pp at same pool size |
+| | W/L at iter 29 | Phase 1 v3 iter 29 (51.8% pool=4) | ±5pp at same pool size |
+| | Entropy trajectory shape | similar arc | can shift up/down 0.05, but should rise/fall similarly with pool growth |
+| | KL early-stop firing | same epoch range (2-3 of 5) | clipping at trust region |
+| | smart_avg at iter 19 | 69% baseline | within ±5pp |
+| | smart_avg at iter 29 | 60% baseline | within ±5pp |
+| **NICE to have (true improvement)** | Wall-time/iter | claim 10-15 min | actual ≤15 min |
+| | smart_avg trajectory | flatter dip | might hold higher than 60% if Tier 3 has cleaner exploration |
+
+Run analyze_eval.py with `--deep` mode at iter 19 + iter 29 of the new
+run. Compare against Phase 1 v3's iter 19/29 deep playstyle reference
+(documented in §C above). Match-or-exceed criteria above = Tier 3
+ships to Phase 2.
+
+**Confounds to acknowledge** (noted, not fatal):
+- bf16 update vs Phase 1 v3's fp16: known small numerical drift, can
+  shift specific values 1-2pp without changing qualitative behavior.
+- Different rng_seed: legitimate exploration trajectory divergence.
+  Comparing distributions, not exact paths.
+- PFSP pool composition diverges: pool SIZES match (snapshot_interval=5
+  → 2/2/3/3/3/3/3/3/3/3 then 4 at iter 24, then 4 at iter 29) but the
+  specific snapshots in the pool differ. Some legitimate divergence
+  expected.
+- CIS+pipeline overlap effect: collect-K-1 happens during update-K,
+  which is a slightly different on-policy regime. Should not change
+  qualitative behavior; might shift entropy dynamics slightly.
+
+**If A/B fails the MUST tier**: investigate before shipping. Likely
+suspects: Tier 3 batching introduced a bug (loss masking wrong, episode
+boundaries leaking, pad_mask dimensions off). Roll back to current
+arch + revisit Tier 3 design.
+
+**If A/B fails the SHOULD tier but MUST tier holds**: Tier 3 is
+quality-preserving but training dynamics shifted. Likely fine to ship
+to Phase 2 — Phase 2's 200-iter run will resolve dynamics. Document
+the drift for next-time-me.
 
 **STEP 4: `torch.compile(train_step)`** (~2-3 days, BUNDLE WITH STEP 3)
 Rationale: ~10-15% additional saving on update phase by fusing forward
