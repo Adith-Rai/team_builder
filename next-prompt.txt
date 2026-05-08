@@ -485,27 +485,67 @@ User's framing: speed gates everything. The "elite measurement" + "infra
 hygiene" items only become useful when training throughput is high
 enough to make runs affordable. Speed work first, ops on the side.
 
-**STEP 2: CIS worker respawn** (~1 day dev + ~$1-2 A100 validation, SESSION 54 HEADLINE)
-Rationale: Phase 2 will use `--cis --pipeline --bf16`. CIS workers don't
-yet have a watchdog/respawn mechanism — if a worker dies mid-iter, the
-iter is lost (~50 min of wasted compute at production scale). For a 5-7
-day Phase 2 run, this WILL happen at least once and probably more.
+**STEP 2: CIS Phase 4.6 — worker respawn + CIS subprocess respawn** (~1.5 days dev + ~$2-3 A100 validation, SESSION 54 HEADLINE)
 
-The `--mp` watchdog pattern is already shipped (S51) and proven through
-Phase 1 v3's pool-growth boundaries. Port the same heartbeat-from-OS-thread
-+ 600s tolerance + paced respawn pattern to CIS workers.
+Phase 2 will use `--cis --pipeline --bf16`. Two failure modes need
+recovery before a 5-7 day run is safe; CURRENTLY NEITHER IS HANDLED:
 
-**Files**:
-- `mp_centralized_collect.py:_cis_worker_main` — currently no liveness
-  thread; add one mirroring `mp_disk_collect.py`'s pattern
+**STEP 2a: Worker proc respawn** (~1 day)
+If a `_cis_worker_main` process dies mid-iter, the iter is lost
+(~50 min of wasted compute at production scale). The `--mp` watchdog
+pattern is already shipped (S51) and proven through Phase 1 v3's pool-
+growth boundaries (zero dead workers across 36+ iters). Port the same
+heartbeat-from-OS-thread + 600s tolerance + paced respawn pattern.
+
+Files:
+- `mp_centralized_collect.py:_cis_worker_main` — add liveness thread
+  mirroring `mp_disk_collect.py`'s pattern
 - `mp_centralized_collect.py:_ensure_cis_global` — add a respawn manager
   similar to `_GLOBAL_MANAGER` in mp_disk
-- Expand `_cis_wait_results_and_aggregate` to detect dead workers via
+- `_cis_wait_results_and_aggregate` — detect dead workers via
   health_check, respawn cleanly, decrement expected count
 
-**Validation**: cookbook §5 Test 6 — kill -9 a CIS worker mid-iter,
-verify watchdog respawns, iter completes, subsequent iters normal. Run
-against `test_cis_phase4_3c_walltime.py` config (N=8, conc=200, games=400).
+Validation: cookbook §5 Test 6a — kill -9 a CIS worker mid-iter,
+verify watchdog respawns, iter completes, subsequent iters normal.
+
+**STEP 2b: CIS subprocess respawn** (~half day, easy to underestimate)
+If the CIS subprocess itself dies (CUDA OOM, segfault, signal kill,
+unhandled exception escapes service loop), all workers' recv_loops
+hit EOF, all in-flight requests fail, current iter dies, NO RECOVERY
+mechanism exists. For a 5-7 day Phase 2 run, this WILL happen.
+
+When CIS dies, parent's `_ctrl_handle.reload()` also fails. Workers'
+`CISInferenceBatcher.submit` raises. Workers report errors to
+orchestrator but there's no path to re-spawn CIS + reload all slots
++ retry the iter.
+
+Implementation: at CISServer level, watchdog the subprocess. On death:
+1. Workers must pause (signal them via `worker_ctrl_pipes`)
+2. Re-spawn CIS subprocess (re-create pipe pairs, re-spawn `_cis_main_multi`)
+3. Re-load all K+1 model slots from `current_slot_paths`
+4. Re-build CISClientHandle for each worker (new pipe pairs)
+5. Workers resume with new handle references
+6. Retry the iter (don't lose collect progress if possible — checkpoint
+   trajectories on disk per-worker, similar to mp_disk_collect)
+
+Files:
+- `mp_centralized_collect.py:CISServer` — watchdog method polling
+  `self._proc.is_alive()`, respawn logic
+- `mp_centralized_collect.py:_cis_wait_results_and_aggregate` — detect
+  CIS death (all workers reporting BrokenPipeError simultaneously),
+  trigger CISServer respawn, re-issue collect_iter to workers
+- New CISClientHandle method to swap pipe references (or re-construct)
+
+Validation: cookbook §5 Test 6b — kill -9 the CIS subprocess mid-iter,
+verify CISServer respawns it + all slots reload + workers continue +
+iter completes. Run against the same prod-scale config.
+
+**Combined Phase 4.6 acceptance gates**:
+- Test 6a worker respawn: kill -9 worker mid-iter → respawn → iter completes
+- Test 6b CIS respawn: kill -9 CIS mid-iter → respawn → all slots reload → iter completes
+- All Phase 1/2/3/4.3/4.4/4.5 regressions still PASS bit-exact
+- Sustained 5-iter smoke with 1 random worker kill + 1 random CIS kill
+  during the run: completes within ~10% of baseline wall-time
 
 **STEP 3: Tier 3 transition-level minibatching** (~1.5-2 weeks dev + 20-iter cloud A/B validation)
 Rationale: this is THE remaining big lever. PPO update phase is currently
@@ -696,11 +736,34 @@ we're at the gen-9 ceiling and ready to go horizontal.
 §E. CONNECTING + MONITORING
 ═══════════════════════════════════════════════════════════════════════════════
 
-**SSH to pod** (current pod, may be reprovisioned in future sessions):
-```bash
-ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
-```
-If the IP/port changes, find new in MEMORY.md or ask the user.
+**TWO POD SETUP (S53 end → S54 start)**:
+
+1. **Production pod** — Phase 1 v3 compiled run (DO NOT DISTURB, HEAD
+   locked at `251cd14a`). Continuous run, no pause/stop.
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
+   ```
+   - Run dir: `/workspace/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/`
+   - Log: `/workspace/logs/ppo_phase1_v3_compiled.log`
+   - 8 battle servers on ports 9000-9007
+   - This pod is for read-only monitoring only. Don't pull, don't push, don't restart.
+
+2. **Dev/validation pod (A100 80GB)** — kept up at S53 end for S54 immediate use.
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 -p 19373 -o StrictHostKeyChecking=no root@154.54.102.26
+   ```
+   - HEAD: latest origin (S53 end at `803f5b5a` or later)
+   - Already has: torch 2.2.1+cu121 + triton 2.2.0 + poke-env 0.10.0 stack + Node 20 + npm install for battle_server
+   - Battle servers running on ports 9000-9007
+   - Ckpts in place: `data/models/bc/dummy_for_cis_dev.pt` (synthetic),
+     `data/models/bc/v10_padded_for_cis_dev.pt` (BC v10 padded to current arch),
+     `data/models/bc/v10_cloud_gen9/epoch_003.pt` (BC v10 original, source of truth)
+   - Use this pod for: CIS Phase 4.6 implementation + validation, Tier 3
+     dev + A/B (STEP 3), H2H gauntlet wiring (STEP 6 — local but can use this
+     for the A100 validation runs)
+   - Cost: ~$1.50/hr while up. Kill via RunPod console when done.
+
+If either IP/port changes, find new in MEMORY.md or ask the user.
 
 **Tail production log live**:
 ```bash
