@@ -55,7 +55,7 @@ import sys
 import time
 import traceback
 from contextlib import nullcontext as _nullcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -423,26 +423,35 @@ def _slice_numpy_output(np_out: Dict[str, np.ndarray],
 
 
 def _cis_main_multi(worker_req_readers, worker_resp_writers,
-                    ckpt_path: str, device_str: str,
+                    ckpt_paths: List[str], device_str: str,
                     fp16: bool = True,
                     amp_dtype_name: Optional[str] = None,
                     min_batch: int = 8,
                     timeout_ms: int = 15) -> None:
-    """Phase 2 CIS subprocess entrypoint. Multiplexes inference requests across
-    N worker pipes via mp.connection.wait, accumulates pending requests until
-    min_batch OR timeout_ms, fires one batched forward, dispatches per-request
-    responses back via per-worker response pipes.
+    """Phase 2/4.3a CIS subprocess entrypoint. Multiplexes inference requests
+    across N worker pipes via mp.connection.wait. Holds K+1 model slots:
+    slot 0 = player, slots 1..K = PFSP opp pool entries (Phase 4.3a).
+
+    Each request carries a `slot` field (default 0). Pending requests are
+    queued PER SLOT and batched independently — slot 0 (player) cross-batches
+    requests from all 8 workers; slots 1..K cross-batch the subset of workers
+    currently playing each opp. Batch fires when slot accumulates >= min_batch
+    OR timeout_ms elapses since the slot's last fire.
 
     Protocol per pipe:
-      Inbound on req_pipe[i]:  same as Phase 1 single-CIS protocol
-      Outbound on resp_pipe[i]: per-request response; for batched infer we
-                                slice the mega-batch result and send the
-                                appropriate slice to each worker.
+      Inbound on req_pipe[i]:
+        {"cmd": "infer", "slot": int, "batch": dict, "history"?, "history_lens"?, "req_id"?}
+        {"cmd": "reload", "slot": int, "weights_path": str}
+        {"cmd": "ping"}
+        {"cmd": "shutdown"}
+      Outbound on resp_pipe[i]: per-request response; batched infer slices
+        the mega-batch result and sends per-worker slices.
 
     Args:
       worker_req_readers:  list of mp.Pipe reader ends, one per worker
       worker_resp_writers: list of mp.Pipe writer ends, one per worker
-      (other args: same as _cis_main)
+      ckpt_paths: list of K+1 ckpt paths. Length is the number of slots.
+                  Single-element list is the Phase 1-3 single-slot mode.
     """
     import warnings
     from multiprocessing.connection import wait as mp_wait
@@ -467,13 +476,24 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     # Map pipe object -> worker index for fast lookup after mp_wait
     pipe_to_widx = {p: i for i, p in enumerate(worker_req_readers)}
 
+    n_slots = len(ckpt_paths)
+    if n_slots < 1:
+        raise ValueError("CIS needs at least one ckpt path")
+
     try:
-        model, cfg, _ = load_checkpoint(ckpt_path, device)
-        model.eval()
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"[CIS-multi N={n_workers}] loaded {ckpt_path} "
-              f"({n_params/1e6:.1f}M params, device={device}, "
-              f"min_batch={min_batch}, timeout_ms={timeout_ms})", flush=True)
+        model_slots: List[Any] = []
+        cfg = None
+        for s, path in enumerate(ckpt_paths):
+            m, cfg_s, _ = load_checkpoint(path, device)
+            m.eval()
+            model_slots.append(m)
+            if cfg is None:
+                cfg = cfg_s
+        n_params = sum(p.numel() for p in model_slots[0].parameters())
+        print(f"[CIS-multi N={n_workers} slots={n_slots}] loaded "
+              f"{n_slots} model slot(s) ({n_params/1e6:.1f}M params each, "
+              f"device={device}, min_batch={min_batch}, "
+              f"timeout_ms={timeout_ms})", flush=True)
     except Exception as e:
         for w in worker_resp_writers:
             try:
@@ -483,6 +503,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             except Exception:
                 pass
         return
+
+    # Phase 4.3a uses slot 0 as the canonical "model" reference for shape
+    # introspection. All slots share architecture (same TransformerConfig),
+    # only the parameter values differ.
+    model = model_slots[0]
 
     # CUDA stream priority (Phase 4.2): CIS forwards run on a LOW-priority
     # stream so when main process does optimizer.step on the default
@@ -513,11 +538,12 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         except Exception:
             pass
 
-    # Service loop with cross-worker batching.
-    # pending: list of 5-tuples (worker_idx, req_id_or_None, batch_size,
-    #                            np_batch, np_history_or_None)
-    pending: list = []
-    last_fire_t = time.time()
+    # Service loop with per-slot cross-worker batching.
+    # pending_per_slot[s] is a list of 5-tuples
+    # (worker_idx, req_id_or_None, batch_size, np_batch, np_history_or_None)
+    # for slot s. Each slot accumulates and fires independently.
+    pending_per_slot: List[list] = [[] for _ in range(n_slots)]
+    last_fire_t_per_slot: List[float] = [time.time()] * n_slots
     timeout_s = timeout_ms / 1000.0
     closed_workers: set = set()
 
@@ -534,11 +560,13 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
     d_temporal = getattr(model, "d_temporal", model.cfg.d_model)
 
-    def _fire_batch():
-        """Fire one batched forward over `pending` and dispatch responses.
+    def _fire_batch(slot: int):
+        """Fire one batched forward over `pending_per_slot[slot]` using
+        `model_slots[slot]` and dispatch responses. Slot-isolated: requests
+        for different slots batch independently.
 
-        Two paths:
-        - If NO request in pending has a history, use the simple
+        Two paths (per slot):
+        - If NO request in this slot's pending has a history, use the simple
           model(mega_batch) path (Phase 1 single-call style). All requests
           get processed at once, history-free.
         - If ANY request has a history, use the InferenceBatcher pattern:
@@ -551,7 +579,8 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         v_logits (51), summary (d_temporal). `summary` is what workers
         accumulate into their per-battle history buffer.
         """
-        nonlocal last_fire_t
+        pending = pending_per_slot[slot]
+        slot_model = model_slots[slot]
         if not pending:
             return
         try:
@@ -566,20 +595,23 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             # process's optimizer.step gets first dibs on the GPU. The
             # `with torch.cuda.stream(...)` ctx is a no-op if stream is None
             # (CPU device or stream creation failed at startup).
+            # Phase 4.3a: stream is shared across slots (single low-priority
+            # stream serves all slot forwards; slot just selects which model
+            # to run, not which CUDA stream).
             _stream_ctx = (torch.cuda.stream(cis_low_pri_stream)
                            if cis_low_pri_stream is not None
                            else _nullcontext())
             with torch.no_grad(), autocast_ctx(fp16), _stream_ctx:
                 if not any_history or not _have_arch_compat:
                     # Simple path: history-free or arch_compat unavailable.
-                    out = model(torch_batch)
+                    out = slot_model(torch_batch)
                     mega_np = _output_to_numpy(out)
                 else:
                     # Full batched-with-histories path. Mirrors
                     # inference_batcher._gpu_forward.
                     N = len(pending)
-                    spatial_out, summaries = model.forward_spatial(torch_batch)
-                    action_ctx = call_action_encoder(model, torch_batch, spatial_out)
+                    spatial_out, summaries = slot_model.forward_spatial(torch_batch)
+                    action_ctx = call_action_encoder(slot_model, torch_batch, spatial_out)
 
                     # Build padded all_summaries with per-request histories.
                     # Per-request bsize is always 1 in worker submits (one
@@ -609,7 +641,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                         cursor += bsize
 
                     total_B = cursor  # == sum of bsizes == summaries.shape[0]
-                    max_T = min(max(seq_lens), model.temporal.temporal_context)
+                    max_T = min(max(seq_lens), slot_model.temporal.temporal_context)
                     seq_lens_t = torch.tensor(seq_lens, device=device,
                                               dtype=torch.long).clamp(max=max_T)
                     all_summaries = torch.zeros(
@@ -626,7 +658,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                         else:
                             all_summaries[i, 0] = summaries[i]
 
-                    temporal_ctx = model.temporal(
+                    temporal_ctx = slot_model.temporal(
                         all_summaries.float(), seq_lens_t
                     ).to(summaries.dtype)
 
@@ -634,7 +666,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     at = torch.cat([actor_out, temporal_ctx], dim=-1)
                     at_exp = at.unsqueeze(1).expand(-1, 9, -1)
                     pi_input = torch.cat([at_exp, action_ctx], dim=-1)
-                    logits = call_policy_logits(model, pi_input)
+                    logits = call_policy_logits(slot_model, pi_input)
 
                     if "legal_mask" in torch_batch:
                         logits = logits.float().masked_fill(
@@ -642,9 +674,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
                     critic_out = spatial_out[:, 1, :]
                     vi = torch.cat([critic_out, temporal_ctx], dim=-1)
-                    v_logits = call_value_logits(model, vi)
+                    v_logits = call_value_logits(slot_model, vi)
                     v_probs = F.softmax(v_logits, dim=-1)
-                    values = (v_probs * get_v_support(model)).sum(-1)
+                    values = (v_probs * get_v_support(slot_model)).sum(-1)
 
                     mega_np = {
                         "action_logits": logits.detach().float().cpu().numpy(),
@@ -683,8 +715,8 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                 except Exception:
                     closed_workers.add(widx)
 
-        pending.clear()
-        last_fire_t = time.time()
+        pending_per_slot[slot].clear()
+        last_fire_t_per_slot[slot] = time.time()
 
     while True:
         # Active pipes = readers we still listen to (skip closed workers)
@@ -694,11 +726,22 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             print(f"[CIS-multi] all worker pipes closed, exiting", flush=True)
             break
 
-        # Compute remaining timeout budget for this batch window
-        elapsed = time.time() - last_fire_t
-        remaining = max(0.0, timeout_s - elapsed) if pending else timeout_s
-        # If pending is empty, block longer (no urgency); else cap at remaining
-        wait_to = remaining if pending else timeout_s
+        # Compute earliest deadline across all slots with pending. We must
+        # wake up by then so a pending slot's timeout-fire isn't starved
+        # by quiet pipes elsewhere.
+        now = time.time()
+        any_pending = False
+        earliest_deadline = now + timeout_s
+        for s in range(n_slots):
+            if pending_per_slot[s]:
+                any_pending = True
+                slot_deadline = last_fire_t_per_slot[s] + timeout_s
+                if slot_deadline < earliest_deadline:
+                    earliest_deadline = slot_deadline
+        if any_pending:
+            wait_to = max(0.0, earliest_deadline - now)
+        else:
+            wait_to = timeout_s
 
         ready = mp_wait(active_pipes, timeout=wait_to)
 
@@ -731,10 +774,16 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                 # is unchanged - only the parameters update. Returns "ok" once
                 # load completes so main knows it's safe to start the next
                 # iter's collect.
+                # Phase 4.3a: req carries `slot` (default 0 = player). Reload
+                # affects only that slot; other slots remain bit-stable.
                 try:
                     weights_path = req.get("weights_path")
+                    slot = int(req.get("slot", 0))
                     if not weights_path:
                         raise ValueError("reload cmd missing weights_path")
+                    if slot < 0 or slot >= n_slots:
+                        raise ValueError(f"reload slot {slot} out of range "
+                                         f"[0, {n_slots})")
                     state = torch.load(weights_path, map_location=device,
                                        weights_only=True)
                     sd = state.get("model_state_dict") if isinstance(state, dict) else state
@@ -753,13 +802,13 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     # the bug Phase 3 Stage 6 caught before this fix shipped.
                     missing, unexpected = [], []
                     try:
-                        model.load_state_dict(sd, strict=True)
+                        model_slots[slot].load_state_dict(sd, strict=True)
                     except RuntimeError as load_err:
                         # If strict load fails, fall back to non-strict but
                         # surface the error so caller knows reload was partial.
-                        result = model.load_state_dict(sd, strict=False)
+                        result = model_slots[slot].load_state_dict(sd, strict=False)
                         missing, unexpected = list(result.missing_keys), list(result.unexpected_keys)
-                        print(f"[CIS] WARN reload had key mismatches: {load_err}",
+                        print(f"[CIS] WARN reload slot {slot} had key mismatches: {load_err}",
                               flush=True)
                     del state, sd
                     import gc
@@ -767,6 +816,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     msg = {"status": "ok",
+                           "slot": slot,
                            "missing_keys": missing[:5],
                            "unexpected_keys": unexpected[:5]}
                     worker_resp_writers[widx].send(msg)
@@ -784,6 +834,20 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
             if cmd == "infer":
                 np_batch = req["batch"]
+                slot = int(req.get("slot", 0))
+                if slot < 0 or slot >= n_slots:
+                    # Out-of-range slot: respond with error so worker fails
+                    # loudly rather than silently routing to slot 0.
+                    try:
+                        err_msg = {"status": "error",
+                                   "exc_msg": f"infer slot {slot} out of "
+                                              f"range [0, {n_slots})"}
+                        if req.get("req_id") is not None:
+                            err_msg["req_id"] = req.get("req_id")
+                        worker_resp_writers[widx].send(err_msg)
+                    except Exception:
+                        closed_workers.add(widx)
+                    continue
                 # Determine batch size from first ndarray-shaped field
                 bsize = None
                 for k, v in np_batch.items():
@@ -801,13 +865,21 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     bsize = 1
                 # History (B, T_i, D) carried as numpy. None if first turn.
                 np_history = req.get("history")
-                pending.append((widx, req.get("req_id"), bsize, np_batch, np_history))
+                pending_per_slot[slot].append(
+                    (widx, req.get("req_id"), bsize, np_batch, np_history))
 
-        # Fire if accumulated enough OR timed out with non-empty pending
-        accumulated = sum(p[2] for p in pending)
-        timed_out = (time.time() - last_fire_t) >= timeout_s
-        if pending and (accumulated >= min_batch or timed_out):
-            _fire_batch()
+        # Fire any slot that hit threshold or timed out. Each slot fires
+        # independently — slot 0 (player) typically fires first because it
+        # accumulates fastest (all workers contribute), slots 1..K fire when
+        # their subset of workers reaches min_batch or hits timeout.
+        now = time.time()
+        for s in range(n_slots):
+            if not pending_per_slot[s]:
+                continue
+            accumulated = sum(p[2] for p in pending_per_slot[s])
+            timed_out = (now - last_fire_t_per_slot[s]) >= timeout_s
+            if accumulated >= min_batch or timed_out:
+                _fire_batch(s)
 
 
 class CISClientHandle:
@@ -822,10 +894,17 @@ class CISClientHandle:
         self.worker_idx = worker_idx
 
     def infer(self, numpy_batch: Dict[str, Any], timeout_s: float = 30.0,
-              req_id: Optional[int] = None) -> Dict[str, np.ndarray]:
-        msg = {"cmd": "infer", "batch": numpy_batch}
+              req_id: Optional[int] = None,
+              history: Optional[np.ndarray] = None,
+              history_lens: Optional[np.ndarray] = None,
+              slot: int = 0) -> Dict[str, np.ndarray]:
+        msg = {"cmd": "infer", "batch": numpy_batch, "slot": int(slot)}
         if req_id is not None:
             msg["req_id"] = req_id
+        if history is not None:
+            msg["history"] = history
+        if history_lens is not None:
+            msg["history_lens"] = history_lens
         self.req_writer.send(msg)
         if not self.resp_reader.poll(timeout=timeout_s):
             raise TimeoutError(f"CIS infer (worker {self.worker_idx}) "
@@ -848,11 +927,17 @@ class CISClientHandle:
         except Exception:
             return False
 
-    def reload(self, weights_path: str, timeout_s: float = 60.0) -> Dict[str, Any]:
+    def reload(self, weights_path: str, timeout_s: float = 60.0,
+               slot: int = 0) -> Dict[str, Any]:
         """Phase 3: signal CIS to load fresh weights from disk. Blocks until
         CIS confirms load complete. Returns the response dict (with optional
-        missing_keys/unexpected_keys for diagnostics)."""
-        self.req_writer.send({"cmd": "reload", "weights_path": weights_path})
+        missing_keys/unexpected_keys for diagnostics).
+
+        slot selects which model slot to reload (default 0 = player slot).
+        Phase 4.3a adds K opp slots; orchestrator reloads slot 1..K with
+        PFSP pool ckpts at iter start."""
+        self.req_writer.send({"cmd": "reload", "weights_path": weights_path,
+                              "slot": int(slot)})
         if not self.resp_reader.poll(timeout=timeout_s):
             raise TimeoutError(f"CIS reload (worker {self.worker_idx}) "
                                f"response not received within {timeout_s}s")
@@ -874,10 +959,21 @@ class CISServer:
     with cross-worker batching. Returns N CISClientHandle objects, one per
     worker, that can be used independently from threads/processes."""
 
-    def __init__(self, ckpt_path: str, n_workers: int, device: str = "cuda",
+    def __init__(self, ckpt_path: Union[str, List[str]], n_workers: int,
+                 device: str = "cuda",
                  fp16: bool = True, amp_dtype_name: Optional[str] = None,
                  min_batch: int = 8, timeout_ms: int = 15):
-        self.ckpt_path = ckpt_path
+        # Phase 4.3a: ckpt_path can be a single str (single-slot, back-compat
+        # with Phase 1-3) or a list of str (multi-slot: slot 0 = player,
+        # slots 1..K = PFSP opp pool entries). Single str is normalized to
+        # a 1-element list internally so the server always sees List[str].
+        if isinstance(ckpt_path, str):
+            self.ckpt_paths: List[str] = [ckpt_path]
+        else:
+            self.ckpt_paths = list(ckpt_path)
+            if not self.ckpt_paths:
+                raise ValueError("CISServer needs at least one ckpt path")
+        self.ckpt_path = self.ckpt_paths[0]  # legacy alias for slot 0
         self.n_workers = n_workers
         self.device = device
         self.fp16 = fp16
@@ -907,7 +1003,7 @@ class CISServer:
         self._proc = ctx.Process(
             target=_cis_main_multi,
             args=(worker_req_readers, worker_resp_writers,
-                  self.ckpt_path, self.device, self.fp16, self.amp_dtype_name,
+                  self.ckpt_paths, self.device, self.fp16, self.amp_dtype_name,
                   self.min_batch, self.timeout_ms),
             daemon=False,
         )
@@ -941,16 +1037,21 @@ class CISServer:
 
         return self._handles
 
-    def reload_weights(self, weights_path: str, timeout_s: float = 60.0) -> Dict[str, Any]:
+    def reload_weights(self, weights_path: str, timeout_s: float = 60.0,
+                       slot: int = 0) -> Dict[str, Any]:
         """Phase 3 weight sync: signal CIS to reload from disk. Routes through
         worker 0's handle (any handle works - one CIS process serves all).
         Production caller writes weights atomically first (via
         _save_worker_weights_atomic in mp_disk_collect.py or equivalent), then
         invokes this. Blocks until reload completes; safe to start next iter's
-        infer requests after this returns."""
+        infer requests after this returns.
+
+        Phase 4.3a: `slot` selects which model slot to reload (default 0 =
+        player slot). Orchestrator reloads slots 1..K between iters when
+        the PFSP pool changes."""
         if not self._handles:
             raise RuntimeError("CIS not spawned")
-        return self._handles[0].reload(weights_path, timeout_s=timeout_s)
+        return self._handles[0].reload(weights_path, timeout_s=timeout_s, slot=slot)
 
     def shutdown(self, timeout_s: float = 5.0) -> None:
         if self._proc is None:
@@ -1007,12 +1108,18 @@ class CISInferenceBatcher:
     """
 
     def __init__(self, handle: "CISClientHandle", device: torch.device,
-                 fp16: bool = False, min_batch: int = 8, timeout_ms: int = 20):
+                 fp16: bool = False, min_batch: int = 8, timeout_ms: int = 20,
+                 slot: int = 0):
         # `min_batch` and `timeout_ms` are accepted for InferenceBatcher API
         # compat but not used here - CIS does the batching, not us.
+        # Phase 4.3a: `slot` selects which model slot in CIS to route to.
+        # slot=0 is the player slot (default for back-compat with Phase 1-3
+        # tests). Worker creates one batcher per opp with slot=1..K matching
+        # the orchestrator's pool slot map.
         self.handle = handle
         self.device = device
         self.fp16 = fp16
+        self.slot = int(slot)
         # Profiling counters (reset per collection); same names as
         # InferenceBatcher so any stats-printing code keeps working.
         self._prof_batch_sizes: list = []
@@ -1046,7 +1153,8 @@ class CISInferenceBatcher:
         loop = asyncio.get_running_loop()
         np_out = await loop.run_in_executor(
             None,
-            lambda: self.handle.infer(np_batch, history=np_history, timeout_s=60.0),
+            lambda: self.handle.infer(np_batch, history=np_history,
+                                      slot=self.slot, timeout_s=60.0),
         )
 
         # Convert back to torch on device. Squeeze leading B=1 dim to match
@@ -1223,6 +1331,9 @@ def _do_collect_iter_cis(state, worker_id, cmd, result_pipe, heartbeat_fn):
     procedural_teams_path = cmd.get("procedural_teams_path")
     rng_seed = cmd.get("rng_seed", 0)
     opp_pool = cmd["opp_pool"]
+    # Phase 4.3a: orchestrator broadcasts pool_slot_map (opp_path -> slot_idx).
+    # Empty/missing falls back to Phase 4.1 single-slot self-play.
+    pool_slot_map = cmd.get("pool_slot_map") or {}
     temp_range = tuple(cmd.get("temp_range", (1.0, 2.25)))
     opp_temp_range = tuple(cmd.get("opp_temp_range", temp_range))
     device_str = cmd.get("device", "cuda")
@@ -1281,6 +1392,7 @@ def _do_collect_iter_cis(state, worker_id, cmd, result_pipe, heartbeat_fn):
         procedural_teams_path=procedural_teams_path,
         heartbeat_fn=heartbeat_fn,
         liveness_state=_liveness_state,
+        pool_slot_map=pool_slot_map,
     )
     elapsed_s = time.time() - t0
     _liveness_state["alive"] = False
@@ -1311,15 +1423,20 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                                n_games, max_concurrent, server_url, opp_pool,
                                temp_range, opp_temp_range, fp16, rs_cfg,
                                turn_cap, battle_format, procedural_teams_path,
-                               heartbeat_fn, liveness_state=None):
+                               heartbeat_fn, liveness_state=None,
+                               pool_slot_map: Optional[Dict[str, int]] = None):
     """CIS-routed self-play collect inside one worker.
 
     Differences from mp_disk's _run_collect_in_worker:
     - No model load (CIS owns the model)
     - No opp ckpt cache (CIS loads opp via reload_weights when self-play
-      switches opp - or, in Phase 4.1, just self-play vs SAME model and
-      defer opp routing to Phase 4.2)
+      switches opp; orchestrator pre-loads PFSP pool slots before iter)
     - Uses CISInferenceBatcher instead of InferenceBatcher
+
+    Phase 4.3a: `pool_slot_map` (opp_path -> slot_idx) tells the worker
+    which CIS slot holds each opp's weights. Player always uses slot 0.
+    Each opp gets its own batcher tagged with the right slot, so requests
+    route to the correct model on the server side.
 
     Memory hygiene fixes (3.5b/c) + POKE_LOOP threading rule (await
     asyncio.sleep(1.5)) all carry over from mp_disk.
@@ -1350,11 +1467,23 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
     else:
         train_tb = None
 
-    # Build CIS-routed inference batcher.
-    batcher = CISInferenceBatcher(
+    # Phase 4.3a: build per-slot batchers. Player always slot 0; each opp
+    # path gets the slot from pool_slot_map (orchestrator-assigned). If the
+    # map is missing or empty (legacy callers), fall back to slot 0 for
+    # everything — preserves Phase 4.1 self-play-vs-self behavior.
+    pool_slot_map = pool_slot_map or {}
+    player_batcher = CISInferenceBatcher(
         handle=cis_handle, device=device, fp16=fp16,
-        min_batch=min(8, max_concurrent), timeout_ms=15,
+        min_batch=min(8, max_concurrent), timeout_ms=15, slot=0,
     )
+    opp_batchers: Dict[str, CISInferenceBatcher] = {}
+    for opp_entry in opp_pool:
+        opp_path = opp_entry["path"]
+        slot_idx = pool_slot_map.get(opp_path, 0)
+        opp_batchers[opp_path] = CISInferenceBatcher(
+            handle=cis_handle, device=device, fp16=fp16,
+            min_batch=min(8, max_concurrent), timeout_ms=15, slot=slot_idx,
+        )
 
     all_trajs = []
     total_w_count = total_l = total_ties = 0
@@ -1368,8 +1497,14 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         batch_id = (worker_id * 100000) + (iter_n * 1000) + (hash(opp_path) % 1000)
         opp_tb = train_tb or random_pool_teambuilder()
 
+        # Phase 4.3a: player goes through slot 0; opp goes through its
+        # assigned slot. If pool_slot_map didn't list this opp (or fell
+        # back to {}), we use the player batcher for opp too — preserves
+        # Phase 4.1 self-play-vs-self behavior, never silently corrupts.
+        opp_batcher = opp_batchers.get(opp_path, player_batcher)
+
         player = V9RLPlayer(
-            batcher=batcher, device=device,
+            batcher=player_batcher, device=device,
             reward_shaper_cfg=rs_cfg,
             temperature=1.0,
             turn_cap=turn_cap,
@@ -1381,14 +1516,8 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             server_configuration=srv,
         )
 
-        # Phase 4.1 simplification: opp is the SAME CISInferenceBatcher (i.e.,
-        # self-play vs SAME current model, not vs an opp ckpt). PFSP weighting
-        # is approximated by replaying current vs current. Phase 4.2 will add
-        # opp ckpt swap via CIS handle to a separate "opp model" slot.
-        # Practical impact: lose true PFSP-against-old-snapshots in CIS path
-        # until Phase 4.2 ships. Production keeps using mp_disk path until then.
         opponent = V9RLPlayer(
-            batcher=batcher, device=device,
+            batcher=opp_batcher, device=device,
             reward_shaper_cfg=rs_cfg,
             temperature=1.0,
             turn_cap=turn_cap,
@@ -1457,10 +1586,13 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         while True:
             heartbeat_fn(iter_n=iter_n, n_done=n_done, n_total=n_games)
             try:
-                if hasattr(batcher, '_prof_total_requests'):
-                    print(f"[cis-w{worker_id} t+{loop_counter*15}s] "
-                          f"infer_reqs={batcher._prof_total_requests} "
-                          f"n_done={n_done}/{n_games}", flush=True)
+                # Aggregate request counts across all batchers (player + opps).
+                total_reqs = player_batcher._prof_total_requests
+                for ob in opp_batchers.values():
+                    total_reqs += ob._prof_total_requests
+                print(f"[cis-w{worker_id} t+{loop_counter*15}s] "
+                      f"infer_reqs={total_reqs} "
+                      f"n_done={n_done}/{n_games}", flush=True)
             except Exception:
                 pass
             loop_counter += 1
@@ -1561,21 +1693,32 @@ def shutdown_cis_workers() -> None:
 
 def _ensure_cis_global(weights_path: str, n_workers: int, device: str,
                        fp16: bool, amp_dtype_name: Optional[str],
-                       min_batch: int, timeout_ms: int) -> Dict[str, Any]:
-    """Lazy-init the CIS server + N worker procs. Returns the global dict."""
+                       min_batch: int, timeout_ms: int,
+                       max_pool_size: int = 16) -> Dict[str, Any]:
+    """Lazy-init the CIS server + N worker procs. Returns the global dict.
+
+    Phase 4.3a: CIS is spawned with `max_pool_size + 1` slots (slot 0 = player,
+    slots 1..K_max = PFSP opp pool entries). All slots load `weights_path`
+    initially; the orchestrator reloads slots 1..K with actual opp ckpts as
+    the pool fills. Memory: (max_pool_size+1) × ~80MB. At default K_max=16
+    that's ~1.4GB extra GPU memory, trivial on A100 80GB."""
     global _CIS_GLOBAL
     if _CIS_GLOBAL is not None:
         return _CIS_GLOBAL
 
     ctx = _get_mp_ctx()
 
-    # 1. Spawn CIS server with N pipes (one per worker)
+    # 1. Spawn CIS server with N pipes (one per worker) and K_max+1 slots
+    n_slots = max_pool_size + 1
+    initial_ckpt_paths = [weights_path] * n_slots
     cis_server = CISServer(
-        ckpt_path=weights_path, n_workers=n_workers,
+        ckpt_path=initial_ckpt_paths, n_workers=n_workers,
         device=device, fp16=fp16, amp_dtype_name=amp_dtype_name,
         min_batch=min_batch, timeout_ms=timeout_ms,
     )
-    cis_handles = cis_server.spawn(ready_timeout_s=120.0)
+    cis_handles = cis_server.spawn(ready_timeout_s=180.0)
+    print(f"[cis-orch] CIS server spawned with {n_slots} slots "
+          f"(player + {max_pool_size} opp slots)", flush=True)
 
     # 2. Spawn N worker procs, each gets ONE handle's pipe ends.
     # The handle's req_writer (parent->worker side) and resp_reader belong
@@ -1641,6 +1784,13 @@ def _ensure_cis_global(weights_path: str, n_workers: int, device: str,
         "worker_ctrl_pipes": worker_ctrl_writers,
         "worker_result_pipes": worker_result_readers,
         "n_workers": n_workers,
+        "max_pool_size": max_pool_size,
+        "n_slots": n_slots,
+        # current_slot_paths[s] tracks which file is loaded in slot s.
+        # Slot 0 = player (reloaded each iter). Slots 1..K_max are opp
+        # slots; orchestrator only reloads when path changes (vs blindly
+        # reloading every iter, which would burn ~5s × K).
+        "current_slot_paths": [weights_path] * n_slots,
     }
     return _CIS_GLOBAL
 
@@ -1664,6 +1814,7 @@ def mp_centralized_collect_sync(
     amp_dtype: Optional[str] = None,
     cis_min_batch: int = 8,
     cis_timeout_ms: int = 15,
+    max_pool_size: int = 16,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
 
@@ -1684,15 +1835,48 @@ def mp_centralized_collect_sync(
         weights_path=weights_path, n_workers=n_workers,
         device=str(device), fp16=fp16, amp_dtype_name=amp_dtype,
         min_batch=cis_min_batch, timeout_ms=cis_timeout_ms,
+        max_pool_size=max_pool_size,
     )
 
-    # 3. Signal CIS to reload weights for this iter (skip on first call;
-    # CIS already loaded the iter's weights at spawn).
-    if iter_n > 0:  # rough heuristic; first call after iter 0 reloads
+    # 3. Phase 4.3a slot routing: build pool_slot_map and reload only the
+    # slots whose ckpt path changed since last iter. Slot 0 = player
+    # (always reloaded with this iter's weights). Slots 1..K = pool entries
+    # in stable order; reload only if path differs from current_slot_paths.
+    n_slots = g["n_slots"]
+    cur_paths = g["current_slot_paths"]
+    pool_slot_map: Dict[str, int] = {}
+    for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
+        slot_idx = i + 1  # slots 1..K
+        pool_slot_map[opp_path] = slot_idx
+
+    # Reload slot 0 (player) every iter — model state changes after each PPO update.
+    try:
+        g["handles_main_view"][0].reload(weights_path, slot=0, timeout_s=60.0)
+        cur_paths[0] = weights_path
+    except Exception as e:
+        print(f"[cis-orch] WARN slot 0 reload at iter {iter_n}: {e}", flush=True)
+
+    # Reload opp slots whose path changed. Skip slots where the path
+    # matches what's already loaded — saves ~3-5s per slot per iter.
+    n_opp_reloaded = 0
+    for opp_path, slot_idx in pool_slot_map.items():
+        if slot_idx >= n_slots:
+            print(f"[cis-orch] WARN opp slot {slot_idx} exceeds n_slots={n_slots}; "
+                  f"raise --max-pool-size", flush=True)
+            continue
+        if cur_paths[slot_idx] == opp_path:
+            continue  # already loaded
         try:
-            g["handles_main_view"][0].reload(weights_path, timeout_s=60.0)
+            g["handles_main_view"][0].reload(opp_path, slot=slot_idx,
+                                             timeout_s=60.0)
+            cur_paths[slot_idx] = opp_path
+            n_opp_reloaded += 1
         except Exception as e:
-            print(f"[cis-collect] WARN reload at iter {iter_n}: {e}", flush=True)
+            print(f"[cis-orch] WARN slot {slot_idx} reload "
+                  f"({opp_path}): {e}", flush=True)
+    if n_opp_reloaded:
+        print(f"[cis-orch] iter {iter_n}: reloaded {n_opp_reloaded} opp "
+              f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
 
     # 4. Build opp_pool message + dispatch to workers
     opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
@@ -1715,6 +1899,7 @@ def mp_centralized_collect_sync(
             "max_concurrent": max_concurrent,
             "server_url": srv_url,
             "opp_pool": opp_pool_msg,
+            "pool_slot_map": pool_slot_map,
             "temp_range": list(temp_range),
             "opp_temp_range": list(temp_range),
             "fp16": fp16,
