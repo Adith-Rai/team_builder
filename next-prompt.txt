@@ -19,16 +19,29 @@ discussed end of S52; we agreed to do dual-slot CIS (Option (i)) with
 slot-tagged infer/reload. Tests 1-3 are the load-bearing correctness
 gates. Match the bar of S51/S52 carefully-shipped work.
 
-If you read NOTHING else, read these FOUR things:
+If you read NOTHING else, read these SIX things:
 
 1. THE GOAL (§A below) — re-read every time you make a decision
 2. WHAT NOT TO DO (§B below) — costs you money + time if you ignore
 3. CURRENT STATE (§C below) — what's running, what's at risk
 4. PRIORITY-ORDERED TODO (§D below) — what to do, in what order, why
+5. **`memory/project_strategic_frame.md`** — load-bearing strategic
+   ordering that infra prioritization flows from (vertical-then-horizontal,
+   gen-9-as-infra-testbed, multi-gen-AGNOSTIC vs SPECIFIC split). Don't
+   re-derive — the user has explicitly aligned on this in S52.
+6. **`memory/project_cis_4_3_design.md`** — load BEFORE coding CIS 4.3.
+   Dual-slot Option (i), int slot index API, Tests 1-3 ordering, with
+   rationale. Re-confirm open questions with user; don't re-debate resolved
+   ones.
 
 The rest is context: gains, failures, dead paths, codebase orientation,
 connection how-tos, validation patterns, etc. Skim the headings, dive into
 the section that matches what you're about to touch.
+
+**Behavioral note** (`memory/feedback_ask_when_uncertain.md`): when half-
+informed on a load-bearing decision, ASK. Don't guess. Pattern paid off
+in S52 — almost killed a healthy production run because of a misread
+counter; user's "ask me — don't guess" instruction caught it.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
