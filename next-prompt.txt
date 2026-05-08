@@ -221,6 +221,15 @@ opp).** S53 found it doesn't compose with asyncio.gather opp concurrency
 S53 replaced with **pool-mirror slots** (slots 1..K mirror the PFSP
 pool). See §K dead paths + `memory/project_cis_4_3_design.md`.
 
+**B13. DO NOT route reload calls through worker handles (`handles_main_view[0]`).**
+Phase 4.5 (S53) added a dedicated CTRL pipe between parent and CIS.
+Worker procs do NOT have read access to the ctrl pipe → no race with
+worker recv_loops at iter boundaries. Use `cis_server.reload_weights(...)`
+which routes via `_ctrl_handle` (sync mode, parent-only). The pre-4.5
+pattern (`g["handles_main_view"][0].reload(...)`) raced with worker
+recv_loops at iter 1+ boundaries — workers ate parent's reload responses
+and parent timed out. See §K dead paths + `memory/project_cis_4_3_design.md`.
+
 
 ═══════════════════════════════════════════════════════════════════════════════
 §C. CURRENT STATE — what's running + what's at risk
@@ -349,6 +358,18 @@ shows the right batch shape for transformer-temporal-with-on-policy-PPO:
   + missing_action_mask combine to mask loss terms per `(B, L, G, _)` batch
 - `MetamonTstepEncoder` (line 477) and AMAGO's traj_encoder confirm our
   spatial + temporal split maps directly to their tstep + traj encoder
+
+**NOT a reference: VGC-Bench** (cameronangliss/vgc-bench). Same library
+stack (poke-env + PettingZoo), same LR (1e-5 base, annealing), same
+self-play / FP / DO methods, same arch family (transformer encoder).
+But: STATELESS per-turn — their `policy.py:AttentionExtractor.forward()`
+reshapes obs to `(B, 12, -1)` with NO temporal dim. Their batch_size=512
+is "free" because each transition is self-contained. Their multi-team
+failure (79% W/L on 3 teams → 40% on 30 teams) is likely the stateless-
+arch ceiling. Don't confuse "their LR matches ours" with "we should
+copy their batching strategy" — they sidestepped the temporal-stack
+batching problem by not having a temporal stack. Metamon is the right
+reference because they kept temporal AND scaled batch.
 
 **Implementation approach**: borrow the batch SHAPE from Metamon (sequence
 of variable-length episodes, padded to L_max in batch, masked loss).
@@ -666,7 +687,7 @@ reducing ent_coef in response. This is normal; don't try to "fix" it.
 §J0. SESSION 53 — GAINS, METRICS, NON-ACTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Gains (8 commits + 2 memory files, all on origin/master)**:
+**Gains (10+ commits + 2 memory files, all on origin/master)**:
 - `92caecd3` CIS Phase 4.3a: pool-mirror multi-slot + Tests 1-3
 - `3accb9fd` Per-handle Lock around pipe IPC + Path/random imports + Test 4
 - `475b32d1` CIS Phase 4.3b: CISBgCollector + bg overlap re-enable
@@ -677,9 +698,15 @@ reducing ent_coef in response. This is normal; don't try to "fix" it.
 - `4d901830` CIS Phase 4.4: async-with-req_id-dispatch (~20% collect speedup, prod-scale measured)
 - `02c2f3c9` docs: Phase 4.4 outcome + S54 priorities
 - `b4e60bce` diag: pad_bc_v10_to_d1d2_arch script (BC v10 → current arch warm init)
+- `7a70eeb2` docs: re-prioritize speed track first + remove stale references
+- (Phase 4.5 ctrl-pipe fix expected to commit after validation; see below)
 - Production-scale 4.3c + 4.4 on A100 measured. Pre-refactor (4.3) GPU at
   ~48% util lock-bound, iter 0 collect = 649s. Post-refactor (4.4) GPU
   saturating, iter 0 collect = 520s (-20%).
+- Padded BC v10 init (synthetic warm-from-trained, gen_embed zeroed):
+  iter 0 collect = 430s — battles end naturally faster (BC v10 plays
+  competently → ~30-50 turns/battle vs ~150-200 turns with random init).
+  W/L 254/146 (63.5%) shows real skill differential, not 50% noise.
 - Updated memory: `project_cis_4_3_design.md`, `feedback_cis_thread_safety.md`
 
 **Architectural change from S52 memo** (CRITICAL — read carefully):
@@ -711,23 +738,32 @@ producing silent training corruption. Two resolutions:
   `mp_centralized_collect.py`. Caused NameError surfaces in 4.3b
   orchestrator path that wasn't exercised before.
 
-**Pre-existing CIS thread-safety issue surfaced + fixed (twice)**:
-- First fix (Phase 4.3): Test 4's first end-to-end run hit
+**CIS thread-safety issues surfaced + fixed (THREE iterations)**:
+- **Fix 1 (Phase 4.3, S53)**: Test 4's first end-to-end run hit
   `_pickle.UnpicklingError: invalid load key` + Broken pipe. Root cause:
   `mp.Pipe.send` is not byte-atomic across threads; concurrent submits
   from one worker (player + opp at minimum) corrupted the pickle stream.
   Fix: per-handle `threading.Lock` wrapping each (send, poll, recv) cycle.
-- Second issue surfaced when Phase 4.4 was being added: worker's recv-loop
-  thread races with PARENT's `cis_handles[wid].reload()` reads. Both
-  processes have read access to the same resp pipe (parent uses for slot
-  reloads; worker for inference). If worker's recv_thread starts at
-  __init__ time, it eats parent's reload responses → "invalid load key"
+- **Fix 2 (Phase 4.4, S53)**: worker's recv-loop thread races with
+  PARENT's `cis_handles[wid].reload()` reads at INIT time. Both processes
+  have read access to the same resp pipe. If worker's recv_thread starts
+  at __init__, it eats parent's reload responses → "invalid load key"
   on parent. Fix: `_cis_worker_main` constructs handle with
   `start_recv=False`, calls `cis_handle.start_recv_loop()` only on first
   `collect_iter` cmd (by which time parent's reload window has closed).
-  Parent-side handles in `CISServer` keep `start_recv=False` permanently
-  → use the SYNC lock-based path. Two-mode class for two callsites.
-- Both fixes shipped + prod-validated. See `feedback_cis_thread_safety.md`.
+- **Fix 3 (Phase 4.5, S53)**: SAME race re-emerges at ITER 1+ boundaries
+  — once worker's recv_loop is running (started at iter 0's first
+  collect_iter), parent's reload at iter 1 start hits the same shared
+  pipe and worker steals the response. Symptom: "untagged response
+  dropped" warning in worker + reload timeout in parent + corrupted
+  slot state. Fix: dedicated CTRL pipe between parent and CIS subprocess.
+  CISServer now creates a ctrl pipe pair at spawn(); CIS service loop
+  reads from worker pipes AND ctrl pipe via mp_wait. Reload calls go
+  via `cis_server.reload_weights()` which routes via `_ctrl_handle`
+  (sync mode, parent-only). Worker procs DO NOT have read access to
+  ctrl pipe → race-free. **Use `cis_server.reload_weights()`, NOT
+  `handles_main_view[0].reload()`** — see B13.
+- All three fixes shipped + prod-validated. See `feedback_cis_thread_safety.md`.
 
 **Production observations from S53**:
 - Phase 1 v3 healthy through iter 22, iter 23 in update at S53 end
@@ -748,16 +784,26 @@ producing silent training corruption. Two resolutions:
   no UnpicklingError, all req_id matched correctly to futures, trajs collected
   cleanly with proper W/L (210/190 in 4.4 iter 0)
 
-**Wall-time savings projection** (full prod scale, 1600 games/iter):
-- Current `--mp` no-pipeline: 16 + 38 = 54 min/iter
-- `--cis --pipeline` Phase 4.3 (Lock-based, **shipped**): max(40, 38) = ~40 min/iter, **~26% saving**
-- `--cis --pipeline` Phase 4.4 (async-dispatch, **shipped**): max(32, 38) = ~38 min/iter, **~30% saving**
-  (collect now update-bound — overlap recovers most of update time)
-- Per-200-iter saving: ~$120 vs current `--mp` baseline
-- Multi-gen 5-7 wk saving: ~$600
-- Remaining wall-time levers (post Phase 4.4): bf16 update autocast (already
-  shipped, just needs `--bf16` at relaunch, ~10-15% on update) + Tier 3
-  transition-level minibatching (~4-10× on update, biggest remaining lever)
+**Wall-time projection — full speed stack** (full prod scale, 1600 games/iter):
+
+| Stack | Iter time | Saving vs current `--mp` |
+|---|---|---|
+| Current `--mp` no-pipeline (Phase 1 v3) | 54 min | — |
+| `--cis --pipeline` Phase 4.3 (Lock-based, shipped S53) | ~40 min | ~26% |
+| **`--cis --pipeline` Phase 4.4 + 4.5 (shipped S53)** | **~38 min** | **~30%** |
+| + bf16 update autocast (already in code, needs `--bf16` flag) | ~32 min | ~41% |
+| + Tier 3 transition-level minibatching (next session) | ~12 min | ~78% |
+| + `torch.compile(train_step)` (bundled with Tier 3) | ~10 min | ~82% |
+
+**For 5M trajectory goal (3125 iters at games=1600):**
+- Current trajectory (`--mp`): 108 days, ~$3,900
+- Post-CIS+pipeline+bf16: ~70 days, ~$2,500 (saves ~38 days, ~$1,400)
+- Post-Tier-3 + train_step compile: **~22-26 days, ~$800-1,000** (saves
+  ~80 days, ~$2,900 from current)
+
+The full speed stack is the difference between "long but feasible" and
+"actually nice." Each lever multiplies — CIS unlocks pipeline overlap,
+Tier 3 attacks update phase, train_step compile makes Tier 3 even faster.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -859,6 +905,25 @@ These have been investigated and rejected. Don't waste cycles re-walking:
   parent's reload reads on the same pipe → "invalid load key"
   UnpicklingError. `_cis_worker_main` MUST defer `start_recv_loop()`
   until first `collect_iter` cmd is received. Don't move it earlier.
+- **Routing parent reloads through worker handles** (e.g.,
+  `handles_main_view[0].reload(...)` from Phase 4.4): races with worker
+  recv_loops at iter 1+ boundaries. Worker eats parent's reload
+  response (logged as "untagged response dropped"); parent's sync recv
+  times out. Phase 4.5 added a dedicated ctrl pipe — use
+  `cis_server.reload_weights()` which routes via `_ctrl_handle`
+  (parent-only, no worker access).
+- **VGC-Bench as a Tier 3 reference** (their LR matches ours, they use
+  PPO + self-play, batch_size=512 transitions): explicitly reviewed
+  and rejected as the right reference. They are STATELESS per-turn
+  (no temporal stack — confirmed in their `policy.py` where
+  `AttentionExtractor.forward()` reshapes to `(B, 12, -1)` with no
+  temporal dim). Their batching freedom comes from architectural
+  simplicity we deliberately don't share. Their multi-team failure
+  mode (79% W/L on 3 teams → 40% on 30 teams) likely IS due to
+  stateless arch hitting a ceiling. **Use Metamon's
+  `metamon_to_amago.py` as the Tier 3 reference instead** — they have
+  temporal + transformer + the right batch shape (sequence-batched
+  with pad_mask).
 
 
 ═══════════════════════════════════════════════════════════════════════════════

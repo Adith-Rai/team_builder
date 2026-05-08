@@ -429,7 +429,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     fp16: bool = True,
                     amp_dtype_name: Optional[str] = None,
                     min_batch: int = 8,
-                    timeout_ms: int = 15) -> None:
+                    timeout_ms: int = 15,
+                    ctrl_req_reader=None,
+                    ctrl_resp_writer=None) -> None:
     """Phase 2/4.3a CIS subprocess entrypoint. Multiplexes inference requests
     across N worker pipes via mp.connection.wait. Holds K+1 model slots:
     slot 0 = player, slots 1..K = PFSP opp pool entries (Phase 4.3a).
@@ -477,6 +479,14 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
     # Map pipe object -> worker index for fast lookup after mp_wait
     pipe_to_widx = {p: i for i, p in enumerate(worker_req_readers)}
+
+    # Phase 4.5 (S54): separate control pipe between CIS and PARENT (CISServer).
+    # Used for reload calls that previously raced with worker recv_loops on
+    # shared resp pipes. ctrl_req_reader is the read end CIS uses for parent
+    # commands; ctrl_resp_writer is the write end CIS uses for parent
+    # responses. Worker procs never see these pipes — no race possible.
+    # Backward-compat: if ctrl pipes not provided, fall back to old behavior.
+    _CTRL_WIDX = -1  # sentinel: ctrl path, not a worker
 
     n_slots = len(ckpt_paths)
     if n_slots < 1:
@@ -537,6 +547,13 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     for w in worker_resp_writers:
         try:
             w.send({"status": "ready"})
+        except Exception:
+            pass
+    # Phase 4.5: also send ready on the ctrl pipe (if present) so CISServer's
+    # ctrl handle can confirm liveness.
+    if ctrl_resp_writer is not None:
+        try:
+            ctrl_resp_writer.send({"status": "ready"})
         except Exception:
             pass
 
@@ -721,9 +738,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         last_fire_t_per_slot[slot] = time.time()
 
     while True:
-        # Active pipes = readers we still listen to (skip closed workers)
+        # Active pipes = worker readers + ctrl pipe (if present).
         active_pipes = [p for p in worker_req_readers
                         if pipe_to_widx[p] not in closed_workers]
+        if ctrl_req_reader is not None:
+            active_pipes.append(ctrl_req_reader)
         if not active_pipes:
             print(f"[CIS-multi] all worker pipes closed, exiting", flush=True)
             break
@@ -748,27 +767,44 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         ready = mp_wait(active_pipes, timeout=wait_to)
 
         for r in ready:
-            widx = pipe_to_widx[r]
+            # Determine if this is the ctrl pipe or a worker pipe.
+            is_ctrl = (r is ctrl_req_reader)
+            widx = _CTRL_WIDX if is_ctrl else pipe_to_widx[r]
             try:
                 req = r.recv()
             except (EOFError, BrokenPipeError):
-                closed_workers.add(widx)
+                if is_ctrl:
+                    # Parent closed ctrl pipe (shouldn't happen until shutdown).
+                    print(f"[CIS-multi] ctrl pipe closed unexpectedly", flush=True)
+                    ctrl_req_reader = None  # stop polling it
+                else:
+                    closed_workers.add(widx)
                 continue
 
             cmd = req.get("cmd") if isinstance(req, dict) else None
 
+            # Helper: send response on the correct pipe (ctrl or worker).
+            def _send_resp(msg):
+                try:
+                    if is_ctrl:
+                        if ctrl_resp_writer is not None:
+                            ctrl_resp_writer.send(msg)
+                    else:
+                        worker_resp_writers[widx].send(msg)
+                except Exception:
+                    if not is_ctrl:
+                        closed_workers.add(widx)
+
             if cmd == "shutdown":
-                closed_workers.add(widx)
+                if not is_ctrl:
+                    closed_workers.add(widx)
                 continue
 
             if cmd == "ping":
-                try:
-                    resp = {"status": "ok"}
-                    if req.get("req_id") is not None:
-                        resp["req_id"] = req.get("req_id")
-                    worker_resp_writers[widx].send(resp)
-                except Exception:
-                    closed_workers.add(widx)
+                resp = {"status": "ok"}
+                if req.get("req_id") is not None:
+                    resp["req_id"] = req.get("req_id")
+                _send_resp(resp)
                 continue
 
             if cmd == "reload":
@@ -826,37 +862,40 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                            "unexpected_keys": unexpected[:5]}
                     if req.get("req_id") is not None:
                         msg["req_id"] = req.get("req_id")
-                    worker_resp_writers[widx].send(msg)
+                    _send_resp(msg)
                 except Exception as e:
                     tb = traceback.format_exc()
-                    try:
-                        err_msg = {
-                            "status": "error",
-                            "exc_msg": f"reload failed: {e}",
-                            "traceback": tb,
-                        }
-                        if req.get("req_id") is not None:
-                            err_msg["req_id"] = req.get("req_id")
-                        worker_resp_writers[widx].send(err_msg)
-                    except Exception:
-                        closed_workers.add(widx)
+                    err_msg = {
+                        "status": "error",
+                        "exc_msg": f"reload failed: {e}",
+                        "traceback": tb,
+                    }
+                    if req.get("req_id") is not None:
+                        err_msg["req_id"] = req.get("req_id")
+                    _send_resp(err_msg)
                 continue
 
             if cmd == "infer":
+                if is_ctrl:
+                    # Infer should never come via ctrl pipe — that's parent-only,
+                    # and parent doesn't run inference. Respond with error.
+                    err_msg = {"status": "error",
+                               "exc_msg": "infer cmd not allowed on ctrl pipe"}
+                    if req.get("req_id") is not None:
+                        err_msg["req_id"] = req.get("req_id")
+                    _send_resp(err_msg)
+                    continue
                 np_batch = req["batch"]
                 slot = int(req.get("slot", 0))
                 if slot < 0 or slot >= n_slots:
                     # Out-of-range slot: respond with error so worker fails
                     # loudly rather than silently routing to slot 0.
-                    try:
-                        err_msg = {"status": "error",
-                                   "exc_msg": f"infer slot {slot} out of "
-                                              f"range [0, {n_slots})"}
-                        if req.get("req_id") is not None:
-                            err_msg["req_id"] = req.get("req_id")
-                        worker_resp_writers[widx].send(err_msg)
-                    except Exception:
-                        closed_workers.add(widx)
+                    err_msg = {"status": "error",
+                               "exc_msg": f"infer slot {slot} out of "
+                                          f"range [0, {n_slots})"}
+                    if req.get("req_id") is not None:
+                        err_msg["req_id"] = req.get("req_id")
+                    _send_resp(err_msg)
                     continue
                 # Determine batch size from first ndarray-shaped field
                 bsize = None
@@ -1146,9 +1185,20 @@ class CISServer:
         self.timeout_ms = timeout_ms
         self._proc = None
         self._handles: list = []
+        # Phase 4.5: ctrl pipe + handle for parent-only commands (reload).
+        # Initialized in spawn(); shutdown() closes them.
+        self._ctrl_req_writer = None
+        self._ctrl_resp_reader = None
+        self._ctrl_handle: Optional["CISClientHandle"] = None
 
     def spawn(self, ready_timeout_s: float = 60.0) -> list:
-        """Start CIS subprocess. Returns list of N CISClientHandle objects."""
+        """Start CIS subprocess. Returns list of N CISClientHandle objects.
+
+        Phase 4.5: also creates a separate CTRL pipe pair between parent and
+        CIS. Parent uses ctrl pipe for reload calls; worker procs only see
+        the worker pipes. This eliminates the iter-boundary race where
+        worker recv_loops would steal parent's reload responses (Phase 4.4
+        had this bug at iter 1+ boundaries)."""
         ctx = _get_mp_ctx()
 
         worker_req_readers = []   # child-side reader for ctrl direction
@@ -1164,11 +1214,19 @@ class CISServer:
             worker_resp_readers.append(resp_r)
             worker_resp_writers.append(resp_w)
 
+        # Phase 4.5: separate CTRL pipe pair (parent <-> CIS, worker procs
+        # NEVER see this). Used for parent-only reload calls.
+        ctrl_req_r, ctrl_req_w = ctx.Pipe(duplex=False)   # parent writes, CIS reads
+        ctrl_resp_r, ctrl_resp_w = ctx.Pipe(duplex=False)  # CIS writes, parent reads
+        self._ctrl_req_writer = ctrl_req_w
+        self._ctrl_resp_reader = ctrl_resp_r
+
         self._proc = ctx.Process(
             target=_cis_main_multi,
             args=(worker_req_readers, worker_resp_writers,
                   self.ckpt_paths, self.device, self.fp16, self.amp_dtype_name,
-                  self.min_batch, self.timeout_ms),
+                  self.min_batch, self.timeout_ms,
+                  ctrl_req_r, ctrl_resp_w),
             daemon=False,
         )
         self._proc.start()
@@ -1177,6 +1235,8 @@ class CISServer:
             r.close()
         for w in worker_resp_writers:
             w.close()
+        ctrl_req_r.close()
+        ctrl_resp_w.close()
 
         # Build handles WITHOUT starting their recv threads — parent-side
         # handles use the sync lock-based path (only used for occasional
@@ -1206,29 +1266,52 @@ class CISServer:
             if msg.get("status") != "ready":
                 raise RuntimeError(f"CIS unexpected ready msg: {msg!r}")
 
+        # Phase 4.5: also consume ready on ctrl pipe + build ctrl handle.
+        if not self._ctrl_resp_reader.poll(timeout=ready_timeout_s):
+            raise RuntimeError(f"CIS ctrl pipe not ready in {ready_timeout_s}s")
+        msg = self._ctrl_resp_reader.recv()
+        if msg.get("status") != "ready":
+            raise RuntimeError(f"CIS ctrl unexpected ready msg: {msg!r}")
+        # Build ctrl handle: sync mode (no recv_thread). Parent uses for reloads.
+        self._ctrl_handle = CISClientHandle(
+            req_writer=self._ctrl_req_writer,
+            resp_reader=self._ctrl_resp_reader,
+            worker_idx=-1,  # sentinel: ctrl, not a worker
+            start_recv=False,
+        )
+
         return self._handles
 
     def reload_weights(self, weights_path: str, timeout_s: float = 60.0,
                        slot: int = 0) -> Dict[str, Any]:
-        """Phase 3 weight sync: signal CIS to reload from disk. Routes through
-        worker 0's handle (any handle works - one CIS process serves all).
-        Production caller writes weights atomically first (via
-        _save_worker_weights_atomic in mp_disk_collect.py or equivalent), then
-        invokes this. Blocks until reload completes; safe to start next iter's
-        infer requests after this returns.
+        """Weight sync: signal CIS to reload from disk. Production caller
+        writes weights atomically first (via _save_worker_weights_atomic in
+        mp_disk_collect.py or equivalent), then invokes this. Blocks until
+        reload completes; safe to start next iter's infer requests after
+        this returns.
 
-        Phase 4.3a: `slot` selects which model slot to reload (default 0 =
-        player slot). Orchestrator reloads slots 1..K between iters when
-        the PFSP pool changes."""
-        if not self._handles:
-            raise RuntimeError("CIS not spawned")
-        return self._handles[0].reload(weights_path, timeout_s=timeout_s, slot=slot)
+        Phase 4.5: routes through the dedicated CTRL pipe (parent <-> CIS).
+        Worker procs don't see this pipe → no race with their recv_loops.
+        Earlier Phase 4.4 used worker handle 0's pipe, which raced with
+        worker recv_loops at iter boundaries (S53 bug). `slot` selects
+        which model slot to reload (default 0 = player; slots 1..K = PFSP
+        opp pool entries)."""
+        if self._ctrl_handle is None:
+            raise RuntimeError("CIS not spawned (no ctrl handle)")
+        return self._ctrl_handle.reload(weights_path, timeout_s=timeout_s,
+                                         slot=slot)
 
     def shutdown(self, timeout_s: float = 5.0) -> None:
         if self._proc is None:
             return
         for h in self._handles:
             h.shutdown()
+        # Phase 4.5: also signal shutdown via ctrl pipe.
+        if self._ctrl_handle is not None:
+            try:
+                self._ctrl_handle.shutdown()
+            except Exception:
+                pass
         if self._proc.is_alive():
             self._proc.join(timeout=timeout_s)
             if self._proc.is_alive():
@@ -1242,8 +1325,17 @@ class CISServer:
                 h.resp_reader.close()
             except Exception:
                 pass
+        for p in (self._ctrl_req_writer, self._ctrl_resp_reader):
+            if p is not None:
+                try:
+                    p.close()
+                except Exception:
+                    pass
         self._proc = None
         self._handles = []
+        self._ctrl_handle = None
+        self._ctrl_req_writer = None
+        self._ctrl_resp_reader = None
 
 
 # =============================
@@ -2033,7 +2125,7 @@ def mp_centralized_collect_sync(
 
     # Reload slot 0 (player) every iter — model state changes after each PPO update.
     try:
-        g["handles_main_view"][0].reload(weights_path, slot=0, timeout_s=60.0)
+        g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
         cur_paths[0] = weights_path
     except Exception as e:
         print(f"[cis-orch] WARN slot 0 reload at iter {iter_n}: {e}", flush=True)
@@ -2049,8 +2141,8 @@ def mp_centralized_collect_sync(
         if cur_paths[slot_idx] == opp_path:
             continue  # already loaded
         try:
-            g["handles_main_view"][0].reload(opp_path, slot=slot_idx,
-                                             timeout_s=60.0)
+            g["server"].reload_weights(opp_path, slot=slot_idx,
+                                        timeout_s=60.0)
             cur_paths[slot_idx] = opp_path
             n_opp_reloaded += 1
         except Exception as e:
@@ -2261,7 +2353,7 @@ class CISBgCollector:
             pool_slot_map[opp_path] = slot_idx
 
         try:
-            g["handles_main_view"][0].reload(weights_path, slot=0, timeout_s=60.0)
+            g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
             cur_paths[0] = weights_path
         except Exception as e:
             print(f"[cis-bg] WARN slot 0 reload at iter {iter_n}: {e}",

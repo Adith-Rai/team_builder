@@ -430,13 +430,17 @@ on a low-priority CUDA stream; workers pipe obs via numpy IPC.
 - 4.3b: CISBgCollector + bg overlap re-enabled (S53, `475b32d1`)
 - 4.3c: wall-time A/B at small + production scale (S53, `4f0a292f`)
 - 4.4: async-with-req_id-dispatch lock refactor (S53, `4d901830`) — production-scale measured ~20% collect speedup vs 4.3 lock-based
+- 4.5: dedicated CTRL pipe between parent and CIS (S53) — fixes iter-boundary reload race that Phase 4.4 had at iter 1+ boundaries (worker recv_loop ate parent's reload responses on the shared resp pipe). Reload now goes via `cis_server.reload_weights()` → `_ctrl_handle` (sync mode, parent-only). Worker procs don't have read access to ctrl pipe → race-free.
 
 **Production-scale measurements (A100 80GB, S53)**:
 - Phase 4.3 lock-based, N=8 conc=200 games=400: iter 0 collect = 649s, GPU ~48% util
 - Phase 4.4 async-dispatch, same config: iter 0 collect = 520s, GPU saturating
+- Phase 4.4 + padded BC v10 init (more realistic battle dynamics): iter 0
+  collect = 430s, W/L 254/146 (battles end naturally faster ~30-50 turns
+  vs ~150-200 with random init)
 - At full prod scale (1600 games/iter, projected):
   - `--mp` no-pipeline (current): 16 + 38 = 54 min/iter
-  - `--cis --pipeline` Phase 4.3+4.4 (shipped): max(32, 38) = ~38 min/iter
+  - `--cis --pipeline` Phase 4.3+4.4+4.5 (shipped): max(32, 38) = ~38 min/iter
   - **~30% wall-time saving vs `--mp` no-pipeline**
 
 **Production deployment status**:
