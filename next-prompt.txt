@@ -1,20 +1,24 @@
 pre prompt :
 
-Read `next-prompt.txt` top to bottom — it's the Session 54 boot doc. The "if you read nothing else" list at the top names SEVEN required-reading items in order — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
+Read `next-prompt.txt` top to bottom — it's the Session 55 boot doc. The "if you read nothing else" list at the top names EIGHT required-reading items in order — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
 
 Then load `memory/project_strategic_frame.md` — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive. Frame is locked.
 
-Then load `memory/project_cis_4_3_design.md` — **CIS Phase 4.3 a/b/c + 4.4 SHIPPED + production-scale validated in S53**. Pool-mirror multi-slot (NOT dual-slot per S52 memo). 4.4 async-with-req_id-dispatch replaces the per-handle Lock; ~20% collect speedup measured on A100 at production scale. Phase 4.3+4.4 stack now delivers projected ~30% wall-time saving vs `--mp` (vs 26% with 4.3 alone, vs theoretical 36%+ — the gap is now mostly bf16 update + Tier 3 territory).
+Then load `memory/project_cis_4_3_design.md` + `memory/project_cis_4_6_design.md` — **CIS Phase 4.3 a/b/c + 4.4 + 4.5 + 4.6 ALL SHIPPED**. 4.6 is the failure recovery path (Option B unified full-reset); shipped + Tests 6a/6b PASS on dev pod A100 in S54. The full --cis --pipeline stack is now production-ready for Phase 2 launch.
 
 Also load `memory/feedback_cis_thread_safety.md` — async-dispatch pattern is now the prod default. Per-handle Lock retained for parent-side reload calls (sync, rare). Don't conflate the two paths.
 
-First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was healthy through iter 28 (W/L ~53-54%, iter 19 EVAL smart_avg=69%) at S53 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on STEP 2 (CIS worker respawn) as headline + STEP 6 (H2H gauntlet) and STEP 7 (Network Volume) as parallel side work. If wrapped: pull final.pt, run full eval suite + H2H gauntlet, document Elo + smart_avg + per-bot, then move to STEP 3 (Tier 3) + STEP 5 (Phase 2 launch with full speed stack). If failed: diagnose, relaunch only after RCA.
+**Then load `docs/PHASE1_V3_OBSERVATIONS.md`** — load-bearing for any Phase 2 launch design decision. Documents (a) iter 39 EVAL drop diagnosis (smart_avg 69→60→53 tracking S50 trajectory despite lr=1e-5 fix), (b) the three S50 postmortem causes and which were/weren't applied to Phase 1 v3, (c) Phase 2 design implications including team distribution mix (NOT mixing the eval set into training), perm/canonical fix, external opps, lr scheduling, (d) strict sequencing constraint (infra optimizations FIRST, then Phase 2 with all changes).
 
-Headline work for next session: **CIS worker respawn (Phase 4.5)** — the last piece needed before Phase 2 can safely launch with `--cis --pipeline`. Without watchdog/respawn, a worker death mid-iter wastes ~50 min of compute. Port the proven `--mp` watchdog pattern (heartbeat-from-OS-thread + 600s tolerance + paced respawn) to CIS workers. ~1 day dev + ~$1-2 A100 validation. After that: Tier 3 transition-level minibatching is the headline (~1.5-2 wks dev + 20-iter A/B), the actual remaining big lever (~4-10× update speedup). Reference: `metamon_ref/metamon/rl/metamon_to_amago.py` for the right batch shape (sequence-batched with pad_mask). Don't START Tier 3 until Phase 1 v3 finishes.
+First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was at iter 41+ (W/L 43-56% across pool growth, iter 39 EVAL smart_avg=53%) at S54 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on Tier 3 dev + H2H gauntlet wiring + Network Volume verification. If wrapped at iter 200: pull final.pt, run full eval suite + H2H gauntlet, document final Elo + smart_avg + per-bot trajectory, then move to Phase 2 launch with full stack. If failed: diagnose, relaunch only after RCA.
 
-If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter) and S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer) are both wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
+**Headline work for S55**: Tier 3 transition-level minibatching (~1.5-2 wks dev + 20-iter A/B). The actual remaining big lever — ~4-10× update speedup if quality holds. Reference: `metamon_ref/metamon/rl/metamon_to_amago.py` for sequence-batched-PPO with-temporal-stack. Don't START until Phase 1 v3 finishes (no mid-run variable changes per §B). Bundle with `torch.compile(train_step)` per §D STEP 4.
 
-S53 shipped: CIS Phase 4.3 a/b/c + Phase 4.4 (async-with-req_id-dispatch) + production-scale validation. Pool-mirror multi-slot, bg overlap re-enable, small-scale + prod-scale wall-time A/B (4.4 measured ~20% collect speedup vs 4.3 lock-based at production scale). All pushed to origin. HEAD on production pod: `251cd14a` (still locked — DO NOT pull while Phase 1 v3 is running; CIS 4.3+4.4 changes the codebase incompatibly with the iter-22+ snapshot). Match the bar.
+Parallel side work (zero-GPU, hours not days): **H2H gauntlet wiring** (STEP 6, ~3-4 hrs), **Network Volume verification** (STEP 7, ~10 min), **sourcing 100-150 real elite teams** for Phase 2 training-distribution mix (see `docs/PHASE1_V3_OBSERVATIONS.md` §2 for sourcing details — copy verbatim from Smogon archive / ladder replays / tournament posts; do NOT generate or estimate; the eval-set 16 mm-competitive teams MUST stay isolated and NEVER enter training).
+
+If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter), S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer), and S54's REBIND_WORKER pivot (Connection-passing-over-pipe broken; pivoted to full-reset Option B) are all wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
+
+S54 shipped: **CIS Phase 4.6 — Option B unified full-reset recovery** (commit `64b822a3` on origin/master). Failure detection (worker death + CIS subprocess death + stale heartbeat) all route through `_orchestrator_full_reset` → re-collect from zero. Tests 6a/6b PASS on dev pod A100. Plus latent bug fixes: parent FD-close after worker spawn, L2371 racy reload pattern, cis_server.is_alive() check that V9RLPlayer fallback was hiding. Pivoted from REBIND_WORKER plan after dev-pod validation showed Connection-passing via mp.Pipe.send hangs (DupFd via resource_sharer either deadlocks or 30s+ slow). HEAD on production pod still `251cd14a` — DO NOT pull while Phase 1 v3 is running.
 
 ═══════════════════════════════════════════════════════════════════════════════
 SESSION 54 BOOT — read top to bottom before doing ANYTHING
@@ -49,7 +53,7 @@ Parallel side work (zero-GPU, hours not days): **H2H gauntlet wiring**
 (STEP 6, ~3-4 hrs), **Network Volume verification** (STEP 7, ~10 min).
 Match the bar of S51/S52/S53 carefully-shipped work.
 
-If you read NOTHING else, read these SEVEN things:
+If you read NOTHING else, read these EIGHT things:
 
 1. **`memory/feedback_engineering_standard.md`** — THE OPERATING STANDARD.
    Read FIRST every session. Thoroughly understand code BEFORE touching,
@@ -66,10 +70,21 @@ If you read NOTHING else, read these SEVEN things:
    ordering that infra prioritization flows from (vertical-then-horizontal,
    gen-9-as-infra-testbed, multi-gen-AGNOSTIC vs SPECIFIC split). Don't
    re-derive — the user has explicitly aligned on this in S52.
-7. **`memory/project_cis_4_3_design.md`** — CIS 4.3 a/b/c SHIPPED + prod-scale
-   validated. Pool-mirror multi-slot (NOT dual-slot — that's a dead path,
-   see §K). Per-handle Lock is correct but throughput-bottlenecked at prod
-   scale. Load this before any CIS code work.
+7. **`memory/project_cis_4_3_design.md` + `memory/project_cis_4_6_design.md`**
+   — CIS Phase 4.3 + 4.4 + 4.5 + 4.6 ALL SHIPPED. 4.6 is the failure recovery
+   path (Option B unified full-reset on any failure). Tests 6a/6b PASS on
+   dev pod. The full --cis --pipeline stack is production-ready for Phase 2.
+   Load before any CIS code work. Pool-mirror multi-slot (NOT dual-slot —
+   that's a dead path, see §K). REBIND_WORKER also a dead path (S54 found
+   Connection-passing-via-pipe broken; full-reset is the right answer).
+8. **`docs/PHASE1_V3_OBSERVATIONS.md`** — Phase 1 v3 iter 39 EVAL drop
+   diagnosis (53% smart_avg, tracking S50 trajectory despite lr=1e-5 fix).
+   Documents the three S50 postmortem causes and which were/weren't applied
+   to Phase 1 v3 + Phase 2 design implications + strict sequencing constraint
+   (infra optimizations FIRST, then Phase 2 with all changes). Critical:
+   the eval set (16 mm-competitive teams) MUST NEVER enter training pool.
+   Phase 2 needs SEPARATE 100-150 real elite teams sourced for the training
+   mix. Load before any Phase 2 launch design conversation.
 
 The rest is context: gains, failures, dead paths, codebase orientation,
 connection how-tos, validation patterns, etc. Skim the headings, dive into
@@ -241,12 +256,32 @@ and parent timed out. See §K dead paths + `memory/project_cis_4_3_design.md`.
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-At S53 end: iter 36 complete (W/L 53.5%, recovering from iter 35
-pool-growth dip). W/L peaked at 56.7% (iter 34). Iter 29 eval = 60% —
-drop from iter 19's 69% (deep analysis below confirms exploration
-+ specialization, not catastrophic forgetting). Iter 37 in update.
-~163 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
-(~$235 to completion). Iter 39 is next eval data point.
+At S54 end (2026-05-09): iter 41+ in flight. **Iter 39 EVAL: smart_avg=53%**
+— a -16pp drop from iter 19's 69% and below the 67% BC baseline gate.
+Iter 29 was 60%, iter 39 is 53%. This is **tracking S50's catastrophic
+trajectory** at iter 39 (S50: 54%) — see `docs/PHASE1_V3_OBSERVATIONS.md`
+for full diagnosis.
+
+**Critical finding**: lr=1e-5 (S50 postmortem fix) is applied but not
+sufficient. The remaining drop is from the two S50 causes that were
+NEVER fixed for Phase 1 v3:
+- Procedural train, mm-competitive eval distribution shift (-15-20pp)
+- Perm features at training, canonical at eval (-7pp)
+
+Combined potential -22-27pp drop from these two causes alone matches
+what we're seeing (-16pp at iter 39). **Phase 1 v3 will likely land
+at smart_avg ~35-50% by iter 200 — same as S50.** That's the EXPECTED
+baseline measurement of "lr fix only, no team mix, no external opps,
+no perm fix." Don't abort — this is the baseline we need.
+
+**Phase 2 launches with the missing fixes** (after Phase 1 v3 completes
++ all infra optimizations land). See `docs/PHASE1_V3_OBSERVATIONS.md`
+for full Phase 2 design including the team-distribution mix design
+(SEPARATE 100-150 real elite teams; the eval-set 16 mm-competitive
+teams MUST stay isolated from training).
+
+~159 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
+(~$235 to completion). Iter 49 is next eval data point.
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -485,67 +520,34 @@ User's framing: speed gates everything. The "elite measurement" + "infra
 hygiene" items only become useful when training throughput is high
 enough to make runs affordable. Speed work first, ops on the side.
 
-**STEP 2: CIS Phase 4.6 — worker respawn + CIS subprocess respawn** (~1.5 days dev + ~$2-3 A100 validation, SESSION 54 HEADLINE)
+**STEP 2: CIS Phase 4.6 — SHIPPED in S54 (commit `64b822a3`)** ✅
 
-Phase 2 will use `--cis --pipeline --bf16`. Two failure modes need
-recovery before a 5-7 day run is safe; CURRENTLY NEITHER IS HANDLED:
+Pivoted from REBIND_WORKER (Q1 Option ii) to **Option B unified
+full-reset on any failure** after dev-pod validation showed
+Connection-passing-via-mp.Pipe.send hangs in this RunPod environment
+(DupFd via resource_sharer either deadlocks or 30s+ slow). Honest
+re-evaluation surfaced that mp_disk's 0/36-iters failure track record
++ ~$0.50-6.50/run cost made full-reset the right answer over granular
+respawn. Single recovery path covers worker death AND CIS death.
 
-**STEP 2a: Worker proc respawn** (~1 day)
-If a `_cis_worker_main` process dies mid-iter, the iter is lost
-(~50 min of wasted compute at production scale). The `--mp` watchdog
-pattern is already shipped (S51) and proven through Phase 1 v3's pool-
-growth boundaries (zero dead workers across 36+ iters). Port the same
-heartbeat-from-OS-thread + 600s tolerance + paced respawn pattern.
+What landed: CISWorkerManager (lifecycle), CISResetNeeded exception,
+_orchestrator_full_reset(), retry-on-reset loops in mp_centralized_collect_sync
++ CISBgCollector. Plus latent bug fixes:
+- Parent's CIS pipe FDs were never closed after worker spawn → CIS
+  blocked when buffer filled on dead worker's resp pipe → reset hung
+- L2371 racy reload pattern in CISBgCollector.start
+- cis_server.is_alive() check (V9RLPlayer fallback was hiding CIS death)
 
-Files:
-- `mp_centralized_collect.py:_cis_worker_main` — add liveness thread
-  mirroring `mp_disk_collect.py`'s pattern
-- `mp_centralized_collect.py:_ensure_cis_global` — add a respawn manager
-  similar to `_GLOBAL_MANAGER` in mp_disk
-- `_cis_wait_results_and_aggregate` — detect dead workers via
-  health_check, respawn cleanly, decrement expected count
+Validation (dev pod A100 80GB):
+- Phase 4.3 sustained regression: PASS
+- Test 6a (kill -9 worker mid-iter): PASS — full reset → re-collect
+  → all 4 worker pids changed → CIS pid changed
+- Test 6b (kill -9 CIS subprocess mid-iter): PASS — same path, full
+  reset triggered via cis_server.is_alive() check
 
-Validation: cookbook §5 Test 6a — kill -9 a CIS worker mid-iter,
-verify watchdog respawns, iter completes, subsequent iters normal.
-
-**STEP 2b: CIS subprocess respawn** (~half day, easy to underestimate)
-If the CIS subprocess itself dies (CUDA OOM, segfault, signal kill,
-unhandled exception escapes service loop), all workers' recv_loops
-hit EOF, all in-flight requests fail, current iter dies, NO RECOVERY
-mechanism exists. For a 5-7 day Phase 2 run, this WILL happen.
-
-When CIS dies, parent's `_ctrl_handle.reload()` also fails. Workers'
-`CISInferenceBatcher.submit` raises. Workers report errors to
-orchestrator but there's no path to re-spawn CIS + reload all slots
-+ retry the iter.
-
-Implementation: at CISServer level, watchdog the subprocess. On death:
-1. Workers must pause (signal them via `worker_ctrl_pipes`)
-2. Re-spawn CIS subprocess (re-create pipe pairs, re-spawn `_cis_main_multi`)
-3. Re-load all K+1 model slots from `current_slot_paths`
-4. Re-build CISClientHandle for each worker (new pipe pairs)
-5. Workers resume with new handle references
-6. Retry the iter (don't lose collect progress if possible — checkpoint
-   trajectories on disk per-worker, similar to mp_disk_collect)
-
-Files:
-- `mp_centralized_collect.py:CISServer` — watchdog method polling
-  `self._proc.is_alive()`, respawn logic
-- `mp_centralized_collect.py:_cis_wait_results_and_aggregate` — detect
-  CIS death (all workers reporting BrokenPipeError simultaneously),
-  trigger CISServer respawn, re-issue collect_iter to workers
-- New CISClientHandle method to swap pipe references (or re-construct)
-
-Validation: cookbook §5 Test 6b — kill -9 the CIS subprocess mid-iter,
-verify CISServer respawns it + all slots reload + workers continue +
-iter completes. Run against the same prod-scale config.
-
-**Combined Phase 4.6 acceptance gates**:
-- Test 6a worker respawn: kill -9 worker mid-iter → respawn → iter completes
-- Test 6b CIS respawn: kill -9 CIS mid-iter → respawn → all slots reload → iter completes
-- All Phase 1/2/3/4.3/4.4/4.5 regressions still PASS bit-exact
-- Sustained 5-iter smoke with 1 random worker kill + 1 random CIS kill
-  during the run: completes within ~10% of baseline wall-time
+See `memory/project_cis_4_6_design.md` for full design + gotchas.
+Per-worker traj checkpointing was REJECTED (not deferred) per Q3 cost
+analysis — see `memory/feedback_phase46_traj_checkpoint_rejected.md`.
 
 **STEP 3: Tier 3 transition-level minibatching** (~1.5-2 weeks dev + 20-iter cloud A/B validation)
 Rationale: this is THE remaining big lever. PPO update phase is currently
@@ -665,18 +667,50 @@ fixed `(B, L_max)` shape gives compile what it needs. Standalone
 train_step compile on the current per-turn variable-shape path would
 fight against shape changes — net loss likely.
 
-**STEP 5: Phase 2 launch with full speed stack** (~5-7 days, ~$200-300)
-After STEPs 2-4 land + parallel ops items (STEP 6+7), launch Phase 2:
+**STEP 5: Phase 2 launch with full speed stack + training-distribution fixes** (~5-7 days, ~$200-300)
+
+After STEPs 2-4 land + parallel ops items (STEP 6+7+8), launch Phase 2:
 `--cis --pipeline --bf16` + Phase 4.4 async-dispatch + 4.5 ctrl-pipe
-+ Tier 3 + train_step compile. **Init from Phase 1 v3's final.pt** (or
-last clean snapshot if final.pt isn't generated). Phase 1 v3 is already
-post-D1+D2 arch with `gen_embed.weight` baked in (initialized at zero,
-never updated since gen_embed contributes a zero vector for the gen-9-only
-training distribution — equivalent to "no gen info", which is what BC v10
-was trained on). BC v11 retrain is NOT needed for Phase 2 since we stay
-gen-9-only; it's only needed when we start multi-gen training (D4-D6).
++ 4.6 reset recovery + Tier 3 + train_step compile. Init from Phase 1
+v3's final.pt (or last clean snapshot if final.pt not generated).
+
+**CRITICAL Phase 2 design changes from Phase 1 v3** — see
+`docs/PHASE1_V3_OBSERVATIONS.md` for full reasoning. Strict order:
+infra optimizations FIRST, then Phase 2 launches with ALL of these:
+
+1. **Team distribution mix** (STEP 8 below sources the teams):
+   - 50-70% procedural teams (current `pokemon_usage/2024-04`) — keeps
+     Pokemon-fundamentals breadth + slot-permutation invariance
+   - 30-50% NEW: 100-150 real elite-player teams (separate pool, NOT the
+     16 mm-competitive eval teams — those stay isolated for eval ONLY,
+     no data leakage)
+   - Per-battle random pick, both sides independently sample
+2. **Perm/canonical eval consistency**: enable perm at eval (one-line
+   config) OR document why we keep canonical-at-eval. S50 measured
+   ~+7pp recovery from this fix.
+3. **External opponents in PFSP pool**: mcts-fast (in-process) +
+   Kakuna/SmallRL/Minikazam (after STEP 6 wires the H2H gauntlet).
+   Breaks the self-play attractor that S50 + Phase 1 v3 both hit.
+4. **lr scheduling** (optional but recommended): cosine decay 1e-5→1e-6
+   over 200 iters, OR step decay. After Tier 3 lands, MUST re-ablate
+   lr (4-point: 5e-6, 1e-5, 2e-5, 5e-5) — Tier 3 changes effective
+   batch size, may justify higher lr per linear scaling rule.
+5. **Absolute early-stop threshold**: `smart_avg < init_baseline - 10pt
+   → stop immediately`. Catches drift sooner than relative-to-best.
+6. **bf16** (`--bf16` flag) — autocast on PPO update path is in code
+   (S52 commit `fb2127a3`); just needs the flag at relaunch.
+
+Phase 1 v3 is already post-D1+D2 arch with `gen_embed.weight` baked in
+(initialized at zero, never updated since gen_embed contributes a zero
+vector for the gen-9-only training distribution — equivalent to "no gen
+info", which is what BC v10 was trained on). BC v11 retrain is NOT
+needed for Phase 2 since we stay gen-9-only.
+
 Target wall-time: ~10-15 min/iter (vs current 55 min). Target cost:
-$200-300 for 200 iters (vs current $275).
+$200-300 for 200 iters. Target smart_avg trajectory: hold ≥65% across
+iter 19/29/39 evals (significant improvement over Phase 1 v3's
+69→60→53). The team mix + external opps + perm fix should recover
+most of the -16pp drop at iter 39 we saw in Phase 1 v3.
 
 ## OPS TRACK — parallel side work, $0 GPU, hours not days
 
@@ -706,6 +740,38 @@ ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
 If Container Disk: don't pause/stop the prod pod (current Phase 1 v3 is
 fine — continuous run, no pause planned). Plan Phase 2 launch with a new
 pod that has Network Volume from spawn.
+
+**STEP 8: Source 100-150 real elite teams for Phase 2 training mix** (~3-6 hrs, $0)
+Per `docs/PHASE1_V3_OBSERVATIONS.md` §2 — the team-distribution shift
+is one of two unfixed S50 postmortem causes contributing to the iter 39
+smart_avg drop (-15-20pp estimated). For Phase 2, augment the training
+team pool with 100-150 real competitive teams from real strong players.
+
+**Hard constraint — eval set isolation**: the existing 16
+metamon-competitive teams (`metamon_cache/teams/competitive/gen9ou/`)
+MUST NEVER enter the training pool. They are eval-only. Mixing them in
+would be data leakage — the model would memorize them, eval inflates
+artificially, eval signal lost. The 100-150 elite teams below must be
+SEPARATE from these 16.
+
+**Sources** (copy verbatim — don't generate, don't estimate, don't
+synthesize):
+- Smogon team archive (https://www.smogon.com/teams/) — gen 9 OU teams
+  from RMTs and tournament reports
+- Showdown ladder replay scraping — top-100 ladder players, gen 9 OU,
+  last 30 days. Each replay has both teams in the metadata
+- /r/stunfisk OU sample teams threads
+- Recent OST / OLT tournament team posts
+- Smogon VR (Viability Rankings) sample teams
+
+Quality bar: every team must be one a top-100 OU ladder player ACTUALLY
+USED, not a hypothetical "good team" composition. 100-150 teams gives
+roughly tournament-level diversity coverage.
+
+**Output**: pickled team list in `metamon_cache/teams/elite_training/gen9ou/`
+or similar, loadable as a poke-env Teambuilder. The Phase 2 self-play
+config picks per-battle: 50-70% procedural / 30-50% from this pool.
+Both sides sample independently.
 
 ## DEFER — multi-gen-SPECIFIC, only when multi-gen is the next move
 
