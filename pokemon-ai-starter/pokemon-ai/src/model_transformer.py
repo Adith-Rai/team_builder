@@ -1700,7 +1700,22 @@ class TemporalTransformer(nn.Module):
         self,
         summaries: torch.Tensor,          # (B, T, d_temporal)
         seq_lens: Optional[torch.Tensor] = None,
+        return_all_positions: bool = False,
     ) -> torch.Tensor:
+        """Causal-masked self-attention over per-turn summaries.
+
+        Default (return_all_positions=False): returns (B, d_temporal) — only
+        the last valid timestep per batch item. This is the inference + per-t
+        BC training path.
+
+        Tier 3 (return_all_positions=True): returns (B, T, d_temporal) — full
+        sequence. Used by TransformerBattlePolicy.forward_ppo_sequence to
+        compute logits at all valid (b, t) positions in one batched forward,
+        replacing the per-t temporal loop in forward_sequence/PPO update.
+        Causal mask + padding_mask ensure each position only attends to its
+        own valid past — output at (b, t) for t < seq_lens[b] is bit-exact
+        equivalent to running the temporal forward on summaries[b:b+1, :t+1]
+        independently."""
         B, T, D = summaries.shape
         device = summaries.device
 
@@ -1726,6 +1741,9 @@ class TemporalTransformer(nn.Module):
             )
         else:
             x = self.transformer(x, mask=causal_mask, src_key_padding_mask=padding_mask)
+
+        if return_all_positions:
+            return x  # (B, T, D) — Tier 3 sequence-batched path
 
         # Last valid timestep per batch item.
         if seq_lens is not None:
@@ -2241,6 +2259,143 @@ class TransformerBattlePolicy(nn.Module):
             out_logits [valid_mask_t, t] = logits .to(out_logits.dtype)
             out_vlogits[valid_mask_t, t] = v_logits.to(out_vlogits.dtype)
             out_value  [valid_mask_t, t] = val    .to(out_value.dtype)
+
+        return {
+            "action_logits": out_logits,
+            "value":         out_value,
+            "v_logits":      out_vlogits,
+        }
+
+    def forward_ppo_sequence(self, collated: dict, device: torch.device) -> Dict[str, torch.Tensor]:
+        """Tier 3 (Phase 4.7+, S55) C2: fully sequence-batched forward for
+        PPO update. Replaces the per-t temporal loop in forward_sequence
+        with a single causal-masked temporal forward over (B, L_max, D).
+
+        Input schema: dict from `ppo.collate_episodes()`:
+            collated["feat_batches"]: nested dict of (B, L_max, ...) tensors
+                — same key structure as `features.build_turn_batch` output
+            collated["pad_mask"]:     (B, L_max) bool — True at valid positions
+            collated["seq_lens"]:     (B,) long — actual T per episode
+            collated["B"], collated["L_max"]: scalars
+
+        Output schema (same as forward_sequence):
+            action_logits: (B, L_max, n_actions)  — -100.0 at padding
+            value:         (B, L_max)             — 0.0 at padding
+            v_logits:      (B, L_max, v_bins)     — 0.0 at padding
+
+        Equivalence guarantee: at every valid (b, t) position (where
+        t < seq_lens[b]), outputs are bit-equivalent (within fp32) to
+        running forward_sequence on the same data. Padding positions are
+        fillers and NOT meaningful — caller must apply pad_mask in the
+        loss to avoid gradient through them (see C3).
+
+        Why this is faster than forward_sequence (per-t loop):
+          - 1 temporal forward of (B, L_max, D) instead of L_max forwards
+            of (n_valid_t, t+1, D)
+          - Single GPU kernel launch for the temporal stack vs L_max launches
+          - Eliminates Python-level for-loop overhead
+          - Heads computed in one mega-batched call at all valid positions
+        Total Tier 3 speedup (4-10× update phase) comes from this PLUS C4's
+        switch to per-iter PPO loop using collated batches; C2 alone is the
+        forward-pass component."""
+        cfg = self.cfg
+        B = collated["B"]
+        L_max = collated["L_max"]
+        seq_lens = collated["seq_lens"].to(device)
+        pad_mask = collated["pad_mask"].to(device)  # (B, L_max) bool
+
+        # Phase 1: extract valid (b, t) indices.
+        # pad_mask is True at valid positions; .nonzero gives (n_valid, 2)
+        # which we split into b_idx (n_valid,) and t_idx (n_valid,).
+        b_idx, t_idx = pad_mask.nonzero(as_tuple=True)
+        n_valid = int(b_idx.shape[0])
+
+        if n_valid == 0:
+            # Edge case: empty batch (all-padded). Return zero outputs.
+            n_actions = cfg.format_config.n_actions
+            return {
+                "action_logits": torch.full((B, L_max, n_actions), -100.0,
+                                             device=device),
+                "value":         torch.zeros(B, L_max, device=device),
+                "v_logits":      torch.zeros(B, L_max, cfg.v_bins, device=device),
+            }
+
+        # Phase 2: build mega_batch by gathering feat_batches at valid positions.
+        # collated["feat_batches"] is a nested dict; recurse to gather.
+        def _gather_recursive(d: dict) -> dict:
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor):
+                    out[k] = v.to(device)[b_idx, t_idx]  # (n_valid, ...)
+                elif isinstance(v, dict):
+                    out[k] = _gather_recursive(v)
+                else:
+                    out[k] = v
+            return out
+        mega_batch = _gather_recursive(collated["feat_batches"])
+
+        # Phase 3: mega-batch spatial pass (same as forward_sequence Phase 1).
+        spatial_out, all_summaries = self.forward_spatial(mega_batch)
+        n_tokens = spatial_out.shape[1]
+
+        # Phase 4: action context (mega-batch). Mirrors forward_sequence.
+        our_full_ids = self.tokenizer._fix_ids(mega_batch, "our")  # (n_valid, 6, 7)
+        action_ctx = self._per_action_context(
+            spatial_out=spatial_out,
+            our_pokemon_move_ids=our_full_ids[..., 3:7],
+            active_move_ids=mega_batch["active_move_ids"],
+            switch_ids=mega_batch["switch_ids"],
+            our_pokemon_species_ids=our_full_ids[..., 0],
+            switch_cont=mega_batch["switch_cont"],
+        )
+
+        # Phase 5: scatter all_summaries back into (B, L_max, d_temporal) grid
+        # for the batched temporal forward. Padding positions stay zero
+        # (they're masked out by padding_mask in temporal attention).
+        d_temporal = cfg.d_temporal
+        summary_grid = torch.zeros(B, L_max, d_temporal, device=device,
+                                    dtype=all_summaries.dtype)
+        summary_grid[b_idx, t_idx] = all_summaries
+
+        # Phase 6: SINGLE causal-masked temporal forward over (B, L_max, D).
+        # This is the C2 efficiency win — replaces the per-t loop in
+        # forward_sequence. return_all_positions=True returns the full
+        # (B, L_max, D) sequence; causal mask ensures position t only sees
+        # 0..t (so output at (b, t) is equivalent to running temporal on
+        # summary_grid[b:b+1, :t+1] independently).
+        temporal_ctx_grid = self.temporal(
+            summary_grid, seq_lens, return_all_positions=True
+        )  # (B, L_max, d_temporal)
+
+        # Phase 7: gather temporal_ctx at valid positions for head computation.
+        temporal_ctx_valid = temporal_ctx_grid[b_idx, t_idx]  # (n_valid, D)
+
+        # Heads at all valid positions in one call each. spatial_out from
+        # mega-batch is already at valid positions: (n_valid, n_tokens, d_model).
+        actor_out  = spatial_out[:, 0, :]   # (n_valid, d_model)
+        critic_out = spatial_out[:, 1, :]   # (n_valid, d_model)
+        legal_valid = mega_batch["legal_mask"]  # (n_valid, n_actions)
+
+        logits_valid = self.action_head(
+            actor_out, temporal_ctx_valid, action_ctx, legal_mask=legal_valid
+        )  # (n_valid, n_actions)
+        v_logits_valid, value_valid = self.value_head(
+            critic_out, temporal_ctx_valid
+        )  # (n_valid, v_bins), (n_valid,)
+
+        # Phase 8: scatter back to (B, L_max, ...) output grids. Padding
+        # positions get fillers (-100.0 for logits, 0 for value/v_logits).
+        n_actions = cfg.format_config.n_actions
+        out_logits  = torch.full((B, L_max, n_actions), -100.0,
+                                  device=device, dtype=logits_valid.dtype)
+        out_vlogits = torch.zeros(B, L_max, cfg.v_bins,
+                                   device=device, dtype=v_logits_valid.dtype)
+        out_value   = torch.zeros(B, L_max,
+                                   device=device, dtype=value_valid.dtype)
+
+        out_logits [b_idx, t_idx] = logits_valid
+        out_vlogits[b_idx, t_idx] = v_logits_valid
+        out_value  [b_idx, t_idx] = value_valid
 
         return {
             "action_logits": out_logits,
