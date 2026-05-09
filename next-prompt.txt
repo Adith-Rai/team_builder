@@ -1,6 +1,23 @@
 pre prompt :
 
-Read `next-prompt.txt` top to bottom — it's the Session 55 boot doc. The "if you read nothing else" list at the top names EIGHT required-reading items in order — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
+⚠️ **READ FIRST, EVERY SESSION (set up by user S55, project-eternal layer)**:
+
+The user has explicitly set up a standing-order architecture so future sessions inherit FULL context without them repeating anything. Apply on every decision. Your auto-loaded `MEMORY.md` (`~/.claude/projects/.../memory/MEMORY.md`) at session start lists the mandatory reads. Specifically:
+
+1. **`memory/project_session_boot_protocol.md`** (also mirrored at `docs/SESSION_BOOT_PROTOCOL.md` for git-visible reference) — STANDING ORDERS. Philosophy + sequencing + DO/DO NOT (with WHY for each) + locked decisions table + plan trajectory. Read this BEFORE everything else. The user will NOT repeat this — internalize it on every session load.
+2. `memory/feedback_engineering_standard.md` — quality standard
+3. `memory/feedback_ask_when_uncertain.md` — when to ask vs guess
+4. `memory/project_strategic_frame.md` — locked sequencing
+5. `memory/project_cis_4_6_design.md` — most recent shipped infra
+6. THIS FILE (`next-prompt.txt`) — session-specific deep state
+7. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design implications + iter 39/49 EVAL diagnosis
+8. **First action**: production status check (next-prompt §E)
+
+If files conflict, surface — don't silently reconcile. Apply philosophy + sequencing rules from boot protocol on every decision. Don't half-ass. Don't shortcut. Don't pivot to deferred items.
+
+---
+
+Then continue with this session-specific boot doc. The "if you read nothing else" list below names EIGHT required-reading items — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
 
 Then load `memory/project_strategic_frame.md` — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive. Frame is locked.
 
