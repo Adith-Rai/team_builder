@@ -344,6 +344,142 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
 
 
 # =============================
+# Tier 3 C3 (Phase 4.7+, S55): masked PPO loss for sequence-batched update
+# =============================
+#
+# C3: compute PPO loss components over a (B, L_max) batched forward output
+# with pad_mask weighting. Replaces the per-episode loss math in
+# `ppo_update`'s inner loop. Used by C4's switch-to-batched-update.
+#
+# Aggregation choice — IMPORTANT: per-transition mean (sum / pad_mask.sum())
+# rather than per-episode mean (mean of per-episode means). This is the
+# Metamon / standard-PPO aggregation and is what produces the 4-10× speedup
+# in C4 (one optimizer step per WHOLE batch rather than one per episode).
+#
+# Equivalence with current per-episode loss path is EXACT only when B=1
+# (single episode); for B>1 with variable T_i, batched per-transition mean
+# weights longer episodes more (each transition equal), while current
+# per-episode-mean weights each episode equally. The C3 unit test verifies
+# B=1 equivalence; the multi-episode case is a deliberate semantic shift
+# that ships in C4 + validated end-to-end in C6 vs Phase 1 v3 baseline.
+
+def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
+                     ent_coef: float = 0.02, vf_coef: float = 0.5,
+                     clip_eps: float = 0.2,
+                     normalize_advantages: bool = False) -> dict:
+    """Compute PPO loss components over a sequence-batched forward output
+    with pad_mask weighting.
+
+    Args:
+      collated: output of `ppo.collate_episodes()`. Reads:
+        actions       (B, L_max) long
+        old_logp      (B, L_max) float
+        advantages    (B, L_max) float
+        returns       (B, L_max) float
+        pad_mask      (B, L_max) bool — True at valid positions
+      forward_out: output of `model.forward_ppo_sequence()`. Reads:
+        action_logits (B, L_max, n_actions) — -100.0 at padding
+        v_logits      (B, L_max, v_bins)    — 0.0 at padding
+        (value not used; we recompute from v_logits via twohot_target inverse
+        only if needed for diagnostics — not used in loss)
+      model: TransformerBattlePolicy — needed for `model.twohot_target()`
+        (distributional value targets)
+      cfg: model config — reads cfg.v_min, cfg.v_max for return clamping
+      ent_coef, vf_coef, clip_eps: PPO hyperparameters
+      normalize_advantages: if True, advantages are normalized in-place over
+        valid positions (zero-mean, unit-std). If False, assume caller
+        already normalized in build_ppo_episodes (current production path).
+
+    Returns:
+      dict with:
+        total_loss:      scalar tensor — pi - ent_coef*ent + vf_coef*v
+        pi_loss:         scalar tensor — policy clip loss
+        entropy:         scalar tensor — mean entropy across valid positions
+        v_loss:          scalar tensor — distributional value CE
+        approx_kl:       scalar (Python float) — old_logp vs new_logp diff
+        ratio_clip_frac: scalar (Python float) — fraction of ratios outside [1-clip, 1+clip]
+        n_valid:         int — number of valid (b, t) positions in batch
+
+    Aggregation: ALL losses use per-transition mean over valid positions:
+      loss = (per_pos_loss * pad_mask).sum() / pad_mask.sum().clamp(min=1)
+    """
+    pad_mask = collated["pad_mask"]                 # (B, L_max) bool
+    actions = collated["actions"]                   # (B, L_max) long
+    old_logp = collated["old_logp"]                 # (B, L_max) float
+    advantages = collated["advantages"]             # (B, L_max) float
+    returns = collated["returns"]                   # (B, L_max) float
+
+    logits_all = forward_out["action_logits"]       # (B, L_max, n_actions)
+    vlogits_all = forward_out["v_logits"]           # (B, L_max, v_bins)
+
+    # Match dtypes/devices of forward outputs (autocast paths may produce bf16/fp16)
+    device = logits_all.device
+    pad_mask_f = pad_mask.to(device).float()        # (B, L_max) for arithmetic
+    n_valid = pad_mask_f.sum().clamp(min=1.0)       # scalar tensor, ≥1 to avoid div-zero
+    actions = actions.to(device)
+    old_logp = old_logp.to(device).float()
+    advantages = advantages.to(device).float()
+    returns = returns.to(device).float()
+
+    # Optional per-batch advantage normalization over valid positions.
+    if normalize_advantages:
+        adv_mean = (advantages * pad_mask_f).sum() / n_valid
+        adv_var = ((advantages - adv_mean).pow(2) * pad_mask_f).sum() / n_valid
+        adv_std = adv_var.clamp(min=1e-8).sqrt()
+        advantages = (advantages - adv_mean) / adv_std
+        # Zero out padding positions explicitly (they had value 0; after norm
+        # they'd be -mean/std). Keep them zero so they don't contribute to loss.
+        advantages = advantages * pad_mask_f
+
+    # Policy: log_softmax → per-position log-prob of the chosen action.
+    lp = F.log_softmax(logits_all.float(), dim=-1)  # (B, L_max, n_actions)
+    new_logp = lp.gather(2, actions.unsqueeze(-1)).squeeze(-1)  # (B, L_max)
+
+    ratio = torch.exp(new_logp - old_logp)          # (B, L_max)
+
+    # Track ratio-clip fraction at valid positions (Exp 4-style instability signal).
+    with torch.no_grad():
+        clipped_per_pos = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float()
+        ratio_clip_frac = ((clipped_per_pos * pad_mask_f).sum() / n_valid).item()
+
+    s1 = ratio * advantages                         # (B, L_max)
+    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+    pi_loss_per_pos = -torch.min(s1, s2)            # (B, L_max)
+    pi_loss = (pi_loss_per_pos * pad_mask_f).sum() / n_valid
+
+    # Entropy — per-position then masked-mean
+    probs = F.softmax(logits_all.float(), dim=-1)   # (B, L_max, n_actions)
+    entropy_per_pos = -(probs * lp).sum(-1)         # (B, L_max)
+    entropy = (entropy_per_pos * pad_mask_f).sum() / n_valid
+
+    # Value loss — distributional two-hot CE with per-step return clamping
+    ret_c = returns.clamp(cfg.v_min, cfg.v_max)
+    # twohot_target expects (N,) → returns (N, v_bins). We flatten then reshape.
+    B_dim, L_max_dim = ret_c.shape
+    vtgt_flat = model.twohot_target(ret_c.reshape(-1))  # (B*L_max, v_bins)
+    vtgt = vtgt_flat.reshape(B_dim, L_max_dim, -1).float()
+    v_loss_per_pos = -(vtgt * F.log_softmax(vlogits_all.float(), dim=-1)).sum(-1)  # (B, L_max)
+    v_loss = (v_loss_per_pos * pad_mask_f).sum() / n_valid
+
+    # Approximate KL — masked mean over valid positions
+    with torch.no_grad():
+        kl_per_pos = (old_logp - new_logp)          # (B, L_max)
+        approx_kl = ((kl_per_pos * pad_mask_f).sum() / n_valid).item()
+
+    total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
+
+    return {
+        "total_loss":      total_loss,
+        "pi_loss":         pi_loss,
+        "entropy":         entropy,
+        "v_loss":          v_loss,
+        "approx_kl":       approx_kl,
+        "ratio_clip_frac": ratio_clip_frac,
+        "n_valid":         int(n_valid.item()),
+    }
+
+
+# =============================
 # PPO Update (batched spatial, sequential temporal)
 # =============================
 
