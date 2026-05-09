@@ -1157,6 +1157,103 @@ class CISClientHandle:
             f"CIS handle (worker {self.worker_idx}) shutting down"))
 
 
+class CISWorkerManager:
+    """Phase 4.6 (S54): lifecycle manager for CIS worker procs.
+
+    Owns spawn/health_check/kill_all. Does NOT do per-worker respawn —
+    the unified Option B recovery path is full CIS+workers reset on any
+    detected failure, handled by `_orchestrator_full_reset` at module
+    level. See `_cis_wait_results_and_aggregate` for detection.
+
+    HEARTBEAT_TIMEOUT_S=600.0 matches mp_disk WorkerManager — same
+    iter-17-class hang RCA applies (heartbeat starvation when blocking
+    torch.load races the asyncio loop)."""
+
+    HEARTBEAT_TIMEOUT_S = 600.0
+
+    def __init__(self, n_workers: int, ctx):
+        self.n = n_workers
+        self.ctx = ctx
+        self.workers: Dict[int, Any] = {}
+        # Parent-side ends of worker<->parent ctrl/result pipes.
+        self.ctrl_pipes: Dict[int, Any] = {}     # parent writes -> worker reads
+        self.result_pipes: Dict[int, Any] = {}   # parent reads <- worker writes
+        # Health tracking.
+        self.last_heartbeat: Dict[int, float] = {}
+
+    def _spawn_proc(self, worker_id: int, cis_req_writer, cis_resp_reader):
+        """Spawn one worker proc: creates ctrl/result pipes (parent<->worker),
+        spawns the proc with the supplied CIS pipe ends, closes child-side
+        ends in parent. Populates manager dicts."""
+        ctrl_r, ctrl_w = self.ctx.Pipe(duplex=False)
+        res_r, res_w = self.ctx.Pipe(duplex=False)
+        proc = self.ctx.Process(
+            target=_cis_worker_main,
+            args=(worker_id, ctrl_r, res_w, cis_req_writer, cis_resp_reader),
+            daemon=False,
+        )
+        proc.start()
+        # Close child-side ends in parent (held only by worker after spawn).
+        ctrl_r.close()
+        res_w.close()
+        self.workers[worker_id] = proc
+        self.ctrl_pipes[worker_id] = ctrl_w
+        self.result_pipes[worker_id] = res_r
+        self.last_heartbeat[worker_id] = time.time()
+
+    def initial_spawn(self, worker_id: int, cis_req_writer, cis_resp_reader,
+                       pace_s: float = 0.5):
+        """First-time spawn during _ensure_cis_global. Uses the CIS pipe
+        ends pre-allocated by CISServer.spawn() (parent's view of the
+        per-worker pipe pairs). Pacing matches mp_disk SemLock-race
+        mitigation."""
+        self._spawn_proc(worker_id, cis_req_writer, cis_resp_reader)
+        if pace_s > 0:
+            time.sleep(pace_s)
+
+    def health_check(self) -> List[Tuple[int, str]]:
+        """Returns [(worker_id, reason), ...] for any unhealthy worker.
+        Caller (orchestrator) treats any non-empty result as a trigger
+        for full reset — no per-worker respawn."""
+        unhealthy = []
+        now = time.time()
+        for wid, p in self.workers.items():
+            if not p.is_alive():
+                unhealthy.append((wid, "dead"))
+            elif now - self.last_heartbeat.get(wid, now) > self.HEARTBEAT_TIMEOUT_S:
+                unhealthy.append((wid, "stale_heartbeat"))
+        return unhealthy
+
+    def alive_worker_ids(self) -> List[int]:
+        return [wid for wid in self.workers
+                if self.workers[wid].is_alive()]
+
+    def kill_all(self):
+        """End-of-run cleanup OR pre-reset cleanup. Sends shutdown cmd,
+        terminates, joins."""
+        for wid, ctrl in list(self.ctrl_pipes.items()):
+            try:
+                ctrl.send({"cmd": "shutdown"})
+            except Exception:
+                pass
+        time.sleep(2.0)
+        for wid, p in list(self.workers.items()):
+            if p.is_alive():
+                p.terminate()
+            p.join(timeout=2.0)
+            if p.is_alive():
+                p.kill()
+        for d in (self.ctrl_pipes, self.result_pipes):
+            for p in d.values():
+                try:
+                    p.close()
+                except Exception:
+                    pass
+        self.workers.clear()
+        self.ctrl_pipes.clear()
+        self.result_pipes.clear()
+
+
 class CISServer:
     """Phase 2 server: spawns one CIS subprocess that multiplexes N worker pipes
     with cross-worker batching. Returns N CISClientHandle objects, one per
@@ -1300,6 +1397,11 @@ class CISServer:
             raise RuntimeError("CIS not spawned (no ctrl handle)")
         return self._ctrl_handle.reload(weights_path, timeout_s=timeout_s,
                                          slot=slot)
+
+    def is_alive(self) -> bool:
+        """Phase 4.6 (S54): used by orchestrator failure-detection path.
+        Returns True only if CIS subprocess is spawned and running."""
+        return self._proc is not None and self._proc.is_alive()
 
     def shutdown(self, timeout_s: float = 5.0) -> None:
         if self._proc is None:
@@ -1926,6 +2028,97 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
 _CIS_GLOBAL: Optional[Dict[str, Any]] = None  # holds CISServer, worker procs, pipes
 
+# Phase 4.6 (S54): track timestamps of full-reset events for cap enforcement.
+# A persistent failure mode that fires reset > MAX_RESETS_IN_WINDOW times in
+# a 5-min sliding window aborts the run rather than spinning indefinitely.
+_RESET_HISTORY: List[float] = []
+_MAX_RESETS_IN_WINDOW = 5
+_RESET_WINDOW_S = 300.0
+
+
+class CISResetNeeded(Exception):
+    """Phase 4.6 (S54): raised by _cis_wait_results_and_aggregate when a
+    failure is detected (worker death, stale heartbeat, pipe EOF, or CIS
+    subprocess death). Caller catches it, runs `_orchestrator_full_reset`,
+    and re-dispatches the iter. Capped via _RESET_HISTORY."""
+    pass
+
+
+def _record_reset_and_check_cap() -> bool:
+    """Append now to _RESET_HISTORY, prune old entries, return True if
+    we're still under the cap (safe to retry) or False if we've reset
+    too often recently (give up)."""
+    now = time.time()
+    _RESET_HISTORY[:] = [t for t in _RESET_HISTORY if t > now - _RESET_WINDOW_S]
+    _RESET_HISTORY.append(now)
+    return len(_RESET_HISTORY) <= _MAX_RESETS_IN_WINDOW
+
+
+def _orchestrator_full_reset(weights_path: str, n_workers: int, device: str,
+                              fp16: bool, amp_dtype_name: Optional[str],
+                              min_batch: int, timeout_ms: int,
+                              max_pool_size: int) -> Dict[str, Any]:
+    """Phase 4.6 (S54) Option B unified recovery: tear down current CIS +
+    workers, spawn fresh, restore opp slot paths from prior `current_slot_paths`.
+
+    Triggered by `CISResetNeeded` from `_cis_wait_results_and_aggregate`.
+    Cost: ~60-90s (CIS spawn + sequential K+1 slot loads + N worker spawns).
+    Expected frequency: <2 events per 200-iter run (mp_disk track record:
+    0 failures in 36+ iters). Returns the new `_CIS_GLOBAL` dict.
+
+    Slot 0 is set to `weights_path` by the fresh CIS spawn; opp slots
+    1..K_max start at the placeholder and are then reloaded with their
+    pre-failure paths so PFSP state survives the reset."""
+    global _CIS_GLOBAL
+
+    # Snapshot current slot paths BEFORE teardown so we can restore them.
+    prior_slot_paths: List[str] = list(weights_path for _ in range(max_pool_size + 1))
+    if _CIS_GLOBAL is not None:
+        prior_slot_paths = list(_CIS_GLOBAL.get("current_slot_paths",
+                                                 prior_slot_paths))
+
+    # Tear down old CIS + workers. Order: workers first (they need pipes
+    # to CIS that we're about to close), then CIS subprocess.
+    if _CIS_GLOBAL is not None:
+        old_g = _CIS_GLOBAL
+        _CIS_GLOBAL = None
+        try:
+            old_g["manager"].kill_all()
+        except Exception as e:
+            print(f"[cis-reset] WARN manager.kill_all: {e}", flush=True)
+        try:
+            old_g["server"].shutdown()
+        except Exception as e:
+            print(f"[cis-reset] WARN server.shutdown: {e}", flush=True)
+
+    # Spawn fresh CIS + workers. _ensure_cis_global will set _CIS_GLOBAL.
+    new_g = _ensure_cis_global(
+        weights_path=weights_path, n_workers=n_workers,
+        device=device, fp16=fp16, amp_dtype_name=amp_dtype_name,
+        min_batch=min_batch, timeout_ms=timeout_ms,
+        max_pool_size=max_pool_size,
+    )
+
+    # Restore opp slot paths. Slot 0 already correct (player weights). For
+    # slots 1..K, only reload if the prior path differs from the
+    # placeholder (which is `weights_path` for fresh-spawn slots).
+    n_restored = 0
+    for slot_idx in range(1, len(prior_slot_paths)):
+        prior = prior_slot_paths[slot_idx]
+        if prior == weights_path:
+            continue  # placeholder, no opp was loaded here
+        try:
+            new_g["server"].reload_weights(prior, slot=slot_idx,
+                                            timeout_s=60.0)
+            new_g["current_slot_paths"][slot_idx] = prior
+            n_restored += 1
+        except Exception as e:
+            print(f"[cis-reset] WARN slot {slot_idx} restore "
+                  f"({prior}): {e}", flush=True)
+    print(f"[cis-reset] full reset complete; restored {n_restored} opp "
+          f"slot(s) from prior state", flush=True)
+    return new_g
+
 
 def shutdown_cis_workers() -> None:
     """End-of-run cleanup. Safe to call repeatedly."""
@@ -1936,18 +2129,9 @@ def shutdown_cis_workers() -> None:
     _CIS_GLOBAL = None
 
     # Shutdown workers first (they need pipes to CIS that we're about to close).
-    for wid, proc in g.get("workers", {}).items():
-        try:
-            g["worker_ctrl_pipes"][wid].send({"cmd": "shutdown"})
-        except Exception:
-            pass
-    time.sleep(2.0)
-    for wid, proc in g.get("workers", {}).items():
-        if proc.is_alive():
-            proc.terminate()
-        proc.join(timeout=2.0)
-        if proc.is_alive():
-            proc.kill()
+    manager = g.get("manager")
+    if manager is not None:
+        manager.kill_all()
 
     # Then shutdown CIS server.
     if g.get("server") is not None:
@@ -1955,14 +2139,6 @@ def shutdown_cis_workers() -> None:
             g["server"].shutdown()
         except Exception:
             pass
-
-    # Close any leftover pipe parent ends.
-    for d in [g.get("worker_ctrl_pipes", {}), g.get("worker_result_pipes", {})]:
-        for p in d.values():
-            try:
-                p.close()
-            except Exception:
-                pass
 
 
 def _ensure_cis_global(weights_path: str, n_workers: int, device: str,
@@ -1994,69 +2170,46 @@ def _ensure_cis_global(weights_path: str, n_workers: int, device: str,
     print(f"[cis-orch] CIS server spawned with {n_slots} slots "
           f"(player + {max_pool_size} opp slots)", flush=True)
 
-    # 2. Spawn N worker procs, each gets ONE handle's pipe ends.
-    # The handle's req_writer (parent->worker side) and resp_reader belong
-    # to MAIN. The worker needs the OTHER side of each pipe... wait, no.
-    # The handle was created so that MAIN talks to CIS via these. For a
-    # WORKER process to talk to CIS, it needs ITS OWN pair of pipes that
-    # connect to CIS. CISServer.spawn already created N pairs - one per
-    # worker. handles[i] gives main access to pipe pair i. But the WORKER
-    # process should OWN those pipe ends instead of main.
+    # 2. Spawn N worker procs via CISWorkerManager (Phase 4.6, S54).
+    # Each worker inherits its assigned CIS pipe pair from cis_handles[wid]
+    # via Process(args=...) FD inheritance.
     #
-    # The pattern: main creates pipes, hands them to BOTH the CIS process
-    # AND the worker. Worker keeps the parent ends; CIS got the child ends.
-    # In _ensure_cis_global, we currently have main holding the parent
-    # ends (via cis_handles[i].req_writer/resp_reader). To migrate, we'd
-    # need to pickle the pipe ends and pass them to spawn'd workers.
-    #
-    # mp.Pipe ends ARE picklable (they're just file descriptors). So we
-    # can pass them as args to the worker proc.
-
-    workers: Dict[int, Any] = {}
-    worker_ctrl_writers: Dict[int, Any] = {}  # main -> worker ctrl direction
-    worker_result_readers: Dict[int, Any] = {}  # worker -> main result direction
-
+    # CRITICAL (Phase 4.6 latent-bug fix): after the worker proc is spawned,
+    # we MUST close the parent's copies of the CIS pipe FDs. Spawn context
+    # gives the child SEPARATE FDs via reduction; the parent's copies are
+    # redundant. If we leave them open, then when a worker dies, the pipe
+    # inode still has parent's reader FD open → CIS's writes to the dead
+    # worker's resp pipe never raise BrokenPipeError → CIS blocks once its
+    # buffer fills → CISServer.shutdown() hangs → orchestrator reset hangs.
+    # The pre-S54 comment at this site claimed "main can drop its references"
+    # but never actually did; this surfaced under Option B's full-reset path.
+    manager = CISWorkerManager(n_workers=n_workers, ctx=ctx)
     for wid in range(n_workers):
-        # Worker's main-talks-to-it ctrl pipe
-        ctrl_r, ctrl_w = ctx.Pipe(duplex=False)
-        # Worker's it-talks-to-main result pipe
-        res_r, res_w = ctx.Pipe(duplex=False)
-
-        # The worker also gets THE CIS-bound pipes from the handle.
-        # These were originally main-side; transfer them to the worker.
         cis_handle_for_worker = cis_handles[wid]
-        cis_req_writer = cis_handle_for_worker.req_writer
-        cis_resp_reader = cis_handle_for_worker.resp_reader
-
-        proc = ctx.Process(
-            target=_cis_worker_main,
-            args=(wid, ctrl_r, res_w, cis_req_writer, cis_resp_reader),
-            daemon=False,
+        manager.initial_spawn(
+            worker_id=wid,
+            cis_req_writer=cis_handle_for_worker.req_writer,
+            cis_resp_reader=cis_handle_for_worker.resp_reader,
+            pace_s=0.5,  # SemLock-race mitigation pacing
         )
-        proc.start()
-        # Close child-side ends in parent
-        ctrl_r.close()
-        res_w.close()
-        # The CIS pipe ends are now held by the worker (after fork/spawn
-        # they're inherited); main can drop its references. But CIS handle
-        # still has them in cis_server's _handles. We don't close them
-        # here because the worker uses them.
-
-        workers[wid] = proc
-        worker_ctrl_writers[wid] = ctrl_w
-        worker_result_readers[wid] = res_r
-
-        # Pace the spawns (same SemLock-race mitigation pattern)
-        time.sleep(0.5)
+        # Close parent's redundant copies. The handle's attribute references
+        # still exist; subsequent send/recv on them will raise (caught by
+        # the try/except in CISClientHandle.shutdown).
+        try:
+            cis_handle_for_worker.req_writer.close()
+        except Exception:
+            pass
+        try:
+            cis_handle_for_worker.resp_reader.close()
+        except Exception:
+            pass
 
     time.sleep(2.0)
 
     _CIS_GLOBAL = {
         "server": cis_server,
-        "handles_main_view": cis_handles,  # reference for weight reload
-        "workers": workers,
-        "worker_ctrl_pipes": worker_ctrl_writers,
-        "worker_result_pipes": worker_result_readers,
+        "manager": manager,                # Phase 4.6: lifecycle owner
+        "handles_main_view": cis_handles,  # legacy ref kept for shutdown
         "n_workers": n_workers,
         "max_pool_size": max_pool_size,
         "n_slots": n_slots,
@@ -2112,91 +2265,131 @@ def mp_centralized_collect_sync(
         max_pool_size=max_pool_size,
     )
 
-    # 3. Phase 4.3a slot routing: build pool_slot_map and reload only the
-    # slots whose ckpt path changed since last iter. Slot 0 = player
-    # (always reloaded with this iter's weights). Slots 1..K = pool entries
-    # in stable order; reload only if path differs from current_slot_paths.
-    n_slots = g["n_slots"]
-    cur_paths = g["current_slot_paths"]
-    pool_slot_map: Dict[str, int] = {}
-    for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
-        slot_idx = i + 1  # slots 1..K
-        pool_slot_map[opp_path] = slot_idx
+    # Phase 4.6 (S54) Option B: dispatch + wait + retry-on-reset loop.
+    # On any failure detected by _cis_wait_results_and_aggregate (worker
+    # death, stale heartbeat, pipe EOF, CIS death), we tear down + re-spawn
+    # everything and re-dispatch the iter from zero. Cap retries via
+    # _record_reset_and_check_cap to avoid spinning on persistent failures.
+    MAX_RESET_ATTEMPTS = 2  # initial + 2 retries = 3 total attempts
+    last_reset_reason: Optional[str] = None
+    for attempt in range(MAX_RESET_ATTEMPTS + 1):
+        # 3. Slot routing: reload slot 0 every iter (player weights changed
+        # via PPO update); reload opp slots only if path changed since last
+        # iter. After a reset, _orchestrator_full_reset already restored opp
+        # slot paths, so this becomes mostly no-op on retry.
+        n_slots = g["n_slots"]
+        cur_paths = g["current_slot_paths"]
+        pool_slot_map: Dict[str, int] = {}
+        for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
+            slot_idx = i + 1  # slots 1..K
+            pool_slot_map[opp_path] = slot_idx
 
-    # Reload slot 0 (player) every iter — model state changes after each PPO update.
-    try:
-        g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
-        cur_paths[0] = weights_path
-    except Exception as e:
-        print(f"[cis-orch] WARN slot 0 reload at iter {iter_n}: {e}", flush=True)
-
-    # Reload opp slots whose path changed. Skip slots where the path
-    # matches what's already loaded — saves ~3-5s per slot per iter.
-    n_opp_reloaded = 0
-    for opp_path, slot_idx in pool_slot_map.items():
-        if slot_idx >= n_slots:
-            print(f"[cis-orch] WARN opp slot {slot_idx} exceeds n_slots={n_slots}; "
-                  f"raise --max-pool-size", flush=True)
-            continue
-        if cur_paths[slot_idx] == opp_path:
-            continue  # already loaded
+        # Reload slot 0 (player) every iter — model state changes after each
+        # PPO update.
         try:
-            g["server"].reload_weights(opp_path, slot=slot_idx,
-                                        timeout_s=60.0)
-            cur_paths[slot_idx] = opp_path
-            n_opp_reloaded += 1
+            g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
+            cur_paths[0] = weights_path
         except Exception as e:
-            print(f"[cis-orch] WARN slot {slot_idx} reload "
-                  f"({opp_path}): {e}", flush=True)
-    if n_opp_reloaded:
-        print(f"[cis-orch] iter {iter_n}: reloaded {n_opp_reloaded} opp "
-              f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
+            print(f"[cis-orch] WARN slot 0 reload at iter {iter_n}: {e}",
+                  flush=True)
 
-    # 4. Build opp_pool message + dispatch to workers
-    opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
+        # Reload opp slots whose path changed.
+        n_opp_reloaded = 0
+        for opp_path, slot_idx in pool_slot_map.items():
+            if slot_idx >= n_slots:
+                print(f"[cis-orch] WARN opp slot {slot_idx} exceeds "
+                      f"n_slots={n_slots}; raise --max-pool-size", flush=True)
+                continue
+            if cur_paths[slot_idx] == opp_path:
+                continue  # already loaded
+            try:
+                g["server"].reload_weights(opp_path, slot=slot_idx,
+                                            timeout_s=60.0)
+                cur_paths[slot_idx] = opp_path
+                n_opp_reloaded += 1
+            except Exception as e:
+                print(f"[cis-orch] WARN slot {slot_idx} reload "
+                      f"({opp_path}): {e}", flush=True)
+        if n_opp_reloaded:
+            print(f"[cis-orch] iter {iter_n}: reloaded {n_opp_reloaded} opp "
+                  f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
 
-    n_alive = n_workers  # CIS workers don't have respawn yet (Phase 4.2 work)
-    games_per_worker = n_games // n_alive
-    remainder = n_games % n_alive
+        # 4. Build opp_pool message + dispatch to all alive workers.
+        opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
+        manager = g["manager"]
+        alive_wids = manager.alive_worker_ids()
+        n_alive = len(alive_wids)
+        if n_alive == 0:
+            raise RuntimeError(f"[cis-orch] iter {iter_n}: no alive workers")
+        games_per_worker = n_games // n_alive
+        remainder = n_games % n_alive
 
-    cmds_sent: List[int] = []
-    t_start = time.time()
-    for i, wid in enumerate(range(n_workers)):
-        worker_n = games_per_worker + (1 if i < remainder else 0)
-        srv_idx = i % len(server_pool)
-        srv = server_pool[srv_idx]
-        srv_url = getattr(srv, 'websocket_url', None) or str(srv)
-        cmd = {
-            "cmd": "collect_iter",
-            "iter_n": iter_n,
-            "n_games": worker_n,
-            "max_concurrent": max_concurrent,
-            "server_url": srv_url,
-            "opp_pool": opp_pool_msg,
-            "pool_slot_map": pool_slot_map,
-            "temp_range": list(temp_range),
-            "opp_temp_range": list(temp_range),
-            "fp16": fp16,
-            "rs_cfg": reward_shaper_cfg,
-            "turn_cap": turn_cap,
-            "battle_format": battle_format,
-            "procedural_teams_path": procedural_teams_path,
-            "device": str(device),
-            "opponent_device": opponent_device,
-            "rng_seed": rng_seed,
-            "amp_dtype": amp_dtype,
-        }
-        g["worker_ctrl_pipes"][wid].send(cmd)
-        cmds_sent.append(wid)
-        # Stagger same as mp_disk - reduces I/O burst at iter boundary.
-        if i + 1 < n_workers:
-            time.sleep(0.25)
+        cmds_sent: List[int] = []
+        t_start = time.time()
+        for i, wid in enumerate(alive_wids):
+            worker_n = games_per_worker + (1 if i < remainder else 0)
+            srv_idx = i % len(server_pool)
+            srv = server_pool[srv_idx]
+            srv_url = getattr(srv, 'websocket_url', None) or str(srv)
+            cmd = {
+                "cmd": "collect_iter",
+                "iter_n": iter_n,
+                "n_games": worker_n,
+                "max_concurrent": max_concurrent,
+                "server_url": srv_url,
+                "opp_pool": opp_pool_msg,
+                "pool_slot_map": pool_slot_map,
+                "temp_range": list(temp_range),
+                "opp_temp_range": list(temp_range),
+                "fp16": fp16,
+                "rs_cfg": reward_shaper_cfg,
+                "turn_cap": turn_cap,
+                "battle_format": battle_format,
+                "procedural_teams_path": procedural_teams_path,
+                "device": str(device),
+                "opponent_device": opponent_device,
+                "rng_seed": rng_seed,
+                "amp_dtype": amp_dtype,
+            }
+            manager.ctrl_pipes[wid].send(cmd)
+            cmds_sent.append(wid)
+            # Stagger same as mp_disk - reduces I/O burst at iter boundary.
+            if i + 1 < n_alive:
+                time.sleep(0.25)
 
-    # 5+6. Wait for results + aggregate (factored helper, shared with bg path).
-    return _cis_wait_results_and_aggregate(
-        g=g, cmds_sent=cmds_sent, iter_n=iter_n, n_games=n_games,
-        n_alive=n_alive, n_workers=n_workers, t_start=t_start,
-    )
+        # 5+6. Wait for results + aggregate. Raises CISResetNeeded on
+        # detected failure → caught below → full reset + retry.
+        try:
+            return _cis_wait_results_and_aggregate(
+                g=g, cmds_sent=cmds_sent, iter_n=iter_n, n_games=n_games,
+                n_alive=n_alive, n_workers=n_workers, t_start=t_start,
+            )
+        except CISResetNeeded as e:
+            if attempt >= MAX_RESET_ATTEMPTS:
+                raise RuntimeError(
+                    f"[cis-orch] iter {iter_n}: gave up after "
+                    f"{MAX_RESET_ATTEMPTS + 1} attempts. Last reason: {e}"
+                ) from e
+            if not _record_reset_and_check_cap():
+                raise RuntimeError(
+                    f"[cis-orch] iter {iter_n}: reset cap exceeded "
+                    f"({_MAX_RESETS_IN_WINDOW} resets in last "
+                    f"{_RESET_WINDOW_S:.0f}s) — likely persistent failure "
+                    f"mode. Last reason: {e}"
+                ) from e
+            print(f"[cis-orch] iter {iter_n}: reset attempt "
+                  f"{attempt + 1}/{MAX_RESET_ATTEMPTS + 1}: {e}", flush=True)
+            last_reset_reason = str(e)
+            g = _orchestrator_full_reset(
+                weights_path=weights_path, n_workers=n_workers,
+                device=str(device), fp16=fp16, amp_dtype_name=amp_dtype,
+                min_batch=cis_min_batch, timeout_ms=cis_timeout_ms,
+                max_pool_size=max_pool_size,
+            )
+    # Should be unreachable — final attempt either returned or raised.
+    raise RuntimeError(
+        f"[cis-orch] iter {iter_n}: unreachable retry-loop exit. "
+        f"Last reason: {last_reset_reason}")
 
 
 def _cis_wait_results_and_aggregate(
@@ -2205,38 +2398,85 @@ def _cis_wait_results_and_aggregate(
 ) -> Tuple[List, int, int, int, int, str, float, Dict]:
     """Watchdog loop + trajectory aggregation. Used by both sync orchestrator
     (mp_centralized_collect_sync) and bg orchestrator (CISBgCollector.join).
-    Same return-tuple shape as mp_disk_collect_sync."""
+    Same return-tuple shape as mp_disk_collect_sync.
+
+    Phase 4.6 (S54) Option B: on ANY failure (worker death, stale heartbeat,
+    pipe EOF, CIS subprocess death) we raise `CISResetNeeded`. The caller
+    runs `_orchestrator_full_reset` and re-dispatches the iter from zero.
+    No partial trajectories ever reach the PPO update — binary outcome:
+    iter completes cleanly OR iter is fully re-collected after reset."""
     from multiprocessing.connection import wait as mp_wait
     import gzip as _gzip
     import pickle as _pickle
 
+    manager = g["manager"]
+    cis_server = g["server"]
     expected = len(cmds_sent)
     received = 0
     results: List[dict] = []
     expected_collect_s = max(300.0, n_games / max(n_alive, 1) * 2.0)
     deadline = time.time() + 4.0 * expected_collect_s
 
-    pipes_to_wid = {g["worker_result_pipes"][wid]: wid for wid in cmds_sent}
+    pipes_to_wid = {manager.result_pipes[wid]: wid for wid in cmds_sent}
 
     while received < expected and time.time() < deadline:
+        # Phase 4.6 (S54) Test 6b finding: CIS subprocess can die mid-iter
+        # WITHOUT triggering worker errors — workers' inference submits hit
+        # BrokenPipe but V9RLPlayer falls back to default actions, battles
+        # complete with 0 trajectories, workers report `status: done` with
+        # valid W/L. The wait loop must check CIS aliveness explicitly to
+        # detect this; relying on worker error reports misses it.
+        if not cis_server.is_alive():
+            raise CISResetNeeded(
+                f"iter {iter_n}: cis_subprocess_dead (mid-collect)")
         ready = mp_wait(list(pipes_to_wid.keys()), timeout=10.0)
         if not ready:
+            # No worker reported in 10s — check worker liveness too.
+            # ANY unhealthy condition triggers full reset (Option B).
+            unhealthy = manager.health_check()
+            if unhealthy:
+                raise CISResetNeeded(
+                    f"iter {iter_n}: workers={unhealthy}")
             continue
+
         for conn in ready:
             try:
                 msg = conn.recv()
-            except (EOFError, OSError):
-                continue
+            except (EOFError, OSError) as e:
+                # Pipe closed — worker died unexpectedly. Trigger reset.
+                wid = pipes_to_wid.get(conn)
+                raise CISResetNeeded(
+                    f"iter {iter_n}: worker {wid} pipe "
+                    f"{type(e).__name__}: {e}")
             status = msg.get("status")
             if status == "heartbeat":
+                manager.last_heartbeat[msg.get("worker_id")] = time.time()
                 continue
             received += 1
             if status == "done":
                 results.append(msg)
             elif status == "error":
-                print(f"[cis-collect] iter {iter_n}: worker {msg.get('worker_id')} "
-                      f"error: {msg.get('exc_msg')}\n{msg.get('traceback', '')}",
-                      flush=True)
+                # Worker reported a Python exception. Trigger reset rather
+                # than continue with degraded data — Option B contract is
+                # binary (clean iter or full reset).
+                raise CISResetNeeded(
+                    f"iter {iter_n}: worker {msg.get('worker_id')} "
+                    f"reported error: {msg.get('exc_msg')}")
+
+    # Deadline reached without CISResetNeeded means workers are sending
+    # heartbeats but not finishing. That's degenerate — treat as reset.
+    if received < expected:
+        raise CISResetNeeded(
+            f"iter {iter_n}: deadline reached, received={received}/{expected}")
+
+    # Final aliveness check: even if all workers reported "done", CIS might
+    # have died mid-iter and workers completed with default actions. The
+    # responses look valid (W/L counts present) but trajectories are empty.
+    # If CIS is dead now, treat the iter as failed → reset path.
+    if not cis_server.is_alive():
+        raise CISResetNeeded(
+            f"iter {iter_n}: cis_subprocess_dead (post-collect, "
+            f"trajectories may be invalid)")
 
     all_trajs = []
     total_w = total_l = total_ties = 0
@@ -2304,53 +2544,32 @@ class CISBgCollector:
         self._n_alive = 0
         self._n_workers = 0
         self._g: Optional[Dict[str, Any]] = None
+        # Phase 4.6 (S54): retain dispatch context so .join() can re-dispatch
+        # on reset (Option B unified path). All fields populated by .start();
+        # cleared by .join().
+        self._dispatch_ctx: Optional[Dict[str, Any]] = None
 
     @property
     def running(self) -> bool:
         return self._kicked_off
 
-    def start(self, model, device, server_pool, snapshot_pool, args_dict,
-              win_rates=None, iter_n: int = 0):
-        """Kick off CIS collect for the next iter. Returns immediately;
-        results retrieved via .join(). Same args_dict shape as
-        MPDiskBgCollector.start (which mirrors the sync collect kwargs)."""
-        n_workers = args_dict.get("n_workers", 8)
-        n_games = args_dict["games_per_iter"]
-        max_concurrent = args_dict["max_concurrent"]
-        fp16 = args_dict["fp16"]
-        rs_cfg = args_dict["rs_cfg"]
-        temp_range = args_dict["temp_range"]
-        opponent_device = args_dict.get("opponent_device", str(device))
-        turn_cap = args_dict.get("turn_cap", 300)
-        battle_format = args_dict.get("battle_format", "gen9ou")
-        procedural_teams_path = args_dict.get("teambuilder_path")
-        amp_dtype = args_dict.get("amp_dtype")
-        max_pool_size = args_dict.get("max_pool_size", 16)
-        cis_min_batch = args_dict.get("cis_min_batch", 8)
-        cis_timeout_ms = args_dict.get("cis_timeout_ms", 15)
-        rng_seed = args_dict.get("rng_seed") or random.randint(0, 1_000_000)
+    def _reload_slots_and_dispatch(self, g: Dict[str, Any]) -> List[int]:
+        """Phase 4.6 (S54) factored helper: slot reload + dispatch
+        collect_iter to all alive workers. Used by both initial start()
+        and .join()'s retry-on-reset path. Returns cmds_sent."""
+        ctx = self._dispatch_ctx
+        assert ctx is not None
+        weights_path = ctx["weights_path"]
+        snapshot_pool = ctx["snapshot_pool"]
+        max_pool_size = ctx["max_pool_size"]
+        iter_n = ctx["iter_n"]
 
-        if device.type == "cpu":
-            raise ValueError("CISBgCollector not supported on CPU.")
-
-        # 1. Save weights for CIS to load
-        weights_path = _save_weights_atomic_for_cis(model, iter_n)
-
-        # 2. Init or reuse CIS global
-        g = _ensure_cis_global(
-            weights_path=weights_path, n_workers=n_workers,
-            device=str(device), fp16=fp16, amp_dtype_name=amp_dtype,
-            min_batch=cis_min_batch, timeout_ms=cis_timeout_ms,
-            max_pool_size=max_pool_size,
-        )
-
-        # 3. Slot reload (slot 0 every iter; opp slots only if path changed)
+        # Slot reload (slot 0 every iter; opp slots only if path changed).
         n_slots = g["n_slots"]
         cur_paths = g["current_slot_paths"]
         pool_slot_map: Dict[str, int] = {}
         for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
-            slot_idx = i + 1
-            pool_slot_map[opp_path] = slot_idx
+            pool_slot_map[opp_path] = i + 1
 
         try:
             g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
@@ -2368,8 +2587,11 @@ class CISBgCollector:
             if cur_paths[slot_idx] == opp_path:
                 continue
             try:
-                g["handles_main_view"][0].reload(opp_path, slot=slot_idx,
-                                                 timeout_s=60.0)
+                # Phase 4.6 (S54) bug fix: route reload through CISServer's
+                # ctrl handle, NOT handles_main_view[0]. Pre-4.6 bg path
+                # used the racy pre-4.5 pattern (§B13).
+                g["server"].reload_weights(opp_path, slot=slot_idx,
+                                            timeout_s=60.0)
                 cur_paths[slot_idx] = opp_path
                 n_opp_reloaded += 1
             except Exception as e:
@@ -2379,64 +2601,179 @@ class CISBgCollector:
             print(f"[cis-bg] iter {iter_n}: reloaded {n_opp_reloaded} opp "
                   f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
 
-        # 4. Build opp_pool message + dispatch
-        opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
-        n_alive = n_workers  # CIS workers don't have respawn yet
+        # Build opp_pool message + dispatch (alive-only).
+        opp_pool_msg = _build_opp_pool_msg(snapshot_pool, ctx["win_rates"])
+        manager = g["manager"]
+        alive_wids = manager.alive_worker_ids()
+        n_alive = len(alive_wids)
+        if n_alive == 0:
+            raise RuntimeError(f"[cis-bg] iter {iter_n}: no alive workers")
+        n_games = ctx["n_games"]
         games_per_worker = n_games // n_alive
         remainder = n_games % n_alive
 
         cmds_sent: List[int] = []
-        for i, wid in enumerate(range(n_workers)):
+        for i, wid in enumerate(alive_wids):
             worker_n = games_per_worker + (1 if i < remainder else 0)
-            srv_idx = i % len(server_pool)
-            srv = server_pool[srv_idx]
+            srv_idx = i % len(ctx["server_pool"])
+            srv = ctx["server_pool"][srv_idx]
             srv_url = getattr(srv, 'websocket_url', None) or str(srv)
             cmd = {
                 "cmd": "collect_iter",
                 "iter_n": iter_n,
                 "n_games": worker_n,
-                "max_concurrent": max_concurrent,
+                "max_concurrent": ctx["max_concurrent"],
                 "server_url": srv_url,
                 "opp_pool": opp_pool_msg,
                 "pool_slot_map": pool_slot_map,
-                "temp_range": list(temp_range),
-                "opp_temp_range": list(temp_range),
-                "fp16": fp16,
-                "rs_cfg": rs_cfg,
-                "turn_cap": turn_cap,
-                "battle_format": battle_format,
-                "procedural_teams_path": procedural_teams_path,
-                "device": str(device),
-                "opponent_device": opponent_device,
-                "rng_seed": rng_seed,
-                "amp_dtype": amp_dtype,
+                "temp_range": list(ctx["temp_range"]),
+                "opp_temp_range": list(ctx["temp_range"]),
+                "fp16": ctx["fp16"],
+                "rs_cfg": ctx["rs_cfg"],
+                "turn_cap": ctx["turn_cap"],
+                "battle_format": ctx["battle_format"],
+                "procedural_teams_path": ctx["procedural_teams_path"],
+                "device": ctx["device_str"],
+                "opponent_device": ctx["opponent_device"],
+                "rng_seed": ctx["rng_seed"],
+                "amp_dtype": ctx["amp_dtype"],
             }
-            g["worker_ctrl_pipes"][wid].send(cmd)
+            manager.ctrl_pipes[wid].send(cmd)
             cmds_sent.append(wid)
-            if i + 1 < n_workers:
+            if i + 1 < n_alive:
                 time.sleep(0.25)
+
+        self._n_alive = n_alive
+        return cmds_sent
+
+    def start(self, model, device, server_pool, snapshot_pool, args_dict,
+              win_rates=None, iter_n: int = 0):
+        """Kick off CIS collect for the next iter. Returns immediately;
+        results retrieved via .join(). Same args_dict shape as
+        MPDiskBgCollector.start."""
+        n_workers = args_dict.get("n_workers", 8)
+        n_games = args_dict["games_per_iter"]
+        fp16 = args_dict["fp16"]
+        amp_dtype = args_dict.get("amp_dtype")
+        max_pool_size = args_dict.get("max_pool_size", 16)
+        cis_min_batch = args_dict.get("cis_min_batch", 8)
+        cis_timeout_ms = args_dict.get("cis_timeout_ms", 15)
+        rng_seed = args_dict.get("rng_seed") or random.randint(0, 1_000_000)
+
+        if device.type == "cpu":
+            raise ValueError("CISBgCollector not supported on CPU.")
+
+        # Save weights for CIS to load
+        weights_path = _save_weights_atomic_for_cis(model, iter_n)
+
+        # Init or reuse CIS global
+        g = _ensure_cis_global(
+            weights_path=weights_path, n_workers=n_workers,
+            device=str(device), fp16=fp16, amp_dtype_name=amp_dtype,
+            min_batch=cis_min_batch, timeout_ms=cis_timeout_ms,
+            max_pool_size=max_pool_size,
+        )
+
+        # Phase 4.6: stash all dispatch context so .join() can re-dispatch
+        # on a reset event without needing the original args back.
+        self._dispatch_ctx = {
+            "weights_path": weights_path,
+            "snapshot_pool": snapshot_pool,
+            "win_rates": win_rates,
+            "iter_n": iter_n,
+            "n_workers": n_workers,
+            "n_games": n_games,
+            "max_concurrent": args_dict["max_concurrent"],
+            "fp16": fp16,
+            "rs_cfg": args_dict["rs_cfg"],
+            "temp_range": args_dict["temp_range"],
+            "opponent_device": args_dict.get("opponent_device", str(device)),
+            "turn_cap": args_dict.get("turn_cap", 300),
+            "battle_format": args_dict.get("battle_format", "gen9ou"),
+            "procedural_teams_path": args_dict.get("teambuilder_path"),
+            "device_str": str(device),
+            "device_type": device.type,
+            "amp_dtype": amp_dtype,
+            "max_pool_size": max_pool_size,
+            "cis_min_batch": cis_min_batch,
+            "cis_timeout_ms": cis_timeout_ms,
+            "rng_seed": rng_seed,
+            "server_pool": server_pool,
+        }
+
+        cmds_sent = self._reload_slots_and_dispatch(g)
 
         # Track state for join().
         self._g = g
         self._cmds_sent = cmds_sent
         self._iter_n = iter_n
         self._n_games = n_games
-        self._n_alive = n_alive
         self._n_workers = n_workers
         self._t_start = time.time()
         self._kicked_off = True
 
     def join(self) -> Optional[Tuple]:
-        """Block until workers finish; return aggregated result tuple."""
+        """Block until workers finish; return aggregated result tuple.
+
+        Phase 4.6 (S54) Option B: on CISResetNeeded, runs full reset +
+        re-dispatch the iter from zero. Capped retries via
+        _record_reset_and_check_cap to avoid spinning."""
         if not self._kicked_off:
             return None
-        result = _cis_wait_results_and_aggregate(
-            g=self._g, cmds_sent=self._cmds_sent, iter_n=self._iter_n,
-            n_games=self._n_games, n_alive=self._n_alive,
-            n_workers=self._n_workers, t_start=self._t_start,
-        )
+        ctx = self._dispatch_ctx
+        assert ctx is not None
+        MAX_RESET_ATTEMPTS = 2
+        last_reset_reason: Optional[str] = None
+        for attempt in range(MAX_RESET_ATTEMPTS + 1):
+            try:
+                result = _cis_wait_results_and_aggregate(
+                    g=self._g, cmds_sent=self._cmds_sent,
+                    iter_n=self._iter_n, n_games=self._n_games,
+                    n_alive=self._n_alive, n_workers=self._n_workers,
+                    t_start=self._t_start,
+                )
+                self._kicked_off = False
+                self._dispatch_ctx = None
+                return result
+            except CISResetNeeded as e:
+                if attempt >= MAX_RESET_ATTEMPTS:
+                    self._kicked_off = False
+                    self._dispatch_ctx = None
+                    raise RuntimeError(
+                        f"[cis-bg] iter {self._iter_n}: gave up after "
+                        f"{MAX_RESET_ATTEMPTS + 1} attempts. Last reason: {e}"
+                    ) from e
+                if not _record_reset_and_check_cap():
+                    self._kicked_off = False
+                    self._dispatch_ctx = None
+                    raise RuntimeError(
+                        f"[cis-bg] iter {self._iter_n}: reset cap exceeded "
+                        f"({_MAX_RESETS_IN_WINDOW} resets in last "
+                        f"{_RESET_WINDOW_S:.0f}s) — likely persistent "
+                        f"failure mode. Last reason: {e}"
+                    ) from e
+                print(f"[cis-bg] iter {self._iter_n}: reset attempt "
+                      f"{attempt + 1}/{MAX_RESET_ATTEMPTS + 1}: {e}",
+                      flush=True)
+                last_reset_reason = str(e)
+                self._g = _orchestrator_full_reset(
+                    weights_path=ctx["weights_path"],
+                    n_workers=ctx["n_workers"],
+                    device=ctx["device_str"],
+                    fp16=ctx["fp16"],
+                    amp_dtype_name=ctx["amp_dtype"],
+                    min_batch=ctx["cis_min_batch"],
+                    timeout_ms=ctx["cis_timeout_ms"],
+                    max_pool_size=ctx["max_pool_size"],
+                )
+                self._cmds_sent = self._reload_slots_and_dispatch(self._g)
+                self._t_start = time.time()
+        # Unreachable.
         self._kicked_off = False
-        return result
+        self._dispatch_ctx = None
+        raise RuntimeError(
+            f"[cis-bg] iter {self._iter_n}: unreachable retry-loop exit. "
+            f"Last reason: {last_reset_reason}")
 
 
 def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
