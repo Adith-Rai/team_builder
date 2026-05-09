@@ -728,6 +728,220 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
 
 # =============================
+# Tier 3 C4 (Phase 4.7+, S55): sequence-batched PPO update
+# =============================
+
+def ppo_update_batched(model, optimizer, episodes, device, cfg,
+                       epochs: int = 3, clip_eps: float = 0.2,
+                       ent_coef: float = 0.02, vf_coef: float = 0.5,
+                       max_grad_norm: float = 0.5, target_kl: float = 0.02,
+                       L_max: Optional[int] = None,
+                       normalize_advantages: bool = False,
+                       in_warmup: bool = False) -> dict:
+    """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
+        collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
+    → backward → optimizer.step().
+
+    Replaces the per-episode loop in `ppo_update` with a SINGLE
+    forward+loss+backward+step per epoch over the WHOLE batch. Where the
+    4-10× update-phase speedup lives (per-iter optimizer.step calls drop
+    from B*epochs to epochs).
+
+    Drop-in replacement for `ppo_update`: same arguments, same returned
+    stats dict shape, same KL early-stop semantics. Caller (train_rl.py)
+    selects this path via a flag (added in C5 wiring).
+
+    Aggregation choice (intentional, see C3 docstring): per-transition
+    mean over valid positions. Differs from current per-episode mean for
+    multi-episode batches with variable T. Larger effective batch per
+    gradient step → enables higher lr safely (re-ablate after Tier 3).
+
+    NOT supported in v1 (will add in subsequent commit if needed):
+      - in_warmup=True (per-step value-only training): currently raises
+        NotImplementedError. Warmup is 5 iters; production launches with
+        --warmup-iters 5 or 10 and then proceeds normally. For Tier 3
+        warmup support, callers can use the existing per-episode
+        ppo_update for warmup iters, then switch to ppo_update_batched.
+      - Minibatching within an epoch: currently 1 batch per epoch (one
+        gradient step per epoch). For very large batches (>2000
+        transitions) consider splitting into 2-4 minibatches per epoch.
+        At our production scale (B≈48, L_avg≈30 → ~1500 transitions),
+        single batch is fine.
+
+    Args:
+      model, optimizer, episodes, device, cfg: same as ppo_update
+      epochs, clip_eps, ent_coef, vf_coef, max_grad_norm, target_kl: same
+      L_max: optional cap on episode length passed to collate_episodes
+      normalize_advantages: passed through to ppo_loss_batched
+      in_warmup: rejected with NotImplementedError in v1 (see above)
+
+    Returns:
+      stats dict with same keys as ppo_update:
+        pi, v, ent, kl, ratio_clip_frac, value_mean, return_mean, adv_abs_mean
+        n_succeeded, n_failed, n_skipped_kl, n_skipped_nan
+      Stats are normalized over the number of EPOCHS that ran (not
+      episodes), since batched path runs 1 step per epoch.
+    """
+    if in_warmup:
+        raise NotImplementedError(
+            "ppo_update_batched does not support in_warmup=True yet. "
+            "Use the per-episode ppo_update for warmup iters, then switch "
+            "to ppo_update_batched for the main training loop."
+        )
+    if not episodes:
+        # No episodes — nothing to do. Return zero-stats.
+        return {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
+                "ratio_clip_frac": 0.0, "value_mean": 0.0,
+                "return_mean": 0.0, "adv_abs_mean": 0.0,
+                "n_succeeded": 0, "n_failed": 0,
+                "n_skipped_kl": 0, "n_skipped_nan": 0}
+
+    model.train()
+    stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
+             "ratio_clip_frac": 0.0,
+             "value_mean": 0.0, "return_mean": 0.0, "adv_abs_mean": 0.0}
+    n = 0                # number of epochs that ran without skip
+    n_failed = 0         # epochs that raised an exception
+    n_skipped_kl = 0     # epochs gated by per-batch KL check (target_kl × 5)
+    n_skipped_nan = 0    # epochs skipped due to NaN/inf in loss
+    kl_early_stopped = False
+
+    # bf16 autocast on update (same gating as ppo_update line 226-228):
+    # autocast_ctx() only when amp_dtype is bf16; fp16 backward without
+    # GradScaler underflows. fp32 path stays unchanged.
+    _update_amp_ctx = (autocast_ctx()
+                       if get_amp_dtype() is torch.bfloat16
+                       else _nullcontext())
+
+    for ppo_ep in range(epochs):
+        if kl_early_stopped:
+            break
+
+        # Shuffle episode order each epoch — same intent as ppo_update's
+        # random.shuffle(episodes), now applied before collation.
+        random.shuffle(episodes)
+
+        try:
+            # Collate B episodes → (B, L_max, *) padded batch on device
+            collated = collate_episodes(episodes, L_max=L_max, device=device)
+
+            with _update_amp_ctx:
+                # Forward: collated → (B, L_max, n_actions) logits etc.
+                forward_out = model.forward_ppo_sequence(collated, device)
+
+                # NaN/inf check on forward
+                if (forward_out["action_logits"].isnan().any()
+                        or forward_out["v_logits"].isnan().any()):
+                    print(f"  [WARN] NaN in batched forward, skip epoch "
+                          f"{ppo_ep}", flush=True)
+                    n_skipped_nan += 1
+                    continue
+
+                # Loss: ppo_loss_batched (C3) — pi + entropy + value + kl
+                loss_dict = ppo_loss_batched(
+                    collated, forward_out, model, cfg,
+                    ent_coef=ent_coef, vf_coef=vf_coef,
+                    clip_eps=clip_eps,
+                    normalize_advantages=normalize_advantages,
+                )
+                total_loss = loss_dict["total_loss"]
+                approx_kl = loss_dict["approx_kl"]
+
+            # NaN/inf check on loss
+            if total_loss.isnan() or total_loss.isinf():
+                print(f"  [WARN] NaN/inf loss (pi={loss_dict['pi_loss'].item():.4f} "
+                      f"v={loss_dict['v_loss'].item():.4f}), aborting batched "
+                      f"PPO update", flush=True)
+                optimizer.zero_grad()
+                kl_early_stopped = True
+                break
+
+            # Per-batch KL gate: skip this epoch's update if policy diverged
+            # too much. Coarser than the per-episode gate in ppo_update
+            # (which skips just outlier episodes), but the effect is
+            # similar at the optimizer-step level (no harmful update lands).
+            if abs(approx_kl) > target_kl * 5:
+                n_skipped_kl += 1
+                # Don't break — we might recover next epoch on shuffled batch
+                continue
+
+            # Backward + clip + step
+            optimizer.zero_grad()
+            total_loss.backward()
+            if max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+            # Accumulate stats (per-epoch since batched path is 1 step / epoch)
+            stats["pi"] += loss_dict["pi_loss"].item()
+            stats["v"] += loss_dict["v_loss"].item()
+            stats["ent"] += loss_dict["entropy"].item()
+            stats["kl"] += abs(approx_kl)
+            stats["ratio_clip_frac"] += loss_dict["ratio_clip_frac"]
+
+            # Drift diagnostics: value vs return (same as ppo_update lines
+            # 532-539). Computed over valid positions of the collated batch.
+            with torch.no_grad():
+                pad_mask_f = collated["pad_mask"].to(device).float()
+                n_valid = pad_mask_f.sum().clamp(min=1.0)
+                returns_t = collated["returns"].to(device).float()
+                advantages_t = collated["advantages"].to(device).float()
+                v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                v_pred = (v_probs * get_v_support(model)).sum(-1)  # (B, L_max)
+                stats["value_mean"]  += ((v_pred * pad_mask_f).sum() / n_valid).item()
+                stats["return_mean"] += ((returns_t * pad_mask_f).sum() / n_valid).item()
+                stats["adv_abs_mean"]+= ((advantages_t.abs() * pad_mask_f).sum() / n_valid).item()
+
+            n += 1
+
+            # KL early-stop: avg-KL > target_kl × 1.5 → break out of epoch loop
+            # (same threshold + intent as ppo_update lines 700-706, computed
+            # over per-batch KL since each epoch IS one batch update).
+            if abs(approx_kl) > target_kl * 1.5:
+                print(f"    KL early stop (batched): epoch {ppo_ep}, "
+                      f"kl={abs(approx_kl):.4f} > {target_kl*1.5:.4f}",
+                      flush=True)
+                kl_early_stopped = True
+
+        except Exception as e:
+            print(f"  [ERROR] Batched PPO epoch {ppo_ep} failed: {e}", flush=True)
+            traceback.print_exc()
+            n_failed += 1
+            optimizer.zero_grad()
+            continue
+
+        # Memory cleanup between epochs (collated batch can be 100-500 MB)
+        del collated, forward_out, loss_dict, total_loss
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Normalize stats by number of completed epochs
+    for k in stats:
+        stats[k] /= max(1, n)
+
+    stats["n_succeeded"] = n
+    stats["n_failed"] = n_failed
+    stats["n_skipped_kl"] = n_skipped_kl
+    stats["n_skipped_nan"] = n_skipped_nan
+
+    # Surface silent discards (same heuristic as ppo_update line 717-721)
+    total_epochs = n + n_failed + n_skipped_kl + n_skipped_nan
+    if total_epochs > 0 and (n_skipped_kl + n_skipped_nan) >= max(2, total_epochs // 3):
+        print(f"  [NOTICE] PPO-batched discarded {n_skipped_kl} KL + "
+              f"{n_skipped_nan} NaN epochs out of {total_epochs} "
+              f"({100*(n_skipped_kl+n_skipped_nan)/total_epochs:.1f}%)",
+              flush=True)
+    # Surface value/return drift (same heuristic as ppo_update line 723-726)
+    vm, rm = stats["value_mean"], stats["return_mean"]
+    if abs(vm - rm) > 0.3:
+        print(f"  [NOTICE] Value drift (batched): value_mean={vm:.3f} vs "
+              f"return_mean={rm:.3f} (gap={abs(vm-rm):.3f}). Critic may be "
+              f"miscalibrated.", flush=True)
+    return stats
+
+
+# =============================
 # Utility
 # =============================
 
