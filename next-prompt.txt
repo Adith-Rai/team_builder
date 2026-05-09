@@ -18,29 +18,35 @@ If files conflict, surface — don't silently reconcile. Don't half-ass. Don't s
 
 ---
 
-**S55 wrap (2026-05-09)** — picking up from Session 55 (just finished). Production iter 49+ in flight (last checked iter 52 in collect at 10:25 UTC). **Iter 49 EVAL: smart_avg=49%** (SH=59 SmartDmg=44 Tactical=42 Strategic=52). Trajectory 69→60→53→49 — within expected baseline range per `docs/PHASE1_V3_OBSERVATIONS.md`. ~5 days remaining to iter 200. HEAD on prod pod LOCKED at `251cd14a`. **DO NOT pull**. Read-only monitoring only.
+**S56 wrap (2026-05-09)** — picking up from Session 56 (just finished). Production iter 55+ in flight (last checked iter 55 done at 12:21 UTC, iter 56 in collect). Iter 49 EVAL was smart_avg=49% — trajectory 69→60→53→49 within expected baseline range per `docs/PHASE1_V3_OBSERVATIONS.md`. ~4-5 days remaining to iter 200. HEAD on prod pod LOCKED at `251cd14a`. **DO NOT pull**. Read-only monitoring only.
 
-**S55 SHIPPED** (4 commits beyond Phase 4.6, all on origin/master):
-- `f79ea477` Tier 3 C1: `collate_episodes()` — padded (B, L_max, *) batching foundation. 6/6 unit tests PASS.
-- `f728b3af` Tier 3 C2: TemporalTransformer `return_all_positions=True` + `forward_ppo_sequence()`. 5/5 tests PASS, max diff 2.38e-07 vs sequential.
-- `f720dccc` Tier 3 C3: `ppo_loss_batched()` masked PPO loss. 5/5 tests PASS, B=1 bit-equivalent to per-episode.
-- `8ce7ffcc` Tier 3 C4: `ppo_update_batched()` sequence-batched PPO update. 6/6 smoke tests PASS, gradient flows.
-- `6758cc3c` Standing orders: `docs/SESSION_BOOT_PROTOCOL.md` + restructured `MEMORY.md`.
+**S56 SHIPPED** (1 commit pending, ~all on dev branch — Tier 3 C5 + train_rl.py wiring + dev pod end-to-end smoke validated):
+- **Tier 3 C5: single-graph compiled train_step** (`make_compiled_train_step` in ppo.py). Compile region = forward + loss + masked-backward (aot_autograd captures fwd+bwd graphs together). Eager wrapper handles `optimizer.zero_grad()` + (gated) `clip_grad_norm_` + `optimizer.step()`. Three torch 2.2.x dynamo limits engineered through honestly (NOT shortcuts) — see `memory/project_tier3_c5_design.md` for full rationale.
+- **`twohot_target` rewrite** (model_transformer.py): scatter_ → broadcast-equality `(arange == idx.unsqueeze(-1)).to(dtype)`. Bit-equivalent (Test 1 max diff 0.0). F.one_hot was tried but fails on dynamic-shape compile (`Cannot call numel() on tensor with symbolic sizes/strides` in torch 2.2.x).
+- **`ppo_loss_batched` refactor** (ppo.py): split into `_ppo_loss_batched_internal` (tensor-only output, compile-friendly) + `ppo_loss_batched` (eager wrapper preserving Python-scalar contract for backward compat). C3 + C4 tests still PASS unchanged.
+- **train_rl.py wired**: new `--tier3` flag dispatches to `ppo_update_batched` when not in_warmup; with `--compile` additionally builds `model._tier3_step` (compiled train_step). Banner shows "Tier3: ON+compile" / "ON (eager)" / "OFF". Warmup iters fall back to eager `ppo_update` (batched path doesn't support frozen-backbone warmup; trivial: 5/200 iters).
+- **C5 unit test** (`scripts/diag/test_tier3_c5_compile.py`): 6/6 PASS on dev pod (Linux + torch 2.2.1 + triton 2.2.0). Tests 1+2 also PASS on Windows (no compile required).
+- **Dev pod end-to-end smoke**: 2-iter `--tier3 --compile --bf16` run on real BC v10 ckpt. Iter 0 update = 275s (compile cold-start + tracing). **Iter 1 update = 151s — 45% speedup from compile cache hit (the C5 win).** Stats sane (pi=0.004, v_loss 13.93→11.22, ent=1.18, kl=0.017-0.018, no NaN, no KL gate fires). bf16 autocast verified active during compiled update.
+
+**S55 SHIPPED** (still on origin/master, foundation for S56):
+- `f79ea477` C1 collate_episodes / `f728b3af` C2 forward_ppo_sequence / `f720dccc` C3 ppo_loss_batched / `8ce7ffcc` C4 ppo_update_batched / `6758cc3c` Standing orders.
 
 **S54 SHIPPED** (still relevant): CIS Phase 4.6 Option B unified full-reset recovery (`64b822a3`) + `docs/PHASE1_V3_OBSERVATIONS.md` Phase 2 design (`1bbff8ac`). Both validated on dev pod A100.
 
-**Headline work for next session (S56)**:
-1. **Tier 3 C5** — `torch.compile(train_step)`. Surgical compile-region wrap of forward+loss; control flow stays uncompiled. Bundled with C4 since compile needs fixed shapes. ~1 day.
-2. **train_rl.py wiring** — add `--tier3` flag routing to `ppo_update_batched`. The path is implemented but not connected to the production entry point yet. Read train_rl.py PPO update call site, add flag dispatch, smoke. ~half day.
-3. **Dev pod end-to-end smoke** — full `--tier3` path runs without errors at small scale on real model + ckpt. ~$2-3 A100, ~30 min.
-4. **H2H gauntlet wiring** (parallel side work, ~3-4 hrs, $0) — Kakuna/SmallRL/Minikazam adapters. Needed for Phase 1 v3 final eval (~5 days). Interleave when Phase 1 v3 is ~1 day from finish.
+**S57 priorities** (in order):
+1. **H2H gauntlet wiring** (~3-4 hrs, $0) — Kakuna/SmallRL/Minikazam adapters in `eval_h2h_gauntlet.py`. Needed for Phase 1 v3 final eval (~4-5 days out). Code already exists; "wiring" = downloading 3 bot weights + writing 3 small adapter classes for `make_self_play_opponent` factory.
+2. **Phase 1 v3 final eval** when iter 200 lands — pull `final.pt`, run smart_avg + Elo + H2H gauntlet, document final.
+3. **C6 — 20-iter Tier 3 A/B validation** on dev pod (~$10-15) against Phase 1 v3 iter 19/29 deep playstyle baseline. Init from BC v10 e3, same hyperparams. MUST pass MUST tier (SE rate ±3pp, move waste ±2pp, top-5 Pokemon usage, per-mon move dist ±10pp) before Phase 2 launches.
+4. **Easy items JIT for Phase 2** (parallel with C6): perm-at-eval enable, lr scheduling impl, source 100-150 SEPARATE real elite teams from Smogon archive / Showdown ladder replays / /r/stunfisk OU samples / OST/OLT tournament posts (NOT mm-competitive 16 — eval set isolation), bf16 dev pod smoke.
+5. **Phase 2 launch** — `--cis --pipeline --bf16 --tier3 --compile` + team mix (50-70% procedural / 30-50% NEW elite teams) + perm-at-eval + external opps + lr scheduling + absolute early-stop. ~$200-300 / 5-7 days at 10-12 min/iter target.
 
-**S56 deferred** (do NOT pivot to — boot protocol §4 + §5):
+**S57 deferred** (do NOT pivot to — boot protocol §4 + §5):
 - Multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3) — POST-Phase-2 only.
 - Doubles/Triples/VGC/AG/in-game format support — POST-multi-gen only.
 - **Network Volume migration** — DEFERRED until multi-gen per user (S55). Container Disk acceptable for Phase 1/2 since user monitors and won't stop pod without informing. Risk consciously accepted; do NOT redo this analysis.
 - Per-worker traj checkpointing — REJECTED (`feedback_phase46_traj_checkpoint_rejected.md`).
-- Easy items (perm fix, lr sched impl, source 100-150 elite teams, bf16 dev pod smoke) — these are Phase 2 PREP, JIT before Phase 2 launches. Do NOT start until Tier 3 (C5 + wiring + smoke) is shipped + Phase 1 v3 finishes.
+- C5b "wider compile region" attempts — torch 2.2.x has documented limits engineered through; widening requires torch 2.4+ which is a separate cross-cutting upgrade. Don't relitigate. (`memory/project_tier3_c5_design.md`)
+- **torch 2.4+ upgrade** — DEFERRED to JIT pre-multi-gen (alongside D4-D6 + BC v11 retrain). Would unlock: full single-graph train_step (no clip_grad_norm split), F.one_hot under dynamic compile, mode="reduce-overhead" cudagraph (~+5-10% update, ~+10-20% forward, aggregate ~+15-30% over current 2.2.x). Cost: 1-2 wks cross-cutting re-validation (compile + mp_disk + CIS + autocast + dep interop, new triton 3.x pair). ROI bad pre-Phase-2 ($40-60 saved on one $200-300 run vs 2 wk dev); ROI good pre-multi-gen ($500+ saved across multiple $400-600 multi-gen runs). DEV POD makes this safe — production pod isolation is NOT a blocker per S56 user note. Don't pursue mid-vertical.
 
 **Post-Phase-1-v3 priorities** (in order, not now):
 1. Pull final.pt + full eval suite (smart_avg + Elo + H2H gauntlet)

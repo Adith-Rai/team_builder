@@ -2117,7 +2117,19 @@ class TransformerBattlePolicy(nn.Module):
     # ---- Legacy convenience ----
 
     def twohot_target(self, value: torch.Tensor) -> torch.Tensor:
-        """Convert scalar value targets to 2-hot encoding. Mirrors model.py:805-816."""
+        """Convert scalar value targets to 2-hot encoding. Mirrors model.py:805-816.
+
+        Implementation note (Tier 3 C5): uses broadcast-equality comparison
+        instead of in-place scatter_ for torch.compile + AOTAutograd
+        cleanliness. F.one_hot is NOT used here because torch 2.2.x's
+        dynamic-shape compile path can't call numel() on symbolic-sized
+        tensors that one_hot requires (verified failure mode on dev pod
+        S56). Broadcast-equality (`arange == idx.unsqueeze(-1)`) produces
+        the same one-hot pattern via pure arithmetic that traces cleanly.
+        Bit-equivalent to the prior scatter_ version because lo and hi
+        never collide (lo clamped to [0, v_bins-2], hi=lo+1 clamped to
+        [0, v_bins-1]).
+        """
         cfg = self.cfg
         v_support = self.value_head.v_support
         value = value.clamp(cfg.v_min, cfg.v_max)
@@ -2126,10 +2138,10 @@ class TransformerBattlePolicy(nn.Module):
         lo = idx.floor().long().clamp(0, cfg.v_bins - 2)
         hi = (lo + 1).clamp(max=cfg.v_bins - 1)
         weight_hi = (idx - lo.float()).clamp(0, 1)
-        target = torch.zeros(value.shape[0], cfg.v_bins, device=value.device)
-        target.scatter_(1, lo.unsqueeze(1), (1 - weight_hi).unsqueeze(1))
-        target.scatter_(1, hi.unsqueeze(1), weight_hi.unsqueeze(1))
-        return target
+        arange = torch.arange(cfg.v_bins, device=value.device).unsqueeze(0)  # (1, v_bins)
+        lo_oh = (arange == lo.unsqueeze(-1)).to(weight_hi.dtype)              # (B, v_bins)
+        hi_oh = (arange == hi.unsqueeze(-1)).to(weight_hi.dtype)              # (B, v_bins)
+        return lo_oh * (1 - weight_hi).unsqueeze(-1) + hi_oh * weight_hi.unsqueeze(-1)
 
     # ---- BC training mega-batch path ----
 

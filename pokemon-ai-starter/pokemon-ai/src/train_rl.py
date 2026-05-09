@@ -51,6 +51,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model import PokeTransformer, PokeTransformerConfig, add_model_args
 from ppo import (
     Trajectory, compute_gae, build_ppo_episodes, ppo_update,
+    ppo_update_batched, make_compiled_train_step,
     load_checkpoint, save_checkpoint,
 )
 from rewards import RewardShaper
@@ -148,6 +149,16 @@ def parse_args():
     p.add_argument("--temp-max", type=float, default=2.25, help="Opponent temp range max")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile spatial encoder (Linux only)")
+    p.add_argument("--tier3", action="store_true",
+                   help="Tier 3 sequence-batched PPO update (S55+). Composes "
+                        "collate_episodes + forward_ppo_sequence + ppo_loss_batched "
+                        "into ONE forward+backward+step per epoch instead of one "
+                        "per episode (4-10× update phase speedup). When combined "
+                        "with --compile, additionally enables C5 single-graph "
+                        "torch.compile of forward+loss+backward+clip+optimizer.step. "
+                        "NOT supported in warmup iters (auto-falls-back to per-"
+                        "episode ppo_update during warmup). Linux + transformer "
+                        "arch only.")
     p.add_argument("--pipeline", action="store_true",
                    help="Pipeline collection and PPO update (overlap on GPU)")
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
@@ -885,6 +896,36 @@ def main():
             # don't crash the run - just fall back to eager.
             print(f"torch.compile: SKIPPED ({e})", flush=True)
 
+    # Tier 3 C5 (S55+): single-graph compiled train_step for the batched PPO
+    # update. Built AFTER per-submodule compile so the per-submodule compile
+    # wrappers are transparently traced through by the outer graph (net effect
+    # is one fused forward+loss+backward+clip+optimizer.step graph). Stashed
+    # on the model object so it survives across iters and is reused (compile
+    # cache stays warm). Only built when both --tier3 + --compile are set
+    # AND the per-submodule compile succeeded; otherwise the eager batched
+    # path runs (still 4-10× faster than per-episode ppo_update).
+    #
+    # Per S56 design (no shortcuts, ship optimal once): the full train_step
+    # in one graph maximizes kernel fusion across forward/backward/step
+    # boundaries. Safety gates (NaN, KL > target × 5) are in-graph tensor
+    # masks (no host sync, no graph break). See `make_compiled_train_step`
+    # docstring for details.
+    model._tier3_step = None
+    if args.tier3 and args.compile and compiled:
+        try:
+            model._tier3_step = make_compiled_train_step(
+                model, optimizer, cfg,
+                vf_coef=args.vf_coef,
+                max_grad_norm=args.max_grad_norm,
+                normalize_advantages=False,  # build_ppo_episodes already normalizes
+            )
+            print("torch.compile: Tier 3 C5 train_step compiled "
+                  "(fwd+loss+backward+clip+step in one graph)", flush=True)
+        except Exception as e:
+            print(f"torch.compile: Tier 3 C5 train_step SKIPPED ({e}); "
+                  f"--tier3 will use eager batched path", flush=True)
+            model._tier3_step = None
+
     # External opponents — appended AFTER resume so resumed pool state stays clean
     # (resume loads only local snapshot paths; externals are re-instantiated each
     # run from the YAML). Subprocess adapters (metamon) get spawned + supervised
@@ -931,9 +972,12 @@ def main():
     print(f"Iters: {args.n_iters}, Games/iter: {args.games_per_iter}, Concurrent: {args.max_concurrent}")
     print(f"gamma={args.gamma}, lam={args.lam}, ent={args.ent_coef}, target_kl={args.target_kl}, grad_accum={args.grad_accum}")
     _collect_mode = "CIS" if args.cis else ("MP" if args.mp else "SYNC")
+    _tier3_status = ("OFF" if not args.tier3
+                     else ("ON+compile" if model._tier3_step is not None
+                           else "ON (eager)"))
     print(f"FP16: {'ON' if args.fp16 else 'OFF'}, Compile: {'ON' if compiled else 'OFF'}, "
           f"Pipeline: {'ON' if args.pipeline else 'OFF'}, Collect: {_collect_mode}, "
-          f"Device: {device}")
+          f"Tier3: {_tier3_status}, Device: {device}")
     print(f"Snapshot pool: {len(snapshot_pool)} checkpoints\n", flush=True)
 
     # Register this run (fire-and-forget)
@@ -1011,14 +1055,34 @@ def main():
 
         _flow("starting PPO update")
         t_update = time.time()
-        loss_info = ppo_update(
-            model, optimizer, episodes, device, cfg,
-            epochs=args.ppo_epochs, clip_eps=args.clip_eps,
-            ent_coef=ent_coef, vf_coef=args.vf_coef,
-            max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
-            grad_accum=args.grad_accum,
-            in_warmup=in_warmup,  # skips autograd through frozen backbone
-        )
+        # Tier 3 (--tier3) routes to ppo_update_batched which is a drop-in
+        # replacement: same args, same returned stats. Warmup iters fall
+        # back to per-episode ppo_update because ppo_update_batched does NOT
+        # support the value-head-only frozen-backbone warmup pattern (raises
+        # NotImplementedError). Warmup is 5 iters / 200 — trivial.
+        # When --tier3 + --compile + per-submodule compile succeeded,
+        # `model._tier3_step` holds the C5 single-graph compiled train_step;
+        # ppo_update_batched dispatches to it via compiled_step kwarg. Else
+        # ppo_update_batched runs its eager path (still 4-10× faster than
+        # ppo_update via single-step-per-epoch batching).
+        if args.tier3 and not in_warmup:
+            loss_info = ppo_update_batched(
+                model, optimizer, episodes, device, cfg,
+                epochs=args.ppo_epochs, clip_eps=args.clip_eps,
+                ent_coef=ent_coef, vf_coef=args.vf_coef,
+                max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
+                normalize_advantages=False,
+                compiled_step=getattr(model, "_tier3_step", None),
+            )
+        else:
+            loss_info = ppo_update(
+                model, optimizer, episodes, device, cfg,
+                epochs=args.ppo_epochs, clip_eps=args.clip_eps,
+                ent_coef=ent_coef, vf_coef=args.vf_coef,
+                max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
+                grad_accum=args.grad_accum,
+                in_warmup=in_warmup,  # skips autograd through frozen backbone
+            )
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")
 

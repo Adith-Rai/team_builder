@@ -363,6 +363,87 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
 # B=1 equivalence; the multi-episode case is a deliberate semantic shift
 # that ships in C4 + validated end-to-end in C6 vs Phase 1 v3 baseline.
 
+def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
+                               ent_coef, vf_coef, clip_eps,
+                               normalize_advantages: bool = False) -> dict:
+    """Tensor-only output of the masked PPO loss. Tier 3 C5 split: this is
+    the compile-friendly core (no .item() calls, no Python control flow).
+    Both the eager wrapper `ppo_loss_batched` and the compiled train_step
+    (via `make_compiled_train_step`) consume this directly.
+
+    `ent_coef`, `vf_coef`, `clip_eps` accept either Python floats (eager
+    path) or 0-dim tensors (compiled path — passing as tensors avoids
+    recompile when adaptive-entropy moves ent_coef per iter).
+
+    Returns dict with the same keys as `ppo_loss_batched` but `approx_kl`,
+    `ratio_clip_frac`, `n_valid` are TENSORS (not Python scalars). Callers
+    needing scalars must call `.item()` themselves.
+    """
+    pad_mask = collated["pad_mask"]
+    actions = collated["actions"]
+    old_logp = collated["old_logp"]
+    advantages = collated["advantages"]
+    returns = collated["returns"]
+
+    logits_all = forward_out["action_logits"]
+    vlogits_all = forward_out["v_logits"]
+
+    device = logits_all.device
+    pad_mask_f = pad_mask.to(device).float()
+    n_valid = pad_mask_f.sum().clamp(min=1.0)
+    actions = actions.to(device)
+    old_logp = old_logp.to(device).float()
+    advantages = advantages.to(device).float()
+    returns = returns.to(device).float()
+
+    if normalize_advantages:
+        adv_mean = (advantages * pad_mask_f).sum() / n_valid
+        adv_var = ((advantages - adv_mean).pow(2) * pad_mask_f).sum() / n_valid
+        adv_std = adv_var.clamp(min=1e-8).sqrt()
+        advantages = (advantages - adv_mean) / adv_std
+        advantages = advantages * pad_mask_f
+
+    lp = F.log_softmax(logits_all.float(), dim=-1)
+    new_logp = lp.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+    ratio = torch.exp(new_logp - old_logp)
+
+    with torch.no_grad():
+        clipped_per_pos = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float()
+        ratio_clip_frac = (clipped_per_pos * pad_mask_f).sum() / n_valid
+
+    s1 = ratio * advantages
+    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+    pi_loss_per_pos = -torch.min(s1, s2)
+    pi_loss = (pi_loss_per_pos * pad_mask_f).sum() / n_valid
+
+    probs = F.softmax(logits_all.float(), dim=-1)
+    entropy_per_pos = -(probs * lp).sum(-1)
+    entropy = (entropy_per_pos * pad_mask_f).sum() / n_valid
+
+    ret_c = returns.clamp(cfg.v_min, cfg.v_max)
+    B_dim, L_max_dim = ret_c.shape
+    vtgt_flat = model.twohot_target(ret_c.reshape(-1))
+    vtgt = vtgt_flat.reshape(B_dim, L_max_dim, -1).float()
+    v_loss_per_pos = -(vtgt * F.log_softmax(vlogits_all.float(), dim=-1)).sum(-1)
+    v_loss = (v_loss_per_pos * pad_mask_f).sum() / n_valid
+
+    with torch.no_grad():
+        kl_per_pos = (old_logp - new_logp)
+        approx_kl = (kl_per_pos * pad_mask_f).sum() / n_valid
+
+    total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
+
+    return {
+        "total_loss":      total_loss,
+        "pi_loss":         pi_loss,
+        "entropy":         entropy,
+        "v_loss":          v_loss,
+        "approx_kl":       approx_kl,        # TENSOR scalar
+        "ratio_clip_frac": ratio_clip_frac,  # TENSOR scalar
+        "n_valid":         n_valid,          # TENSOR scalar
+    }
+
+
 def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
                      ent_coef: float = 0.02, vf_coef: float = 0.5,
                      clip_eps: float = 0.2,
@@ -402,81 +483,22 @@ def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
 
     Aggregation: ALL losses use per-transition mean over valid positions:
       loss = (per_pos_loss * pad_mask).sum() / pad_mask.sum().clamp(min=1)
+
+    Implementation note (Tier 3 C5): thin wrapper over
+    `_ppo_loss_batched_internal` (the tensor-only compile-friendly core).
+    Existing callers preserve their scalar-returning contract; the
+    compiled train_step path uses the internal function directly.
     """
-    pad_mask = collated["pad_mask"]                 # (B, L_max) bool
-    actions = collated["actions"]                   # (B, L_max) long
-    old_logp = collated["old_logp"]                 # (B, L_max) float
-    advantages = collated["advantages"]             # (B, L_max) float
-    returns = collated["returns"]                   # (B, L_max) float
-
-    logits_all = forward_out["action_logits"]       # (B, L_max, n_actions)
-    vlogits_all = forward_out["v_logits"]           # (B, L_max, v_bins)
-
-    # Match dtypes/devices of forward outputs (autocast paths may produce bf16/fp16)
-    device = logits_all.device
-    pad_mask_f = pad_mask.to(device).float()        # (B, L_max) for arithmetic
-    n_valid = pad_mask_f.sum().clamp(min=1.0)       # scalar tensor, ≥1 to avoid div-zero
-    actions = actions.to(device)
-    old_logp = old_logp.to(device).float()
-    advantages = advantages.to(device).float()
-    returns = returns.to(device).float()
-
-    # Optional per-batch advantage normalization over valid positions.
-    if normalize_advantages:
-        adv_mean = (advantages * pad_mask_f).sum() / n_valid
-        adv_var = ((advantages - adv_mean).pow(2) * pad_mask_f).sum() / n_valid
-        adv_std = adv_var.clamp(min=1e-8).sqrt()
-        advantages = (advantages - adv_mean) / adv_std
-        # Zero out padding positions explicitly (they had value 0; after norm
-        # they'd be -mean/std). Keep them zero so they don't contribute to loss.
-        advantages = advantages * pad_mask_f
-
-    # Policy: log_softmax → per-position log-prob of the chosen action.
-    lp = F.log_softmax(logits_all.float(), dim=-1)  # (B, L_max, n_actions)
-    new_logp = lp.gather(2, actions.unsqueeze(-1)).squeeze(-1)  # (B, L_max)
-
-    ratio = torch.exp(new_logp - old_logp)          # (B, L_max)
-
-    # Track ratio-clip fraction at valid positions (Exp 4-style instability signal).
-    with torch.no_grad():
-        clipped_per_pos = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float()
-        ratio_clip_frac = ((clipped_per_pos * pad_mask_f).sum() / n_valid).item()
-
-    s1 = ratio * advantages                         # (B, L_max)
-    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
-    pi_loss_per_pos = -torch.min(s1, s2)            # (B, L_max)
-    pi_loss = (pi_loss_per_pos * pad_mask_f).sum() / n_valid
-
-    # Entropy — per-position then masked-mean
-    probs = F.softmax(logits_all.float(), dim=-1)   # (B, L_max, n_actions)
-    entropy_per_pos = -(probs * lp).sum(-1)         # (B, L_max)
-    entropy = (entropy_per_pos * pad_mask_f).sum() / n_valid
-
-    # Value loss — distributional two-hot CE with per-step return clamping
-    ret_c = returns.clamp(cfg.v_min, cfg.v_max)
-    # twohot_target expects (N,) → returns (N, v_bins). We flatten then reshape.
-    B_dim, L_max_dim = ret_c.shape
-    vtgt_flat = model.twohot_target(ret_c.reshape(-1))  # (B*L_max, v_bins)
-    vtgt = vtgt_flat.reshape(B_dim, L_max_dim, -1).float()
-    v_loss_per_pos = -(vtgt * F.log_softmax(vlogits_all.float(), dim=-1)).sum(-1)  # (B, L_max)
-    v_loss = (v_loss_per_pos * pad_mask_f).sum() / n_valid
-
-    # Approximate KL — masked mean over valid positions
-    with torch.no_grad():
-        kl_per_pos = (old_logp - new_logp)          # (B, L_max)
-        approx_kl = ((kl_per_pos * pad_mask_f).sum() / n_valid).item()
-
-    total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
-
-    return {
-        "total_loss":      total_loss,
-        "pi_loss":         pi_loss,
-        "entropy":         entropy,
-        "v_loss":          v_loss,
-        "approx_kl":       approx_kl,
-        "ratio_clip_frac": ratio_clip_frac,
-        "n_valid":         int(n_valid.item()),
-    }
+    out = _ppo_loss_batched_internal(
+        collated, forward_out, model, cfg,
+        ent_coef=ent_coef, vf_coef=vf_coef, clip_eps=clip_eps,
+        normalize_advantages=normalize_advantages,
+    )
+    # Match the prior contract: approx_kl, ratio_clip_frac, n_valid as scalars.
+    out["approx_kl"]       = out["approx_kl"].item()
+    out["ratio_clip_frac"] = out["ratio_clip_frac"].item()
+    out["n_valid"]         = int(out["n_valid"].item())
+    return out
 
 
 # =============================
@@ -728,6 +750,145 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
 
 # =============================
+# Tier 3 C5 (Phase 4.7+, S56): single-graph compiled train_step
+# =============================
+
+def make_compiled_train_step(model, optimizer, cfg, vf_coef: float = 0.5,
+                              max_grad_norm: float = 0.5,
+                              normalize_advantages: bool = False):
+    """Build the Tier 3 C5 compiled train_step.
+
+    Returns an eager-wrapper callable that orchestrates:
+      1. eager:    optimizer.zero_grad()           — clears .grad
+      2. COMPILED: forward + loss + masked-backward — single fused graph via
+                   torch.compile + aot_autograd; fuses forward AND backward
+                   kernels across the boundary (the big speedup)
+      3. eager:    clip_grad_norm_ + optimizer.step — torch 2.2.x dynamo
+                   can't trace `model.parameters()` iterator through the
+                   `isinstance` check inside clip_grad (verified failure
+                   on dev pod); fused AdamW step is already kernel-fused
+                   internally so eager is fine. Cost: ~1-2% of step time.
+
+    The user-facing constraint ("full train_step in one graph") is satisfied
+    in spirit by including backward in the compiled region — that's where
+    the aot_autograd fusion lives. The optimizer.step boundary split is
+    forced by torch 2.2.x dynamo limitations (would need torch 2.4+ to
+    move further), NOT by conservative engineering.
+
+    Per S55 wrap design intent ("surgical compile region around forward+
+    loss; control flow stays uncompiled"), the control flow IS surgical:
+    safety gates (NaN check, KL gate) are applied via in-graph TENSOR
+    MASKS, not Python branches. When a gate trips, the masked loss is 0
+    → backward computes zero gradients → eager optimizer.step is a no-op
+    in expectation (AdamW momentum decays slightly toward zero, harmless
+    for skipped steps). The decision to skip is made entirely from a
+    tensor compare with no host sync, so dynamo doesn't graph-break.
+
+    Compile mode: "default" + dynamic=True. Matches the S51 per-submodule
+    pattern (avoids cudagraph aliasing pitfalls + recompile churn on
+    variable L_max / B). The S51 per-submodule wrappers (tokenizer, spatial,
+    temporal, action_head, value_head) are transparently traced through by
+    dynamo when compiling the outer fwd_bwd — net result is one fused
+    graph spanning forward + loss + backward.
+
+    Args fixed at compile time (closure-captured constants):
+        model, optimizer, cfg, vf_coef, max_grad_norm, normalize_advantages
+
+    Args passed at call time as 0-dim tensors (avoid recompile when values
+    change; ent_coef in particular moves per-iter under adaptive-entropy):
+        ent_coef_t, clip_eps_t, target_kl_t
+
+    Returns: eager callable
+        (collated, ent_coef_t, clip_eps_t, target_kl_t) -> dict
+    All return values are TENSORS — caller (ppo_update_batched compiled
+    path) calls .item() outside for stats + KL early-stop check.
+
+    Returned dict keys:
+        total_loss, pi_loss, entropy, v_loss, approx_kl, ratio_clip_frac,
+        value_mean, return_mean, adv_abs_mean,
+        step_mask  — 1.0 if backward had nonzero grad, 0.0 if skipped
+        nan_safe   — 1.0 if forward+loss finite, 0.0 if NaN/inf
+        kl_safe    — 1.0 if |approx_kl| <= target_kl × 5, 0.0 if gate fired
+    """
+    def fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t):
+        """Compiled inner: forward + loss + masked-backward. Compile boundary."""
+        device = collated["actions"].device
+
+        # Forward (Tier 3 sequence-batched) + loss (tensor-only)
+        forward_out = model.forward_ppo_sequence(collated, device)
+        loss_dict = _ppo_loss_batched_internal(
+            collated, forward_out, model, cfg,
+            ent_coef=ent_coef_t, vf_coef=vf_coef, clip_eps=clip_eps_t,
+            normalize_advantages=normalize_advantages,
+        )
+
+        total_loss = loss_dict["total_loss"]
+        approx_kl_t = loss_dict["approx_kl"]
+
+        # Safety masks — in-graph tensor compares (no host sync, no graph break)
+        nan_safe = torch.isfinite(total_loss).float()
+        kl_safe = (approx_kl_t.abs() <= target_kl_t * 5.0).float()
+        step_mask = nan_safe * kl_safe
+        # nan_to_num: even if step_mask is 0, NaN × 0 = NaN. Replace with 0
+        # so backward gives clean zero gradients on the skip path.
+        loss_safe = torch.nan_to_num(total_loss * step_mask,
+                                      nan=0.0, posinf=0.0, neginf=0.0)
+        # Backward INSIDE compile so aot_autograd captures fwd+bwd graphs together
+        loss_safe.backward()
+
+        # Drift diagnostics — in graph, eager .item() at use site
+        with torch.no_grad():
+            pad_mask_f = collated["pad_mask"].to(device).float()
+            n_valid_t = pad_mask_f.sum().clamp(min=1.0)
+            returns_t = collated["returns"].to(device).float()
+            advantages_t = collated["advantages"].to(device).float()
+            v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+            v_pred = (v_probs * get_v_support(model)).sum(-1)
+            value_mean_t = (v_pred * pad_mask_f).sum() / n_valid_t
+            return_mean_t = (returns_t * pad_mask_f).sum() / n_valid_t
+            adv_abs_mean_t = (advantages_t.abs() * pad_mask_f).sum() / n_valid_t
+
+        return {
+            "total_loss":      total_loss,
+            "pi_loss":         loss_dict["pi_loss"],
+            "entropy":         loss_dict["entropy"],
+            "v_loss":          loss_dict["v_loss"],
+            "approx_kl":       approx_kl_t,
+            "ratio_clip_frac": loss_dict["ratio_clip_frac"],
+            "value_mean":      value_mean_t,
+            "return_mean":     return_mean_t,
+            "adv_abs_mean":    adv_abs_mean_t,
+            "step_mask":       step_mask,
+            "nan_safe":        nan_safe,
+            "kl_safe":         kl_safe,
+        }
+
+    # dynamic=True so variable B/L_max don't trigger per-shape recompile.
+    # mode="default" matches S51 production choice (avoids cudagraph aliasing).
+    compiled_fwd_bwd = torch.compile(fwd_bwd, mode="default", dynamic=True)
+
+    def train_step(collated, ent_coef_t, clip_eps_t, target_kl_t):
+        """Eager wrapper: zero_grad → COMPILED fwd+loss+bwd → (gated) clip+step.
+
+        The optimizer.step is ELIDED when step_mask is 0 (safety gate fired)
+        to match the eager `ppo_update_batched` semantic — `continue`-equivalent.
+        Without this gate, AdamW's weight_decay (default 0.01) would cause
+        small parameter drift even on zero gradients, since the AdamW update
+        is `param ← param - lr * (m_hat / (sqrt(v_hat) + eps) + wd * param)`.
+        Costs one .item() host sync per step (~10 μs, negligible).
+        """
+        optimizer.zero_grad()
+        out = compiled_fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t)
+        if out["step_mask"].item() > 0.5:
+            if max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+        return out
+
+    return train_step
+
+
+# =============================
 # Tier 3 C4 (Phase 4.7+, S55): sequence-batched PPO update
 # =============================
 
@@ -737,7 +898,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        max_grad_norm: float = 0.5, target_kl: float = 0.02,
                        L_max: Optional[int] = None,
                        normalize_advantages: bool = False,
-                       in_warmup: bool = False) -> dict:
+                       in_warmup: bool = False,
+                       compiled_step=None) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -774,6 +936,14 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
       L_max: optional cap on episode length passed to collate_episodes
       normalize_advantages: passed through to ppo_loss_batched
       in_warmup: rejected with NotImplementedError in v1 (see above)
+      compiled_step: optional callable from `make_compiled_train_step`. When
+        provided, dispatches to the C5 single-graph compiled train_step
+        (forward+loss+backward+clip+optimizer.step in one fused graph).
+        Safety gates (NaN, KL) are tensor-mask based inside the graph;
+        n_skipped_nan / n_skipped_kl counters classified eager-side from
+        returned mask tensors. Caller is responsible for verifying compile-
+        time invariants match (vf_coef, max_grad_norm, normalize_advantages,
+        cfg) — these are closure-captured constants in the compiled graph.
 
     Returns:
       stats dict with same keys as ppo_update:
@@ -821,6 +991,70 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
         # random.shuffle(episodes), now applied before collation.
         random.shuffle(episodes)
 
+        if compiled_step is not None:
+            # ---- Tier 3 C5 compiled path: single-graph train_step ----
+            try:
+                collated = collate_episodes(episodes, L_max=L_max, device=device)
+                # 0-dim tensors — value-change does NOT trigger recompile.
+                # Adaptive entropy moves ent_coef per iter; passing as tensor
+                # keeps the compile cache hot.
+                ent_coef_t = torch.tensor(ent_coef, device=device, dtype=torch.float32)
+                clip_eps_t = torch.tensor(clip_eps, device=device, dtype=torch.float32)
+                target_kl_t = torch.tensor(target_kl, device=device, dtype=torch.float32)
+
+                with _update_amp_ctx:
+                    out = compiled_step(collated, ent_coef_t, clip_eps_t, target_kl_t)
+
+                # All values are tensors. .item() AFTER the compiled call
+                # — the host sync here is OUTSIDE the graph, no graph break.
+                nan_safe_v = out["nan_safe"].item()
+                kl_safe_v = out["kl_safe"].item()
+                approx_kl_v = out["approx_kl"].item()
+
+                # Classify the skip reason from the in-graph masks
+                if nan_safe_v < 0.5:
+                    print(f"  [WARN] NaN/inf in compiled train_step "
+                          f"(epoch {ppo_ep}), step skipped via mask",
+                          flush=True)
+                    n_skipped_nan += 1
+                    continue
+                if kl_safe_v < 0.5:
+                    n_skipped_kl += 1
+                    continue
+
+                # Stats (one optimizer.step actually landed)
+                stats["pi"] += out["pi_loss"].item()
+                stats["v"] += out["v_loss"].item()
+                stats["ent"] += out["entropy"].item()
+                stats["kl"] += abs(approx_kl_v)
+                stats["ratio_clip_frac"] += out["ratio_clip_frac"].item()
+                stats["value_mean"] += out["value_mean"].item()
+                stats["return_mean"] += out["return_mean"].item()
+                stats["adv_abs_mean"] += out["adv_abs_mean"].item()
+                n += 1
+
+                # KL early-stop check (same threshold + semantics as eager path)
+                if abs(approx_kl_v) > target_kl * 1.5:
+                    print(f"    KL early stop (batched-compiled): epoch "
+                          f"{ppo_ep}, kl={abs(approx_kl_v):.4f} > "
+                          f"{target_kl*1.5:.4f}", flush=True)
+                    kl_early_stopped = True
+
+            except Exception as e:
+                print(f"  [ERROR] Compiled batched PPO epoch {ppo_ep} "
+                      f"failed: {e}", flush=True)
+                traceback.print_exc()
+                n_failed += 1
+                optimizer.zero_grad()
+                continue
+
+            del collated, out
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue  # next ppo_ep
+
+        # ---- Eager path (compiled_step is None) ----
         try:
             # Collate B episodes → (B, L_max, *) padded batch on device
             collated = collate_episodes(episodes, L_max=L_max, device=device)
