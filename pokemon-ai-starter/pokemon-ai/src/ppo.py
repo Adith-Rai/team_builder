@@ -108,6 +108,242 @@ def build_ppo_episodes(trajectories: List[Trajectory],
 
 
 # =============================
+# Tier 3 (Phase 4.7+, S55): Episode collation for sequence-batched PPO
+# =============================
+#
+# C1 (this function): collate B episodes into padded (B, L_max, *) tensors
+# with pad_mask. Foundational change for Tier 3 — does NOT alter the
+# existing per-episode `ppo_update()` path. C2/C3/C4 will wire collated
+# data into the new sequence-batched forward + masked loss.
+#
+# Design constraints (per docs/PHASE1_V3_OBSERVATIONS.md + boot doc):
+#   - Reference shape from Metamon's metamon_to_amago.py:
+#     (B episodes, L_max turns, ...) + pad_mask
+#   - PPO is on-policy → no off-policy reweighting needed (vs Metamon V-trace)
+#   - Causal masking lives in C2 (temporal attention); collate is just shape
+#   - Per-episode storage (Trajectory, build_ppo_episodes) unchanged
+
+def collate_episodes(episodes, L_max=None, device=None) -> dict:
+    """Collate B episode dicts into padded (B, L_max, *) tensors + pad_mask.
+
+    Args:
+      episodes: list of episode dicts as returned by `build_ppo_episodes`.
+        Each must contain: feat_batches (list of T per-turn feat dicts),
+        actions/old_logp/advantages/returns (length-T sequences),
+        action_masks (list of T arrays/tensors of shape (A,)).
+      L_max: optional max sequence length. Defaults to longest episode in
+        the bundle. Episodes longer than L_max are right-truncated.
+      device: optional torch.device — if given, output tensors are moved
+        there. If None, output stays on CPU (move at use site).
+
+    Returns:
+      dict with the following keys:
+        feat_batches: dict — each leaf is (B, L_max, ...) padded tensor.
+          Nested dicts are recursed; non-tensor leaves are stacked as-is.
+        actions:      (B, L_max) long tensor — padded with 0
+        old_logp:     (B, L_max) float tensor — padded with 0.0
+        advantages:   (B, L_max) float tensor — padded with 0.0
+        returns:      (B, L_max) float tensor — padded with 0.0
+        action_masks: (B, L_max, A) float tensor — padded with 0.0
+        pad_mask:     (B, L_max) bool tensor — True at valid positions,
+                      False at padding. Multiply loss by pad_mask to zero
+                      gradient at padding positions.
+        seq_lens:     (B,) long tensor — actual T per episode (post-truncation)
+        B:            int — batch size (number of episodes)
+        L_max:        int — padded sequence length
+
+    Memory notes:
+      - At production scale (B=48 episodes, L_max=200 turns, ~few hundred
+        feature dims): collated tensors are ~100-500 MB on GPU. Manageable.
+      - For very large bundles, caller can pass L_max < max(seq_lens) to
+        cap memory at the cost of right-truncating long episodes (rare).
+
+    Acceptance gate (C1 unit test): reduce-sum equivalence on valid positions
+      sum(collated[k] * pad_mask) == sum_per_episode(k) for all k.
+    """
+    import torch as _t
+
+    if not episodes:
+        raise ValueError("collate_episodes: empty episode list")
+
+    # 1. Determine L_max + seq_lens
+    seq_lens_list = [len(ep["actions"]) for ep in episodes]
+    if L_max is None:
+        L_max = max(seq_lens_list)
+    # Right-truncate any episode longer than L_max (defensive)
+    seq_lens_list = [min(s, L_max) for s in seq_lens_list]
+    B = len(episodes)
+
+    seq_lens = _t.tensor(seq_lens_list, dtype=_t.long)
+    # pad_mask[b, t] = True iff t < seq_lens[b]
+    arange_L = _t.arange(L_max).unsqueeze(0)            # (1, L_max)
+    pad_mask = arange_L < seq_lens.unsqueeze(1)          # (B, L_max) bool
+
+    # 2. Pad scalar-per-turn fields (actions, old_logp, advantages, returns)
+    #    to (B, L_max). Each ep[k] is a length-T list/array.
+    def _pad_1d(ep_list, T_actual, dtype, fill=0.0):
+        """Convert a length-T list/array to a length-L_max tensor padded with `fill`."""
+        x = _t.as_tensor(list(ep_list)[:T_actual], dtype=dtype)
+        if T_actual < L_max:
+            pad = _t.full((L_max - T_actual,), fill, dtype=dtype)
+            x = _t.cat([x, pad], dim=0)
+        return x
+
+    actions = _t.stack([_pad_1d(ep["actions"], s, _t.long, fill=0)
+                         for ep, s in zip(episodes, seq_lens_list)], dim=0)
+    old_logp = _t.stack([_pad_1d(ep["old_logp"], s, _t.float32, fill=0.0)
+                          for ep, s in zip(episodes, seq_lens_list)], dim=0)
+    advantages = _t.stack([_pad_1d(ep["advantages"], s, _t.float32, fill=0.0)
+                            for ep, s in zip(episodes, seq_lens_list)], dim=0)
+    returns = _t.stack([_pad_1d(ep["returns"], s, _t.float32, fill=0.0)
+                         for ep, s in zip(episodes, seq_lens_list)], dim=0)
+
+    # 3. action_masks: list of T per-turn (A,) arrays/tensors → (B, L_max, A)
+    #    Determine A from first non-empty episode.
+    A = None
+    for ep in episodes:
+        if ep["action_masks"]:
+            first_m = ep["action_masks"][0]
+            A = (first_m.shape[0] if hasattr(first_m, "shape")
+                 else len(first_m))
+            break
+    if A is None:
+        raise ValueError("collate_episodes: no action_masks found")
+
+    def _pad_2d(am_list, T_actual, A):
+        """Stack T (A,) masks into (T, A), pad to (L_max, A) with zeros."""
+        if T_actual == 0:
+            stacked = _t.zeros(0, A, dtype=_t.float32)
+        else:
+            stacked = _t.stack([_t.as_tensor(m, dtype=_t.float32)
+                                for m in am_list[:T_actual]], dim=0)
+        if T_actual < L_max:
+            pad = _t.zeros(L_max - T_actual, A, dtype=_t.float32)
+            stacked = _t.cat([stacked, pad], dim=0)
+        return stacked
+
+    action_masks = _t.stack([_pad_2d(ep["action_masks"], s, A)
+                              for ep, s in zip(episodes, seq_lens_list)], dim=0)
+
+    # 4. feat_batches: per-episode list of T per-turn dicts. Each per-turn
+    #    dict has tensor leaves of shape (1, ...) and possibly nested dict
+    #    leaves of the same shape. Need to:
+    #      (a) per-episode: stack T turn dicts → leaves (T, ...)
+    #      (b) per-episode: pad to (L_max, ...) with zeros
+    #      (c) across episodes: stack to (B, L_max, ...)
+    #    Recurse for nested dicts. Non-tensor leaves return None (caller
+    #    must handle; current production has no non-tensor leaves).
+    def _stack_pad_one_episode(turn_dicts, T_actual):
+        """Return a dict with leaves stacked + padded to (L_max, ...).
+        Recurses for nested dicts."""
+        if T_actual == 0:
+            # Empty episode: synthesize zero-shaped leaves matching schema
+            # of OTHER episodes. Caller should not normally pass empty episodes
+            # (build_ppo_episodes filters them), but be defensive.
+            raise ValueError("collate_episodes: T_actual==0 episode "
+                             "(should be filtered upstream)")
+
+        sample = turn_dicts[0]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                # Stack along dim 0 (each leaf is (1, ...) per turn) — squeeze
+                # the leading-1 if present (use cat which preserves shape).
+                # Cat gives (T, ...) — same as existing _stack_field at L168.
+                stacked = _t.cat([turn_dicts[t][k]
+                                  for t in range(T_actual)], dim=0)
+                # Pad to (L_max, ...) with zeros
+                if T_actual < L_max:
+                    pad_shape = (L_max - T_actual,) + tuple(stacked.shape[1:])
+                    pad = _t.zeros(pad_shape, dtype=stacked.dtype,
+                                    device=stacked.device)
+                    stacked = _t.cat([stacked, pad], dim=0)
+                out[k] = stacked
+            elif isinstance(v, dict):
+                # Recurse: build a nested dict where each key's value is the
+                # padded tensor across turns of the OUTER episode.
+                inner_out = {}
+                for inner_k, inner_v in v.items():
+                    if isinstance(inner_v, _t.Tensor):
+                        inner_stacked = _t.cat(
+                            [turn_dicts[t][k][inner_k]
+                             for t in range(T_actual)], dim=0)
+                        if T_actual < L_max:
+                            pad_shape = ((L_max - T_actual,)
+                                         + tuple(inner_stacked.shape[1:]))
+                            pad = _t.zeros(pad_shape, dtype=inner_stacked.dtype,
+                                            device=inner_stacked.device)
+                            inner_stacked = _t.cat([inner_stacked, pad], dim=0)
+                        inner_out[inner_k] = inner_stacked
+                    else:
+                        # Non-tensor nested leaf: not supported in current
+                        # production schema. Skip rather than crash.
+                        pass
+                out[k] = inner_out
+            # else: non-tensor non-dict leaf — skip (not used in production)
+        return out
+
+    # Per-episode collated dicts, then stack across batch dim
+    per_episode_collated = [
+        _stack_pad_one_episode(ep["feat_batches"], s)
+        for ep, s in zip(episodes, seq_lens_list)
+    ]
+
+    def _stack_batch_dim(per_ep_list):
+        """Given list of per-episode dicts where each leaf is (L_max, ...),
+        stack across batch to give dicts where each leaf is (B, L_max, ...).
+        Recurses for nested dicts."""
+        sample = per_ep_list[0]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                out[k] = _t.stack([d[k] for d in per_ep_list], dim=0)
+            elif isinstance(v, dict):
+                inner_out = {}
+                for inner_k in v:
+                    inner_out[inner_k] = _t.stack(
+                        [d[k][inner_k] for d in per_ep_list], dim=0)
+                out[k] = inner_out
+        return out
+
+    feat_batches = _stack_batch_dim(per_episode_collated)
+
+    # 5. Optional device move
+    if device is not None:
+        def _to_device(d):
+            r = {}
+            for k, v in d.items():
+                if isinstance(v, _t.Tensor):
+                    r[k] = v.to(device, non_blocking=True)
+                elif isinstance(v, dict):
+                    r[k] = _to_device(v)
+                else:
+                    r[k] = v
+            return r
+        feat_batches = _to_device(feat_batches)
+        actions = actions.to(device, non_blocking=True)
+        old_logp = old_logp.to(device, non_blocking=True)
+        advantages = advantages.to(device, non_blocking=True)
+        returns = returns.to(device, non_blocking=True)
+        action_masks = action_masks.to(device, non_blocking=True)
+        pad_mask = pad_mask.to(device, non_blocking=True)
+        seq_lens = seq_lens.to(device, non_blocking=True)
+
+    return {
+        "feat_batches": feat_batches,
+        "actions": actions,
+        "old_logp": old_logp,
+        "advantages": advantages,
+        "returns": returns,
+        "action_masks": action_masks,
+        "pad_mask": pad_mask,
+        "seq_lens": seq_lens,
+        "B": B,
+        "L_max": L_max,
+    }
+
+
+# =============================
 # PPO Update (batched spatial, sequential temporal)
 # =============================
 
