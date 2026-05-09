@@ -79,7 +79,7 @@ The project has a strict order. Items LATER must not start before items EARLIER 
 
 1. **Phase 1 v3 (currently running)** — V1 gen-9-OU baseline measurement. Iter 200 target. ~5 days remaining at S54 end. **Do not pull new code on prod pod (HEAD locked at `251cd14a`)**. Do not switch precision mid-run. Do not change variables.
 
-2. **Tier 3 + train_step compile dev** — in parallel with #1, on dev pod. **C1+C2+C3+C4 SHIPPED in S54**. Remaining: C5 (compile boundary), train_rl.py wiring (`--tier3` flag), dev pod end-to-end smoke. Validation A/B (C6) MUST wait for #1 to finish (needs clean baseline + GPU).
+2. **Tier 3 + train_step compile dev** — in parallel with #1, on dev pod. **C1+C2+C3+C4 SHIPPED in S55**. Remaining: C5 (compile boundary), train_rl.py wiring (`--tier3` flag), dev pod end-to-end smoke. Validation A/B (C6) MUST wait for #1 to finish (needs clean baseline + GPU).
 
 3. **H2H gauntlet wiring** (parallel side work, ~3-4 hrs, $0 GPU) — needed for Phase 1 v3 final eval (when iter 200 lands). Interleave when Phase 1 v3 is ~1 day from finish.
 
@@ -226,7 +226,7 @@ These are the load-bearing choices that have been made + validated. Don't reliti
 
 ### In flight (current sessions)
 
-- **Phase 1 v3 production run** — iter 49+ at S54 end, EVAL trajectory 69→60→53→49 (within expected baseline range; see `docs/PHASE1_V3_OBSERVATIONS.md` for diagnosis). ~5 days to iter 200.
+- **Phase 1 v3 production run** — iter 49+ at S55 end, EVAL trajectory 69→60→53→49 (within expected baseline range; see `docs/PHASE1_V3_OBSERVATIONS.md` for diagnosis). ~5 days to iter 200.
 - **Tier 3 dev** — C1+C2+C3+C4 SHIPPED. Remaining: C5 + train_rl.py wiring + dev pod smoke.
 
 ### Next (interleave with above as Phase 1 v3 finishes)

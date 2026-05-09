@@ -10,7 +10,9 @@ This doc is a **follow-up** to `PHASE1_POSTMORTEM.md`, not a replacement. The S5
 
 ## TL;DR
 
-Phase 1 v3 is **tracking the S50 trajectory at iter 39 despite the lr=1e-5 fix being applied** — 53% smart_avg vs S50's 54% at the same iter. Different per-bot signature (we're stronger vs SH, weaker vs Tactical). The lr fix removed cause #1 from S50; causes #2 (team distribution) and #3 (perm/canonical) are still present, accounting for the remaining drop.
+Phase 1 v3 is **tracking the S50 trajectory at iter 39+49 despite the lr=1e-5 fix being applied** — 53% / 49% smart_avg vs S50's 54% / ~51% (interp) at the same iters. Different per-bot signature (we're stronger vs SH, weaker vs Tactical). The lr fix removed cause #1 from S50; causes #2 (team distribution) and #3 (perm/canonical) are still present, accounting for the remaining drop.
+
+**Update (iter 49 EVAL — 2026-05-09)**: smart_avg dropped from iter 39's 53% to **49%**. Per-bot SH=59 SmartDmg=44 Tactical=42 Strategic=52. Below the 50% concerning-band threshold. Still within expected baseline range (per §7 below); hard abort triggers (smart_avg <30%, W/L <35% sustained, KL >0.06, v_loss >5.0) all NOT firing. Continue. Iter 59 next eval data point.
 
 **Phase 1 v3 will likely land at smart_avg ~35-50% by iter 200**, similar to S50. That's the **expected baseline measurement** for "pure self-play with lr fix only." Not elite. The point of the run is to confirm this ceiling so Phase 2 can target the remaining gaps.
 
@@ -163,7 +165,8 @@ The training-distribution changes (§2-4) are **multi-iter aggregate effects**, 
 
 Phase 1 v3 will measure: "with all S50 fixes that don't require changing training distribution applied (lr, lam, ent_coef, warmup, adaptive entropy), where does pure self-play cap?"
 
-Best estimate based on current trajectory (53% at iter 39, S50 trajectory):
+Best estimate based on current trajectory (53% at iter 39, 49% at iter 49, S50 trajectory):
+- iter 59: ~46-50%
 - iter 79: ~35-45%
 - iter 200: ~30-40%
 

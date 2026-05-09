@@ -1,74 +1,118 @@
 pre prompt :
 
-⚠️ **READ FIRST, EVERY SESSION (set up by user S55, project-eternal layer)**:
+⚠️ **STANDING-ORDER ARCHITECTURE (set up S55, project-eternal)**:
 
-The user has explicitly set up a standing-order architecture so future sessions inherit FULL context without them repeating anything. Apply on every decision. Your auto-loaded `MEMORY.md` (`~/.claude/projects/.../memory/MEMORY.md`) at session start lists the mandatory reads. Specifically:
+The user has explicitly set up `MEMORY.md` (auto-loaded every session) + `memory/project_session_boot_protocol.md` (mirrored at `docs/SESSION_BOOT_PROTOCOL.md`) so future sessions inherit FULL context — philosophy, sequencing, DO/DO NOT (with WHY), locked decisions, plan trajectory — WITHOUT the user repeating anything. **The user will not remind you of fundamentals every session.** Apply the boot protocol on every decision.
 
-1. **`memory/project_session_boot_protocol.md`** (also mirrored at `docs/SESSION_BOOT_PROTOCOL.md` for git-visible reference) — STANDING ORDERS. Philosophy + sequencing + DO/DO NOT (with WHY for each) + locked decisions table + plan trajectory. Read this BEFORE everything else. The user will NOT repeat this — internalize it on every session load.
+**Mandatory reads at session start, in this exact order (also listed in MEMORY.md ⚠️ READ FIRST)**:
+1. `memory/project_session_boot_protocol.md` — STANDING ORDERS. Read FIRST. Internalize on every session.
 2. `memory/feedback_engineering_standard.md` — quality standard
 3. `memory/feedback_ask_when_uncertain.md` — when to ask vs guess
-4. `memory/project_strategic_frame.md` — locked sequencing
-5. `memory/project_cis_4_6_design.md` — most recent shipped infra
-6. THIS FILE (`next-prompt.txt`) — session-specific deep state
+4. `memory/project_strategic_frame.md` — locked sequencing (vertical → horizontal)
+5. `memory/project_cis_4_6_design.md` — most recent shipped infra (S54)
+6. THIS FILE (`next-prompt.txt`) — session-specific state
 7. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design implications + iter 39/49 EVAL diagnosis
 8. **First action**: production status check (next-prompt §E)
 
-If files conflict, surface — don't silently reconcile. Apply philosophy + sequencing rules from boot protocol on every decision. Don't half-ass. Don't shortcut. Don't pivot to deferred items.
+If files conflict, surface — don't silently reconcile. Don't half-ass. Don't shortcut. Don't pivot to deferred items (§4 + §5 of boot protocol enumerate exactly what's now vs deferred).
 
 ---
 
-Then continue with this session-specific boot doc. The "if you read nothing else" list below names EIGHT required-reading items — start with #1 which is `memory/feedback_engineering_standard.md`. That's the operating standard: read code + docs BEFORE touching anything, no shortcuts, hard-won decisions in the codebase stay (don't re-walk dead paths in §K), ship the proper/efficient/correct/stable/long-lasting solution that doesn't need revisiting. Cost discipline = thoroughness, not speed. The pod is paid time. Anything you ship should not need to be touched again.
+**S55 wrap (2026-05-09)** — picking up from Session 55 (just finished). Production iter 49+ in flight (last checked iter 52 in collect at 10:25 UTC). **Iter 49 EVAL: smart_avg=49%** (SH=59 SmartDmg=44 Tactical=42 Strategic=52). Trajectory 69→60→53→49 — within expected baseline range per `docs/PHASE1_V3_OBSERVATIONS.md`. ~5 days remaining to iter 200. HEAD on prod pod LOCKED at `251cd14a`. **DO NOT pull**. Read-only monitoring only.
 
-Then load `memory/project_strategic_frame.md` — the strategic ordering. Vertical-first (gen 9 ceiling before multi-gen), gen 9 as infra testbed, multi-gen-AGNOSTIC vs SPECIFIC split. Don't re-derive. Frame is locked.
+**S55 SHIPPED** (4 commits beyond Phase 4.6, all on origin/master):
+- `f79ea477` Tier 3 C1: `collate_episodes()` — padded (B, L_max, *) batching foundation. 6/6 unit tests PASS.
+- `f728b3af` Tier 3 C2: TemporalTransformer `return_all_positions=True` + `forward_ppo_sequence()`. 5/5 tests PASS, max diff 2.38e-07 vs sequential.
+- `f720dccc` Tier 3 C3: `ppo_loss_batched()` masked PPO loss. 5/5 tests PASS, B=1 bit-equivalent to per-episode.
+- `8ce7ffcc` Tier 3 C4: `ppo_update_batched()` sequence-batched PPO update. 6/6 smoke tests PASS, gradient flows.
+- `6758cc3c` Standing orders: `docs/SESSION_BOOT_PROTOCOL.md` + restructured `MEMORY.md`.
 
-Then load `memory/project_cis_4_3_design.md` + `memory/project_cis_4_6_design.md` — **CIS Phase 4.3 a/b/c + 4.4 + 4.5 + 4.6 ALL SHIPPED**. 4.6 is the failure recovery path (Option B unified full-reset); shipped + Tests 6a/6b PASS on dev pod A100 in S54. The full --cis --pipeline stack is now production-ready for Phase 2 launch.
+**S54 SHIPPED** (still relevant): CIS Phase 4.6 Option B unified full-reset recovery (`64b822a3`) + `docs/PHASE1_V3_OBSERVATIONS.md` Phase 2 design (`1bbff8ac`). Both validated on dev pod A100.
 
-Also load `memory/feedback_cis_thread_safety.md` — async-dispatch pattern is now the prod default. Per-handle Lock retained for parent-side reload calls (sync, rare). Don't conflate the two paths.
+**Headline work for next session (S56)**:
+1. **Tier 3 C5** — `torch.compile(train_step)`. Surgical compile-region wrap of forward+loss; control flow stays uncompiled. Bundled with C4 since compile needs fixed shapes. ~1 day.
+2. **train_rl.py wiring** — add `--tier3` flag routing to `ppo_update_batched`. The path is implemented but not connected to the production entry point yet. Read train_rl.py PPO update call site, add flag dispatch, smoke. ~half day.
+3. **Dev pod end-to-end smoke** — full `--tier3` path runs without errors at small scale on real model + ckpt. ~$2-3 A100, ~30 min.
+4. **H2H gauntlet wiring** (parallel side work, ~3-4 hrs, $0) — Kakuna/SmallRL/Minikazam adapters. Needed for Phase 1 v3 final eval (~5 days). Interleave when Phase 1 v3 is ~1 day from finish.
 
-**Then load `docs/PHASE1_V3_OBSERVATIONS.md`** — load-bearing for any Phase 2 launch design decision. Documents (a) iter 39 EVAL drop diagnosis (smart_avg 69→60→53 tracking S50 trajectory despite lr=1e-5 fix), (b) the three S50 postmortem causes and which were/weren't applied to Phase 1 v3, (c) Phase 2 design implications including team distribution mix (NOT mixing the eval set into training), perm/canonical fix, external opps, lr scheduling, (d) strict sequencing constraint (infra optimizations FIRST, then Phase 2 with all changes).
+**S56 deferred** (do NOT pivot to — boot protocol §4 + §5):
+- Multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3) — POST-Phase-2 only.
+- Doubles/Triples/VGC/AG/in-game format support — POST-multi-gen only.
+- **Network Volume migration** — DEFERRED until multi-gen per user (S55). Container Disk acceptable for Phase 1/2 since user monitors and won't stop pod without informing. Risk consciously accepted; do NOT redo this analysis.
+- Per-worker traj checkpointing — REJECTED (`feedback_phase46_traj_checkpoint_rejected.md`).
+- Easy items (perm fix, lr sched impl, source 100-150 elite teams, bf16 dev pod smoke) — these are Phase 2 PREP, JIT before Phase 2 launches. Do NOT start until Tier 3 (C5 + wiring + smoke) is shipped + Phase 1 v3 finishes.
 
-First action, literally: run the production status check (next-prompt §E). Phase 1 v3 compiled run was at iter 41+ (W/L 43-56% across pool growth, iter 39 EVAL smart_avg=53%) at S54 end. Status TBD now. If still running: don't disturb it (HEAD locked at `251cd14a`), work on Tier 3 dev + H2H gauntlet wiring + Network Volume verification. If wrapped at iter 200: pull final.pt, run full eval suite + H2H gauntlet, document final Elo + smart_avg + per-bot trajectory, then move to Phase 2 launch with full stack. If failed: diagnose, relaunch only after RCA.
+**Post-Phase-1-v3 priorities** (in order, not now):
+1. Pull final.pt + full eval suite (smart_avg + Elo + H2H gauntlet)
+2. **C6 Tier 3 A/B validation** — 20-iter run on dev pod, init from BC v10 e3, same hyperparams as Phase 1 v3, compare deep playstyle at iter 19 + 29 against Phase 1 v3 baseline. ~$10-15.
+3. Easy items JIT (perm fix + lr sched + team sourcing + bf16 smoke)
+4. **Phase 2 launch** with full stack: `--cis --pipeline --bf16` + Tier 3 + train_step compile + 30-50% real elite team mix (SEPARATE from eval set) + perm at eval + external opps + lr scheduling + absolute early-stop.
 
-**Headline work for S55**: Tier 3 transition-level minibatching (~1.5-2 wks dev + 20-iter A/B). The actual remaining big lever — ~4-10× update speedup if quality holds. Reference: `metamon_ref/metamon/rl/metamon_to_amago.py` for sequence-batched-PPO with-temporal-stack. Don't START until Phase 1 v3 finishes (no mid-run variable changes per §B). Bundle with `torch.compile(train_step)` per §D STEP 4.
+If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter), S53's pool-mirror redesign, S54's REBIND_WORKER pivot, and S55's parallel-Tier-3 decision (boot doc said "don't start until Phase 1 v3 finishes" but user's parallelism case was sound + dev pod was idle) are all wins for the "ask, don't guess" + "honest opinion including pushback" patterns. `memory/feedback_ask_when_uncertain.md` has the why.
 
-Parallel side work (zero-GPU, hours not days): **H2H gauntlet wiring** (STEP 6, ~3-4 hrs), **Network Volume verification** (STEP 7, ~10 min), **sourcing 100-150 real elite teams** for Phase 2 training-distribution mix (see `docs/PHASE1_V3_OBSERVATIONS.md` §2 for sourcing details — copy verbatim from Smogon archive / ladder replays / tournament posts; do NOT generate or estimate; the eval-set 16 mm-competitive teams MUST stay isolated and NEVER enter training).
-
-If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter), S53's pool-mirror redesign (the dual-slot memo didn't compose; honest read produced the right answer), and S54's REBIND_WORKER pivot (Connection-passing-over-pipe broken; pivoted to full-reset Option B) are all wins for the "ask, don't guess" pattern. `memory/feedback_ask_when_uncertain.md` has the why.
-
-S54 shipped: **CIS Phase 4.6 — Option B unified full-reset recovery** (commit `64b822a3` on origin/master). Failure detection (worker death + CIS subprocess death + stale heartbeat) all route through `_orchestrator_full_reset` → re-collect from zero. Tests 6a/6b PASS on dev pod A100. Plus latent bug fixes: parent FD-close after worker spawn, L2371 racy reload pattern, cis_server.is_alive() check that V9RLPlayer fallback was hiding. Pivoted from REBIND_WORKER plan after dev-pod validation showed Connection-passing via mp.Pipe.send hangs (DupFd via resource_sharer either deadlocks or 30s+ slow). HEAD on production pod still `251cd14a` — DO NOT pull while Phase 1 v3 is running.
+HEAD on production pod still `251cd14a` — DO NOT pull while Phase 1 v3 is running. Local + origin HEAD: `6758cc3c` (S55 end). Dev pod (port 19373) up at S55 end with full dev stack — use for C5 + wiring + dev smoke.
 
 ═══════════════════════════════════════════════════════════════════════════════
-SESSION 54 BOOT — read top to bottom before doing ANYTHING
+SESSION 55 WRAP — what's done, what's next (read top to bottom)
 ═══════════════════════════════════════════════════════════════════════════════
 
-You are picking up from Session 53 (2026-05-08). **CIS Phase 4.3 a/b/c
-SHIPPED + production-scale validated** (5+ commits, all pushed to origin).
-Pool-mirror multi-slot (NOT the S52-memo dual-slot — that didn't compose
-with asyncio.gather opp concurrency; honest re-read found pool-mirror
-was strictly better). All Tests 1-3, Test 4 sustained, 4.3b BG overlap,
-small-scale 4.3c (22.8% saving), AND production-scale 4.3c on A100
-(~26% projected at full prod, lock-bound) all PASS. Per-handle
-threading.Lock holds correctness at conc=200 but caps GPU at ~48% util
-— it's the next throughput bottleneck. Production Phase 1 v3 was healthy
-through iter 22 + iter 23 in update at S53 end (iter 19 EVAL:
-smart_avg=69%, passed ≥67% baseline gate); status TBD now — first
-action below covers it.
+You are picking up from Session 55 (2026-05-09). Multi-shipping session:
 
-Headline work for THIS session is **CIS worker respawn (Phase 4.5)**
-(§D STEP 2). Last piece needed before Phase 2 can safely launch with
-`--cis --pipeline`. Worker watchdog/respawn — port the proven `--mp`
-heartbeat-from-OS-thread + 600s tolerance + paced respawn pattern to
-CIS workers. ~1 day dev + ~$1-2 A100 validation.
+**S55 SHIPPED** (5 commits beyond Phase 4.6, all on origin/master):
+- `f79ea477` Tier 3 C1 — `collate_episodes()` padded-batch foundation. 6/6 unit tests PASS.
+- `f728b3af` Tier 3 C2 — TemporalTransformer batched forward + `forward_ppo_sequence()`. 5/5 tests PASS, max diff 2.38e-07 vs sequential.
+- `f720dccc` Tier 3 C3 — `ppo_loss_batched()` masked PPO loss. 5/5 tests PASS, B=1 bit-equivalent to per-episode.
+- `8ce7ffcc` Tier 3 C4 — `ppo_update_batched()` sequence-batched PPO update. 6/6 smoke tests PASS, gradient flows.
+- `6758cc3c` Standing orders — `docs/SESSION_BOOT_PROTOCOL.md` + restructured `MEMORY.md` so future sessions inherit FULL context without user repetition.
 
-After that: **Tier 3 transition-level minibatching** is the headline
-(~1.5-2 wks dev + 20-iter A/B validation). The actual remaining big
-lever — ~4-10× update speedup if quality holds. Reference:
-`metamon_ref/metamon/rl/metamon_to_amago.py` for sequence-batched-PPO
-with-temporal-stack. Don't start until Phase 1 v3 finishes.
+**S54 SHIPPED** (still relevant): CIS Phase 4.6 Option B unified
+full-reset recovery (`64b822a3`) + `docs/PHASE1_V3_OBSERVATIONS.md`
+Phase 2 design (`1bbff8ac`).
 
-Parallel side work (zero-GPU, hours not days): **H2H gauntlet wiring**
-(STEP 6, ~3-4 hrs), **Network Volume verification** (STEP 7, ~10 min).
-Match the bar of S51/S52/S53 carefully-shipped work.
+The full --cis --pipeline stack is now production-ready for Phase 2
+launch. The Tier 3 algorithmic core (C1+C2+C3+C4) is COMPLETE in code
+but NOT yet wired into train_rl.py — that's S56 work.
+
+**Production Phase 1 v3 status at S55 end**: iter 49+ in flight (last
+checked iter 52 in collect at 10:25 UTC). Iter 49 EVAL: smart_avg=49%
+(SH=59 SmartDmg=44 Tactical=42 Strategic=52). Trajectory 69→60→53→49 —
+within expected baseline range per `docs/PHASE1_V3_OBSERVATIONS.md`.
+Tracking S50's catastrophic-trajectory at iter 39+ DESPITE the lr=1e-5
+fix being applied — the two unfixed S50 causes (team-distribution shift
++ perm/canonical mismatch) account for the remaining drop. ~5 days
+remaining to iter 200, ~$235 to completion. Phase 1 v3 will land at
+~35-50% smart_avg by iter 200 — this is the EXPECTED baseline measurement
+for "lr fix only, no team mix, no external opps". Don't abort. Hard
+abort triggers (smart_avg <30%, W/L <35% sustained, KL >0.06, v_loss >5.0)
+all NOT firing.
+
+**Headline work for S56** (in priority order):
+1. **Tier 3 C5** — `torch.compile(train_step)`. ~1 day. Surgical compile
+   region around forward+loss; control flow stays uncompiled.
+2. **train_rl.py wiring** — `--tier3` flag routes to `ppo_update_batched`.
+   ~half day. Read PPO update call site in train_rl.py, add flag dispatch.
+3. **Dev pod end-to-end smoke** — full --tier3 path runs at small scale
+   on real model + ckpt. ~$2-3 A100, ~30 min.
+4. **H2H gauntlet wiring** (parallel side work, ~3-4 hrs, $0) — needed
+   for Phase 1 v3 final eval (~5 days out). Interleave when Phase 1 v3
+   is ~1 day from finish.
+
+**Post-Phase-1-v3 priorities** (in order, NOT now):
+1. Pull final.pt + full eval suite (smart_avg + Elo + H2H gauntlet)
+2. **C6 Tier 3 A/B validation** — 20-iter run on dev pod, ~$10-15
+3. Easy items JIT for Phase 2: perm fix + lr sched + source 100-150 elite
+   teams (SEPARATE from 16 eval teams; copy verbatim from real comp sources)
+   + bf16 dev pod smoke
+4. **Phase 2 launch** with full stack
+
+**S56 deferred — DO NOT pivot to** (boot protocol §4 + §5):
+- Multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3) — POST-Phase-2 only
+- Doubles/Triples/VGC/AG/in-game format support — POST-multi-gen only
+- Network Volume migration — DEFERRED until multi-gen per user (S55).
+  Container Disk acceptable for Phase 1/2 since user monitors and won't
+  stop pod without informing. Risk consciously accepted; do NOT redo
+  this analysis. STEP 7 in §D below is OBSOLETE for current sessions.
+- Per-worker traj checkpointing — REJECTED per `feedback_phase46_traj_checkpoint_rejected.md`
 
 If you read NOTHING else, read these EIGHT things:
 
@@ -269,36 +313,63 @@ and parent timed out. See §K dead paths + `memory/project_cis_4_3_design.md`.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-§C. CURRENT STATE — what's running + what's at risk
+§C. CURRENT STATE — what's running + what's at risk (S55 wrap)
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Phase 1 v3 compiled production run** (started 2026-05-07 23:53:07 UTC).
-At S54 end (2026-05-09): iter 41+ in flight. **Iter 39 EVAL: smart_avg=53%**
-— a -16pp drop from iter 19's 69% and below the 67% BC baseline gate.
-Iter 29 was 60%, iter 39 is 53%. This is **tracking S50's catastrophic
-trajectory** at iter 39 (S50: 54%) — see `docs/PHASE1_V3_OBSERVATIONS.md`
-for full diagnosis.
+At S55 end (2026-05-09 ~10:25 UTC): iter 52 in collect, iter 49 EVAL
+just landed.
 
-**Critical finding**: lr=1e-5 (S50 postmortem fix) is applied but not
-sufficient. The remaining drop is from the two S50 causes that were
-NEVER fixed for Phase 1 v3:
+**EVAL trajectory** (the load-bearing data point):
+
+| iter | SH | SmartDmg | Tactical | Strategic | smart_avg |
+|---|---|---|---|---|---|
+| 19 | 66 | 68 | 68 | 76 | **69** |
+| 29 | 64 | 56 | 56 | 62 | **60** |
+| 39 | 58 | 56 | 45 | 53 | **53** |
+| **49** | **59** | **44** | **42** | **52** | **49** |
+
+**Iter 49 EVAL just dropped below 50% threshold** for first time. Drop
+concentrated in Tactical (68→42, -26pp) and SmartDmg (68→44, -24pp);
+SH only -7pp. Pattern matches "model wins via aggressive Kingambit/
+priority-attacker playstyle that simple bots tolerate but tactical
+bots punish via type-aware counters."
+
+**Comparison to S50 catastrophic regression** (same arch, lr=3e-5 was
+the bad lr; we're at lr=1e-5):
+
+| iter | S50 smart_avg | Phase 1 v3 smart_avg |
+|---|---|---|
+| 19 | 64 | **69** (+5 ours) |
+| 39 | 54 | **53** (-1 ours) |
+| 49 | (interp ~51) | **49** |
+| 79 | 35 | (projected ~35-45) |
+
+**We're tracking S50's trajectory DESPITE the lr=1e-5 fix.** The remaining
+drop is from the two S50 causes never fixed for Phase 1 v3:
 - Procedural train, mm-competitive eval distribution shift (-15-20pp)
 - Perm features at training, canonical at eval (-7pp)
 
-Combined potential -22-27pp drop from these two causes alone matches
-what we're seeing (-16pp at iter 39). **Phase 1 v3 will likely land
-at smart_avg ~35-50% by iter 200 — same as S50.** That's the EXPECTED
-baseline measurement of "lr fix only, no team mix, no external opps,
-no perm fix." Don't abort — this is the baseline we need.
+Full diagnosis in `docs/PHASE1_V3_OBSERVATIONS.md`. **Phase 1 v3 will
+land at ~35-50% smart_avg by iter 200 — this is the EXPECTED baseline
+measurement** for "lr fix only, no team mix, no external opps, no perm
+fix." Don't abort — this is the baseline we need to inform Phase 2 design.
+
+**Hard abort triggers** (none firing as of iter 52):
+- smart_avg <30% (catastrophic, worse than S50)
+- W/L vs PFSP pool <35% sustained (current 42-46%)
+- KL trajectory diverging above 0.06 (current 0.04 stable)
+- v_loss exploding above 5.0 (current 2.3)
 
 **Phase 2 launches with the missing fixes** (after Phase 1 v3 completes
-+ all infra optimizations land). See `docs/PHASE1_V3_OBSERVATIONS.md`
-for full Phase 2 design including the team-distribution mix design
-(SEPARATE 100-150 real elite teams; the eval-set 16 mm-competitive
-teams MUST stay isolated from training).
++ Tier 3 wired + dev pod smoke). See `docs/PHASE1_V3_OBSERVATIONS.md`
+for full Phase 2 design — team mix from SEPARATE 100-150 real elite teams
+(eval-set 16 mm-competitive teams MUST stay isolated from training,
+no data leakage), perm at eval enabled, external opps in PFSP pool,
+lr scheduling, absolute early-stop threshold.
 
-~159 iters to go to iter 200 target, ~6-7 days remaining at $1.50/hr
-(~$235 to completion). Iter 49 is next eval data point.
+~148 iters to go to iter 200 target, ~5 days remaining at $1.50/hr
+(~$180 to completion). Iter 59 is next eval data point.
 
 ```
 Run dir:   data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/
@@ -339,6 +410,18 @@ Iter 33: collect=1255s update=2249s  W/L 880/720 (55.0%)  pi=-0.045 ent=1.038 kl
 Iter 34: collect=1280s update=2270s  W/L 906/692 (56.7%)  pi=-0.032 ent=1.020 kl=0.043  pool=5  ← new W/L peak
 Iter 35: collect=1314s update=1745s  W/L 682/627 (43.6%)  pi=-0.013 ent=1.017 kl=0.043  pool=6  ← pool grew, 254 ties
 Iter 36: collect=1387s update=2203s  W/L 856/736 (53.5%)  pi=-0.039 ent=1.016 kl=0.044  pool=6  ← already recovering
+Iter 37: collect=1383s update=2192s  W/L 908/687/4 (56.8%)  pi=-0.023 ent=1.047 kl=0.043  pool=6  ← W/L peak iter 34/37
+Iter 38: collect=1375s update=2212s  W/L 877/712/11 (54.8%)  pi=-0.032 ent=1.053 kl=0.041  pool=6
+Iter 39: collect=??? update=??? W/L?  ← eval; smart_avg=53% ← drop continues (down from iter 29's 60%)
+Iter 40: collect=1367s update=1499s  W/L 590/563/169 (44.6%)  pi=-0.024 ent=1.057 kl=0.043  pool=7  ← pool grew, 169 ties
+Iter 41: collect=1415s update=1645s  W/L 660/604/242 (43.8%)  pi=-0.044 ent=1.043 kl=0.044  pool=7
+Iter 46: collect=1465s update=856s   W/L 547/453/261 (43.4%)  pi=-0.019 ent=1.012 kl=0.041  pool=8  ← W/L sustained low
+Iter 47: collect=1452s update=1248s  W/L 535/464/268 (42.2%)  pi=-0.038 ent=1.022 kl=0.043  pool=8
+Iter 48: collect=1447s update=1278s  W/L 543/464/260 (42.9%)  pi=-0.034 ent=1.029 kl=0.042  pool=8
+Iter 49: collect=1453s update=1320s  W/L 548/450/267 (43.3%)  pi=-0.043 ent=1.038 kl=0.041  pool=8  ← eval; smart_avg=49% ← below 50%
+Iter 50: collect=1530s update=1173s  W/L 465/436/136 (44.8%)  pi=-0.037 ent=1.001 kl=0.044  pool=9  ← pool grew
+Iter 51: collect=1489s update=721s   W/L 470/372/188 (45.6%)  pi=-0.008 ent=0.966 kl=0.044  pool=9  ← entropy dropping
+Iter 52: collect=1496s update=979s   W/L 433/357/207 (43.4%)  pi=-0.038 ent=0.961 kl=0.044  pool=9
 ```
 
 **KL early-stop firing every iter** (epoch 2-3 of 5) since ~iter 19 — model
@@ -566,12 +649,25 @@ See `memory/project_cis_4_6_design.md` for full design + gotchas.
 Per-worker traj checkpointing was REJECTED (not deferred) per Q3 cost
 analysis — see `memory/feedback_phase46_traj_checkpoint_rejected.md`.
 
-**STEP 3: Tier 3 transition-level minibatching** (~1.5-2 weeks dev + 20-iter cloud A/B validation)
-Rationale: this is THE remaining big lever. PPO update phase is currently
-bound by per-episode batching (~48 episodes/forward). Published practice
-(ps-ppo, Metamon) uses 256-2048 transitions/gradient — we're 48× below.
-Estimated: **4-10× update speedup** if quality holds. For 5M trajectories,
-this is the difference between ~70 days and ~22-30 days post-CIS.
+**STEP 3: Tier 3 transition-level minibatching** — C1+C2+C3+C4 SHIPPED in S55 ✅. C5 + train_rl.py wiring + dev pod smoke pending (S56).
+
+**Status**:
+- ✅ C1 `collate_episodes()` — `f79ea477` — 6/6 unit tests PASS
+- ✅ C2 batched temporal + `forward_ppo_sequence()` — `f728b3af` — 5/5 tests PASS, max diff 2.38e-07 vs sequential
+- ✅ C3 `ppo_loss_batched()` — `f720dccc` — 5/5 tests PASS, B=1 bit-equivalent to per-episode
+- ✅ C4 `ppo_update_batched()` — `8ce7ffcc` — 6/6 smoke tests PASS, gradient flows
+- ⏳ C5 `torch.compile(train_step)` — bundled with C4, ~1 day dev next session
+- ⏳ train_rl.py `--tier3` flag wiring — ~half day next session
+- ⏳ Dev pod end-to-end smoke — ~$2-3 next session
+- ⏳ C6 20-iter A/B vs Phase 1 v3 — runs AFTER Phase 1 v3 finishes (needs clean baseline + GPU). ~$10-15.
+
+**Critical context retained for S56 sessions** (don't re-derive):
+
+Rationale (why we did this): PPO update phase was bound by per-episode
+batching (~48 episodes/forward). Published practice (ps-ppo, Metamon)
+uses 256-2048 transitions/gradient — we were 48× below. Estimated
+**4-10× update speedup** if quality holds. For 5M trajectories, this
+is the difference between ~70 days and ~22-30 days post-CIS.
 
 **Reference: Metamon's source.** `metamon_ref/metamon/rl/metamon_to_amago.py`
 shows the right batch shape for transformer-temporal-with-on-policy-PPO:
@@ -744,19 +840,27 @@ vs basic bots is necessary but insufficient — H2H against published bots
 is the actual ceiling measurement. Needed at Phase 1 v3 iter 200 final
 eval AND throughout Phase 2 to track elite-ness over time.
 
-**STEP 7: Network Volume verification on prod pod** (~10 min verify, ~30 min migrate if needed)
-Critical infra debt. Before any future relaunch (Phase 2 or otherwise)
-we MUST have Network Volume — `MEMORY.md` warns "S49 lost a BC run to
-stop+resume on Container Disk." Verify whether prod pod's `/workspace`
-is on Network Volume or Container Disk:
+**STEP 7: Network Volume verification — DEFERRED until multi-gen (S55 user decision)**
 
-```
-ssh ... root@prod-pod "df -T /workspace && mount | grep workspace"
-```
+Per user (S55): Network Volume migration is deferred until multi-gen
+launch. Reasoning: Container Disk persists through pause/resume; only
+voluntary stop+start (with re-provision on different host) loses data.
+User monitors pod and won't stop without informing. Risk of RunPod
+hardware failure / outage is non-zero (~$80 per failure event on Phase 2,
+~$200+ on multi-gen) but accepted. Network Volume becomes mandatory for
+multi-gen runs (5+ wk, $200+ per failure), not Phase 2.
 
-If Container Disk: don't pause/stop the prod pod (current Phase 1 v3 is
-fine — continuous run, no pause planned). Plan Phase 2 launch with a new
-pod that has Network Volume from spawn.
+Do NOT redo this analysis. Do NOT verify Container Disk vs Network
+Volume on prod pod (waste of cycles — user has chosen). The original
+"S49 lost a BC run" warning still stands but only applies if pod is
+voluntarily stopped, which user won't do.
+
+If a different user / future agent decides to pursue this for Phase 2:
+the verify command is `ssh ... root@prod-pod "df -T /workspace && mount
+| grep workspace"`. Don't migrate the running prod pod (would require
+restart). Spin up a new pod with Network Volume from spawn for Phase 2.
+
+This step exists in the doc for reference; it's NOT a current TODO.
 
 **STEP 8: Source 100-150 real elite teams for Phase 2 training mix** (~3-6 hrs, $0)
 Per `docs/PHASE1_V3_OBSERVATIONS.md` §2 — the team-distribution shift
@@ -819,7 +923,7 @@ we're at the gen-9 ceiling and ready to go horizontal.
 §E. CONNECTING + MONITORING
 ═══════════════════════════════════════════════════════════════════════════════
 
-**TWO POD SETUP (S53 end → S54 start)**:
+**TWO POD SETUP (S55 end)**:
 
 1. **Production pod** — Phase 1 v3 compiled run (DO NOT DISTURB, HEAD
    locked at `251cd14a`). Continuous run, no pause/stop.
@@ -829,21 +933,22 @@ we're at the gen-9 ceiling and ready to go horizontal.
    - Run dir: `/workspace/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v10/ppo_phase1_v3_compiled/selfplay_v9_20260507_235306/`
    - Log: `/workspace/logs/ppo_phase1_v3_compiled.log`
    - 8 battle servers on ports 9000-9007
-   - This pod is for read-only monitoring only. Don't pull, don't push, don't restart.
+   - Read-only monitoring only. Don't pull, don't push, don't restart.
+   - At S55 end: iter 52 in collect, iter 49 EVAL=49% (within expected baseline range).
 
-2. **Dev/validation pod (A100 80GB)** — kept up at S53 end for S54 immediate use.
+2. **Dev/validation pod (A100 80GB)** — kept up at S55 end for S56 immediate use.
    ```bash
    ssh -i ~/.ssh/id_ed25519 -p 19373 -o StrictHostKeyChecking=no root@154.54.102.26
    ```
-   - HEAD: latest origin (S53 end at `803f5b5a` or later)
-   - Already has: torch 2.2.1+cu121 + triton 2.2.0 + poke-env 0.10.0 stack + Node 20 + npm install for battle_server
-   - Battle servers running on ports 9000-9007
+   - HEAD: bring to latest origin (S55 end: `6758cc3c`) before any C5 / wiring work.
+     Verify: `cd /workspace/team_builder && git log -1 --oneline`. If older, `git stash && git pull` (S54 captured a stash protocol; check via `git stash list`).
+   - Has: torch 2.2.1+cu121 + triton 2.2.0 + poke-env 0.10.0 + Node 20 + battle_server.
+   - Battle servers running on ports 9000-9007.
    - Ckpts in place: `data/models/bc/dummy_for_cis_dev.pt` (synthetic),
      `data/models/bc/v10_padded_for_cis_dev.pt` (BC v10 padded to current arch),
      `data/models/bc/v10_cloud_gen9/epoch_003.pt` (BC v10 original, source of truth)
-   - Use this pod for: CIS Phase 4.6 implementation + validation, Tier 3
-     dev + A/B (STEP 3), H2H gauntlet wiring (STEP 6 — local but can use this
-     for the A100 validation runs)
+   - Use for S56: Tier 3 C5 + train_rl.py wiring + dev pod end-to-end smoke (STEP 3 of §D);
+     H2H gauntlet wiring (STEP 6); post-Phase-1-v3, C6 A/B validation.
    - Cost: ~$1.50/hr while up. Kill via RunPod console when done.
 
 If either IP/port changes, find new in MEMORY.md or ask the user.
@@ -1175,9 +1280,9 @@ producing silent training corruption. Two resolutions:
 | Current `--mp` no-pipeline (Phase 1 v3) | 54 min | — |
 | `--cis --pipeline` Phase 4.3 (Lock-based, shipped S53) | ~40 min | ~26% |
 | **`--cis --pipeline` Phase 4.4 + 4.5 (shipped S53)** | **~38 min** | **~30%** |
-| + bf16 update autocast (already in code, needs `--bf16` flag) | ~32 min | ~41% |
-| + Tier 3 transition-level minibatching (next session) | ~12 min | ~78% |
-| + `torch.compile(train_step)` (bundled with Tier 3) | ~10 min | ~82% |
+| + bf16 update autocast (already in code, needs `--bf16` flag at Phase 2 launch) | ~32 min | ~41% |
+| + Tier 3 transition-level minibatching (C1-C4 SHIPPED S55; C5+wiring+smoke pending S56) | ~12 min | ~78% |
+| + `torch.compile(train_step)` (Tier 3 C5, bundled with C4 — pending S56) | ~10 min | ~82% |
 
 **For 5M trajectory goal (3125 iters at games=1600):**
 - Current trajectory (`--mp`): 108 days, ~$3,900
@@ -1335,27 +1440,23 @@ to find the relevant commit + read its message for context.
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-§M. THE STARTUP ROUTINE (verbatim, do this exactly)
+§M. THE STARTUP ROUTINE (verbatim, do this exactly — S55+ updated)
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. Read `memory/MEMORY.md` "Current State" section.
-2. Read this entire file. Yes, all of it. It's not that long.
-3. Run the production status check (§E).
-4. If production is healthy: pick STEP 2 from §D (CIS worker respawn)
-   as your headline work. Plan it. Discuss the plan with the user before
-   coding. STEP 6 (H2H gauntlet) and STEP 7 (Network Volume) can run
-   in parallel — code-only side work, $0 GPU.
-5. If production has FATAL or stale-heartbeat: diagnose first.
-   `feedback_iter17_heartbeat_hang.md` is the diagnostic playbook.
-6. If production is done (iter 200 reached): pull final.pt, run full eval
-   suite (`eval_diag.py` + `eval_metamon_competitive.py` + H2H gauntlet
-   if wired), document final smart_avg + Elo + per-bot + H2H. Then
-   move to STEP 3 (Tier 3) + STEP 5 (Phase 2 launch with full speed stack).
-7. Don't start coding before step 4-or-5-or-6's outcome is clear.
+1. Read `memory/MEMORY.md` (auto-loaded) — has the ⚠️ READ FIRST list at top.
+2. Read `memory/project_session_boot_protocol.md` (or `docs/SESSION_BOOT_PROTOCOL.md`) — STANDING ORDERS. Internalize.
+3. Read this entire file (`next-prompt.txt`). Yes, all of it.
+4. Read `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design + iter 39/49 EVAL diagnosis.
+5. Run the production status check (§E).
+6. If production is healthy AND not at iter 200 yet: headline work is **Tier 3 C5 + train_rl.py wiring + dev pod smoke** (per S55 wrap above + boot protocol §4 + §8). Plan + discuss with user before coding. **H2H gauntlet wiring** (STEP 6) is parallel side work — interleave when Phase 1 v3 is ~1 day from finish (iter 195+).
+7. If production has FATAL or stale-heartbeat: diagnose first. `feedback_iter17_heartbeat_hang.md` is the playbook.
+8. If production is done (iter 200 reached): pull final.pt, run full eval suite (`eval_diag.py` + `eval_metamon_competitive.py` + H2H gauntlet), document final smart_avg + Elo + per-bot + H2H. Then **C6 Tier 3 A/B validation** (~$10-15 dev pod) + easy items JIT (perm fix + lr sched + source 100-150 elite teams + bf16 smoke) + **Phase 2 launch** with full stack.
+9. Do NOT pivot to: multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3 — POST-Phase-2 only); doubles/VGC/triples/AG/in-game (POST-multi-gen only); Network Volume migration (deferred per user, see §D STEP 7); Easy items before Tier 3 ships.
+10. Don't start coding before step 6-or-7-or-8's outcome is clear.
 
 If you find yourself confused or context-loaded: ASK THE USER. Do not
-guess. The previous session's worker noted that "going in half-informed"
-is the pattern that costs most.
+guess. Past sessions confirmed "going in half-informed" is the pattern
+that costs most. (See `feedback_ask_when_uncertain.md`.)
 
 ═══════════════════════════════════════════════════════════════════════════════
 §N. EVAL EXPECTED OUTCOMES — what numbers mean
