@@ -190,15 +190,58 @@ S58 PRIORITIES (in order — no shortcuts, no premature pivoting)
    needs. Not blocking Phase 2 launch but blocking Phase 2 final eval +
    any "did we hit elite gen 9" assertion.
 
-6. **Easy Phase 2 prep items** (parallel, $0):
-   - Perm-at-eval enable (one-line config change)
-   - lr scheduling impl (cosine 1e-5 → 1e-6)
-   - Source 100-150 SEPARATE real elite teams (Smogon archive / Showdown
-     ladder replays / r/stunfisk OU samples / OST/OLT). NOT the 16
-     mm-competitive teams (eval-set isolation per `docs/PHASE1_V3_OBSERVATIONS.md`)
-   - Absolute early-stop threshold (SE-rate-based per S57 diagnosis)
-   - Cap adaptive entropy max (don't ramp above ~1.0; prevents the Phase 1 v3
-     Stage A→B trigger)
+6. **Easy Phase 2 prep items** — small code edits + manual data work,
+   each precisely scoped to "expose / wire what's already implemented" or
+   "add a small thing on top." DO NOT re-implement what already exists.
+
+   **Already implemented, just needs to be USED at production eval**:
+   - **Perm at eval (~5-10 lines)** — `build_turn_batch(training=True)` in
+     `features.py` ALREADY permutes slot order. V9RLPlayer (rl_player.py:70)
+     uses it during TRAINING collect. `eval_diag.py --diag-training-mode`
+     has a one-off monkey-patch that turns it on for eval. **For Phase 2:**
+     either add `--eval-perm` CLI flag in train_rl.py that flips
+     `BattleAgentTransformer`'s `_build_turn_batch` call to pass
+     `training=True`, OR change the default. Estimated +7pp smart_avg per
+     S50 measurement (closes the train/eval distribution mismatch).
+
+   **Already implemented, framework exists, just needs ckpts + 3 adapter classes**:
+   - **External opps wiring (~3-4 hr)** — `external_adapters.yaml` +
+     `ExternalOpponentManager` framework already exists in `train_rl.py`.
+     For Phase 2: download Kakuna / SmallRL / Minikazam ckpts + write
+     ~3 small adapter classes for the `make_self_play_opponent` factory
+     dispatch. Same as the H2H gauntlet wiring (priority #5 above) —
+     adapters get reused for both H2H eval AND PFSP pool entries.
+
+   **Small new code on top of existing infra** (~5-50 lines each):
+   - **lr scheduling (~30-50 lines)** — currently constant lr=1e-5. Add
+     `--lr-schedule cosine --lr-min FLOAT` flag + scheduler step in train_rl
+     main loop. Cosine 1e-5 → 1e-6 over 200 iters. (Per `docs/PHASE1_V3_OBSERVATIONS.md`
+     §5.1, after Tier 3 lands also re-ablate lr — Tier 3 changes effective
+     batch size; linear scaling rule may justify higher start lr.)
+   - **Absolute early-stop threshold (~10-20 lines)** — currently
+     `--early-stop --early-stop-patience N` is RELATIVE (3 evals declining).
+     Add `--early-stop-savg-floor FLOAT` (abort if eval smart_avg below) AND
+     `--early-stop-se-rate-drop FLOAT` (abort if SE rate drops >5pp from peak
+     across 2 evals — would have caught Phase 1 v3 Stage B at iter 39 before
+     cascade per S57 diagnosis).
+   - **Adaptive entropy MAX cap (~5 lines)** — currently
+     `--adaptive-entropy-low/--high` define the W/L band but ent_coef can
+     ramp UNBOUNDEDLY (Phase 1 v3 hit 1.10 → triggered Stage A→B). Add
+     `--adaptive-entropy-coef-max FLOAT` clamp (suggest 1.0 or 0.95).
+
+   **Manual data work** (no code, just curation):
+   - **Source 100-150 real elite teams (~3-6 hr, $0)** — Smogon team archive
+     (RMTs + tournament reports) / Showdown ladder replay scraping (top-100
+     OU last 30 days, both teams in metadata) / r/stunfisk OU sample teams /
+     recent OST/OLT tournament team posts / Smogon VR sample teams. Quality
+     bar: every team must be one a top-100 OU ladder player ACTUALLY USED.
+     **HARD constraint**: must be SEPARATE from the 16 mm-competitive eval
+     teams in `metamon_cache/teams/competitive/gen9ou/` (eval-set isolation;
+     mixing into training = data leakage per `docs/PHASE1_V3_OBSERVATIONS.md`).
+     Output: pickled team list in
+     `metamon_cache/teams/elite_training/gen9ou/` loadable as a poke-env
+     Teambuilder. Phase 2 mixes per-battle: 50-70% procedural / 30-50% from
+     this pool, both sides sampling independently.
 
 7. **Phase 2 launch** — full stack: `--cis --pipeline --bf16 --tier3 --compile
    --tier3-minibatch-size 16 --bc-anchor-ckpt v10 --bc-anchor-coef 0.1` +
