@@ -26,10 +26,10 @@ If files conflict, surface — don't silently reconcile. Don't half-ass. Don't s
 This was a long, dense session. Multiple bugs found and fixed. BC anchor designed + implemented. Phase 1 v3 finished. Diagnosis revised from `docs/PHASE1_V3_OBSERVATIONS.md`. **A real validation experiment is in flight on dev pod RIGHT NOW** — first eval data lands ~1.5 hr from S57 end (around iter 9). Don't kill it without checking; check status first.
 
 ═══════════════════════════════════════════════════════════════════
-PHILOSOPHY (the only chance for the real-deal final solution)
+PHILOSOPHY (apply to EVERY decision, no exceptions)
 ═══════════════════════════════════════════════════════════════════
 
-The user has been EMPHATIC about this throughout S57:
+The user has been EMPHATIC about this throughout S57. Quoting:
 
   "no shortcuts -> in order to reach the optimal long term solution
   that is truly correct and optimal with no compromises on training
@@ -41,10 +41,74 @@ The user has been EMPHATIC about this throughout S57:
   "this is the only chance we are getting for the real deal final
   solution"
 
-Apply this on every decision. Phase 2 is the elite-gen-9 attempt;
-multi-gen comes after. Both must launch with FULLY SOLVED infra. No
-"good enough for now". No "we'll fix it later". If something might
-need revisiting — fix it NOW while pods are rented + context is fresh.
+  "remember no shortcuts - we dont have these dev pods or cloud pods
+  forever - make sure next session knows that - and that this is the
+  run to the final form"
+
+### LONG-TERM TRAJECTORY (the load-bearing context)
+
+  Phase 1 v3 (DONE)        →  V1 baseline measurement (failed via
+                              type-knowledge erosion; collapse diagnosed S57)
+  Phase 2 (NEXT)           →  ELITE GEN 9 — the run to the final
+                              SINGLE-FORMAT-SINGLE-GEN form. With BC anchor +
+                              Tier 3 minibatching + external opps replicas +
+                              team mix + perm + lr schedule + early-stop refinements.
+                              ~$200-300, 5-7 days, must work first time.
+  Multi-gen (AFTER Phase 2) →  THE FINAL SINGLE-PLAYER FORM. Gens 6-9 in one
+                              model. ~$400-600/run × multiple iterations.
+                              Cannot afford to find infra bugs mid-flight here.
+  "The other things" (later)→  Doubles / Triples / VGC / AG / in-game battles
+                              / team building. Architecture is format-agnostic
+                              by construction; this is data + tokenizer
+                              extension work, not infra rework.
+
+EVERY decision must serve this trajectory. If a current task doesn't help
+get to elite gen 9 → multi-gen final form, OR if it would need to be
+touched again later, RE-EVALUATE before doing it.
+
+### TIME WINDOW (the hard constraint)
+
+Dev pod + cloud pods are rented NOW. They may not be later (RunPod
+availability fluctuates, project budget is finite). The expensive thing
+isn't dev time — it's WAITING to fix things during a paid run, OR
+discovering bugs at production scale that block multi-gen. Use the dev
+pod NOW, while it's available, to:
+- Run the BC anchor validation (in flight)
+- Solve task #12 (compiled+minibatch+BC anchor composition)
+- Solve task #13 (CIS regression)
+- Solve task #14 (external opps replicas — REQUIRED for Phase 2)
+- Wire H2H gauntlet, source elite teams, add lr sched / early-stop / entropy cap
+- Smoke test full Phase 2 stack at production scale BEFORE Phase 2 launches
+
+### "DONE" MEANS DONE
+
+No "good enough for now." No "we'll fix it later." No "ship and revisit."
+If something might need revisiting after Phase 2 ends or during multi-gen,
+FIX IT NOW while pods are rented + context is fresh. The cost of doing
+it right today is much less than the cost of debugging in production
+during a 5-7 day $200+ run, OR finding it during a 5-7 week $400-600
+multi-gen run.
+
+### THOROUGHLY UNDERSTAND BEFORE TOUCHING
+
+Per `feedback_engineering_standard.md`: BEFORE any non-trivial code
+change, READ:
+1. The file you're about to change + its callers
+2. The docs that reference the area (cookbook, design memos, memory files)
+3. §K dead paths in this file + §5 in `project_session_boot_protocol.md`
+   (has this been tried + abandoned?)
+4. `project_strategic_frame.md` (does this align with strategy?)
+5. If load-bearing or non-obvious: surface options + ask user before committing.
+
+Skipping the read step is how regressions ship. The S57 session uncovered
+SIX bugs that would have silently failed Phase 2 — every one was found by
+reading code carefully + running real tests at scale. The "look at it
+and start typing" anti-pattern would have shipped each of those bugs to
+Phase 2 instead.
+
+This includes understanding what we ALREADY HAVE (perm impl exists, just
+not enabled at eval; external opps framework exists, just doesn't scale).
+DO NOT re-implement what exists. Read it, expose it, extend it.
 
 ═══════════════════════════════════════════════════════════════════
 WHAT'S IN FLIGHT (check FIRST before doing anything)
