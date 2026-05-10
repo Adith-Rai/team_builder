@@ -153,41 +153,82 @@ when triggered.
 WHAT'S IN FLIGHT (check FIRST before doing anything)
 ═══════════════════════════════════════════════════════════════════
 
-**BC anchor + full-stack validation run on dev pod** (port 19373).
-**S57 end re-launched on the FAST stack — see reference_walltime_measurements_s57.md
-for why this stack was chosen over the earlier --mp attempt.**
+**S58 entry (2026-05-10): TWO BC-anchor validation runs in parallel.**
+Same stack on both pods (CIS + Tier3 + minibatch=16 + BC anchor 0.1 + bf16
++ pipeline) at different scales. Prod 1600g is the PRIMARY signal (Phase 2
+scale); dev 200g is the parallel small-scale baseline.
 
-Status check command (read this before any action):
+Status check commands (read these before any action):
 ```
-ssh -i ~/.ssh/id_ed25519 -p 19373 root@154.54.102.26 \
+# PRIMARY: prod pod 1600g
+ssh -i ~/.ssh/id_ed25519 -p 47913 root@195.26.233.30 \
   "ps -eo pid,etime,command | grep 'python.*train_rl' | grep -v grep | head -1; \
-   echo === ITERS ===; \
-   grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL' /tmp/bc_anchor_iso.log | tail -25; \
-   echo === LAST 5 ===; tail -5 /tmp/bc_anchor_iso.log"
+   grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL|smart_avg' /tmp/bc_anchor_1600g.log | tail -25; \
+   echo === LAST 5 ===; tail -5 /tmp/bc_anchor_1600g.log"
+
+# Parallel: dev pod 200g (out-dir _002 after a relaunch — _001 died at CIS spawn)
+ssh -i ~/.ssh/id_ed25519 -p 19373 root@154.54.102.26 \
+  "grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL|smart_avg' /tmp/bc_anchor_iso_v2.log | tail -25; \
+   echo === LAST 5 ===; tail -5 /tmp/bc_anchor_iso_v2.log"
 ```
 
-Stack: `--cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 + BC anchor coef=0.1`
-- 200 games/iter × 200 iters target (stop anytime, eval every 10 iters)
-- Sustained wall-time (measured S57 prod-pod 3-iter test on same stack): **~3.5 min/iter**
-  - Collect via CIS: ~110-270s (variable; pool growth + opp dispatch)
-  - Update via Tier 3 eager + minibatch=16 + BC anchor: ~70-100s
-- 200 iters projection: ~12 hr / ~$18
-- Eval points: iter 9 / 19 / 29 ... 199. **First eval at iter 9 ≈ 30 min after launch.**
-- Out-dir: `data/models/rl_v10/bc_anchor_isolation_001/` on dev pod
-- Log: `/tmp/bc_anchor_iso.log` on dev pod
+| Run | Pod | Scale | Out-dir | Log | Notes |
+|---|---|---|---|---|---|
+| Prod 1600g | port 47913 | 1600g × 200 iters | `bc_anchor_validation_1600g/` | `/tmp/bc_anchor_1600g.log` | PRIMARY. Phase 2 scale. Launched S58 ~2026-05-10 12:00 UTC. Wall-time projection: ~15-25 min/iter sustained (1600g vs 200g, 8× collect scale). Stop anytime user needs the pod. |
+| Dev 200g | port 19373 | 200g × 200 iters | `bc_anchor_isolation_002/` | `/tmp/bc_anchor_iso_v2.log` | PARALLEL small-scale signal. Faster eval cadence (~3-4 min/iter measured S57 = first eval iter 9 in ~30 min). Relaunch after `_001` died at CIS spawn timeout (see KNOWN FLAKES below). |
 
-**Acceptance criteria (the experiment's purpose)**:
+Stack on both: `--cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 + BC anchor coef=0.1`
+- Prod uses `--max-concurrent 200` (8 workers × 200 = 1600 = 1 perfect wave)
+- Dev uses `--max-concurrent 50`
+- Init from `data/models/bc/v10_padded_for_cis_dev.pt` (zero drift from anchor at iter 0)
+- Eval every 10 iters (eval-games=200, metamon-competitive teams)
+- Hyperparams identical to Phase 1 v3: lr=1e-5, lam=0.95, ent=0.02, target-kl=0.03
+
+**Acceptance criteria (BOTH runs, same purpose)**:
 - WIN: SE rate stays >40% across multiple eval points (vs Phase 1 v3 falling 44.6→30.4 over equivalent iter range) → BC anchor confirmed as the primary fix to type-knowledge erosion
 - PARTIAL: SE holds early but degrades later → BC anchor coef may need tuning (try 0.2 or 0.3)
 - FAIL: SE drops similar to Phase 1 v3 → diagnosis incomplete; refine before Phase 2
 
+The 1600g signal is more authoritative for Phase 2 (matches launch scale) but iter cadence is slower (~15-25 min vs ~3-4 min). Use the 200g run for FAST iteration on coef tuning if WIN/PARTIAL/FAIL signal needs refining; use 1600g for the GO/NO-GO decision before Phase 2.
+
 **bc_kl will GROW over iters** as model drifts more (anchor pushes back harder). bc_kl going UP is normal and EXPECTED (means anchor is doing its job). Watch SE rate trajectory in evals — that's the signal.
 
-**Note**: S57 morning runs used `--mp` (slow at 200g — 25 min/iter) because CIS appeared
-broken. The "broken" CIS was actually BC-anchor-state-dict-pollution causing CIS workers
-to hang during model load. AFTER the BC anchor bug fixes (`d1b101bb` + `51511c18`),
-CIS works cleanly. **Task #13 (CIS regression) is RESOLVED via the BC anchor fixes
-themselves.** Don't re-investigate unless you see a new failure mode.
+**Note on CIS path history**: S57 morning runs used `--mp` (slow at 200g — 25 min/iter) because CIS appeared broken. The "broken" CIS was actually BC-anchor-state-dict-pollution causing CIS workers to hang during model load. AFTER the BC anchor bug fixes (`d1b101bb` + `51511c18`), CIS works cleanly. **Task #13 is RESOLVED via the BC anchor fixes themselves.** A SEPARATE residual CIS spawn flake exists — see KNOWN FLAKES below.
+
+═══════════════════════════════════════════════════════════════════
+KNOWN FLAKES (intermittent, non-blocking, document for future sessions)
+═══════════════════════════════════════════════════════════════════
+
+**1. CIS worker spawn timeout (180s ceiling) — borderline on cold load**
+
+Symptom: `RuntimeError: CIS worker 0 not ready in 180.0s` at iter 0 startup.
+Log lines AFTER the traceback show `[CIS-multi N=8 slots=17] loaded 17 model
+slot(s)` — workers DID finish loading, just past the parent's 180s deadline.
+
+Hardcoded at `mp_centralized_collect.py:2169`:
+```python
+cis_handles = cis_server.spawn(ready_timeout_s=180.0)
+```
+Per-worker poll loop at L1356 — first worker that exceeds 180s fails the
+whole spawn.
+
+Each worker loads 17 model slots × 20M params (340M params per worker × 8
+workers = 2.7B params loaded onto shared GPU). Cold disk cache + concurrent
+GPU init contention can push the slowest worker past 180s. Warm-cache runs
+typically finish in 30-60s.
+
+S58 evidence: dev pod `_001` instance hit this AFTER the same stack had
+completed 3 successful iters at 3 min/iter on a prior run. Same code, same
+pod, different outcome — pure flake.
+
+**Mitigation if it persists** (NOT yet shipped — just retry first):
+- Bump `ready_timeout_s=180.0` → `300.0` at L2169
+- Or expose as CLI flag `--cis-spawn-timeout`
+- Or implement retry-on-spawn-flake (2 retries with full kill+restart between)
+
+**Don't relaunch identically more than 2x** without bumping the timeout.
+The flake rate is low enough that retry usually works, but if 2 consecutive
+launches fail at spawn, edit the code.
 
 ═══════════════════════════════════════════════════════════════════
 WALL-TIME REALITY (S57 measurements — critical for Phase 2 planning)
