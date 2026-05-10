@@ -110,24 +110,69 @@ This includes understanding what we ALREADY HAVE (perm impl exists, just
 not enabled at eval; external opps framework exists, just doesn't scale).
 DO NOT re-implement what exists. Read it, expose it, extend it.
 
+### STEP BACK PERIODICALLY (S57 lesson — separate from "thoroughly understand")
+
+"Thoroughly understand before touching" is about technical depth on the
+file in front of you. **"Step back periodically" is about strategic
+reflection on the whole approach.** Different skill, learned the hard way
+in S57. Trigger conditions for stepping back:
+
+- **Stuck on a single approach for >30 min** without measurable progress
+- **User pushes back on the plan** (especially with a specific question or
+  pointed observation — "wait, are we sure X?" or "isn't Y the actual issue?")
+- **Multiple components seem broken in sequence** — likely common cause,
+  not independent failures (S57: "Tier 3 broken → BC anchor broken → CIS
+  broken" all turned out to be SAME BC anchor pollution causing all three)
+- **Cost projections keep being wrong** (S57: projected 30 hr → actual 50+ hr
+  → re-projected → realized you're projecting on the wrong stack entirely)
+
+When triggered:
+1. Stop editing/launching anything
+2. Re-read the relevant memory files + this file
+3. Re-read `project_strategic_frame.md` (does the current approach serve the long-term goal?)
+4. List active tasks (`TaskList`) + ask: is the highest-leverage one still being worked?
+5. Consider: is there a totally different approach that resolves multiple issues at once?
+6. If still unclear, ASK the user with a clear options summary
+
+S57 example of NOT stepping back: I dropped CIS, dropped --compile, dropped
+--pipeline during a debugging cascade — each individually rationalized.
+A 5-minute step-back would have caught that the BC anchor bug fix was the
+root-cause-resolver, and that re-testing CIS with the FIXED BC anchor would
+have unblocked the fast stack. Instead, I burned ~$5-10 of pod time on
+slower paths. The user explicitly asked "isn't it possible CIS started
+failing because of the BC thing itself, and now that BC is fixed CIS might
+work?" — that one question saved hours.
+
+**S57 explicit user instruction (quoting): "be ready to take a step back
+look at the tasks and plans for them - if it needs, read through docs and
+code - and decide whether there is a better solution to what we need and
+want."** Do this periodically. Don't just execute the plan; re-evaluate it
+when triggered.
+
 ═══════════════════════════════════════════════════════════════════
 WHAT'S IN FLIGHT (check FIRST before doing anything)
 ═══════════════════════════════════════════════════════════════════
 
-**BC anchor + full-stack validation run on dev pod** (port 19373):
+**BC anchor + full-stack validation run on dev pod** (port 19373).
+**S57 end re-launched on the FAST stack — see reference_walltime_measurements_s57.md
+for why this stack was chosen over the earlier --mp attempt.**
+
+Status check command (read this before any action):
 ```
 ssh -i ~/.ssh/id_ed25519 -p 19373 root@154.54.102.26 \
   "ps -eo pid,etime,command | grep 'python.*train_rl' | grep -v grep | head -1; \
    echo === ITERS ===; \
-   grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL' /tmp/bc_anchor_iso.log | tail -20; \
+   grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL' /tmp/bc_anchor_iso.log | tail -25; \
    echo === LAST 5 ===; tail -5 /tmp/bc_anchor_iso.log"
 ```
 
-Config: `--mp --mp-workers 8 --compile --pipeline --bf16 + --bc-anchor-ckpt v10_padded --bc-anchor-coef 0.1`
+Stack: `--cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 + BC anchor coef=0.1`
 - 200 games/iter × 200 iters target (stop anytime, eval every 10 iters)
-- Iter 0 confirmed at S57 end: 14.6 min wall, bc_kl=0.0600, kl=0.063, no NaN
-- Per-iter projection (with pipeline overlap on iter 1+): ~9-12 min
-- Eval points: iter 9 / 19 / 29 / 39 ... 199. Iter 9 was ~1.5 hr after iter 0 landed.
+- Sustained wall-time (measured S57 prod-pod 3-iter test on same stack): **~3.5 min/iter**
+  - Collect via CIS: ~110-270s (variable; pool growth + opp dispatch)
+  - Update via Tier 3 eager + minibatch=16 + BC anchor: ~70-100s
+- 200 iters projection: ~12 hr / ~$18
+- Eval points: iter 9 / 19 / 29 ... 199. **First eval at iter 9 ≈ 30 min after launch.**
 - Out-dir: `data/models/rl_v10/bc_anchor_isolation_001/` on dev pod
 - Log: `/tmp/bc_anchor_iso.log` on dev pod
 
@@ -137,6 +182,32 @@ Config: `--mp --mp-workers 8 --compile --pipeline --bf16 + --bc-anchor-ckpt v10_
 - FAIL: SE drops similar to Phase 1 v3 → diagnosis incomplete; refine before Phase 2
 
 **bc_kl will GROW over iters** as model drifts more (anchor pushes back harder). bc_kl going UP is normal and EXPECTED (means anchor is doing its job). Watch SE rate trajectory in evals — that's the signal.
+
+**Note**: S57 morning runs used `--mp` (slow at 200g — 25 min/iter) because CIS appeared
+broken. The "broken" CIS was actually BC-anchor-state-dict-pollution causing CIS workers
+to hang during model load. AFTER the BC anchor bug fixes (`d1b101bb` + `51511c18`),
+CIS works cleanly. **Task #13 (CIS regression) is RESOLVED via the BC anchor fixes
+themselves.** Don't re-investigate unless you see a new failure mode.
+
+═══════════════════════════════════════════════════════════════════
+WALL-TIME REALITY (S57 measurements — critical for Phase 2 planning)
+═══════════════════════════════════════════════════════════════════
+
+See `memory/reference_walltime_measurements_s57.md` for full table. Headlines:
+
+| Stack | 200g iter wall | per-game cost |
+|---|---|---|
+| Single-proc (no --mp), OLD code, no BC anchor | 7.6 min | 2.3 sec/game |
+| `--mp 8w + Tier3 + minibatch + BC anchor` (NEW) | 27 min | 8.1 sec/game |
+| **`--cis + Tier3 + minibatch + BC anchor` (NEW)** | **3.0 min** | **0.9 sec/game** |
+| Phase 1 v3 baseline (1600g, --mp+compile+fp16) | 51 min | 1.9 sec/game |
+
+CIS wins by ~9× over `--mp` at 200g on the SAME Tier 3 + minibatch + BC anchor stack.
+MP worker overhead + GPU contention dominates at small batches. CIS centralizes inference
+in one subprocess, batches across workers, no per-worker model duplication.
+
+For Phase 2 (1600g target): use CIS. Projected ~6-8 min/iter, 200 iters = ~20-23 hr / $30-35
+(huge improvement over Phase 1 v3's 51 min/iter / $130 for same iters).
 
 ═══════════════════════════════════════════════════════════════════
 S57 SHIPPED (5 commits on origin/master)
