@@ -204,37 +204,57 @@ S58 PRIORITIES (in order — no shortcuts, no premature pivoting)
      `training=True`, OR change the default. Estimated +7pp smart_avg per
      S50 measurement (closes the train/eval distribution mismatch).
 
-   **External opps — IMPORTANT scaling caveat (NOT just "wire 3 adapters")**:
-   Current `external_adapters.py` setup spawns ONE subprocess per Metamon
-   bot type, each running its own Showdown account → **max 1 concurrent
-   battle per adapter**. Fine for H2H gauntlet eval (small N games, subprocess
-   serial fine). BREAKS at PFSP-in-training scale: at 200 max-concurrent
-   battles, if PFSP samples ~30% to a single Kakuna subprocess = 60 battles
-   queuing serially → massive collect-time blow up. Plus fragility (30s+
-   subprocess startup, login race, model load timeout — S54 added a
-   watchdog reactively, but the underlying serial-subprocess design wasn't
-   redesigned).
+   **External opps — REQUIRED for Phase 2 + subprocess scaling MUST be fixed first (task #14)**:
 
-   **mcts-fast IS in-process** (`PokeEnginePlayer`, no subprocess) — scales
-   fine in PFSP at any concurrency.
+   Why Metamon bots (Kakuna/SmallRL/Minikazam) are NEEDED in PFSP, not
+   just H2H eval:
+   - BC anchor PREVENTS drift from BC's type knowledge (S57 mechanism)
+   - mcts-fast (in-process search bot) BREAKS the self-play attractor via
+     different decision mechanism — but doesn't necessarily exploit type
+     errors
+   - Metamon bots are NEURAL NETS trained on millions of human battles —
+     they AGGRESSIVELY EXPLOIT type-blind play. They're the opp class that
+     ACTIVELY TEACHES the model to defend against type-aware exploitation
+   - All three together — BC anchor (drift bound) + mcts-fast (diversity)
+     + Metamon bots (type-aware exploit teachers) — are needed for Phase 2's
+     "elite gen 9" goal. Without Metamon in PFSP the model could pass
+     anchor + diversity but still be soft against ladder-realistic opps.
 
-   **Phase 2 pragmatic plan** (revised from naive "wire all 3 in PFSP"):
-   - **PFSP pool**: internal snapshots + mcts-fast in-process. NO Metamon
-     bots in PFSP for now. Skip the subprocess scaling pain.
-   - **H2H gauntlet eval**: Kakuna/SmallRL/Minikazam wired as subprocess
-     adapters (1 subprocess per bot, fine since N=200 H2H games per bot
-     is small). This is the H2H gauntlet wiring item (priority #5 above).
-   - **If Phase 2 shows mcts-fast PFSP isn't enough** (BC anchor + mcts-fast
-     in pool doesn't push above Phase 1 v3 ceiling) → THEN invest in
-     external opps scaling. Two architectural paths (task #14):
-     (a) Spawn N replicas per opp type (8 Kakuna subprocesses, etc. —
-         requires YAML config + ExternalOpponentManager code change,
-         ~half day dev, ~2 GB RAM total)
-     (b) Centralized inference for external opps (similar to CIS — single
-         subprocess per bot type holds the model, N battle clients via
-         local IPC. ~2-3 days dev. Cleaner architecture.)
-   - **DO NOT** wire Metamon bots into PFSP without one of (a) or (b)
-     first — collect time will blow up at production scale.
+   The scaling problem (current setup):
+   - `external_adapters.py` spawns ONE subprocess per Metamon bot type,
+     each running its own Showdown account → **max 1 concurrent battle
+     per adapter**.
+   - At 200 max-conc battles in training, if PFSP samples ~30% to a single
+     Kakuna subprocess = 60 battles queuing serially → massive collect
+     blow-up.
+   - Plus fragility: 30s+ subprocess startup, login race, model load
+     timeout (S54 added a watchdog reactively but the underlying serial-
+     subprocess design wasn't redesigned).
+
+   mcts-fast IS in-process (`PokeEnginePlayer`) — scales fine, NO change
+   needed.
+
+   **Task #14 — REQUIRED before Phase 2 launch**:
+   Pick one of:
+   - **(a) N replicas per opp type** (~half-day dev, RECOMMENDED for Phase 2)
+     — Spawn 8 Kakuna + 8 SmallRL + 8 Minikazam = 24 subprocesses. Each
+     subprocess plays 1 battle at a time; pool of 8 per type → 8 concurrent
+     per type. Resource: ~2-5 GB RAM/GPU total (model copies). Code:
+     YAML config gets `replicas: N` field; `ExternalOpponentManager`
+     gets a "spawn N copies + round-robin" path. Fits Phase 2 timeline.
+   - **(b) Centralized inference per bot type** (~2-3 days dev, cleaner)
+     — Single subprocess per type holds model; N battle clients submit
+     inference requests via local IPC. Same architecture as our CIS for
+     the trainable model. No model duplication. Bigger refactor.
+
+   Phase 2 recommended plan:
+   - PFSP pool = internal snapshots + mcts-fast (in-process) + Metamon
+     bots (via task #14 option (a) replicas)
+   - H2H gauntlet eval = Kakuna/SmallRL/Minikazam (existing subprocess
+     wiring; N=200 sequential per bot fine for occasional eval)
+   - **DO NOT** launch Phase 2 with Metamon bots in PFSP without
+     completing task #14 — collect time would blow up at production
+     scale and Phase 2 would fail silently from throughput collapse.
 
    **Small new code on top of existing infra** (~5-50 lines each):
    - **lr scheduling (~30-50 lines)** — currently constant lr=1e-5. Add
