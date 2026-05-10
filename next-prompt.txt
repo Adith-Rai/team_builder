@@ -9,50 +9,225 @@ The user has explicitly set up `MEMORY.md` (auto-loaded every session) + `memory
 2. `memory/feedback_engineering_standard.md` — quality standard
 3. `memory/feedback_ask_when_uncertain.md` — when to ask vs guess
 4. `memory/project_strategic_frame.md` — locked sequencing (vertical → horizontal)
-5. `memory/project_cis_4_6_design.md` — most recent shipped infra (S54)
-6. THIS FILE (`next-prompt.txt`) — session-specific state
-7. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design implications + iter 39/49 EVAL diagnosis
-8. **First action**: production status check (next-prompt §E)
+5. `memory/project_phase1_v3_diagnosis.md` — **S57 collapse diagnosis (3-stage type-knowledge erosion). Required before any Phase 2 design discussion.**
+6. `memory/project_bc_anchor_design.md` — **S57 BC anchor mechanism + 5 verified failure modes. Required before any BC anchor / Tier 3 / forward_ppo_sequence work.**
+7. `memory/project_tier3_c5_design.md` — Tier 3 compile boundary
+8. `memory/reference_cloud_pods_usage.md` — **S57 pod connections, file paths, launch patterns, what NOT to do**
+9. THIS FILE (`next-prompt.txt`) — session-specific state, S58 entry
+10. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design (NOTE: this doc PREDATES S57 diagnosis — its 3-cause analysis is INCOMPLETE; the type-knowledge erosion mechanism is the missing piece. Use `project_phase1_v3_diagnosis.md` as the corrected version.)
+11. **First action**: validation run status check on dev pod (see §E + `reference_cloud_pods_usage.md`)
 
 If files conflict, surface — don't silently reconcile. Don't half-ass. Don't shortcut. Don't pivot to deferred items (§4 + §5 of boot protocol enumerate exactly what's now vs deferred).
 
 ---
 
-**S56 wrap (2026-05-09)** — picking up from Session 56 (just finished). Production iter 55+ in flight (last checked iter 55 done at 12:21 UTC, iter 56 in collect). Iter 49 EVAL was smart_avg=49% — trajectory 69→60→53→49 within expected baseline range per `docs/PHASE1_V3_OBSERVATIONS.md`. ~4-5 days remaining to iter 200. HEAD on prod pod LOCKED at `251cd14a`. **DO NOT pull**. Read-only monitoring only.
+**S57 wrap (2026-05-10) — S58 entry. Read THIS section + the listed memory files before doing anything else.**
 
-**S56 SHIPPED** (1 commit pending, ~all on dev branch — Tier 3 C5 + train_rl.py wiring + dev pod end-to-end smoke validated):
-- **Tier 3 C5: single-graph compiled train_step** (`make_compiled_train_step` in ppo.py). Compile region = forward + loss + masked-backward (aot_autograd captures fwd+bwd graphs together). Eager wrapper handles `optimizer.zero_grad()` + (gated) `clip_grad_norm_` + `optimizer.step()`. Three torch 2.2.x dynamo limits engineered through honestly (NOT shortcuts) — see `memory/project_tier3_c5_design.md` for full rationale.
-- **`twohot_target` rewrite** (model_transformer.py): scatter_ → broadcast-equality `(arange == idx.unsqueeze(-1)).to(dtype)`. Bit-equivalent (Test 1 max diff 0.0). F.one_hot was tried but fails on dynamic-shape compile (`Cannot call numel() on tensor with symbolic sizes/strides` in torch 2.2.x).
-- **`ppo_loss_batched` refactor** (ppo.py): split into `_ppo_loss_batched_internal` (tensor-only output, compile-friendly) + `ppo_loss_batched` (eager wrapper preserving Python-scalar contract for backward compat). C3 + C4 tests still PASS unchanged.
-- **train_rl.py wired**: new `--tier3` flag dispatches to `ppo_update_batched` when not in_warmup; with `--compile` additionally builds `model._tier3_step` (compiled train_step). Banner shows "Tier3: ON+compile" / "ON (eager)" / "OFF". Warmup iters fall back to eager `ppo_update` (batched path doesn't support frozen-backbone warmup; trivial: 5/200 iters).
-- **C5 unit test** (`scripts/diag/test_tier3_c5_compile.py`): 6/6 PASS on dev pod (Linux + torch 2.2.1 + triton 2.2.0). Tests 1+2 also PASS on Windows (no compile required).
-- **Dev pod end-to-end smoke**: 2-iter `--tier3 --compile --bf16` run on real BC v10 ckpt. Iter 0 update = 275s (compile cold-start + tracing). **Iter 1 update = 151s — 45% speedup from compile cache hit (the C5 win).** Stats sane (pi=0.004, v_loss 13.93→11.22, ent=1.18, kl=0.017-0.018, no NaN, no KL gate fires). bf16 autocast verified active during compiled update.
+This was a long, dense session. Multiple bugs found and fixed. BC anchor designed + implemented. Phase 1 v3 finished. Diagnosis revised from `docs/PHASE1_V3_OBSERVATIONS.md`. **A real validation experiment is in flight on dev pod RIGHT NOW** — first eval data lands ~1.5 hr from S57 end (around iter 9). Don't kill it without checking; check status first.
 
-**S55 SHIPPED** (still on origin/master, foundation for S56):
-- `f79ea477` C1 collate_episodes / `f728b3af` C2 forward_ppo_sequence / `f720dccc` C3 ppo_loss_batched / `8ce7ffcc` C4 ppo_update_batched / `6758cc3c` Standing orders.
+═══════════════════════════════════════════════════════════════════
+PHILOSOPHY (the only chance for the real-deal final solution)
+═══════════════════════════════════════════════════════════════════
 
-**S54 SHIPPED** (still relevant): CIS Phase 4.6 Option B unified full-reset recovery (`64b822a3`) + `docs/PHASE1_V3_OBSERVATIONS.md` Phase 2 design (`1bbff8ac`). Both validated on dev pod A100.
+The user has been EMPHATIC about this throughout S57:
 
-**S57 priorities** (in order):
-1. **H2H gauntlet wiring** (~3-4 hrs, $0) — Kakuna/SmallRL/Minikazam adapters in `eval_h2h_gauntlet.py`. Needed for Phase 1 v3 final eval (~4-5 days out). Code already exists; "wiring" = downloading 3 bot weights + writing 3 small adapter classes for `make_self_play_opponent` factory.
-2. **Phase 1 v3 final eval** when iter 200 lands — pull `final.pt`, run smart_avg + Elo + H2H gauntlet, document final.
-3. **C6 — 20-iter Tier 3 A/B validation** on dev pod (~$10-15) against Phase 1 v3 iter 19/29 deep playstyle baseline. Init from BC v10 e3, same hyperparams. MUST pass MUST tier (SE rate ±3pp, move waste ±2pp, top-5 Pokemon usage, per-mon move dist ±10pp) before Phase 2 launches.
-4. **Easy items JIT for Phase 2** (parallel with C6): perm-at-eval enable, lr scheduling impl, source 100-150 SEPARATE real elite teams from Smogon archive / Showdown ladder replays / /r/stunfisk OU samples / OST/OLT tournament posts (NOT mm-competitive 16 — eval set isolation), bf16 dev pod smoke.
-5. **Phase 2 launch** — `--cis --pipeline --bf16 --tier3 --compile` + team mix (50-70% procedural / 30-50% NEW elite teams) + perm-at-eval + external opps + lr scheduling + absolute early-stop. ~$200-300 / 5-7 days at 10-12 min/iter target.
+  "no shortcuts -> in order to reach the optimal long term solution
+  that is truly correct and optimal with no compromises on training
+  - if we intend to revisit things, we would rather do them now -
+  cause of the pods that are rented now and may not be later -
+  multi gen needs to be fully ready - with no need to go back and
+  fix or optimize fundamental things"
 
-**S57 deferred** (do NOT pivot to — boot protocol §4 + §5):
-- Multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3) — POST-Phase-2 only.
-- Doubles/Triples/VGC/AG/in-game format support — POST-multi-gen only.
-- **Network Volume migration** — DEFERRED until multi-gen per user (S55). Container Disk acceptable for Phase 1/2 since user monitors and won't stop pod without informing. Risk consciously accepted; do NOT redo this analysis.
-- Per-worker traj checkpointing — REJECTED (`feedback_phase46_traj_checkpoint_rejected.md`).
-- C5b "wider compile region" attempts — torch 2.2.x has documented limits engineered through; widening requires torch 2.4+ which is a separate cross-cutting upgrade. Don't relitigate. (`memory/project_tier3_c5_design.md`)
-- **torch 2.4+ upgrade** — DEFERRED to JIT pre-multi-gen (alongside D4-D6 + BC v11 retrain). Would unlock: full single-graph train_step (no clip_grad_norm split), F.one_hot under dynamic compile, mode="reduce-overhead" cudagraph (~+5-10% update, ~+10-20% forward, aggregate ~+15-30% over current 2.2.x). Cost: 1-2 wks cross-cutting re-validation (compile + mp_disk + CIS + autocast + dep interop, new triton 3.x pair). ROI bad pre-Phase-2 ($40-60 saved on one $200-300 run vs 2 wk dev); ROI good pre-multi-gen ($500+ saved across multiple $400-600 multi-gen runs). DEV POD makes this safe — production pod isolation is NOT a blocker per S56 user note. Don't pursue mid-vertical.
+  "this is the only chance we are getting for the real deal final
+  solution"
 
-**Post-Phase-1-v3 priorities** (in order, not now):
-1. Pull final.pt + full eval suite (smart_avg + Elo + H2H gauntlet)
-2. **C6 Tier 3 A/B validation** — 20-iter run on dev pod, init from BC v10 e3, same hyperparams as Phase 1 v3, compare deep playstyle at iter 19 + 29 against Phase 1 v3 baseline. ~$10-15.
-3. Easy items JIT (perm fix + lr sched + team sourcing + bf16 smoke)
-4. **Phase 2 launch** with full stack: `--cis --pipeline --bf16` + Tier 3 + train_step compile + 30-50% real elite team mix (SEPARATE from eval set) + perm at eval + external opps + lr scheduling + absolute early-stop.
+Apply this on every decision. Phase 2 is the elite-gen-9 attempt;
+multi-gen comes after. Both must launch with FULLY SOLVED infra. No
+"good enough for now". No "we'll fix it later". If something might
+need revisiting — fix it NOW while pods are rented + context is fresh.
+
+═══════════════════════════════════════════════════════════════════
+WHAT'S IN FLIGHT (check FIRST before doing anything)
+═══════════════════════════════════════════════════════════════════
+
+**BC anchor + full-stack validation run on dev pod** (port 19373):
+```
+ssh -i ~/.ssh/id_ed25519 -p 19373 root@154.54.102.26 \
+  "ps -eo pid,etime,command | grep 'python.*train_rl' | grep -v grep | head -1; \
+   echo === ITERS ===; \
+   grep -E '^\\[..:..:..\\] Iter|EVAL: SH=|FATAL' /tmp/bc_anchor_iso.log | tail -20; \
+   echo === LAST 5 ===; tail -5 /tmp/bc_anchor_iso.log"
+```
+
+Config: `--mp --mp-workers 8 --compile --pipeline --bf16 + --bc-anchor-ckpt v10_padded --bc-anchor-coef 0.1`
+- 200 games/iter × 200 iters target (stop anytime, eval every 10 iters)
+- Iter 0 confirmed at S57 end: 14.6 min wall, bc_kl=0.0600, kl=0.063, no NaN
+- Per-iter projection (with pipeline overlap on iter 1+): ~9-12 min
+- Eval points: iter 9 / 19 / 29 / 39 ... 199. Iter 9 was ~1.5 hr after iter 0 landed.
+- Out-dir: `data/models/rl_v10/bc_anchor_isolation_001/` on dev pod
+- Log: `/tmp/bc_anchor_iso.log` on dev pod
+
+**Acceptance criteria (the experiment's purpose)**:
+- WIN: SE rate stays >40% across multiple eval points (vs Phase 1 v3 falling 44.6→30.4 over equivalent iter range) → BC anchor confirmed as the primary fix to type-knowledge erosion
+- PARTIAL: SE holds early but degrades later → BC anchor coef may need tuning (try 0.2 or 0.3)
+- FAIL: SE drops similar to Phase 1 v3 → diagnosis incomplete; refine before Phase 2
+
+**bc_kl will GROW over iters** as model drifts more (anchor pushes back harder). bc_kl going UP is normal and EXPECTED (means anchor is doing its job). Watch SE rate trajectory in evals — that's the signal.
+
+═══════════════════════════════════════════════════════════════════
+S57 SHIPPED (5 commits on origin/master)
+═══════════════════════════════════════════════════════════════════
+
+| Commit | What |
+|---|---|
+| `4fd54131` | Tier 3 C5 single-graph compiled train_step (forward+loss+masked-backward in one graph; eager wrapper for clip+step) |
+| `32113607` | S57 diagnosis tooling (`scripts/diag/analyze_run_trajectory.py`) + initial BC anchor in `ppo_update_batched` + train_rl.py CLI flags |
+| `51511c18` | BC anchor `inference_mode → no_grad` (CUDA index OOB on bf16 autocast eager forward) |
+| `d1b101bb` | `forward_ppo_sequence` index OOB at L > temporal_context FIXED via `collate_episodes(tail=True)`. BC anchor extended to per-episode `ppo_update`. Local-variable bc_ref (NOT model attribute). |
+| `6821a907` | Tier 3 minibatching (`--tier3-minibatch-size N`) — ppo_update_batched eager path chunks episodes for memory-bounded forward+backward |
+
+═══════════════════════════════════════════════════════════════════
+REAL BUGS FOUND + FIXED (not in any prior memory; would have failed Phase 2)
+═══════════════════════════════════════════════════════════════════
+
+These are LOAD-BEARING for Phase 2. Read `memory/project_bc_anchor_design.md`
++ `memory/project_phase1_v3_diagnosis.md` for full details. Summary:
+
+1. **`forward_ppo_sequence` index OOB at L > cfg.temporal_context** (FIXED `d1b101bb`)
+   - Cause: TemporalTransformer.forward truncates summaries internally to
+     temporal_context (200), but outer indexing `temporal_ctx_grid[b_idx, t_idx]`
+     used t_idx values up to L_max-1 → CUDA assert at IndexKernel.cu:92
+   - Why missed: C2 unit test mini-cfg, C5 smoke compiled-path, BC smoke turn-cap=100
+   - Fix: `collate_episodes(L_max=cfg.temporal_context, tail=True)` for ALL
+     forward_ppo_sequence callers. `tail=True` matches per-turn ppo_update's
+     `summary_buf[:, -200:]` cap.
+
+2. **Tier 3 mega-batch OOM at 200+ games on A100 80GB** (FIXED `6821a907`)
+   - Cause: `ppo_update_batched` mega-batches all episodes into one forward;
+     activation memory ~36 GB per FF layer × 6 = doesn't fit
+   - Fix: `--tier3-minibatch-size N` chunks episodes; per-chunk forward+backward
+     accumulates into .grad; ONE optimizer.step per epoch. C4 docstring warned
+     about this; impl shipped now.
+   - **Phase 2 launch with --tier3 REQUIRES this flag set**. Default None
+     preserves old behavior (smoke-only).
+
+3. **`torch.inference_mode` + autocast bf16 + eager forward incompat** (FIXED `51511c18`)
+   - Cause: inference_mode produces "inference tensors" that interact badly
+     with autocast in some CUDA kernel paths → CUBLAS_STATUS_EXECUTION_FAILED
+   - Fix: use `torch.no_grad()` (standard frozen-teacher pattern, ~5 sec total
+     perf cost over 7-hour run)
+
+4. **Storing BC ref as `model._bc_ref` corrupts state_dict** (FIXED `d1b101bb`)
+   - Cause: PyTorch picks up BC ref's params in `model.state_dict()` →
+     mp_disk worker respawn fails on `Unexpected key(s): "_bc_ref.tokenizer..."`
+   - Fix: store as a LOCAL variable in `main()`, pass directly to
+     ppo_update / ppo_update_batched
+
+═══════════════════════════════════════════════════════════════════
+S57 DIAGNOSTIC FINDINGS (updates `docs/PHASE1_V3_OBSERVATIONS.md`)
+═══════════════════════════════════════════════════════════════════
+
+`docs/PHASE1_V3_OBSERVATIONS.md` predicted "exploration drift, type
+knowledge intact." **Wrong**. Actual S57 diagnosis (full doc in
+`memory/project_phase1_v3_diagnosis.md`):
+
+3-stage degradation:
+- Stage A (iter 19→29): exploration drift, benign (SE -1.5pp)
+- Stage B (iter 29→49): **TYPE-KNOWLEDGE EROSION** — SE rate falls 43→30%,
+  immune-attack rate jumps 3.8→6.9%. Real forgetting, not what was predicted.
+- Stage C (iter 49→59): adaptive entropy ramps DOWN, model commits to drifted
+  type-blind policy, smart bots punish catastrophically (smart_avg → 35%)
+
+User's reframing: pure self-play USED to give 45→65%+ on OLD MLP arch.
+External opps + team mix were ADDITIONS to push from "good" to "elite",
+NOT requirements for baseline self-play to work. Higher-capacity transformer
++ temporal stack drifts from BC's type knowledge with no anchoring; old MLP
+had implicit regularization via lower capacity.
+
+**Phase 2 prescription update** (beyond original PHASE1_V3_OBSERVATIONS):
+- BC anchor (the foundation, S57 design)
+- Cap adaptive entropy max (don't let it ramp above ~1.0)
+- SE-rate-based early-stop signal (not just smart_avg)
+- (Original prescription stays: team mix + perm + external opps + lr sched)
+
+═══════════════════════════════════════════════════════════════════
+S58 PRIORITIES (in order — no shortcuts, no premature pivoting)
+═══════════════════════════════════════════════════════════════════
+
+1. **CHECK validation run state FIRST** (see "WHAT'S IN FLIGHT" above).
+   If iter 9+ evals available, look at SE rate trajectory + bc_kl evolution.
+   Compare to Phase 1 v3 reference at equivalent iter count.
+
+2. **If validation healthy and shows SE preservation**: proceed to (3).
+   **If SE rate dropping like Phase 1 v3**: STOP, refine BC anchor coef OR
+   diagnose further. Don't ship to Phase 2 with broken anchor.
+
+3. **Task #12 — Compiled + minibatching + BC anchor composition** (~3-4 hr dev,
+   the biggest pre-Phase-2 unblocker). Eager Tier 3 minibatching shipped, but
+   for max throughput Phase 2 needs compile too. Three sub-pieces:
+   - Plumb bc_logits as a tensor input through the compile boundary in
+     `make_compiled_train_step` (currently it's closure-captured from BC ref;
+     need to pass as arg)
+   - Add minibatching support to compiled path (compile a fwd_bwd_per_chunk
+     function; eager orchestrates the chunks + step)
+   - Drop the `--tier3 --compile + bc-anchor-ckpt` mutual exclusion in train_rl.py
+   - Test: full stack at production scale on dev pod
+
+4. **Task #13 — CIS spawn timeout investigation** (~2-4 hr).
+   Phase 4.6 was validated S54 but spawn times out silently on dev pod S57
+   (180s, no useful error). Phase 2 wants CIS for collect speedup. Need:
+   - CIS subprocess stdout/stderr capture (currently swallowed)
+   - Whether model load works in isolation (test via direct CISServer.spawn)
+   - Whether the spawn pipeline has an init-time bug that crept in
+   Workaround for now: use `--mp --pipeline` instead. CIS's ~30% collect
+   speedup is nice-to-have, not a blocker — `--pipeline` alone overlaps
+   collect/update so per-iter wall = max(collect, update) which already
+   captures most of the win when update dominates (which it does at any
+   reasonable scale with our model).
+
+5. **H2H gauntlet wiring** (~3-4 hrs, $0). Kakuna/SmallRL/Minikazam
+   adapters in `eval_h2h_gauntlet.py`. The "are we elite?" signal Phase 2
+   needs. Not blocking Phase 2 launch but blocking Phase 2 final eval +
+   any "did we hit elite gen 9" assertion.
+
+6. **Easy Phase 2 prep items** (parallel, $0):
+   - Perm-at-eval enable (one-line config change)
+   - lr scheduling impl (cosine 1e-5 → 1e-6)
+   - Source 100-150 SEPARATE real elite teams (Smogon archive / Showdown
+     ladder replays / r/stunfisk OU samples / OST/OLT). NOT the 16
+     mm-competitive teams (eval-set isolation per `docs/PHASE1_V3_OBSERVATIONS.md`)
+   - Absolute early-stop threshold (SE-rate-based per S57 diagnosis)
+   - Cap adaptive entropy max (don't ramp above ~1.0; prevents the Phase 1 v3
+     Stage A→B trigger)
+
+7. **Phase 2 launch** — full stack: `--cis --pipeline --bf16 --tier3 --compile
+   --tier3-minibatch-size 16 --bc-anchor-ckpt v10 --bc-anchor-coef 0.1` +
+   team mix + perm-at-eval + external opps + lr schedule + absolute early-stop.
+   Cost ~$200-300 / 5-7 days at projected 10-15 min/iter (with full stack,
+   1600 games, 8 workers). **DO NOT launch until tasks 3+5+6 done.**
+
+═══════════════════════════════════════════════════════════════════
+S58 DEFERRED (DO NOT pivot to)
+═══════════════════════════════════════════════════════════════════
+
+- Multi-gen-SPECIFIC items (D4-D6, BC v11, E1-E3) — POST-Phase-2 only
+- Doubles/Triples/VGC/AG/in-game — POST-multi-gen only
+- Network Volume migration — DEFERRED until multi-gen (S55 user decision; risk accepted)
+- Per-worker traj checkpointing — REJECTED (`feedback_phase46_traj_checkpoint_rejected.md`)
+- C5b "wider compile region" — torch 2.2.x limits engineered through (`project_tier3_c5_design.md`)
+- **torch 2.4+ upgrade** — DEFERRED to JIT pre-multi-gen. Would unlock 15-30% additional speedup but cross-cutting (1-2 wks dev). Not needed pre-Phase-2 (ROI: $40-60 saved on one Phase 2 run vs 2 wks dev). Per-multi-gen ROI good ($500+ saved across multiple $400-600 multi-gen runs).
+
+═══════════════════════════════════════════════════════════════════
+PROD POD STATE (Phase 1 v3 finished S57, may still be alive)
+═══════════════════════════════════════════════════════════════════
+
+Production pod (port 47913) ran Phase 1 v3 to early-stop at iter 59 on
+2026-05-09. ALL ARTIFACTS PULLED to local `data/cloud_runs/001_phase1_v3/`
+(3.5 GB, gitignored). MANIFEST.txt + trajectory.csv + all snapshots
+inside. Pod can be safely shut down — data is local. User's call.
+
+If still alive at S58: do NOT pull on it (HEAD locked at `251cd14a`).
+Read-only monitoring only. For any prod work, use the local archive.
 
 If you find yourself going in half-informed, ASK. S52's near-miss (almost killed a healthy run from a misread counter), S53's pool-mirror redesign, S54's REBIND_WORKER pivot, and S55's parallel-Tier-3 decision (boot doc said "don't start until Phase 1 v3 finishes" but user's parallelism case was sound + dev pod was idle) are all wins for the "ask, don't guess" + "honest opinion including pushback" patterns. `memory/feedback_ask_when_uncertain.md` has the why.
 
