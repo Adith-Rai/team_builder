@@ -159,6 +159,19 @@ def parse_args():
                         "NOT supported in warmup iters (auto-falls-back to per-"
                         "episode ppo_update during warmup). Linux + transformer "
                         "arch only.")
+    p.add_argument("--bc-anchor-ckpt", default=None,
+                   help="S57 BC anchor: path to a frozen BC reference checkpoint. "
+                        "When set, an auxiliary KL(BC || model) loss term anchors "
+                        "the model to BC's policy distribution during PPO, "
+                        "preventing the type-knowledge erosion observed in pure "
+                        "self-play on the new transformer arch (Phase 1 v3 SE "
+                        "rate fell 44%→31% over 60 iters). Requires --tier3 (eager "
+                        "batched path); NOT supported with --compile in v1.")
+    p.add_argument("--bc-anchor-coef", type=float, default=0.1,
+                   help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
+                        "0.0 disables anchor even if --bc-anchor-ckpt given. "
+                        "Default 0.1 — caps drift without capping PPO improvement "
+                        "direction (S57 isolation experiment starting point).")
     p.add_argument("--pipeline", action="store_true",
                    help="Pipeline collection and PPO update (overlap on GPU)")
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
@@ -479,12 +492,14 @@ def _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
     total_games = wins + losses + ties
     wr = wins / max(1, total_games)
     kl_str = f" kl={loss_info['kl']:.4f}" if 'kl' in loss_info else ""
+    bc_kl_str = (f" bc_kl={loss_info['bc_kl']:.4f}"
+                  if loss_info.get('bc_kl', 0.0) > 0 else "")
     warmup_str = " [WARMUP]" if in_warmup else ""
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] Iter {it}: W/L/T={wins}/{losses}/{ties} ({wr:.1%}), {steps} steps, "
           f"collect={collect_time:.0f}s, update={update_time:.0f}s, "
           f"pi={loss_info['pi']:.4f} v={loss_info['v']:.4f} "
-          f"ent={loss_info['ent']:.4f}{kl_str}{warmup_str} "
+          f"ent={loss_info['ent']:.4f}{kl_str}{bc_kl_str}{warmup_str} "
           f"vs={opp_name} pool={len(snapshot_pool)}",
           flush=True)
 
@@ -494,6 +509,8 @@ def _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
     writer.add_scalar("train/entropy", loss_info["ent"], it)
     if "kl" in loss_info:
         writer.add_scalar("train/kl", loss_info["kl"], it)
+    if loss_info.get("bc_kl", 0.0) > 0:
+        writer.add_scalar("train/bc_kl", loss_info["bc_kl"], it)
     writer.add_scalar("train/collect_time", collect_time, it)
     writer.add_scalar("train/update_time", update_time, it)
     writer.add_scalar("train/steps", steps, it)
@@ -926,6 +943,37 @@ def main():
                   f"--tier3 will use eager batched path", flush=True)
             model._tier3_step = None
 
+    # BC anchor (S57): load frozen reference model into a SEPARATE local
+    # variable (NOT an attribute of `model`). Storing on the model would
+    # make PyTorch include the BC ref's parameters in `model.state_dict()`,
+    # breaking snapshot save/load + mp_disk worker respawn (verified on
+    # dev pod S57). Pass `bc_ref` directly to ppo_update_batched.
+    bc_ref = None
+    if args.bc_anchor_ckpt:
+        if not args.tier3:
+            print("[FATAL] --bc-anchor-ckpt requires --tier3 (eager batched "
+                  "path). Use --tier3 without --compile for the BC anchor "
+                  "isolation experiment.", flush=True)
+            sys.exit(2)
+        if model._tier3_step is not None:
+            print("[FATAL] --bc-anchor-ckpt is not supported with the C5 "
+                  "compiled train_step (--compile + --tier3). Drop --compile "
+                  "for the isolation experiment; recombine after BC anchor "
+                  "validates.", flush=True)
+            sys.exit(2)
+        if args.bc_anchor_coef == 0.0:
+            print("[WARN] --bc-anchor-coef is 0.0; BC anchor will be a no-op. "
+                  "Set --bc-anchor-coef 0.1 (or similar) to enable.", flush=True)
+        bc_path = args.bc_anchor_ckpt
+        print(f"BC anchor: loading reference from {bc_path}", flush=True)
+        bc_ref, _bc_cfg, _ = load_checkpoint(bc_path, device)
+        bc_ref.eval()
+        for p in bc_ref.parameters():
+            p.requires_grad_(False)
+        n_bc_params = sum(p.numel() for p in bc_ref.parameters())
+        print(f"BC anchor: ref loaded ({n_bc_params:,} params, frozen, "
+              f"coef={args.bc_anchor_coef})", flush=True)
+
     # External opponents — appended AFTER resume so resumed pool state stays clean
     # (resume loads only local snapshot paths; externals are re-instantiated each
     # run from the YAML). Subprocess adapters (metamon) get spawned + supervised
@@ -975,9 +1023,11 @@ def main():
     _tier3_status = ("OFF" if not args.tier3
                      else ("ON+compile" if model._tier3_step is not None
                            else "ON (eager)"))
+    _bc_anchor_status = (f"ON (coef={args.bc_anchor_coef})"
+                         if bc_ref is not None else "OFF")
     print(f"FP16: {'ON' if args.fp16 else 'OFF'}, Compile: {'ON' if compiled else 'OFF'}, "
           f"Pipeline: {'ON' if args.pipeline else 'OFF'}, Collect: {_collect_mode}, "
-          f"Tier3: {_tier3_status}, Device: {device}")
+          f"Tier3: {_tier3_status}, BCAnchor: {_bc_anchor_status}, Device: {device}")
     print(f"Snapshot pool: {len(snapshot_pool)} checkpoints\n", flush=True)
 
     # Register this run (fire-and-forget)
@@ -1073,6 +1123,8 @@ def main():
                 max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
                 normalize_advantages=False,
                 compiled_step=getattr(model, "_tier3_step", None),
+                bc_ref=bc_ref,
+                bc_anchor_coef=args.bc_anchor_coef,
             )
         else:
             loss_info = ppo_update(

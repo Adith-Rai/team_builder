@@ -187,7 +187,8 @@ def test_smoke_runs_to_completion():
     print(f"  stats: {stats}")
     expected_keys = {"pi", "v", "ent", "kl", "ratio_clip_frac",
                      "value_mean", "return_mean", "adv_abs_mean",
-                     "n_succeeded", "n_failed", "n_skipped_kl", "n_skipped_nan"}
+                     "n_succeeded", "n_failed", "n_skipped_kl", "n_skipped_nan",
+                     "bc_kl"}  # S57: BC anchor stat (0.0 when anchor inactive)
     assert set(stats.keys()) == expected_keys, \
         f"keys mismatch: {set(stats.keys()) ^ expected_keys}"
     assert stats["n_succeeded"] > 0, f"no epochs succeeded"

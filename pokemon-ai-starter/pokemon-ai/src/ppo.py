@@ -365,7 +365,8 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
 
 def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
                                ent_coef, vf_coef, clip_eps,
-                               normalize_advantages: bool = False) -> dict:
+                               normalize_advantages: bool = False,
+                               bc_logits=None, bc_anchor_coef=0.0) -> dict:
     """Tensor-only output of the masked PPO loss. Tier 3 C5 split: this is
     the compile-friendly core (no .item() calls, no Python control flow).
     Both the eager wrapper `ppo_loss_batched` and the compiled train_step
@@ -375,9 +376,26 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
     path) or 0-dim tensors (compiled path — passing as tensors avoids
     recompile when adaptive-entropy moves ent_coef per iter).
 
+    BC anchor (S57 — diagnosis of new-arch self-play type-knowledge erosion):
+      bc_logits: optional (B, L_max, n_actions) tensor — frozen BC reference
+        model's action_logits on the same collated batch. Pass-through from
+        an eager-side BC forward; computed by caller (ppo_update_batched
+        compiled path NOT supported in v1 — would require additional input
+        plumbing through the compile boundary).
+      bc_anchor_coef: scalar (Python float or tensor). Weight on the
+        KL(BC || model) anchor term added to total_loss. Typical 0.05-0.2.
+        0.0 disables the anchor (no-op, eager backward-compat).
+
+      Anchor formulation: KL(BC || model) = sum_a BC_p(a) * (log BC_p(a) -
+      log model_p(a)), masked by pad_mask. Direction = teacher (BC) tells
+      student (model) what the distribution should be. Bounded since BC's
+      mass is finite (vs KL(model || BC) which is unbounded if model puts
+      mass where BC has zero — risky with -100 masking).
+
     Returns dict with the same keys as `ppo_loss_batched` but `approx_kl`,
-    `ratio_clip_frac`, `n_valid` are TENSORS (not Python scalars). Callers
-    needing scalars must call `.item()` themselves.
+    `ratio_clip_frac`, `n_valid` are TENSORS (not Python scalars). When
+    bc_anchor active, returned dict also contains `bc_kl` (tensor scalar).
+    Callers needing scalars must call `.item()` themselves.
     """
     pad_mask = collated["pad_mask"]
     actions = collated["actions"]
@@ -433,6 +451,17 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
 
     total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
 
+    # BC anchor (S57): KL(BC || model) masked-mean over valid positions
+    if bc_logits is not None and bc_anchor_coef != 0.0:
+        bc_lp = F.log_softmax(bc_logits.float(), dim=-1)
+        bc_p = F.softmax(bc_logits.float(), dim=-1)
+        # KL(BC || model) per-pos = sum_a BC_p(a) * (log BC_p(a) - log model_p(a))
+        bc_kl_per_pos = (bc_p * (bc_lp - lp)).sum(-1)  # (B, L_max)
+        bc_kl = (bc_kl_per_pos * pad_mask_f).sum() / n_valid
+        total_loss = total_loss + bc_anchor_coef * bc_kl
+    else:
+        bc_kl = torch.zeros((), device=device)
+
     return {
         "total_loss":      total_loss,
         "pi_loss":         pi_loss,
@@ -441,13 +470,15 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
         "approx_kl":       approx_kl,        # TENSOR scalar
         "ratio_clip_frac": ratio_clip_frac,  # TENSOR scalar
         "n_valid":         n_valid,          # TENSOR scalar
+        "bc_kl":           bc_kl,            # TENSOR scalar (0 if bc anchor off)
     }
 
 
 def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
                      ent_coef: float = 0.02, vf_coef: float = 0.5,
                      clip_eps: float = 0.2,
-                     normalize_advantages: bool = False) -> dict:
+                     normalize_advantages: bool = False,
+                     bc_logits=None, bc_anchor_coef: float = 0.0) -> dict:
     """Compute PPO loss components over a sequence-batched forward output
     with pad_mask weighting.
 
@@ -493,11 +524,13 @@ def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
         collated, forward_out, model, cfg,
         ent_coef=ent_coef, vf_coef=vf_coef, clip_eps=clip_eps,
         normalize_advantages=normalize_advantages,
+        bc_logits=bc_logits, bc_anchor_coef=bc_anchor_coef,
     )
     # Match the prior contract: approx_kl, ratio_clip_frac, n_valid as scalars.
     out["approx_kl"]       = out["approx_kl"].item()
     out["ratio_clip_frac"] = out["ratio_clip_frac"].item()
     out["n_valid"]         = int(out["n_valid"].item())
+    out["bc_kl"]           = out["bc_kl"].item()
     return out
 
 
@@ -899,7 +932,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        L_max: Optional[int] = None,
                        normalize_advantages: bool = False,
                        in_warmup: bool = False,
-                       compiled_step=None) -> dict:
+                       compiled_step=None,
+                       bc_ref=None, bc_anchor_coef: float = 0.0) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -958,18 +992,32 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             "Use the per-episode ppo_update for warmup iters, then switch "
             "to ppo_update_batched for the main training loop."
         )
+    if compiled_step is not None and bc_ref is not None and bc_anchor_coef != 0.0:
+        raise NotImplementedError(
+            "BC anchor (bc_ref + bc_anchor_coef) is not supported with "
+            "the compiled train_step path in v1. Use --tier3 WITHOUT "
+            "--compile, or run without --bc-anchor-ckpt. The BC forward "
+            "would need to be plumbed as a tensor input through the "
+            "compile boundary — additional design work deferred until "
+            "BC anchor is validated as the Phase 2 fix (S57 isolation "
+            "experiment)."
+        )
     if not episodes:
         # No episodes — nothing to do. Return zero-stats.
         return {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
                 "ratio_clip_frac": 0.0, "value_mean": 0.0,
                 "return_mean": 0.0, "adv_abs_mean": 0.0,
                 "n_succeeded": 0, "n_failed": 0,
-                "n_skipped_kl": 0, "n_skipped_nan": 0}
+                "n_skipped_kl": 0, "n_skipped_nan": 0,
+                "bc_kl": 0.0}
 
     model.train()
+    if bc_ref is not None:
+        bc_ref.eval()  # frozen reference; no gradient
     stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
              "ratio_clip_frac": 0.0,
-             "value_mean": 0.0, "return_mean": 0.0, "adv_abs_mean": 0.0}
+             "value_mean": 0.0, "return_mean": 0.0, "adv_abs_mean": 0.0,
+             "bc_kl": 0.0}
     n = 0                # number of epochs that ran without skip
     n_failed = 0         # epochs that raised an exception
     n_skipped_kl = 0     # epochs gated by per-batch KL check (target_kl × 5)
@@ -1059,6 +1107,17 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             # Collate B episodes → (B, L_max, *) padded batch on device
             collated = collate_episodes(episodes, L_max=L_max, device=device)
 
+            # BC reference forward (S57 anchor): one frozen forward outside
+            # the autocast/grad context. Output passed as bc_logits to the
+            # loss. Adds ~1 forward worth of compute per epoch (~1% of
+            # update phase since BC ref runs in inference_mode).
+            bc_logits = None
+            if bc_ref is not None and bc_anchor_coef != 0.0:
+                with torch.inference_mode():
+                    with _update_amp_ctx:
+                        bc_out = bc_ref.forward_ppo_sequence(collated, device)
+                        bc_logits = bc_out["action_logits"]
+
             with _update_amp_ctx:
                 # Forward: collated → (B, L_max, n_actions) logits etc.
                 forward_out = model.forward_ppo_sequence(collated, device)
@@ -1071,12 +1130,13 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     n_skipped_nan += 1
                     continue
 
-                # Loss: ppo_loss_batched (C3) — pi + entropy + value + kl
+                # Loss: ppo_loss_batched (C3) — pi + entropy + value + kl + bc_anchor
                 loss_dict = ppo_loss_batched(
                     collated, forward_out, model, cfg,
                     ent_coef=ent_coef, vf_coef=vf_coef,
                     clip_eps=clip_eps,
                     normalize_advantages=normalize_advantages,
+                    bc_logits=bc_logits, bc_anchor_coef=bc_anchor_coef,
                 )
                 total_loss = loss_dict["total_loss"]
                 approx_kl = loss_dict["approx_kl"]
@@ -1112,6 +1172,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             stats["ent"] += loss_dict["entropy"].item()
             stats["kl"] += abs(approx_kl)
             stats["ratio_clip_frac"] += loss_dict["ratio_clip_frac"]
+            stats["bc_kl"] += loss_dict.get("bc_kl", 0.0)
 
             # Drift diagnostics: value vs return (same as ppo_update lines
             # 532-539). Computed over valid positions of the collated batch.
