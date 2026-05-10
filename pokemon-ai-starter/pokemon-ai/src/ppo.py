@@ -1107,16 +1107,22 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             # Collate B episodes → (B, L_max, *) padded batch on device
             collated = collate_episodes(episodes, L_max=L_max, device=device)
 
-            # BC reference forward (S57 anchor): one frozen forward outside
-            # the autocast/grad context. Output passed as bc_logits to the
-            # loss. Adds ~1 forward worth of compute per epoch (~1% of
-            # update phase since BC ref runs in inference_mode).
+            # BC reference forward (S57 anchor): one frozen forward inside
+            # the autocast context (matches trainable model's autocast for
+            # numerical consistency in the KL term). torch.no_grad — NOT
+            # inference_mode (the latter produces "inference tensors" that
+            # can't always be cleanly used downstream in the autograd-tracked
+            # loss; verified failure on dev pod S57: CUDA index-out-of-bounds
+            # assert during BC ref forward when wrapped in inference_mode).
+            # Detach the output so the loss path treats bc_logits as a
+            # constant (defensive — the no_grad context already blocks grad
+            # tracking, but explicit detach makes intent clear at use site).
             bc_logits = None
             if bc_ref is not None and bc_anchor_coef != 0.0:
-                with torch.inference_mode():
+                with torch.no_grad():
                     with _update_amp_ctx:
                         bc_out = bc_ref.forward_ppo_sequence(collated, device)
-                        bc_logits = bc_out["action_logits"]
+                        bc_logits = bc_out["action_logits"].detach()
 
             with _update_amp_ctx:
                 # Forward: collated → (B, L_max, n_actions) logits etc.
