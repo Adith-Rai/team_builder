@@ -987,7 +987,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        normalize_advantages: bool = False,
                        in_warmup: bool = False,
                        compiled_step=None,
-                       bc_ref=None, bc_anchor_coef: float = 0.0) -> dict:
+                       bc_ref=None, bc_anchor_coef: float = 0.0,
+                       minibatch_size: Optional[int] = None) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1169,115 +1170,142 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             continue  # next ppo_ep
 
         # ---- Eager path (compiled_step is None) ----
+        # Mini-batching (task #10): split episodes into chunks of size
+        # `minibatch_size`. Per chunk: collate → forward → loss → backward
+        # (grads accumulate into .grad). After ALL chunks: clip + ONE
+        # optimizer.step. This bounds activation memory per forward by
+        # chunk size, NOT by total episodes count — the Tier 3 design fix
+        # required for production-scale (1600+ games) where mega-batching
+        # all episodes blows past A100 80GB. Loss is scaled by 1/n_chunks
+        # so accumulated gradient ≈ single-batch gradient on the average.
+        if minibatch_size is None or minibatch_size >= len(episodes):
+            chunks = [episodes]
+        else:
+            chunks = [episodes[i:i + minibatch_size]
+                      for i in range(0, len(episodes), minibatch_size)]
+        n_chunks = len(chunks)
+        inv_n = 1.0 / n_chunks
+
         try:
-            # Cap L_max at cfg.temporal_context + tail-truncate (S57 fix —
-            # see compiled-path block above for rationale). For arches
-            # without temporal_context (e.g., test mini cfg), fall back to
-            # the existing L_max behavior.
-            _temp_ctx = getattr(cfg, "temporal_context", None)
-            if _temp_ctx is not None:
-                _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
-                collated = collate_episodes(
-                    episodes, L_max=_eff_L, device=device, tail=True,
-                )
-            else:
-                collated = collate_episodes(episodes, L_max=L_max, device=device)
+            optimizer.zero_grad()
+            chunk_stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
+                           "ratio_clip_frac": 0.0, "value_mean": 0.0,
+                           "return_mean": 0.0, "adv_abs_mean": 0.0,
+                           "bc_kl": 0.0}
+            chunk_failed = False
 
-            # BC reference forward (S57 anchor): one frozen forward inside
-            # the autocast context (matches trainable model's autocast for
-            # numerical consistency in the KL term). torch.no_grad — NOT
-            # inference_mode (the latter produces "inference tensors" that
-            # can't always be cleanly used downstream in the autograd-tracked
-            # loss; verified failure on dev pod S57: CUDA index-out-of-bounds
-            # assert during BC ref forward when wrapped in inference_mode).
-            # Detach the output so the loss path treats bc_logits as a
-            # constant (defensive — the no_grad context already blocks grad
-            # tracking, but explicit detach makes intent clear at use site).
-            bc_logits = None
-            if bc_ref is not None and bc_anchor_coef != 0.0:
+            for chunk_idx, chunk_eps in enumerate(chunks):
+                # Collate this chunk only (memory-bounded by chunk size).
+                _temp_ctx = getattr(cfg, "temporal_context", None)
+                if _temp_ctx is not None:
+                    _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                    collated = collate_episodes(
+                        chunk_eps, L_max=_eff_L, device=device, tail=True,
+                    )
+                else:
+                    collated = collate_episodes(
+                        chunk_eps, L_max=L_max, device=device,
+                    )
+
+                # BC ref forward (per chunk; same memory bound as model)
+                bc_logits = None
+                if bc_ref is not None and bc_anchor_coef != 0.0:
+                    with torch.no_grad():
+                        with _update_amp_ctx:
+                            bc_out = bc_ref.forward_ppo_sequence(collated, device)
+                            bc_logits = bc_out["action_logits"].detach()
+
+                with _update_amp_ctx:
+                    forward_out = model.forward_ppo_sequence(collated, device)
+
+                    if (forward_out["action_logits"].isnan().any()
+                            or forward_out["v_logits"].isnan().any()):
+                        print(f"  [WARN] NaN in chunk {chunk_idx}/{n_chunks} "
+                              f"forward (epoch {ppo_ep})", flush=True)
+                        chunk_failed = True
+                        break
+
+                    loss_dict = ppo_loss_batched(
+                        collated, forward_out, model, cfg,
+                        ent_coef=ent_coef, vf_coef=vf_coef,
+                        clip_eps=clip_eps,
+                        normalize_advantages=normalize_advantages,
+                        bc_logits=bc_logits, bc_anchor_coef=bc_anchor_coef,
+                    )
+                    # Scale by inv_n so accumulated grad = mean across chunks
+                    chunk_loss = loss_dict["total_loss"] * inv_n
+
+                if chunk_loss.isnan() or chunk_loss.isinf():
+                    print(f"  [WARN] NaN/inf loss in chunk {chunk_idx}/{n_chunks} "
+                          f"(pi={loss_dict['pi_loss'].item():.4f} "
+                          f"v={loss_dict['v_loss'].item():.4f})", flush=True)
+                    chunk_failed = True
+                    break
+
+                # Backward — gradients accumulate into model.parameters().grad
+                chunk_loss.backward()
+
+                # Aggregate per-chunk stats (each chunk weight = 1/n_chunks)
+                chunk_stats["pi"] += loss_dict["pi_loss"].item() * inv_n
+                chunk_stats["v"] += loss_dict["v_loss"].item() * inv_n
+                chunk_stats["ent"] += loss_dict["entropy"].item() * inv_n
+                chunk_stats["kl"] += abs(loss_dict["approx_kl"]) * inv_n
+                chunk_stats["ratio_clip_frac"] += loss_dict["ratio_clip_frac"] * inv_n
+                chunk_stats["bc_kl"] += loss_dict.get("bc_kl", 0.0) * inv_n
+
+                # Drift diagnostics (per-chunk averaged into epoch totals)
                 with torch.no_grad():
-                    with _update_amp_ctx:
-                        bc_out = bc_ref.forward_ppo_sequence(collated, device)
-                        bc_logits = bc_out["action_logits"].detach()
+                    pad_mask_f = collated["pad_mask"].to(device).float()
+                    n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
+                    returns_t = collated["returns"].to(device).float()
+                    advantages_t = collated["advantages"].to(device).float()
+                    v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                    v_pred = (v_probs * get_v_support(model)).sum(-1)
+                    chunk_stats["value_mean"] += (
+                        (v_pred * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
+                    chunk_stats["return_mean"] += (
+                        (returns_t * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
+                    chunk_stats["adv_abs_mean"] += (
+                        (advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
 
-            with _update_amp_ctx:
-                # Forward: collated → (B, L_max, n_actions) logits etc.
-                forward_out = model.forward_ppo_sequence(collated, device)
+                # Per-chunk memory cleanup — prevents activation accumulation
+                # across chunks (the whole point of minibatching).
+                del collated, forward_out, loss_dict, chunk_loss
+                if bc_logits is not None:
+                    del bc_logits
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-                # NaN/inf check on forward
-                if (forward_out["action_logits"].isnan().any()
-                        or forward_out["v_logits"].isnan().any()):
-                    print(f"  [WARN] NaN in batched forward, skip epoch "
-                          f"{ppo_ep}", flush=True)
-                    n_skipped_nan += 1
-                    continue
-
-                # Loss: ppo_loss_batched (C3) — pi + entropy + value + kl + bc_anchor
-                loss_dict = ppo_loss_batched(
-                    collated, forward_out, model, cfg,
-                    ent_coef=ent_coef, vf_coef=vf_coef,
-                    clip_eps=clip_eps,
-                    normalize_advantages=normalize_advantages,
-                    bc_logits=bc_logits, bc_anchor_coef=bc_anchor_coef,
-                )
-                total_loss = loss_dict["total_loss"]
-                approx_kl = loss_dict["approx_kl"]
-
-            # NaN/inf check on loss
-            if total_loss.isnan() or total_loss.isinf():
-                print(f"  [WARN] NaN/inf loss (pi={loss_dict['pi_loss'].item():.4f} "
-                      f"v={loss_dict['v_loss'].item():.4f}), aborting batched "
-                      f"PPO update", flush=True)
-                optimizer.zero_grad()
-                kl_early_stopped = True
-                break
-
-            # Per-batch KL gate: skip this epoch's update if policy diverged
-            # too much. Coarser than the per-episode gate in ppo_update
-            # (which skips just outlier episodes), but the effect is
-            # similar at the optimizer-step level (no harmful update lands).
-            if abs(approx_kl) > target_kl * 5:
-                n_skipped_kl += 1
-                # Don't break — we might recover next epoch on shuffled batch
+            # ---- All chunks done — decide if we step ----
+            if chunk_failed:
+                n_skipped_nan += 1
+                optimizer.zero_grad()  # discard accumulated grads
                 continue
 
-            # Backward + clip + step
-            optimizer.zero_grad()
-            total_loss.backward()
+            avg_kl = chunk_stats["kl"]
+
+            # Per-batch KL gate (averaged across chunks): skip this epoch's
+            # update if policy diverged too much. Discard accumulated grads.
+            if avg_kl > target_kl * 5:
+                n_skipped_kl += 1
+                optimizer.zero_grad()
+                continue
+
+            # Clip + ONE optimizer.step for the whole epoch (across all chunks).
             if max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-            # Accumulate stats (per-epoch since batched path is 1 step / epoch)
-            stats["pi"] += loss_dict["pi_loss"].item()
-            stats["v"] += loss_dict["v_loss"].item()
-            stats["ent"] += loss_dict["entropy"].item()
-            stats["kl"] += abs(approx_kl)
-            stats["ratio_clip_frac"] += loss_dict["ratio_clip_frac"]
-            stats["bc_kl"] += loss_dict.get("bc_kl", 0.0)
-
-            # Drift diagnostics: value vs return (same as ppo_update lines
-            # 532-539). Computed over valid positions of the collated batch.
-            with torch.no_grad():
-                pad_mask_f = collated["pad_mask"].to(device).float()
-                n_valid = pad_mask_f.sum().clamp(min=1.0)
-                returns_t = collated["returns"].to(device).float()
-                advantages_t = collated["advantages"].to(device).float()
-                v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
-                v_pred = (v_probs * get_v_support(model)).sum(-1)  # (B, L_max)
-                stats["value_mean"]  += ((v_pred * pad_mask_f).sum() / n_valid).item()
-                stats["return_mean"] += ((returns_t * pad_mask_f).sum() / n_valid).item()
-                stats["adv_abs_mean"]+= ((advantages_t.abs() * pad_mask_f).sum() / n_valid).item()
-
+            # Roll up chunk averages into epoch stats
+            for k, v in chunk_stats.items():
+                stats[k] += v
             n += 1
 
-            # KL early-stop: avg-KL > target_kl × 1.5 → break out of epoch loop
-            # (same threshold + intent as ppo_update lines 700-706, computed
-            # over per-batch KL since each epoch IS one batch update).
-            if abs(approx_kl) > target_kl * 1.5:
-                print(f"    KL early stop (batched): epoch {ppo_ep}, "
-                      f"kl={abs(approx_kl):.4f} > {target_kl*1.5:.4f}",
-                      flush=True)
+            # KL early-stop on averaged KL
+            if avg_kl > target_kl * 1.5:
+                print(f"    KL early stop (batched-mb): epoch {ppo_ep}, "
+                      f"kl={avg_kl:.4f} > {target_kl*1.5:.4f}", flush=True)
                 kl_early_stopped = True
 
         except Exception as e:
@@ -1286,12 +1314,6 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             n_failed += 1
             optimizer.zero_grad()
             continue
-
-        # Memory cleanup between epochs (collated batch can be 100-500 MB)
-        del collated, forward_out, loss_dict, total_loss
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     # Normalize stats by number of completed epochs
     for k in stats:

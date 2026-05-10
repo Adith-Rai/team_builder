@@ -167,6 +167,17 @@ def parse_args():
                         "self-play on the new transformer arch (Phase 1 v3 SE "
                         "rate fell 44%→31% over 60 iters). Requires --tier3 (eager "
                         "batched path); NOT supported with --compile in v1.")
+    p.add_argument("--tier3-minibatch-size", type=int, default=None,
+                   help="S57 task #10: when --tier3 is set, splits each "
+                        "epoch's episodes into minibatches of N for "
+                        "memory-bounded forward+backward (gradients "
+                        "accumulate, ONE optimizer.step per epoch). "
+                        "Required for production scale (1600+ games) on "
+                        "A100 80GB — mega-batching all episodes blows "
+                        "past activation memory. Typical: 16-32 for "
+                        "production scale, 8 for tighter memory. None "
+                        "= one chunk = old mega-batch behavior (smoke "
+                        "scale only).")
     p.add_argument("--bc-anchor-coef", type=float, default=0.1,
                    help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
@@ -1127,6 +1138,7 @@ def main():
                 compiled_step=getattr(model, "_tier3_step", None),
                 bc_ref=bc_ref,
                 bc_anchor_coef=args.bc_anchor_coef,
+                minibatch_size=args.tier3_minibatch_size,
             )
         else:
             loss_info = ppo_update(
