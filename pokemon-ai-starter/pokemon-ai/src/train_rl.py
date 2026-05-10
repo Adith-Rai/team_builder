@@ -950,16 +950,18 @@ def main():
     # dev pod S57). Pass `bc_ref` directly to ppo_update_batched.
     bc_ref = None
     if args.bc_anchor_ckpt:
-        if not args.tier3:
-            print("[FATAL] --bc-anchor-ckpt requires --tier3 (eager batched "
-                  "path). Use --tier3 without --compile for the BC anchor "
-                  "isolation experiment.", flush=True)
-            sys.exit(2)
+        # S57: BC anchor supported on EITHER the per-episode `ppo_update`
+        # path (battle-tested via Phase 1 v3) OR the `ppo_update_batched`
+        # eager path. NOT supported with C5 compile (would need BC logits
+        # plumbed through compile boundary; deferred until BC anchor
+        # validates as Phase 2 fix). Per-episode path is recommended for
+        # the isolation experiment because the eager batched path has
+        # OOM / index-OOB issues at 200+ games scale (task #10/#11).
         if model._tier3_step is not None:
             print("[FATAL] --bc-anchor-ckpt is not supported with the C5 "
                   "compiled train_step (--compile + --tier3). Drop --compile "
-                  "for the isolation experiment; recombine after BC anchor "
-                  "validates.", flush=True)
+                  "to use the per-episode ppo_update path with BC anchor.",
+                  flush=True)
             sys.exit(2)
         if args.bc_anchor_coef == 0.0:
             print("[WARN] --bc-anchor-coef is 0.0; BC anchor will be a no-op. "
@@ -1134,6 +1136,8 @@ def main():
                 max_grad_norm=args.max_grad_norm, target_kl=args.target_kl,
                 grad_accum=args.grad_accum,
                 in_warmup=in_warmup,  # skips autograd through frozen backbone
+                bc_ref=bc_ref,
+                bc_anchor_coef=args.bc_anchor_coef,
             )
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")

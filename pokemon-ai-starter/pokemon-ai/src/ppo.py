@@ -123,7 +123,7 @@ def build_ppo_episodes(trajectories: List[Trajectory],
 #   - Causal masking lives in C2 (temporal attention); collate is just shape
 #   - Per-episode storage (Trajectory, build_ppo_episodes) unchanged
 
-def collate_episodes(episodes, L_max=None, device=None) -> dict:
+def collate_episodes(episodes, L_max=None, device=None, tail: bool = False) -> dict:
     """Collate B episode dicts into padded (B, L_max, *) tensors + pad_mask.
 
     Args:
@@ -132,9 +132,17 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
         actions/old_logp/advantages/returns (length-T sequences),
         action_masks (list of T arrays/tensors of shape (A,)).
       L_max: optional max sequence length. Defaults to longest episode in
-        the bundle. Episodes longer than L_max are right-truncated.
+        the bundle. Episodes longer than L_max are truncated.
       device: optional torch.device — if given, output tensors are moved
         there. If None, output stays on CPU (move at use site).
+      tail: when True AND L_max is given, truncate to the LAST L_max turns
+        of each episode (keep recent context). When False (default), takes
+        the FIRST L_max turns. Tail mode required for Tier 3 paths feeding
+        TemporalTransformer.forward, which truncates internally to
+        cfg.temporal_context — the outer indexing `temporal_ctx_grid[
+        b_idx, t_idx]` requires L_max ≤ temporal_context (caller must
+        pass L_max=cfg.temporal_context, tail=True). Per-turn ppo_update
+        already does this via `summary_buf[:, -200:]`.
 
     Returns:
       dict with the following keys:
@@ -166,12 +174,18 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
     if not episodes:
         raise ValueError("collate_episodes: empty episode list")
 
-    # 1. Determine L_max + seq_lens
-    seq_lens_list = [len(ep["actions"]) for ep in episodes]
+    # 1. Determine L_max + seq_lens + per-episode start offset (tail mode)
+    full_lens_list = [len(ep["actions"]) for ep in episodes]
     if L_max is None:
-        L_max = max(seq_lens_list)
-    # Right-truncate any episode longer than L_max (defensive)
-    seq_lens_list = [min(s, L_max) for s in seq_lens_list]
+        L_max = max(full_lens_list)
+    if tail:
+        # Tail truncation: drop the FIRST (T - L_max) turns of episodes
+        # longer than L_max. Matches per-turn ppo_update's `summary_buf[:, -200:]`
+        # behavior, required for forward_ppo_sequence correctness.
+        start_idx_list = [max(0, T - L_max) for T in full_lens_list]
+    else:
+        start_idx_list = [0] * len(episodes)
+    seq_lens_list = [min(T, L_max) for T in full_lens_list]
     B = len(episodes)
 
     seq_lens = _t.tensor(seq_lens_list, dtype=_t.long)
@@ -181,22 +195,22 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
 
     # 2. Pad scalar-per-turn fields (actions, old_logp, advantages, returns)
     #    to (B, L_max). Each ep[k] is a length-T list/array.
-    def _pad_1d(ep_list, T_actual, dtype, fill=0.0):
-        """Convert a length-T list/array to a length-L_max tensor padded with `fill`."""
-        x = _t.as_tensor(list(ep_list)[:T_actual], dtype=dtype)
+    def _pad_1d(ep_list, start, T_actual, dtype, fill=0.0):
+        """Slice ep_list[start:start+T_actual] then pad to length L_max."""
+        x = _t.as_tensor(list(ep_list)[start:start + T_actual], dtype=dtype)
         if T_actual < L_max:
             pad = _t.full((L_max - T_actual,), fill, dtype=dtype)
             x = _t.cat([x, pad], dim=0)
         return x
 
-    actions = _t.stack([_pad_1d(ep["actions"], s, _t.long, fill=0)
-                         for ep, s in zip(episodes, seq_lens_list)], dim=0)
-    old_logp = _t.stack([_pad_1d(ep["old_logp"], s, _t.float32, fill=0.0)
-                          for ep, s in zip(episodes, seq_lens_list)], dim=0)
-    advantages = _t.stack([_pad_1d(ep["advantages"], s, _t.float32, fill=0.0)
-                            for ep, s in zip(episodes, seq_lens_list)], dim=0)
-    returns = _t.stack([_pad_1d(ep["returns"], s, _t.float32, fill=0.0)
-                         for ep, s in zip(episodes, seq_lens_list)], dim=0)
+    actions = _t.stack([_pad_1d(ep["actions"], st, s, _t.long, fill=0)
+                         for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)], dim=0)
+    old_logp = _t.stack([_pad_1d(ep["old_logp"], st, s, _t.float32, fill=0.0)
+                          for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)], dim=0)
+    advantages = _t.stack([_pad_1d(ep["advantages"], st, s, _t.float32, fill=0.0)
+                            for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)], dim=0)
+    returns = _t.stack([_pad_1d(ep["returns"], st, s, _t.float32, fill=0.0)
+                         for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)], dim=0)
 
     # 3. action_masks: list of T per-turn (A,) arrays/tensors → (B, L_max, A)
     #    Determine A from first non-empty episode.
@@ -210,20 +224,20 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
     if A is None:
         raise ValueError("collate_episodes: no action_masks found")
 
-    def _pad_2d(am_list, T_actual, A):
-        """Stack T (A,) masks into (T, A), pad to (L_max, A) with zeros."""
+    def _pad_2d(am_list, start, T_actual, A):
+        """Slice am_list[start:start+T_actual], stack to (T,A), pad to (L_max,A)."""
         if T_actual == 0:
             stacked = _t.zeros(0, A, dtype=_t.float32)
         else:
             stacked = _t.stack([_t.as_tensor(m, dtype=_t.float32)
-                                for m in am_list[:T_actual]], dim=0)
+                                for m in am_list[start:start + T_actual]], dim=0)
         if T_actual < L_max:
             pad = _t.zeros(L_max - T_actual, A, dtype=_t.float32)
             stacked = _t.cat([stacked, pad], dim=0)
         return stacked
 
-    action_masks = _t.stack([_pad_2d(ep["action_masks"], s, A)
-                              for ep, s in zip(episodes, seq_lens_list)], dim=0)
+    action_masks = _t.stack([_pad_2d(ep["action_masks"], st, s, A)
+                              for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)], dim=0)
 
     # 4. feat_batches: per-episode list of T per-turn dicts. Each per-turn
     #    dict has tensor leaves of shape (1, ...) and possibly nested dict
@@ -233,26 +247,19 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
     #      (c) across episodes: stack to (B, L_max, ...)
     #    Recurse for nested dicts. Non-tensor leaves return None (caller
     #    must handle; current production has no non-tensor leaves).
-    def _stack_pad_one_episode(turn_dicts, T_actual):
+    def _stack_pad_one_episode(turn_dicts, start, T_actual):
         """Return a dict with leaves stacked + padded to (L_max, ...).
-        Recurses for nested dicts."""
+        Reads turn_dicts[start:start+T_actual]. Recurses for nested dicts."""
         if T_actual == 0:
-            # Empty episode: synthesize zero-shaped leaves matching schema
-            # of OTHER episodes. Caller should not normally pass empty episodes
-            # (build_ppo_episodes filters them), but be defensive.
             raise ValueError("collate_episodes: T_actual==0 episode "
                              "(should be filtered upstream)")
 
-        sample = turn_dicts[0]
+        sample = turn_dicts[start]
         out = {}
         for k, v in sample.items():
             if isinstance(v, _t.Tensor):
-                # Stack along dim 0 (each leaf is (1, ...) per turn) — squeeze
-                # the leading-1 if present (use cat which preserves shape).
-                # Cat gives (T, ...) — same as existing _stack_field at L168.
-                stacked = _t.cat([turn_dicts[t][k]
+                stacked = _t.cat([turn_dicts[start + t][k]
                                   for t in range(T_actual)], dim=0)
-                # Pad to (L_max, ...) with zeros
                 if T_actual < L_max:
                     pad_shape = (L_max - T_actual,) + tuple(stacked.shape[1:])
                     pad = _t.zeros(pad_shape, dtype=stacked.dtype,
@@ -260,13 +267,11 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
                     stacked = _t.cat([stacked, pad], dim=0)
                 out[k] = stacked
             elif isinstance(v, dict):
-                # Recurse: build a nested dict where each key's value is the
-                # padded tensor across turns of the OUTER episode.
                 inner_out = {}
                 for inner_k, inner_v in v.items():
                     if isinstance(inner_v, _t.Tensor):
                         inner_stacked = _t.cat(
-                            [turn_dicts[t][k][inner_k]
+                            [turn_dicts[start + t][k][inner_k]
                              for t in range(T_actual)], dim=0)
                         if T_actual < L_max:
                             pad_shape = ((L_max - T_actual,)
@@ -276,17 +281,13 @@ def collate_episodes(episodes, L_max=None, device=None) -> dict:
                             inner_stacked = _t.cat([inner_stacked, pad], dim=0)
                         inner_out[inner_k] = inner_stacked
                     else:
-                        # Non-tensor nested leaf: not supported in current
-                        # production schema. Skip rather than crash.
                         pass
                 out[k] = inner_out
-            # else: non-tensor non-dict leaf — skip (not used in production)
         return out
 
-    # Per-episode collated dicts, then stack across batch dim
     per_episode_collated = [
-        _stack_pad_one_episode(ep["feat_batches"], s)
-        for ep, s in zip(episodes, seq_lens_list)
+        _stack_pad_one_episode(ep["feat_batches"], st, s)
+        for ep, st, s in zip(episodes, start_idx_list, seq_lens_list)
     ]
 
     def _stack_batch_dim(per_ep_list):
@@ -544,11 +545,23 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                   vf_coef: float = 0.5, max_grad_norm: float = 0.5,
                   target_kl: float = 0.02, grad_accum: int = 1,
                   in_warmup: bool = False,
+                  bc_ref=None, bc_anchor_coef: float = 0.0,
                   ) -> dict:
     """PPO update with distributional value loss + KL early stopping (ps-ppo style).
     No KL penalty term — instead stops PPO epochs early if policy changes too much.
-    grad_accum: accumulate gradients over N episodes before each optimizer step."""
+    grad_accum: accumulate gradients over N episodes before each optimizer step.
+
+    BC anchor (S57): when bc_ref + bc_anchor_coef given, adds KL(BC || model)
+    auxiliary loss term per episode. BC ref is called once per episode via
+    `forward_ppo_sequence` on a single-episode collated dict (memory-bounded
+    by per-episode T, no scaling concern). Anchors the model to BC's policy
+    distribution to prevent type-knowledge erosion observed in pure self-play
+    on the new transformer arch. See `project_phase1_v3_diagnosis.md` for
+    diagnosis + isolation experiment design.
+    """
     model.train()
+    if bc_ref is not None:
+        bc_ref.eval()  # frozen reference; no gradient
     stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
              # Diagnostic counters — catch silent policy/value pathologies early
              # (Exp 4-style collapse: value drifts while policy keeps training).
@@ -556,6 +569,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
              "value_mean": 0.0,        # mean predicted value (drift indicator)
              "return_mean": 0.0,       # mean return target (compare to value_mean)
              "adv_abs_mean": 0.0,      # advantage magnitude (normalization sanity)
+             "bc_kl": 0.0,             # mean BC anchor KL term (0 when anchor off)
              }
     n = 0
     n_failed = 0  # episodes that raised an exception (CUDA error, OOM, etc.)
@@ -694,8 +708,47 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                         n_skipped_kl += 1
                         continue  # no backward, no step — episode discarded
 
+                    # BC anchor (S57): KL(BC || model) per-episode. Single
+                    # episode forward through bc_ref via collate_episodes
+                    # ([ep], device) + forward_ppo_sequence — memory-bounded
+                    # by per-episode T (no scale issue like batched path).
+                    # Anchors model toward BC's distribution to prevent
+                    # type-knowledge erosion in pure self-play.
+                    bc_kl_t = torch.zeros((), device=device)
+                    if bc_ref is not None and bc_anchor_coef != 0.0:
+                        # Tail-truncate to last temporal_context turns —
+                        # required for forward_ppo_sequence (its temporal
+                        # forward caps at cfg.temporal_context). For
+                        # episodes with T > temporal_context, BC anchor
+                        # only covers the recent context; the earlier
+                        # turns get no anchor (acceptable: matches the
+                        # per-turn ppo_update's summary_buf[:, -200:] cap).
+                        _temp_ctx = getattr(cfg, "temporal_context", 200)
+                        T_bc = min(T, _temp_ctx)
+                        bc_start = T - T_bc  # offset into lp for alignment
+                        with torch.no_grad():
+                            bc_collated = collate_episodes(
+                                [ep], L_max=_temp_ctx,
+                                device=device, tail=True,
+                            )
+                            with _update_amp_ctx:
+                                bc_out = bc_ref.forward_ppo_sequence(bc_collated, device)
+                                # bc_out["action_logits"] is (1, _temp_ctx, n_actions);
+                                # take valid prefix + detach.
+                                bc_logits = bc_out["action_logits"][0, :T_bc].detach()
+                        # KL(BC || model) on the ALIGNED tail. Both
+                        # tensors are (T_bc, n_actions) — bc covers the
+                        # last T_bc turns of episode, lp[bc_start:] is
+                        # the trainable model's logits for the same turns.
+                        bc_lp = F.log_softmax(bc_logits.float(), dim=-1)
+                        bc_p = F.softmax(bc_logits.float(), dim=-1)
+                        lp_aligned = lp[bc_start:].float()  # (T_bc, n_actions)
+                        bc_kl_per_pos = (bc_p * (bc_lp - lp_aligned)).sum(-1)
+                        bc_kl_t = bc_kl_per_pos.mean()
+
                     # Loss: no KL penalty term — early stopping replaces it
-                    loss = (pi_loss - ent_coef * entropy + vf_coef * v_loss) / grad_accum
+                    loss = (pi_loss - ent_coef * entropy + vf_coef * v_loss
+                            + bc_anchor_coef * bc_kl_t) / grad_accum
 
                 if loss.isnan() or loss.isinf():
                     print(f"  [WARN] NaN/inf loss (pi={pi_loss.item():.4f} v={v_loss.item():.4f}), T={T}, aborting PPO update", flush=True)
@@ -718,6 +771,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 stats["pi"] += pi_loss.item()
                 stats["v"] += v_loss.item()
                 stats["ent"] += entropy.item()
+                stats["bc_kl"] += bc_kl_t.item() if isinstance(bc_kl_t, torch.Tensor) else float(bc_kl_t)
                 stats["kl"] += abs(approx_kl)
                 stats["ratio_clip_frac"] += clipped_frac
                 # Drift diagnostics: value_mean vs return_mean — if they diverge,
@@ -1042,7 +1096,19 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
         if compiled_step is not None:
             # ---- Tier 3 C5 compiled path: single-graph train_step ----
             try:
-                collated = collate_episodes(episodes, L_max=L_max, device=device)
+                # Cap L_max at cfg.temporal_context + tail-truncate (S57 bug
+                # fix): forward_ppo_sequence's temporal forward truncates to
+                # cfg.temporal_context internally; outer indexing
+                # (temporal_ctx_grid[b_idx, t_idx]) then OOBs if L_max larger.
+                # getattr fallback: test mini cfg lacks temporal_context.
+                _temp_ctx = getattr(cfg, "temporal_context", None)
+                if _temp_ctx is not None:
+                    _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                    collated = collate_episodes(
+                        episodes, L_max=_eff_L, device=device, tail=True,
+                    )
+                else:
+                    collated = collate_episodes(episodes, L_max=L_max, device=device)
                 # 0-dim tensors — value-change does NOT trigger recompile.
                 # Adaptive entropy moves ent_coef per iter; passing as tensor
                 # keeps the compile cache hot.
@@ -1104,8 +1170,18 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
 
         # ---- Eager path (compiled_step is None) ----
         try:
-            # Collate B episodes → (B, L_max, *) padded batch on device
-            collated = collate_episodes(episodes, L_max=L_max, device=device)
+            # Cap L_max at cfg.temporal_context + tail-truncate (S57 fix —
+            # see compiled-path block above for rationale). For arches
+            # without temporal_context (e.g., test mini cfg), fall back to
+            # the existing L_max behavior.
+            _temp_ctx = getattr(cfg, "temporal_context", None)
+            if _temp_ctx is not None:
+                _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                collated = collate_episodes(
+                    episodes, L_max=_eff_L, device=device, tail=True,
+                )
+            else:
+                collated = collate_episodes(episodes, L_max=L_max, device=device)
 
             # BC reference forward (S57 anchor): one frozen forward inside
             # the autocast context (matches trainable model's autocast for
