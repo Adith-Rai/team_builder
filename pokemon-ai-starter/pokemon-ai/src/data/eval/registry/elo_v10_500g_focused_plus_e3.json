@@ -1,0 +1,553 @@
+{
+  "config": {
+    "added_to": "data/eval/registry/elo_v10_500g_focused.json",
+    "n_games": 500,
+    "anchor_bot": "SH",
+    "anchor_elo": 1000.0,
+    "n_bootstrap": 200,
+    "n_matchups": 36,
+    "n_players": 9,
+    "new_players": [
+      "bc_v10_cloud_e3"
+    ]
+  },
+  "players": [
+    {
+      "name": "bc_v10_cloud_e1",
+      "kind": "snapshot",
+      "ckpt": "data/models/bc/v10_cloud_gen9/epoch_001.pt"
+    },
+    {
+      "name": "bc_v10_cloud_e2",
+      "kind": "snapshot",
+      "ckpt": "data/models/bc/v10_cloud_gen9/epoch_002.pt"
+    },
+    {
+      "name": "ppo_s39_iter229",
+      "kind": "snapshot",
+      "ckpt": "data/models/rl_v9/_init_sp_0229/snapshot_0229.pt"
+    },
+    {
+      "name": "ppo_curated_iter119",
+      "kind": "snapshot",
+      "ckpt": "data/models/rl_v9_curated_pool/selfplay_v9_20260501_011537/iter_0119.pt"
+    },
+    {
+      "name": "SH",
+      "kind": "bot",
+      "ckpt": null
+    },
+    {
+      "name": "SmartDmg",
+      "kind": "bot",
+      "ckpt": null
+    },
+    {
+      "name": "Tactical",
+      "kind": "bot",
+      "ckpt": null
+    },
+    {
+      "name": "Strategic",
+      "kind": "bot",
+      "ckpt": null
+    },
+    {
+      "name": "bc_v10_cloud_e3",
+      "kind": "snapshot",
+      "ckpt": "data/models/bc/v10_cloud_gen9/epoch_003.pt"
+    }
+  ],
+  "elos": {
+    "bc_v10_cloud_e1": 1118.1,
+    "bc_v10_cloud_e2": 1122.6,
+    "ppo_s39_iter229": 1120.4,
+    "ppo_curated_iter119": 1110.0,
+    "SH": 1000.0,
+    "SmartDmg": 1017.2,
+    "Tactical": 1027.5,
+    "Strategic": 1012.9,
+    "bc_v10_cloud_e3": 1135.9
+  },
+  "cis": {
+    "bc_v10_cloud_e1": {
+      "median": 1118.0,
+      "lo95": 1103.1,
+      "hi95": 1132.2
+    },
+    "bc_v10_cloud_e2": {
+      "median": 1124.3,
+      "lo95": 1109.0,
+      "hi95": 1136.2
+    },
+    "ppo_s39_iter229": {
+      "median": 1121.1,
+      "lo95": 1107.5,
+      "hi95": 1136.0
+    },
+    "ppo_curated_iter119": {
+      "median": 1111.0,
+      "lo95": 1098.6,
+      "hi95": 1125.0
+    },
+    "SH": {
+      "median": 1000.0,
+      "lo95": 1000.0,
+      "hi95": 1000.0
+    },
+    "SmartDmg": {
+      "median": 1016.8,
+      "lo95": 1001.8,
+      "hi95": 1032.1
+    },
+    "Tactical": {
+      "median": 1028.0,
+      "lo95": 1014.8,
+      "hi95": 1042.6
+    },
+    "Strategic": {
+      "median": 1013.4,
+      "lo95": 1000.2,
+      "hi95": 1025.9
+    },
+    "bc_v10_cloud_e3": {
+      "median": 1137.4,
+      "lo95": 1123.3,
+      "hi95": 1151.5
+    }
+  },
+  "matches": [
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "bc_v10_cloud_e2",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 237,
+      "p2_wins": 263,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.474,
+      "elapsed": 748.2
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "ppo_s39_iter229",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 251,
+      "p2_wins": 249,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.502,
+      "elapsed": 544.1
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "ppo_curated_iter119",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 256,
+      "p2_wins": 244,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.512,
+      "elapsed": 530.9
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "SH",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 318,
+      "p2_wins": 182,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.636,
+      "elapsed": 278.6
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "SmartDmg",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 314,
+      "p2_wins": 186,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.628,
+      "elapsed": 288.2
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "Tactical",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 329,
+      "p2_wins": 171,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.658,
+      "elapsed": 286.1
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "Strategic",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 325,
+      "p2_wins": 175,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.65,
+      "elapsed": 298.0
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "ppo_s39_iter229",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 275,
+      "p2_wins": 225,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.55,
+      "elapsed": 549.7
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "ppo_curated_iter119",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 272,
+      "p2_wins": 228,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.544,
+      "elapsed": 536.2
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "SH",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 297,
+      "p2_wins": 203,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.594,
+      "elapsed": 279.8
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "SmartDmg",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 336,
+      "p2_wins": 164,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.672,
+      "elapsed": 300.1
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "Tactical",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 301,
+      "p2_wins": 199,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.602,
+      "elapsed": 287.0
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "Strategic",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 312,
+      "p2_wins": 188,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.624,
+      "elapsed": 286.1
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "ppo_curated_iter119",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 251,
+      "p2_wins": 249,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.502,
+      "elapsed": 403.8
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "SH",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 357,
+      "p2_wins": 143,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.714,
+      "elapsed": 173.8
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "SmartDmg",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 327,
+      "p2_wins": 173,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.654,
+      "elapsed": 184.0
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "Tactical",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 330,
+      "p2_wins": 170,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.66,
+      "elapsed": 186.7
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "Strategic",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 329,
+      "p2_wins": 171,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.658,
+      "elapsed": 184.6
+    },
+    {
+      "p1": "ppo_curated_iter119",
+      "p2": "SH",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 344,
+      "p2_wins": 156,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.688,
+      "elapsed": 173.4
+    },
+    {
+      "p1": "ppo_curated_iter119",
+      "p2": "SmartDmg",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 304,
+      "p2_wins": 196,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.608,
+      "elapsed": 191.6
+    },
+    {
+      "p1": "ppo_curated_iter119",
+      "p2": "Tactical",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 307,
+      "p2_wins": 193,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.614,
+      "elapsed": 184.7
+    },
+    {
+      "p1": "ppo_curated_iter119",
+      "p2": "Strategic",
+      "p1_kind": "snapshot",
+      "p2_kind": "bot",
+      "p1_wins": 326,
+      "p2_wins": 174,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.652,
+      "elapsed": 188.9
+    },
+    {
+      "p1": "SH",
+      "p2": "SmartDmg",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 232,
+      "p2_wins": 268,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.464,
+      "elapsed": 21.4
+    },
+    {
+      "p1": "SH",
+      "p2": "Tactical",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 222,
+      "p2_wins": 278,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.444,
+      "elapsed": 21.3
+    },
+    {
+      "p1": "SH",
+      "p2": "Strategic",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 238,
+      "p2_wins": 262,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.476,
+      "elapsed": 21.2
+    },
+    {
+      "p1": "SmartDmg",
+      "p2": "Tactical",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 240,
+      "p2_wins": 260,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.48,
+      "elapsed": 22.4
+    },
+    {
+      "p1": "SmartDmg",
+      "p2": "Strategic",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 255,
+      "p2_wins": 245,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.51,
+      "elapsed": 25.6
+    },
+    {
+      "p1": "Tactical",
+      "p2": "Strategic",
+      "p1_kind": "bot",
+      "p2_kind": "bot",
+      "p1_wins": 263,
+      "p2_wins": 237,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.526,
+      "elapsed": 22.7
+    },
+    {
+      "p1": "bc_v10_cloud_e1",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 248,
+      "p2_wins": 252,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.496,
+      "elapsed": 708.8
+    },
+    {
+      "p1": "bc_v10_cloud_e2",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 250,
+      "p2_wins": 250,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.5,
+      "elapsed": 821.8
+    },
+    {
+      "p1": "ppo_s39_iter229",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 224,
+      "p2_wins": 276,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.448,
+      "elapsed": 607.7
+    },
+    {
+      "p1": "ppo_curated_iter119",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "snapshot",
+      "p2_kind": "snapshot",
+      "p1_wins": 225,
+      "p2_wins": 275,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.45,
+      "elapsed": 565.7
+    },
+    {
+      "p1": "SH",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "bot",
+      "p2_kind": "snapshot",
+      "p1_wins": 163,
+      "p2_wins": 337,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.326,
+      "elapsed": 307.9
+    },
+    {
+      "p1": "SmartDmg",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "bot",
+      "p2_kind": "snapshot",
+      "p1_wins": 162,
+      "p2_wins": 338,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.324,
+      "elapsed": 304.4
+    },
+    {
+      "p1": "Tactical",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "bot",
+      "p2_kind": "snapshot",
+      "p1_wins": 174,
+      "p2_wins": 326,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.348,
+      "elapsed": 327.7
+    },
+    {
+      "p1": "Strategic",
+      "p2": "bc_v10_cloud_e3",
+      "p1_kind": "bot",
+      "p2_kind": "snapshot",
+      "p1_wins": 166,
+      "p2_wins": 334,
+      "ties": 0,
+      "total": 500,
+      "p1_wr": 0.332,
+      "elapsed": 303.4
+    }
+  ]
+}

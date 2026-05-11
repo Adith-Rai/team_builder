@@ -1,0 +1,96 @@
+{
+  "champion": {
+    "label": "v10_cloud_e1",
+    "path": "data/models/bc/v10_cloud_gen9/epoch_001.pt"
+  },
+  "n_battles_per_matchup": 100,
+  "concurrency": 100,
+  "team_source": "C:\\Users\\raiad\\OneDrive\\Desktop\\team_builder\\metamon_cache\\teams\\competitive\\gen9ou",
+  "matchups": [
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "sp_0229",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 58,
+      "losses": 42,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 58.0,
+      "opp_wr_pct": 42.0,
+      "elapsed_s": 106.1
+    },
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "iter_0119",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 53,
+      "losses": 47,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 53.0,
+      "opp_wr_pct": 47.0,
+      "elapsed_s": 104.2
+    },
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "sp_0114",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 55,
+      "losses": 45,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 55.0,
+      "opp_wr_pct": 45.0,
+      "elapsed_s": 110.3
+    },
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "sp_0224",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 56,
+      "losses": 44,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 56.0,
+      "opp_wr_pct": 44.0,
+      "elapsed_s": 119.4
+    },
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "sp_2979",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 62,
+      "losses": 38,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 62.0,
+      "opp_wr_pct": 38.0,
+      "elapsed_s": 90.4
+    },
+    {
+      "p1": "v10_cloud_e1",
+      "p2": "v8_bc_legacy",
+      "p1_arch": "tx",
+      "p2_arch": "mlp",
+      "wins": 75,
+      "losses": 25,
+      "ties": 0,
+      "total": 100,
+      "wr_pct": 75.0,
+      "opp_wr_pct": 25.0,
+      "elapsed_s": 127.6
+    }
+  ],
+  "summary": {
+    "total_wins": 359,
+    "total_losses": 241,
+    "total_ties": 0,
+    "total_games": 600,
+    "avg_wr_pct": 59.833333333333336
+  }
+}

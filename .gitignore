@@ -17,6 +17,12 @@ pokemon-ai-starter/pokemon-ai/src/data/
 raw_data/
 datasets/
 
+# Exception: ELO registry JSONs are small + valuable history. Persist across machines.
+!pokemon-ai-starter/pokemon-ai/src/data/eval/
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/*.json
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/*.jsonl
+
 # Memmap files
 *.npy
 *.npz
@@ -96,6 +102,13 @@ venv/
 # Caches & raw scratch
 metamon_cache/
 data/
+
+# Exception (S58): ELO registry persistence — small valuable history, allow through both data/ rules
+!pokemon-ai-starter/pokemon-ai/src/data/
+!pokemon-ai-starter/pokemon-ai/src/data/eval/
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/*.json
+!pokemon-ai-starter/pokemon-ai/src/data/eval/registry/*.jsonl
 
 # Logs (top-level)
 logs/

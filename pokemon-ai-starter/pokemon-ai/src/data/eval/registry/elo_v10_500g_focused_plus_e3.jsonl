@@ -1,0 +1,8 @@
+{"p1": "bc_v10_cloud_e1", "p2": "bc_v10_cloud_e3", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 248, "p2_wins": 252, "ties": 0, "total": 500, "p1_wr": 0.496, "elapsed": 708.8}
+{"p1": "bc_v10_cloud_e2", "p2": "bc_v10_cloud_e3", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 250, "p2_wins": 250, "ties": 0, "total": 500, "p1_wr": 0.5, "elapsed": 821.8}
+{"p1": "ppo_s39_iter229", "p2": "bc_v10_cloud_e3", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 224, "p2_wins": 276, "ties": 0, "total": 500, "p1_wr": 0.448, "elapsed": 607.7}
+{"p1": "ppo_curated_iter119", "p2": "bc_v10_cloud_e3", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 225, "p2_wins": 275, "ties": 0, "total": 500, "p1_wr": 0.45, "elapsed": 565.7}
+{"p1": "SH", "p2": "bc_v10_cloud_e3", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 163, "p2_wins": 337, "ties": 0, "total": 500, "p1_wr": 0.326, "elapsed": 307.9}
+{"p1": "SmartDmg", "p2": "bc_v10_cloud_e3", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 162, "p2_wins": 338, "ties": 0, "total": 500, "p1_wr": 0.324, "elapsed": 304.4}
+{"p1": "Tactical", "p2": "bc_v10_cloud_e3", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 174, "p2_wins": 326, "ties": 0, "total": 500, "p1_wr": 0.348, "elapsed": 327.7}
+{"p1": "Strategic", "p2": "bc_v10_cloud_e3", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 166, "p2_wins": 334, "ties": 0, "total": 500, "p1_wr": 0.332, "elapsed": 303.4}

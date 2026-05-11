@@ -1,0 +1,37 @@
+{
+  "team_source": "C:\\Users\\raiad\\OneDrive\\Desktop\\team_builder\\metamon_cache\\teams\\competitive\\gen9ou",
+  "n_teams": 16,
+  "n_games_per_matchup": 200,
+  "concurrency": 100,
+  "results": {
+    "v8_bc_legacy": {
+      "path": "data/models/bc/v8_bc_20260423_195603/best.pt",
+      "SH": {
+        "wins": 91,
+        "losses": 109,
+        "ties": 0,
+        "wr_pct": 45.5
+      },
+      "SmartDmg": {
+        "wins": 81,
+        "losses": 119,
+        "ties": 0,
+        "wr_pct": 40.5
+      },
+      "Tactical": {
+        "wins": 88,
+        "losses": 112,
+        "ties": 0,
+        "wr_pct": 44.0
+      },
+      "Strategic": {
+        "wins": 82,
+        "losses": 118,
+        "ties": 0,
+        "wr_pct": 41.0
+      },
+      "smart_avg": 42.75,
+      "__time_s": 340.11996483802795
+    }
+  }
+}
