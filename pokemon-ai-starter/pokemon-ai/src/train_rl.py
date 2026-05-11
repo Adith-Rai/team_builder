@@ -356,10 +356,22 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                   external_manager=None):
     """Run one collection step. Returns (trajs, wins, losses, ties, steps, opp_name, collect_time, opp_records)."""
     if pending_collection is not None:
-        _flow("using pre-collected data from background")
-        result = pending_collection
-        _flow(f"unpacked pre-collected: {len(result[0])} trajs, {result[4]} steps")
-        return result
+        # Pipeline-timing trap (S58): if bg-collect produced 0 trajectories,
+        # accepting it leads to FATAL on the PPO update (n_succeeded=0). Common
+        # cause: stall-mode policy → games taking >> bg-collect window because
+        # KL early-stop made the prior update phase too short to drain games.
+        # Fall back to synchronous collect (full time budget) instead of dying.
+        # If even sync collect produces 0 trajs, the FATAL safety net still
+        # fires downstream (genuine failure: CIS dead, workers wedged, etc.).
+        if len(pending_collection[0]) == 0:
+            _flow("pre-collected was EMPTY — falling back to sync collect "
+                  "(likely stall-mode + short update window race)")
+            # Fall through to sync collect path below — do NOT return.
+        else:
+            _flow("using pre-collected data from background")
+            result = pending_collection
+            _flow(f"unpacked pre-collected: {len(result[0])} trajs, {result[4]} steps")
+            return result
 
     if getattr(args, 'cis', False):
         # --cis routes to centralized inference server (mp_centralized_collect.py).
