@@ -243,6 +243,20 @@ class V9RLPlayer(Player):
                 traj.rewards[-1] += 1.0
             elif battle.lost:
                 traj.rewards[-1] -= 1.0
+            else:
+                # Tied (battle.won=False AND battle.lost=False). Showdown emits
+                # `|tie` on simultaneous KO, Endless Battle Clause, OR — most
+                # common in our setup — both agents hitting turn_cap=300 on the
+                # same turn (both self-forfeit, Showdown can't pick a winner).
+                # S58 finding: dev pod 200g learned stall play because the
+                # previous tie=0 reward made it RATIONAL to convert losses
+                # into ties when winning was uncertain (EV(stall)=0 > EV(lose)=-1).
+                # tie=-0.5 would still leave a stall incentive in most P(loss)
+                # scenarios; tie=-1.0 (same as loss) forces the model to commit
+                # to a win attempt. The competitive cost of "tie a stall match"
+                # is genuinely equivalent to a loss in competitive Pokemon
+                # (the goal is to win, not avoid losing).
+                traj.rewards[-1] -= 1.0
             traj.dones[-1] = True
             self.completed_trajectories.append(traj)
 
