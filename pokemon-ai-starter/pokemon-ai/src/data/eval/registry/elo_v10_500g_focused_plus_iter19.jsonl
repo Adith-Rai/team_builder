@@ -1,0 +1,11 @@
+{"p1": "bc_v10_cloud_e1", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 230, "p2_wins": 270, "ties": 0, "total": 500, "p1_wr": 0.46, "elapsed": 786.3}
+{"p1": "bc_v10_cloud_e2", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 227, "p2_wins": 273, "ties": 0, "total": 500, "p1_wr": 0.454, "elapsed": 821.9}
+{"p1": "ppo_s39_iter229", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 206, "p2_wins": 294, "ties": 0, "total": 500, "p1_wr": 0.412, "elapsed": 628.2}
+{"p1": "ppo_curated_iter119", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 194, "p2_wins": 306, "ties": 0, "total": 500, "p1_wr": 0.388, "elapsed": 611.4}
+{"p1": "SH", "p2": "rl_v10_1600g_iter19", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 168, "p2_wins": 332, "ties": 0, "total": 500, "p1_wr": 0.336, "elapsed": 324.2}
+{"p1": "SmartDmg", "p2": "rl_v10_1600g_iter19", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 152, "p2_wins": 348, "ties": 0, "total": 500, "p1_wr": 0.304, "elapsed": 336.0}
+{"p1": "Tactical", "p2": "rl_v10_1600g_iter19", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 162, "p2_wins": 338, "ties": 0, "total": 500, "p1_wr": 0.324, "elapsed": 330.2}
+{"p1": "Strategic", "p2": "rl_v10_1600g_iter19", "p1_kind": "bot", "p2_kind": "snapshot", "p1_wins": 161, "p2_wins": 339, "ties": 0, "total": 500, "p1_wr": 0.322, "elapsed": 325.3}
+{"p1": "bc_v10_cloud_e3", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 258, "p2_wins": 242, "ties": 0, "total": 500, "p1_wr": 0.516, "elapsed": 804.3}
+{"p1": "rl_v10_200g_iter9", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 263, "p2_wins": 237, "ties": 0, "total": 500, "p1_wr": 0.526, "elapsed": 784.1}
+{"p1": "rl_v10_1600g_iter9", "p2": "rl_v10_1600g_iter19", "p1_kind": "snapshot", "p2_kind": "snapshot", "p1_wins": 250, "p2_wins": 250, "ties": 0, "total": 500, "p1_wr": 0.5, "elapsed": 824.7}
