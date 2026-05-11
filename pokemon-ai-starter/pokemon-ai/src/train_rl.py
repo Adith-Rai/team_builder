@@ -312,17 +312,17 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     # Normalize all pool paths to forward slashes (fixes Windows \/  duplicates)
     pool = [p.replace("\\", "/") for p in pool]
 
-    # Scan disk for ALL existing snapshots and add to pool
-    import glob as _glob, re as _re
-    # Snapshots before iter 260 are from the pre-type-effectiveness era
-    # (eval 25-44%, suboptimal play). Including them corrupts the value function.
-    MIN_SNAPSHOT_ITER = 260
-    all_disk = sorted(set(_glob.glob("data/models/rl_v9/selfplay_v9_*/snapshot_*.pt")))
-    all_disk = [p.replace("\\", "/") for p in all_disk]
-    def _snap_iter(path):
-        m = _re.search(r'snapshot_(\d+)\.pt$', path)
-        return int(m.group(1)) if m else 0
-    all_disk = [s for s in all_disk if _snap_iter(s) >= MIN_SNAPSHOT_ITER]
+    # Scan disk for snapshots saved by THIS run that aren't yet in pool.
+    # (S58 fix) Previously hardcoded to data/models/rl_v9/ + MIN_SNAPSHOT_ITER=260
+    # — that was V9-era cleanup logic (pre-type-effectiveness snapshots had
+    # eval 25-44%, polluted value function). It's stale for V10+ runs because
+    # (a) the glob misses rl_v10/... paths entirely, and (b) V10 snapshot iter
+    # numbers are tiny (10s-100s, all < 260). Now derives the scan dir from
+    # the resume ckpt's parent (= the actual run dir).
+    from pathlib import Path as _Path
+    run_dir = _Path(args.resume).parent
+    all_disk = sorted(run_dir.glob("snapshot_*.pt"))
+    all_disk = [str(p).replace("\\", "/") for p in all_disk]
     existing = set(pool)
     new_snaps = [s for s in all_disk if s not in existing]
     if new_snaps:
@@ -339,8 +339,8 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     pool = deduped
 
     print(f"Resumed from {args.resume}, starting at iter {start_iter}, "
-          f"pool: {len(pool)} checkpoints (+{len(new_snaps)} from disk scan, "
-          f"filtered sp<{MIN_SNAPSHOT_ITER})"
+          f"pool: {len(pool)} checkpoints (+{len(new_snaps)} from disk scan "
+          f"of {run_dir})"
           f"{f', removed {n_dupes} path duplicates' if n_dupes else ''}", flush=True)
 
     return start_iter, pool
