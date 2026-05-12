@@ -2524,7 +2524,16 @@ def _cis_wait_results_and_aggregate(
     received = 0
     results: List[dict] = []
     expected_collect_s = max(300.0, n_games / max(n_alive, 1) * 2.0)
-    deadline = time.time() + 4.0 * expected_collect_s
+    # S58: bumped multiplier 4.0 -> 8.0. At 1600g/8w, expected_collect_s=400s,
+    # so 4.0× gave ~1600s deadline. Prod 8w iter 40 first-iter cold start
+    # (CIS spawn + 6-slot model loads + 8 worker spawns + WS setup) takes
+    # ~60-90s, pushing total collect to ~1700-1800s and missing the 1600s
+    # deadline on attempts 1 AND 2. The validation 8w run scraped under by
+    # chance. 8.0× gives ~3200s = 53 min, comfortable absorbance for cold
+    # start at any reasonable worker count. Steady-state iters complete in
+    # ~1200s so the higher multiplier never actually delays a clean iter —
+    # it only avoids spurious resets on cold starts.
+    deadline = time.time() + 8.0 * expected_collect_s
 
     pipes_to_wid = {manager.result_pipes[wid]: wid for wid in cmds_sent}
 
