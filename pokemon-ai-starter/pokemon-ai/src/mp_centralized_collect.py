@@ -566,6 +566,16 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     timeout_s = timeout_ms / 1000.0
     closed_workers: set = set()
 
+    # S58 CIS latency instrumentation — proves/disproves the "low-pri stream
+    # contention under multi-slot load" hypothesis. Tracks per-slot fire
+    # latency + queue depth, dumps aggregate stats every 60s. Zero behavioral
+    # impact; pure timing/counters around the existing fire path.
+    _cis_stats: List[Dict[str, float]] = [
+        {"n_fires": 0, "total_ms": 0.0, "max_ms": 0.0, "max_q": 0, "fwd_total_ms": 0.0}
+        for _ in range(n_slots)
+    ]
+    _last_stats_dump_t: List[float] = [time.time()]  # mutable single-element box
+
     # Lazy-import arch_compat helpers; only needed if any request includes
     # a history (i.e., production call path uses the InferenceBatcher-style
     # forward with batched temporal). Phase 1 callers without history fall
@@ -578,6 +588,29 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         _have_arch_compat = False
 
     d_temporal = getattr(model, "d_temporal", model.cfg.d_model)
+
+    def _maybe_dump_cis_stats():
+        """S58: emit per-slot fire latency stats once every 60s. Resets
+        counters after each dump so each window stands alone."""
+        now = time.time()
+        if now - _last_stats_dump_t[0] < 60.0:
+            return
+        _last_stats_dump_t[0] = now
+        for s in range(n_slots):
+            st = _cis_stats[s]
+            if st["n_fires"] == 0:
+                continue
+            mean = st["total_ms"] / st["n_fires"]
+            fwd_mean = st["fwd_total_ms"] / st["n_fires"]
+            print(f"[CIS-STATS] slot={s} fires={int(st['n_fires'])} "
+                  f"mean_fire={mean:.1f}ms (fwd={fwd_mean:.1f}ms) "
+                  f"max_fire={st['max_ms']:.1f}ms maxq={int(st['max_q'])}",
+                  flush=True)
+            st["n_fires"] = 0
+            st["total_ms"] = 0.0
+            st["fwd_total_ms"] = 0.0
+            st["max_ms"] = 0.0
+            st["max_q"] = 0
 
     def _fire_batch(slot: int):
         """Fire one batched forward over `pending_per_slot[slot]` using
@@ -602,6 +635,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         slot_model = model_slots[slot]
         if not pending:
             return
+        # S58 instrumentation: capture queue depth + start times for stats
+        _n_reqs_at_fire = len(pending)
+        _t_fire_start = time.perf_counter()
+        _t_fwd_start = None
+        _t_fwd_end = None
         try:
             # Are any requests carrying a non-empty history?
             any_history = any(p[4] is not None and p[4].shape[1] > 0
@@ -609,6 +647,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
             stacked = _stack_numpy_batches([p[3] for p in pending])
             torch_batch = numpy_dict_to_torch(stacked, device)
+            _t_fwd_start = time.perf_counter()
 
             # Phase 4.2: run forward on LOW-priority CUDA stream so main
             # process's optimizer.step gets first dibs on the GPU. The
@@ -704,6 +743,10 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                         "summary":       summaries.detach().float().cpu().numpy(),
                     }
 
+            # S58: GPU work has synchronized via .cpu().numpy() calls inside
+            # the with block; mark the forward end time before CPU dispatch.
+            _t_fwd_end = time.perf_counter()
+
             # Dispatch per-request slices
             cursor = 0
             for entry in pending:
@@ -733,6 +776,20 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     worker_resp_writers[widx].send(msg)
                 except Exception:
                     closed_workers.add(widx)
+
+        # S58 instrumentation: update per-slot latency stats
+        _t_fire_end = time.perf_counter()
+        _fire_ms = (_t_fire_end - _t_fire_start) * 1000.0
+        _fwd_ms = (((_t_fwd_end or _t_fire_end) -
+                    (_t_fwd_start or _t_fire_start)) * 1000.0)
+        st = _cis_stats[slot]
+        st["n_fires"] += 1
+        st["total_ms"] += _fire_ms
+        st["fwd_total_ms"] += _fwd_ms
+        if _fire_ms > st["max_ms"]:
+            st["max_ms"] = _fire_ms
+        if _n_reqs_at_fire > st["max_q"]:
+            st["max_q"] = _n_reqs_at_fire
 
         pending_per_slot[slot].clear()
         last_fire_t_per_slot[slot] = time.time()
@@ -929,6 +986,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             timed_out = (now - last_fire_t_per_slot[s]) >= timeout_s
             if accumulated >= min_batch or timed_out:
                 _fire_batch(s)
+        # S58: periodic CIS latency stats dump (every 60s). Reveals whether
+        # multi-slot load is driving per-slot fire latency up vs holding it
+        # constant — the proof for/against the low-pri stream contention
+        # hypothesis. No-op outside the dump window.
+        _maybe_dump_cis_stats()
 
 
 class CISClientHandle:
