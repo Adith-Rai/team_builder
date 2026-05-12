@@ -53,6 +53,10 @@ class V9RLPlayer(Player):
         # are also dropped from completed_trajectories.
         self.n_forfeit_wins: int = 0
         self.n_forfeit_losses: int = 0
+        # S58 diagnostic counters — match forfeit_wins/losses pattern. Reset in
+        # reset_battles(). Aggregated by collection driver if exposed via iter line.
+        self.n_ties: int = 0
+        self.n_turn_caps: int = 0
 
     def _get_shaper(self, btag):
         if btag not in self._reward_shapers:
@@ -88,7 +92,9 @@ class V9RLPlayer(Player):
 
         # Turn cap
         if len(traj) >= self.turn_cap:
-            print(f"  [TURN CAP] {btag} hit {self.turn_cap} turns, forfeiting", flush=True)
+            opp_user = getattr(battle, "opponent_username", "?")
+            print(f"  [TURN CAP] {btag} hit {self.turn_cap} turns, forfeiting (opp_user={opp_user})", flush=True)
+            self.n_turn_caps += 1
             # Mark as self-initiated so the abrupt-disconnect filter doesn't
             # drop the resulting trajectory as a forfeit-loss. We DID play
             # turn_cap real turns; the -1 terminal is an honest signal.
@@ -231,8 +237,10 @@ class V9RLPlayer(Player):
             except Exception:
                 opp_fainted = my_fainted = -1
             traj_turns = len(traj) if traj else 0
-            print(f"  [FORFEIT] {btag} ({traj_turns} turns, won={battle.won}, "
-                  f"opp_fainted={opp_fainted}, my_fainted={my_fainted}) — "
+            opp_user = getattr(battle, "opponent_username", "?")
+            battle_turn = getattr(battle, "turn", -1)
+            print(f"  [FORFEIT] {btag} (traj_turns={traj_turns} battle.turn={battle_turn} won={battle.won} "
+                  f"opp_fainted={opp_fainted} my_fainted={my_fainted} opp_user={opp_user}) — "
                   f"likely WS drop, dropping trajectory + W/L credit", flush=True)
         elif traj and len(traj) > 0:
             shaper = self._get_shaper(btag)
@@ -243,6 +251,30 @@ class V9RLPlayer(Player):
                 traj.rewards[-1] += 1.0
             elif battle.lost:
                 traj.rewards[-1] -= 1.0
+            else:
+                # Tied — battle.won=False AND battle.lost=False. Instrument for diagnosis.
+                # Captures turn count, fainted state on both teams, opp username,
+                # whether this side was self-forfeited (turn-cap path). Together these
+                # distinguish: simultaneous KO (both teams ~empty), Endless Battle Clause
+                # (long games, partial teams), turn-cap race (battle.turn near 300),
+                # poke-env race condition (mid-game with full teams), CIS failure modes.
+                try:
+                    opp_team = battle.opponent_team or {}
+                    my_team = battle.team or {}
+                    opp_fainted = sum(1 for m in opp_team.values() if m and m.fainted)
+                    my_fainted = sum(1 for m in my_team.values() if m and m.fainted)
+                    n_opp_team = len(opp_team)
+                    n_my_team = len(my_team)
+                except Exception:
+                    opp_fainted = my_fainted = n_opp_team = n_my_team = -1
+                opp_user = getattr(battle, "opponent_username", "?")
+                traj_turns = len(traj) if traj else 0
+                battle_turn = getattr(battle, "turn", -1)
+                self_ff = btag in self._self_forfeited
+                print(f"  [TIE] {btag} traj_turns={traj_turns} battle.turn={battle_turn} "
+                      f"my={my_fainted}/{n_my_team} opp={opp_fainted}/{n_opp_team} "
+                      f"self_ff={self_ff} opp_user={opp_user}", flush=True)
+                self.n_ties += 1
             traj.dones[-1] = True
             self.completed_trajectories.append(traj)
 
@@ -262,6 +294,8 @@ class V9RLPlayer(Player):
         self.completed_trajectories.clear()
         self.n_forfeit_wins = 0
         self.n_forfeit_losses = 0
+        self.n_ties = 0
+        self.n_turn_caps = 0
         super().reset_battles()
 
 
