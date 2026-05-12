@@ -2490,6 +2490,36 @@ def _cis_wait_results_and_aggregate(
 
     manager = g["manager"]
     cis_server = g["server"]
+
+    # S58 defensive: filter cmds_sent to wids that actually have result_pipe
+    # entries in the current manager. Background: on the retry-after-reset
+    # path (line ~2863), self._cmds_sent is supposed to be refreshed from
+    # _reload_slots_and_dispatch BEFORE the second _cis_wait call. Under
+    # repeated resets the bg-collector path was observed to enter this
+    # function with cmds_sent containing wids that aren't in
+    # manager.result_pipes (KeyError 0 in prod, S58 iter 41 attempt 2).
+    # Root cause not fully pinned — likely a race between the bg-collector's
+    # reset path and concurrent _CIS_GLOBAL mutation, or an exception in
+    # _reload_slots_and_dispatch that left self._cmds_sent stale. Until we
+    # have ironclad RCA, drop stale wids defensively and surface the warn
+    # so any future occurrence is logged with full context. Dropped wids
+    # can't deliver results anyway (no pipe to recv from), so this is
+    # behaviorally equivalent to "wait for the workers we actually have."
+    valid_cmds = [wid for wid in cmds_sent if wid in manager.result_pipes]
+    if len(valid_cmds) != len(cmds_sent):
+        stale = set(cmds_sent) - set(manager.result_pipes.keys())
+        print(f"[cis-orch] WARN iter {iter_n}: cmds_sent had stale wids "
+              f"{sorted(stale)} not in manager.result_pipes "
+              f"(have {sorted(manager.result_pipes.keys())}); "
+              f"filtered {len(cmds_sent)} -> {len(valid_cmds)} wids",
+              flush=True)
+    cmds_sent = valid_cmds
+    if not cmds_sent:
+        # All wids stale → no useful workers. Trigger another reset.
+        raise CISResetNeeded(
+            f"iter {iter_n}: all cmds_sent wids stale after filter; "
+            f"manager.result_pipes={sorted(manager.result_pipes.keys())}")
+
     expected = len(cmds_sent)
     received = 0
     results: List[dict] = []
