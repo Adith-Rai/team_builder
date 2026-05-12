@@ -277,6 +277,38 @@ class V9RLPlayer(Player):
                 self.n_ties += 1
             traj.dones[-1] = True
             self.completed_trajectories.append(traj)
+        else:
+            # Empty-trajectory finish (0-turn ghost battle). Game spawned and
+            # poke-env fired _battle_finished_callback, but choose_move never ran
+            # OR ran and aborted before adding any reward. None of the branches
+            # above catch this: not tainted, finish IS real (well-formed team
+            # state), but traj is None or len(traj)==0.
+            #
+            # These battles DO bump poke-env's n_tied_battles when
+            # battle.won=False AND battle.lost=False (the typical case here),
+            # which feeds the iter-line "ties" count without ever appearing in
+            # our diagnostic prints. The S58 1600g resumed run showed 65-70% of
+            # games hitting this path while [TIE] / [FORFEIT] / [TURN CAP]
+            # counts stayed at 0 — strong evidence of an infrastructure spawn
+            # failure that this instrumentation now captures.
+            try:
+                opp_team = battle.opponent_team or {}
+                my_team = battle.team or {}
+                opp_fainted = sum(1 for m in opp_team.values() if m and m.fainted)
+                my_fainted = sum(1 for m in my_team.values() if m and m.fainted)
+                n_opp_team = len(opp_team)
+                n_my_team = len(my_team)
+            except Exception:
+                opp_fainted = my_fainted = n_opp_team = n_my_team = -1
+            opp_user = getattr(battle, "opponent_username", "?")
+            battle_turn = getattr(battle, "turn", -1)
+            traj_turns = len(traj) if traj else 0
+            traj_state = "None" if traj is None else "empty"
+            print(f"  [GHOST-END] {btag} traj={traj_state} traj_turns={traj_turns} "
+                  f"battle.turn={battle_turn} won={battle.won} lost={battle.lost} "
+                  f"my={my_fainted}/{n_my_team} opp={opp_fainted}/{n_opp_team} "
+                  f"opp_user={opp_user}", flush=True)
+            self.n_ties += 1
 
         self._tainted.discard(btag)
         self._self_forfeited.discard(btag)
