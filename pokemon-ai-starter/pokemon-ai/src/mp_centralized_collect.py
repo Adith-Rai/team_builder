@@ -2377,19 +2377,36 @@ def mp_centralized_collect_sync(
                   f"slot(s); pool_size={len(pool_slot_map)}", flush=True)
 
         # 4. Build opp_pool message + dispatch to all alive workers.
-        opp_pool_msg = _build_opp_pool_msg(snapshot_pool, win_rates)
+        # S58 (F): each worker receives a SINGLE opp via _allocate_opps_to_workers,
+        # eliminating in-process asyncio.gather contention that produced 50-70%
+        # ghost-ties on the prior 1600g run.
+        opp_pool_full = _build_opp_pool_msg(snapshot_pool, win_rates)
         manager = g["manager"]
         alive_wids = manager.alive_worker_ids()
         n_alive = len(alive_wids)
         if n_alive == 0:
             raise RuntimeError(f"[cis-orch] iter {iter_n}: no alive workers")
-        games_per_worker = n_games // n_alive
-        remainder = n_games % n_alive
+        assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games)
+
+        # Log per-iter distribution for visibility (one line, sorted by games).
+        opp_dist: Dict[str, List[int]] = {}
+        for a in assignments:
+            if a["opp"] is None:
+                continue
+            opp_dist.setdefault(a["opp"]["path"], []).append(a["n_games"])
+        dist_summary = ", ".join(
+            f"{os.path.basename(p)}={sum(g)}g/{len(g)}w"
+            for p, g in sorted(opp_dist.items(), key=lambda kv: -sum(kv[1]))
+        )
+        print(f"[cis-orch] iter {iter_n}: {n_alive} workers, "
+              f"{len(opp_dist)} active opps -> {dist_summary}", flush=True)
 
         cmds_sent: List[int] = []
         t_start = time.time()
         for i, wid in enumerate(alive_wids):
-            worker_n = games_per_worker + (1 if i < remainder else 0)
+            assignment = assignments[i]
+            worker_n = assignment["n_games"]
+            single_opp_msg = [assignment["opp"]] if assignment["opp"] is not None else []
             srv_idx = i % len(server_pool)
             srv = server_pool[srv_idx]
             srv_url = getattr(srv, 'websocket_url', None) or str(srv)
@@ -2399,7 +2416,7 @@ def mp_centralized_collect_sync(
                 "n_games": worker_n,
                 "max_concurrent": max_concurrent,
                 "server_url": srv_url,
-                "opp_pool": opp_pool_msg,
+                "opp_pool": single_opp_msg,
                 "pool_slot_map": pool_slot_map,
                 "temp_range": list(temp_range),
                 "opp_temp_range": list(temp_range),
@@ -2671,12 +2688,27 @@ class CISBgCollector:
         if n_alive == 0:
             raise RuntimeError(f"[cis-bg] iter {iter_n}: no alive workers")
         n_games = ctx["n_games"]
-        games_per_worker = n_games // n_alive
-        remainder = n_games % n_alive
+
+        # S58 (F): one opp per worker. See _allocate_opps_to_workers docstring
+        # for rationale. Mirrors the regular orchestrator dispatch path.
+        assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games)
+        opp_dist: Dict[str, List[int]] = {}
+        for a in assignments:
+            if a["opp"] is None:
+                continue
+            opp_dist.setdefault(a["opp"]["path"], []).append(a["n_games"])
+        dist_summary = ", ".join(
+            f"{os.path.basename(p)}={sum(g)}g/{len(g)}w"
+            for p, g in sorted(opp_dist.items(), key=lambda kv: -sum(kv[1]))
+        )
+        print(f"[cis-bg] iter {iter_n}: {n_alive} workers, "
+              f"{len(opp_dist)} active opps -> {dist_summary}", flush=True)
 
         cmds_sent: List[int] = []
         for i, wid in enumerate(alive_wids):
-            worker_n = games_per_worker + (1 if i < remainder else 0)
+            assignment = assignments[i]
+            worker_n = assignment["n_games"]
+            single_opp_msg = [assignment["opp"]] if assignment["opp"] is not None else []
             srv_idx = i % len(ctx["server_pool"])
             srv = ctx["server_pool"][srv_idx]
             srv_url = getattr(srv, 'websocket_url', None) or str(srv)
@@ -2686,7 +2718,7 @@ class CISBgCollector:
                 "n_games": worker_n,
                 "max_concurrent": ctx["max_concurrent"],
                 "server_url": srv_url,
-                "opp_pool": opp_pool_msg,
+                "opp_pool": single_opp_msg,
                 "pool_slot_map": pool_slot_map,
                 "temp_range": list(ctx["temp_range"]),
                 "opp_temp_range": list(ctx["temp_range"]),
@@ -2853,6 +2885,97 @@ def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
         weight = (1.0 - wr) ** 2
         out.append({"path": path, "wr": wr, "weight": weight})
     return out
+
+
+def _allocate_opps_to_workers(
+    opp_pool_msg: List[dict],
+    n_workers: int,
+    total_games: int,
+) -> List[dict]:
+    """S58 (F): orchestrator-side opp -> worker assignment. One opp per worker.
+
+    Background: the prior flow had every worker run all opps in parallel via
+    asyncio.gather() inside its event loop. Under PFSP-weighted allocations
+    like [100, 25, 25, 25, 25] games per worker, the smaller batches starved
+    under shared scheduling and hit their per-batch asyncio.wait_for timeouts
+    (max(300, n_for_opp*30)s) before completing. Result: ~50-70% of games
+    per iter became battle.won=None "ghost-ties" (S58 1600g run, iters 40-48).
+
+    This matches the Metamon self-play architecture (verified in
+    metamon_ref/metamon/rl/self_play/launch_models.py — one subprocess.Popen
+    per username). We keep our orchestrator-side dispatch, but each worker
+    now receives a single opp and plays only that opp's games. Worker's
+    existing asyncio.gather() runs one coro → no contention.
+
+    Allocation:
+      - PFSP-weighted target games per opp computed from .weight field.
+      - n_workers >= n_opps: every opp gets >=1 worker; extras go greedy by
+        games/workers ratio (the opp most under-served).
+      - n_workers <  n_opps: top-N by weight get workers; skipped opps'
+        games redistribute proportionally to included opps. Skipped opps
+        will rise in PFSP weight next iter (less played => higher weight).
+
+    Returns a list of length n_workers; each entry is
+        {"opp": <opp_msg_dict_or_None>, "n_games": <int>}.
+    """
+    n_opps = len(opp_pool_msg)
+    if n_opps == 0 or n_workers == 0:
+        return [{"opp": None, "n_games": 0} for _ in range(n_workers)]
+
+    # Step 1: PFSP-weighted target games per opp.
+    weights = [max(o.get("weight", 1.0), 1e-6) for o in opp_pool_msg]
+    total_w = sum(weights)
+    target = [int(round(total_games * w / total_w)) for w in weights]
+    drift = total_games - sum(target)
+    if drift != 0:
+        target[weights.index(max(weights))] += drift
+
+    # Step 2: distribute workers across opps.
+    if n_workers >= n_opps:
+        workers_per_opp = [1] * n_opps
+        extras = n_workers - n_opps
+        for _ in range(extras):
+            ratios = [target[i] / workers_per_opp[i] for i in range(n_opps)]
+            workers_per_opp[ratios.index(max(ratios))] += 1
+    else:
+        sorted_idx = sorted(range(n_opps), key=lambda i: -weights[i])
+        top_idx = set(sorted_idx[:n_workers])
+        workers_per_opp = [1 if i in top_idx else 0 for i in range(n_opps)]
+        skipped = sum(target[i] for i in range(n_opps) if i not in top_idx)
+        included_total = sum(target[i] for i in top_idx)
+        if skipped > 0 and included_total > 0:
+            new_target = list(target)
+            for i in top_idx:
+                new_target[i] = target[i] + int(round(skipped * target[i] / included_total))
+            for i in range(n_opps):
+                if i not in top_idx:
+                    new_target[i] = 0
+            drift = total_games - sum(new_target)
+            if drift != 0:
+                biggest = max(top_idx, key=lambda j: new_target[j])
+                new_target[biggest] += drift
+            target = new_target
+
+    # Step 3: per-worker assignments. For each opp, split its games among
+    # its assigned workers.
+    assignments: List[dict] = []
+    for opp_idx in range(n_opps):
+        n_w = workers_per_opp[opp_idx]
+        if n_w == 0:
+            continue
+        games = target[opp_idx]
+        base = games // n_w
+        rem = games % n_w
+        for w in range(n_w):
+            assignments.append({
+                "opp": opp_pool_msg[opp_idx],
+                "n_games": base + (1 if w < rem else 0),
+            })
+
+    # Defensive: pad to n_workers (shouldn't trigger if math is right).
+    while len(assignments) < n_workers:
+        assignments.append({"opp": opp_pool_msg[0], "n_games": 0})
+    return assignments[:n_workers]
 
 
 def _save_weights_atomic_for_cis(model, iter_n: int) -> str:
