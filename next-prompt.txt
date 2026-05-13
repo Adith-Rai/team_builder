@@ -9,21 +9,182 @@ The user has explicitly set up `MEMORY.md` (auto-loaded every session) + `memory
 2. `memory/feedback_engineering_standard.md` — quality standard
 3. `memory/feedback_ask_when_uncertain.md` — when to ask vs guess
 4. `memory/project_strategic_frame.md` — locked sequencing (vertical → horizontal)
-5. `memory/project_phase1_v3_diagnosis.md` — **S57 collapse diagnosis (3-stage type-knowledge erosion). Required before any Phase 2 design discussion.**
-6. `memory/project_bc_anchor_design.md` — **S57 BC anchor mechanism + 5 verified failure modes. Required before any BC anchor / Tier 3 / forward_ppo_sequence work.**
-7. `memory/project_tier3_c5_design.md` — Tier 3 compile boundary
-8. `memory/reference_cloud_pods_usage.md` — **S57 pod connections, file paths, launch patterns, what NOT to do**
-9. THIS FILE (`next-prompt.txt`) — session-specific state, S58 entry
-10. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design (NOTE: this doc PREDATES S57 diagnosis — its 3-cause analysis is INCOMPLETE; the type-knowledge erosion mechanism is the missing piece. Use `project_phase1_v3_diagnosis.md` as the corrected version.)
-11. **First action**: validation run status check on dev pod (see §E + `reference_cloud_pods_usage.md`)
+5. `memory/project_phase1_v3_diagnosis.md` — S57 collapse diagnosis (3-stage type-knowledge erosion). Required before any Phase 2 design discussion.
+6. `memory/project_bc_anchor_design.md` — S57 BC anchor mechanism + 5 verified failure modes. Required before any BC anchor / Tier 3 / forward_ppo_sequence work.
+7. `memory/project_s58_session_narrative.md` — **S58 full narrative: ghost-tie root cause + 3 fixes shipped + open post-restart slowdown investigation. Read BEFORE touching the cis collector path, BEFORE relaunching Phase 2, or BEFORE investigating wall-time.**
+8. `memory/feedback_asyncio_gather_at_scale.md` — **architectural rule from S58: don't fanout heterogeneous coros via asyncio.gather; use process-per-task.**
+9. `memory/project_tier3_c5_design.md` — Tier 3 compile boundary
+10. `memory/reference_cloud_pods_usage.md` — pod connections, file paths, launch patterns, what NOT to do
+11. THIS FILE (`next-prompt.txt`) — session-specific state, S58 wrap + S59 entry
+12. `docs/PHASE1_V3_OBSERVATIONS.md` — Phase 2 design (NOTE: predates S57 diagnosis — use `project_phase1_v3_diagnosis.md` for the corrected version.)
+13. **First action (S59)**: SSH prod and check `/tmp/bc_anchor_1600g_v4_freshbs.log` for iter 50 completion. The iter line collect time tells us whether fresh battle_servers fixed the post-restart slowdown. See `project_s58_session_narrative.md` Phase J for the experiment design + interpretation rules.
 
 If files conflict, surface — don't silently reconcile. Don't half-ass. Don't shortcut. Don't pivot to deferred items (§4 + §5 of boot protocol enumerate exactly what's now vs deferred).
 
 ---
 
-**S57 wrap (2026-05-10) — S58 entry. Read THIS section + the listed memory files before doing anything else.**
+**S58 wrap (2026-05-13) — S59 entry. Read `memory/project_s58_session_narrative.md` for the FULL narrative; this is the summary.**
+
+S58 took the BC-anchored Phase 2 launch from "validated on dev, broken on prod" through three production-blocker fixes, ultimately landing a Phase 2 run that's training cleanly but with anomalously slow wall-time. The slowdown investigation is open at session wrap.
+
+═══════════════════════════════════════════════════════════════════
+S58 — THINGS WE TRIED, WHY, AND RESULTS
+═══════════════════════════════════════════════════════════════════
+
+**Problem we entered with**: prod 1600g run was producing 36-76% "ties" per iter as pool grew past 4-5. Phase 1 v3 collapse pattern feared.
+
+**Investigation chain**:
+1. Ruled out turn-cap forfeits (math impossible: 780 ties × 300 turns >> total step count)
+2. Ruled out CIS inference timeouts (only 442 timeout events across 42 iters, can't explain thousands of ties)
+3. Ruled out Showdown `|tie` emissions (0 occurrences in any battle_server log)
+4. Ruled out WS disconnects (literal count = 0)
+5. Ruled out Endless Battle Clause (0 mentions in logs)
+6. Added `[CIS-STATS]` instrumentation → confirmed CIS forward ~16ms healthy, NOT the bottleneck
+7. Added `[GHOST-END]` instrumentation for empty-traj battle finishes → captured ZERO events despite hundreds of "ties" — meaning `_battle_finished_callback` wasn't being called for the ghost games
+8. **Found root cause by reading code**: `mp_centralized_collect.py:2049` `asyncio.gather()` of 5 opp coros per worker, sharing one event loop, made small-batch opps starve. Their per-batch `asyncio.wait_for(max(300, n_for_opp*30))` fired before completion → cancelled batches → `battle.won=None` → counted as "ties" in iter line via `opp_t = sum(1 for b in player.battles.values() if b.won is None)`
+9. **Verified industry standard against Metamon** (`metamon_ref/metamon/rl/self_play/launch_models.py`): one subprocess per agent. No in-process opp-level asyncio. Confirmed our `asyncio.gather` pattern is the unusual choice.
+
+**Fix #1 — one-opp-per-worker dispatch** (commit `548033e8`):
+- Added `_allocate_opps_to_workers(opp_pool_msg, n_workers, total_games)` — PFSP-weighted allocation, each worker gets exactly one opp + game count
+- Both orchestrator dispatch sites updated (sync + bg-collector pipeline)
+- Each worker's existing `asyncio.gather(opp_coros)` now runs ONE coro → no contention
+- Tested at 8w validation: iter 40 = 1599/1600 trajs, 0 ties, 28 min collect
+- Tested at 15w validation: iter 40 = 1599/1600 trajs, 0 ties, 20 min collect (faster due to better balance)
+
+**Fix #2 — defensive cmds_sent filter** (commit `641de8b8`):
+- Phase 2 launch attempt at 15w hit a NEW bug: iter 41 → 10 workers crashed mid-iter → reset → attempt 2 → KeyError 0 at `_cis_wait_results_and_aggregate:2499` dict comprehension
+- Root cause: on retry after `CISResetNeeded`, `self._cmds_sent` had stale wids not in the fresh `manager.result_pipes`
+- Defensive patch: filter `cmds_sent` to valid wids; log WARN if it triggers
+- Doesn't fix the underlying cmds-sent-staleness (still unresolved — task #21 includes this) but prevents run-killing crashes
+
+**Fix #3 — deadline 8.0× multiplier** (commit `d092c4c5`):
+- After fix #2, Phase 2 launch at 8w hit deadline-too-tight: iter 40 attempts 1 AND 2 both timed out at the 1600s deadline (`4.0 * expected_collect_s`)
+- Cold start (CIS spawn + 6-slot model loads + 8 worker spawns + WS setup) takes 60-90s, pushing total collect past 1600s
+- Validation 8w iter 40 took 1704s — past the same deadline, made it through by chance only
+- Bumped multiplier 4.0 → 8.0. Deadline now 3200s = 53 min, comfortable cold-start absorbance.
+- Steady-state iters finish in ~1200s so the higher multiplier only matters for cold starts
+
+**Phase 2 v3 launch** (out-dir `bc_anchor_1600g_v3`):
+- Resume from `snapshot_0039.pt` with all three fixes
+- iter 40-49: ALL CLEAN. 0 ties, 1600 games each, win rate climbing 52.6% → 56.5% (peak iter 48) → 53.8% (iter 49)
+- Snapshot saved at iter 49: pool grew 5 → 6 (`snapshot_0049.pt`)
+- **First in-training eval at iter 50: smart_avg = 70%** (SH 76, SmartDmg 70, Tactical 68, Strategic 68) — comparable to iter 29's 70.2%, slightly better on SmartDmg/Tactical, slightly worse on Strategic. 10 iters of training produced ~0 net change in smart_avg.
+
+═══════════════════════════════════════════════════════════════════
+S58 — WHERE WE ARE AT (session wrap)
+═══════════════════════════════════════════════════════════════════
+
+**The post-restart wall-time slowdown** is the open question:
+- Validation 8w iter 40 collect: 1704s = 28 min
+- Prod v3 iter 40-49 collect: 2540-3201s = 42-53 min
+- Same hardware, same code, same flags
+- CIS-STATS shows CIS forward ~16ms healthy throughout → bottleneck is NOT inference
+- Most likely candidates: stale battle_server state (6 days uptime + 6 successive failed launches in S58), OR shared-host tenancy contention, OR something we haven't identified
+
+**Experiment in flight at S58 wrap**: killed all `node battle_server` processes, restarted fresh, relaunched training from `snapshot_0049.pt` with new out-dir `bc_anchor_1600g_v4_freshbs`. Watch iter 50 collect time.
+- If iter 50 = 28-30 min → stale state was the cause, continue Phase 2
+- If iter 50 = 50+ min → not stale state, deeper investigation needed (per-iter time-breakdown instrumentation)
+
+**S59 first action**: read fresh-bs experiment outcome from `/tmp/bc_anchor_1600g_v4_freshbs.log` on prod. Iter 50 line tells the story.
+
+═══════════════════════════════════════════════════════════════════
+S58 — THINGS THAT STILL NEED OPTIMIZATION
+═══════════════════════════════════════════════════════════════════
+
+1. **Post-restart slowdown root cause** — see above. May resolve via fresh battle_servers, may not. If not, add per-iter time-breakdown instrumentation (WS RTT, async scheduler wait, GC) to localize the bottleneck.
+
+2. **15-worker mid-iter crash** (task #21) — UNRESOLVED. At `--mp-workers 15`, iter 41+ had ~10 workers stall mid-iter (5/15 received at deadline). Validation iter 40 at 15w completed cleanly, so the bug is iter-41+ specific or post-resume-specific. Need controlled experiment to reproduce. MUST fix before Phase 3 launch.
+
+3. **Recovery-path cmds_sent staleness root cause** (folded into task #21) — defensive patch in place but the actual race condition (cmds_sent outliving a reset cycle) isn't pinned. Investigate properly before Phase 3.
+
+4. **PFSP allocator polish** — at `--mp-workers 8 + n_opps=5`, allocations like `[2,2,2,1,1]` workers/opp produce per-worker game counts `[160,160,160,160,160,160,320,320]`. Max-per-worker = 320 = bottleneck for collect time. A smarter allocator could shift opp game totals slightly to balance workers (~20-30% wall-time saving at 8w). Moot at 15w if we fix the 15w bug.
+
+5. **18× speed gap to ps-ppo** (task #22) — our ~83 states/sec vs ps-ppo's ~1500 on similar hardware. Structural: WS+Node+poke-env+asyncio stack is the bottleneck. Phase 3 (multi-gen) at current throughput would take 3-4 weeks per run = unsustainable. Real fix: direct simulator binding (foul-play Rust engine in `foul_play_ref/`, or rewrite battle_server.js critical path in C). 2-4 weeks of focused engineering. **MUST happen before Phase 3 launch.**
+
+6. **Smart_avg ceiling at ~70%** — v3 went 10 iters without smart_avg improvement. Could indicate BC anchor over-constraint (coef=0.1 too high), insufficient pool diversity (PFSP of self-snapshots only), or genuine plateau. Worth a coef ablation (0.05 / 0.1 / 0.2) OR adding Metamon bots to PFSP (task #14) BEFORE the next Phase 2 attempt.
+
+═══════════════════════════════════════════════════════════════════
+S58 — KEY COMMANDS (preserved for S59)
+═══════════════════════════════════════════════════════════════════
+
+**SSH to prod**: `ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30`
+
+**Full kill + restart battle_servers** (use BEFORE any Phase 2 relaunch if battle_servers have been beat up):
+```bash
+pkill -KILL -f "python.*train_rl"
+pkill -9 -f "node battle_server"
+pkill -9 -f "SCREEN.*bs_"
+pkill -9 -f "SCREEN.*battle_server"
+sleep 3
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+screen -dmS battle_server bash -c "node battle_server.js 2>&1 | tee /tmp/battle_server.log"
+sleep 1
+for p in 9001 9002 9003 9004 9005 9006 9007; do
+    screen -dmS bs_$p bash -c "node battle_server.js --port $p 2>&1 | tee /tmp/battle_server_$p.log"
+    sleep 0.3
+done
+sleep 5
+ss -tlnp 2>/dev/null | grep -E ":(900[0-7])"  # verify all 8 listening
+```
+
+**Phase 2 relaunch command** (validated config, 8 workers):
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+nohup python -u train_rl.py \
+  --resume <PATH_TO_SNAPSHOT.pt> \
+  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-coef 0.1 \
+  --device cuda \
+  --servers 9000,9001,9002,9003,9004,9005,9006,9007 \
+  --bf16 --cis --pipeline --mp-workers 8 --tier3 --tier3-minibatch-size 16 \
+  --games-per-iter 1600 --max-concurrent 200 \
+  --n-iters 200 --warmup-iters 0 \
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --target-kl 0.03 \
+  --grad-accum 1 --turn-cap 300 \
+  --reward-style terminal \
+  --eval-interval 10 --eval-games 200 --eval-team-set metamon-competitive \
+  --snapshot-interval 10 \
+  --early-stop --early-stop-patience 3 \
+  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50 \
+  --out-dir data/models/rl_v10/<RUN_NAME> \
+  > /tmp/<RUN_NAME>.log 2>&1 &
+```
+
+DO NOT use `--mp-workers 15` until task #21 (15w mid-iter crash) is resolved.
+
+**Monitoring (greps)**:
+- `grep -E "^\[..:..:..\] Iter " /tmp/<LOG>.log` — iter completions
+- `grep "active opps" /tmp/<LOG>.log` — orchestrator dispatch summaries
+- `grep -E "reset attempt|gave up" /tmp/<LOG>.log` — recovery events
+- `grep "CIS-STATS" /tmp/<LOG>.log | tail -12` — CIS latency (every 60s)
+- `grep -c "\[TIE\]\|\[GHOST-END\]\|\[TURN CAP\]\|\[FORFEIT\]" /tmp/<LOG>.log` — instrumentation events
+- `grep "WARN iter.*cmds_sent had stale" /tmp/<LOG>.log` — defensive recovery triggers (should be rare; if it fires often, investigate)
+
+═══════════════════════════════════════════════════════════════════
+S58 — ELO + EVAL RESULTS THIS SESSION
+═══════════════════════════════════════════════════════════════════
+
+**ELO ladder data** (under `pokemon-ai-starter/pokemon-ai/src/data/eval/registry/`):
+- `elo_v10_500g_focused_plus_iter29.json` — top: rl_v10_1600g_iter29 = **1162.8** [1151.9, 1173.2]
+- `elo_v10_500g_focused_plus_iter39.json` — iter 39 added (computed during S58, not re-checked at wrap)
+- Phase 1 v3 trio in ladder (padded for D1+D2): iter19=1142.7, iter39=1049.7, iter59=940.3 (confirms collapse trajectory)
+
+**In-training evals** (200-game vs metamon-competitive bots):
+- iter 29 (resume baseline, original 1600g run): smart_avg=72%
+- iter 50 (v3 run, after 10 effective policy iters): smart_avg=**70%** (SH 76, SmartDmg 70, Tactical 68, Strategic 68)
+- Net change: ~0pp average. v3's 10 iters did NOT move smart_avg. Investigate before Phase 2 v4.
+
+**Win rate vs PFSP pool over v3 iters 40-49**: 52.6 → 51.8 → 53.4 → 52.7 → 52.1 → 54.1 → 54.8 → 56.0 → 56.5 → 53.8. Net positive, slow trend.
+
+═══════════════════════════════════════════════════════════════════
+**S57 wrap (2026-05-10) — preserved below for full historical context.**
+═══════════════════════════════════════════════════════════════════
 
 This was a long, dense session. Multiple bugs found and fixed. BC anchor designed + implemented. Phase 1 v3 finished. Diagnosis revised from `docs/PHASE1_V3_OBSERVATIONS.md`. **A real validation experiment is in flight on dev pod RIGHT NOW** — first eval data lands ~1.5 hr from S57 end (around iter 9). Don't kill it without checking; check status first.
+
+(NOTE: the "in flight" experiment above WAS the S57 BC anchor isolation run; it has long since completed. The S58 narrative above carries forward from that point.)
 
 ═══════════════════════════════════════════════════════════════════
 PHILOSOPHY (apply to EVERY decision, no exceptions)
