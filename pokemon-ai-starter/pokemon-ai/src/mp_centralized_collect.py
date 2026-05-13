@@ -570,8 +570,12 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     # contention under multi-slot load" hypothesis. Tracks per-slot fire
     # latency + queue depth, dumps aggregate stats every 60s. Zero behavioral
     # impact; pure timing/counters around the existing fire path.
+    # S62: also tracks fire-trigger type (timeout vs min_batch) + mean queue
+    # size — H3 (slot starvation) evidence for the Fix #1 design decision.
     _cis_stats: List[Dict[str, float]] = [
-        {"n_fires": 0, "total_ms": 0.0, "max_ms": 0.0, "max_q": 0, "fwd_total_ms": 0.0}
+        {"n_fires": 0, "total_ms": 0.0, "max_ms": 0.0, "max_q": 0,
+         "fwd_total_ms": 0.0, "n_timeout_fires": 0, "n_minbatch_fires": 0,
+         "q_total": 0}
         for _ in range(n_slots)
     ]
     _last_stats_dump_t: List[float] = [time.time()]  # mutable single-element box
@@ -591,7 +595,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
     def _maybe_dump_cis_stats():
         """S58: emit per-slot fire latency stats once every 60s. Resets
-        counters after each dump so each window stands alone."""
+        counters after each dump so each window stands alone.
+        S62: also emits fire-type breakdown (timeout vs min_batch) +
+        mean queue size — slot-starvation diagnostic for Fix #1."""
         now = time.time()
         if now - _last_stats_dump_t[0] < 60.0:
             return
@@ -602,20 +608,33 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                 continue
             mean = st["total_ms"] / st["n_fires"]
             fwd_mean = st["fwd_total_ms"] / st["n_fires"]
+            mean_q = st["q_total"] / st["n_fires"]
+            n_to = int(st["n_timeout_fires"])
+            n_mb = int(st["n_minbatch_fires"])
+            to_pct = 100.0 * n_to / max(1, n_to + n_mb)
             print(f"[CIS-STATS] slot={s} fires={int(st['n_fires'])} "
                   f"mean_fire={mean:.1f}ms (fwd={fwd_mean:.1f}ms) "
-                  f"max_fire={st['max_ms']:.1f}ms maxq={int(st['max_q'])}",
+                  f"max_fire={st['max_ms']:.1f}ms maxq={int(st['max_q'])} "
+                  f"meanq={mean_q:.1f} timeout_pct={to_pct:.0f}% "
+                  f"(to={n_to}/mb={n_mb})",
                   flush=True)
             st["n_fires"] = 0
             st["total_ms"] = 0.0
             st["fwd_total_ms"] = 0.0
             st["max_ms"] = 0.0
             st["max_q"] = 0
+            st["n_timeout_fires"] = 0
+            st["n_minbatch_fires"] = 0
+            st["q_total"] = 0
 
-    def _fire_batch(slot: int):
+    def _fire_batch(slot: int, fire_reason: str = "unknown"):
         """Fire one batched forward over `pending_per_slot[slot]` using
         `model_slots[slot]` and dispatch responses. Slot-isolated: requests
         for different slots batch independently.
+
+        fire_reason (S62): "minbatch" if min_batch threshold hit, "timeout"
+        if timeout fired with sub-threshold queue. Used for slot-starvation
+        diagnostic in CIS-STATS dump.
 
         Two paths (per slot):
         - If NO request in this slot's pending has a history, use the simple
@@ -778,6 +797,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     closed_workers.add(widx)
 
         # S58 instrumentation: update per-slot latency stats
+        # S62: also track fire-trigger type + cumulative queue for mean_q
         _t_fire_end = time.perf_counter()
         _fire_ms = (_t_fire_end - _t_fire_start) * 1000.0
         _fwd_ms = (((_t_fwd_end or _t_fire_end) -
@@ -786,6 +806,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         st["n_fires"] += 1
         st["total_ms"] += _fire_ms
         st["fwd_total_ms"] += _fwd_ms
+        st["q_total"] += _n_reqs_at_fire
+        if fire_reason == "timeout":
+            st["n_timeout_fires"] += 1
+        elif fire_reason == "minbatch":
+            st["n_minbatch_fires"] += 1
         if _fire_ms > st["max_ms"]:
             st["max_ms"] = _fire_ms
         if _n_reqs_at_fire > st["max_q"]:
@@ -984,8 +1009,13 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                 continue
             accumulated = sum(p[2] for p in pending_per_slot[s])
             timed_out = (now - last_fire_t_per_slot[s]) >= timeout_s
-            if accumulated >= min_batch or timed_out:
-                _fire_batch(s)
+            hit_minbatch = accumulated >= min_batch
+            if hit_minbatch or timed_out:
+                # S62: classify fire reason for slot-starvation diagnostic.
+                # If both true, prefer "minbatch" — the threshold was the
+                # reason CIS would have fired even without the timeout.
+                reason = "minbatch" if hit_minbatch else "timeout"
+                _fire_batch(s, reason)
         # S58: periodic CIS latency stats dump (every 60s). Reveals whether
         # multi-slot load is driving per-slot fire latency up vs holding it
         # constant — the proof for/against the low-pri stream contention

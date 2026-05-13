@@ -223,6 +223,18 @@ def parse_args():
                    help="Per-worker LRU cache size for opponent ckpts (default 3).")
     p.add_argument("--batch-timeout-ms", type=float, default=15,
                    help="InferenceBatcher batch timeout in ms")
+    # CIS batch-formation tuning (S62 Option B). Defaults match the pre-S62
+    # production behavior. Bumping these widens CIS's per-slot batch window
+    # → potentially fewer-larger fires, higher GPU util on the inference path.
+    # See memory/project_s61_fix1_design.md for design + A/B gate spec.
+    p.add_argument("--cis-min-batch", type=int, default=8,
+                   help="CIS per-slot batch-fire threshold. Fires when the slot "
+                        "accumulates this many requests OR --cis-timeout-ms "
+                        "elapses since last fire. Only effective when --cis is "
+                        "set. Default 8 = pre-S62 production.")
+    p.add_argument("--cis-timeout-ms", type=int, default=15,
+                   help="CIS per-slot batch-fire timeout in ms. See "
+                        "--cis-min-batch. Default 15 = pre-S62 production.")
     p.add_argument("--reward-style", choices=["dense", "sparse", "terminal"], default="dense",
                    help="Reward shaping style: dense (KO+HP+terminal), sparse (terminal+immune), terminal (win/loss only)")
     p.add_argument("--external-adapters", default=None,
@@ -396,6 +408,8 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             iter_n=getattr(args, '_current_iter', 0),
             n_workers=args.mp_workers,
             amp_dtype=getattr(args, 'amp_dtype_name', None),
+            cis_min_batch=args.cis_min_batch,
+            cis_timeout_ms=args.cis_timeout_ms,
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1077,6 +1091,12 @@ def main():
         "teambuilder": train_teambuilder,
         "win_rates": win_rates,
         "turn_cap": args.turn_cap,
+        # S62: CIS batching window (Option B). Read by CISBgCollector.start
+        # at mp_centralized_collect.py:2792-2793. Defaults preserved on the
+        # CISBgCollector side (8/15) if absent, but we always pass to keep
+        # sync + bg paths consistent.
+        "cis_min_batch": args.cis_min_batch,
+        "cis_timeout_ms": args.cis_timeout_ms,
     }
     pending_collection = None
     # Background collector for --mp/--cis + --pipeline. Mirrors the
