@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -42,11 +43,12 @@ def is_on() -> bool:
     return _PROFILE_ON
 
 
-def maybe_start_viztracer(name: str, max_entries: int = 2_000_000) -> Optional[object]:
+def maybe_start_viztracer(name: str, max_entries: int = 1_000_000) -> Optional[object]:
     """Start a per-process viztracer if PROFILE_MODE=1.
 
-    Returns the tracer (or None if disabled / failed). Auto-saves on
-    process exit via atexit.
+    Returns the tracer (or None if disabled / failed). Auto-saves on:
+      - SIGUSR1 (synchronous, exits with code 0)
+      - process exit (atexit)
     """
     if not _PROFILE_ON:
         return None
@@ -75,18 +77,38 @@ def maybe_start_viztracer(name: str, max_entries: int = 2_000_000) -> Optional[o
               flush=True, file=sys.stderr)
         return None
 
-    def _stop_and_save():
+    # Double-save protection — SIGUSR1 + atexit both want to save
+    saved = {'done': False}
+
+    def _do_save(reason: str) -> None:
+        if saved['done']:
+            return
+        saved['done'] = True
         try:
             tracer.stop()
             tracer.save()
-            print(f'[PROFILE] saved viztracer for {name} -> {output}',
+            print(f'[PROFILE] saved viztracer for {name} via {reason} -> {output}',
                   flush=True, file=sys.stderr)
         except Exception as e:
-            print(f'[PROFILE] viztracer save failed for {name}: {e}',
+            print(f'[PROFILE] viztracer save failed for {name} via {reason}: {e}',
                   flush=True, file=sys.stderr)
 
-    atexit.register(_stop_and_save)
-    print(f'[PROFILE] viztracer started for {name} (pid={pid}, out={output})',
+    def _sigusr1_handler(signum, frame):
+        _do_save('SIGUSR1')
+        # Exit cleanly so any other atexit/cleanup fires too
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGUSR1, _sigusr1_handler)
+    except (ValueError, OSError) as e:
+        # Some thread contexts (non-main) reject signal.signal — ignore
+        print(f'[PROFILE] could not install SIGUSR1 handler for {name}: {e}',
+              flush=True, file=sys.stderr)
+
+    atexit.register(lambda: _do_save('atexit'))
+
+    print(f'[PROFILE] viztracer started for {name} (pid={pid}, out={output}, '
+          f'sigusr1=on)',
           flush=True, file=sys.stderr)
     return tracer
 
