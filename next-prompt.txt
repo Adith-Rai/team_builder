@@ -1,6 +1,160 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S60 WRAP (2026-05-13 evening) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S60 outcome: Fix #2 SHIPPED, Fix #3 REFUTED, priority hierarchy formalized,
+multiple stale prescriptions corrected. Next session = Fix #1 design session.**
+
+The S59 plan recommended three fixes in order (#3 vectorize → #2 compile
+composition → #1 design → #1 impl). S60 executed in that order:
+- **#3 vectorize collate_episodes**: tried, REFUTED by microbench.
+  Advanced-index scatter is strictly slower than V1; pre-alloc+slice-assign
+  is within noise. The 55s/iter figure was viztracer-INCLUSIVE — child C
+  ops (torch.cat, torch.as_tensor) are bandwidth-bound, not reachable by
+  Python-level vectorization. Diagnostic scripts kept on master at
+  `scripts/diag/bench_collate_*.py` + `test_collate_episodes_vec_bitexact.py`.
+  See `memory/project_s60_fix3_refuted.md`.
+- **#2 BC anchor + Tier3 + compile composition**: SHIPPED on branch
+  `perf/compile-bc-anchor-composition` (merged to master via this wrap).
+  Plumbs bc_logits + bc_anchor_coef_t through compile boundary via
+  `bc_anchor_enabled: bool` closure flag in `make_compiled_train_step`.
+  Adds minibatch chunking to compiled path. Removes the train_rl.py
+  FATAL mutex that previously forced "BC anchor OR compile, not both".
+  **Prod-pod smoke: 9× update-phase speedup on iter-2 (190s → 21s) with
+  BC anchor + minibatch=16 at --cis + 64g/2w.** No NaN, bc_kl recorded,
+  clean training stats. See `memory/project_s60_fix2_design.md`.
+
+**Updated priority order for S61**: Fix #1 design session (NEXT, no code).
+
+═══════════════════════════════════════════════════════════════════════════════
+S60 — PHILOSOPHY REFINEMENTS (NEW MEMORY ENTRIES — READ THESE)
+═══════════════════════════════════════════════════════════════════════════════
+
+S60 surfaced four philosophy refinements / corrections via user pushback.
+All saved as memory files. Apply on every decision going forward:
+
+1. **`feedback_priority_hierarchy.md`** — **Priority hierarchy**:
+   quality > cost > calendar. Hobby project, pod $$ comes out of pocket,
+   so fast/cheap infra COMPOUNDS across experiments. Calendar speed is
+   LAST. Resolves "ship fast vs no shortcuts" tension: do infra right,
+   even if calendar-slow, because cost compounds and quality is
+   non-negotiable.
+
+2. **`feedback_perm_at_eval_wrong.md`** — **Perm-at-eval is conceptually
+   WRONG**, don't propose it. The next-prompt §S58 prescription
+   ("+7pp smart_avg easy win") has been REFUTED. The whole reason we
+   apply perm during training is to teach TRUE Pokemon learning
+   (invariance), not for measurement-fudging. Adding perm at eval MASKS
+   the symptom that the model isn't truly invariant. Other Pokemon PPO
+   codebases (Metamon, ps-ppo) keep eval canonical. The §S58 section
+   has been annotated with the refutation.
+
+3. **`feedback_premature_plateau_call.md`** — **Don't call a plateau /
+   regression on <20 iters of data.** S58 wrap framed the BC anchor v3
+   run as "smart_avg plateau at 70%" based on iter 29 → iter 50 = -2pp
+   (one eval, within noise). I propagated that framing in S60, then
+   added an iter 49 Elo "regression" framing (-5 Elo from iter 39 peak).
+   Both were premature: per-opp breakdown showed iter 49 vs iter 39 is
+   a stylistic shift (better at SH/Tactical, worse at SmartDmg/Strategic,
+   mean wr -0.6pp = within noise). -5 Elo is within 500-game CI.
+   Self-play training is NOISY; small windows are not trends.
+
+4. **`feedback_infra_first_means_first.md`** — **Infra-first means INFRA
+   FIRST**, not "do the easy infra and then jump to Phase 2 prep." After
+   Fix #2 shipped, my instinct was to propose Phase 2 prep (task #14,
+   elite teams, etc.). User correctly pushed back: Fix #1 (IPC redesign)
+   is the next priority per the priority hierarchy. Phase 2 prep is
+   POST-ALL-INFRA, not interleaved.
+
+═══════════════════════════════════════════════════════════════════════════════
+S60 — WHAT'S TRUE NOW (CORRECTIONS TO OLDER FRAMINGS)
+═══════════════════════════════════════════════════════════════════════════════
+
+Older sections of this file may still contain these stale framings.
+Where you see them, trust the S60 correction:
+
+| Older framing (now stale) | S60 correction |
+|---|---|
+| "Perm-at-eval is an easy +7pp Phase 2 prep item" (§S58 #6) | REFUTED — perm-at-eval is conceptually wrong; do not propose. The §S58 section has been annotated. |
+| "BC anchor v3 plateaued at smart_avg=70%" (S58 wrap) | Premature — 10 iters not enough for plateau call. Iter 49 Elo confirms stylistic shift, not regression. |
+| "BC anchor + --tier3 --compile is FATAL" (train_rl.py mutex) | RESOLVED — Fix #2 plumbs BC through compile boundary; mutex removed. |
+| "Fix #3 (vectorize collate) ~10% update savings" (PROFILE_BOTTLENECKS_REPORT §5) | REFUTED — Python-level vectorization doesn't capture the time. PROFILE_BOTTLENECKS_REPORT.md §5 has been annotated. |
+| "Phase 2 prep after Fix #2" (my S60 instinct) | Wrong — Fix #1 design session is next. Phase 2 prep is post-all-infra. |
+
+═══════════════════════════════════════════════════════════════════════════════
+S60 — STATE AT WRAP
+═══════════════════════════════════════════════════════════════════════════════
+
+**Git state**:
+- master HEAD: should be updated to include the perf branch merge (this
+  wrap session). Was `fb88d795` (S60 diag scripts) before perf merge.
+- Branch `perf/compile-bc-anchor-composition`: 2 commits
+  (`cbc9ec01` main + `a6743f0d` followup that removed a stale
+  NotImplementedError guard). Merged to master via this wrap.
+
+**Prod pod state (port 47913)**:
+- No python training running; killed cleanly after smoke
+- 8 battle_servers listening on ports 9000-9007 (idle)
+- GPU clear
+- HEAD on pod = `perf/compile-bc-anchor-composition` after smoke validation;
+  needs `git checkout master && git pull` before next session if used
+- Stashed pod-side edits (eval-registry appends + S59 launch_profile_run.sh
+  edits) are floating. Not popped. Recoverable via `git stash list` if needed.
+
+**Dev pod state (port 19373)**: untouched in S60. Available for Fix #1
+implementation when that lands.
+
+**Last Elo ladder run**: iter 49 of BC anchor v3 = 1172.3 (-5.0 from iter
+39 peak 1177.3). NOT a regression — within 500-game CI. Per-opp
+breakdown shows stylistic shift (see S60 corrections table above).
+
+═══════════════════════════════════════════════════════════════════════════════
+S60 — NEXT SESSION (S61) PRIORITY: FIX #1 DESIGN SESSION
+═══════════════════════════════════════════════════════════════════════════════
+
+**Per `feedback_infra_first_means_first.md`: do NOT jump to Phase 2 prep.**
+Fix #1 (Worker↔CIS IPC redesign) is the next infra item.
+
+**What S61 should do (no code; design + discussion only)**:
+
+1. **Load the load-bearing CIS code into context**:
+   - `pokemon-ai-starter/pokemon-ai/src/mp_centralized_collect.py` (Phase 4.6 CIS)
+   - Worker-side mp.Pipe recv_loop code
+   - `memory/project_cis_4_3_design.md` (pool-mirror multi-slot)
+   - `memory/project_cis_4_6_design.md` (Option B unified recovery)
+   - `memory/feedback_cis_thread_safety.md` (pipe IPC + Lock + async dispatch)
+   - `memory/feedback_asyncio_gather_at_scale.md` (S58 architectural rule)
+
+2. **Compare IPC redesign options** (per PROFILE_BOTTLENECKS_REPORT.md §5):
+   - **Worker-side submission aggregation**: batch the 25 concurrent
+     battles' inference requests into fewer larger CIS submissions
+   - **CIS batching window tuning**: bump `timeout_ms` (currently 15ms)
+     so CIS forms larger batches per round-trip
+   - **Shared-memory ring buffer**: replace mp.Pipe with shared-mem
+     (faster IPC mechanism)
+   - **Unix domain socket binary protocol**: different IPC mechanism
+   - **Hybrid**: combinations of the above
+
+3. **Design the correctness A/B gate** before any implementation:
+   - Same init/seed/hyperparams as a baseline run
+   - N-iter A/B against current master at production scale
+   - smart_avg + per-opp Elo must match within noise OR strictly improve
+   - This is the absolute red line per `feedback_priority_hierarchy.md`
+
+4. **OUTPUT of S61**: a design memo (`memory/project_s61_fix1_design.md`)
+   that picks the lowest-risk path capturing most of the 30-60% collect
+   gain. User reviews + approves before any code.
+
+5. **DO NOT START implementation in S61** — design first, code in S62+.
+
+═══════════════════════════════════════════════════════════════════════════════
+END S60 WRAP — older sections below preserved for historical context
+(but trust S60 wrap + memory entries OVER older speculation)
+═══════════════════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S59 WRAP (2026-05-13) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -693,14 +847,17 @@ S58 PRIORITIES (in order — no shortcuts, no premature pivoting)
    "add a small thing on top." DO NOT re-implement what already exists.
 
    **Already implemented, just needs to be USED at production eval**:
-   - **Perm at eval (~5-10 lines)** — `build_turn_batch(training=True)` in
-     `features.py` ALREADY permutes slot order. V9RLPlayer (rl_player.py:70)
-     uses it during TRAINING collect. `eval_diag.py --diag-training-mode`
-     has a one-off monkey-patch that turns it on for eval. **For Phase 2:**
-     either add `--eval-perm` CLI flag in train_rl.py that flips
-     `BattleAgentTransformer`'s `_build_turn_batch` call to pass
-     `training=True`, OR change the default. Estimated +7pp smart_avg per
-     S50 measurement (closes the train/eval distribution mismatch).
+   - ~~**Perm at eval (~5-10 lines)**~~ **REFUTED IN S60** — see
+     `memory/feedback_perm_at_eval_wrong.md`. The whole reason we apply
+     perm during training is to teach TRUE Pokemon learning (invariance
+     to slot order), NOT to "match train/eval distributions." Adding
+     perm at eval would MASK the symptom that the model isn't truly
+     invariant — a measurement-fudging shortcut that hides a real bug.
+     Other Pokemon PPO codebases (Metamon, ps-ppo) keep eval CANONICAL
+     because that's the deployment distribution. If model isn't fully
+     invariant under canonical eval, that's a TRAINING issue (more
+     iters, more perm coverage), not an eval-config issue. Do NOT
+     propose this for Phase 2. The "+7pp smart_avg" framing is wrong.
 
    **External opps — REQUIRED for Phase 2 + subprocess scaling MUST be fixed first (task #14)**:
 

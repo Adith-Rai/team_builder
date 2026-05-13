@@ -7,6 +7,42 @@ Where this doc disagrees with prior docs, trust this one — it's measurement-ba
 
 ---
 
+## S60 update (post-recon): Fix #2 SHIPPED, Fix #3 REFUTED
+
+**Fix #2 (BC anchor + Tier3 + compile composition) — SHIPPED in S60**
+on branch `perf/compile-bc-anchor-composition` (commits `cbc9ec01` +
+`a6743f0d`). Prod-pod smoke confirmed: compile cache hit gives ~9×
+speedup on update phase iter-2 (190s → 21s with BC anchor + minibatch=16
+at 64 games / 2 workers / --cis). See `memory/project_s60_fix2_design.md`
+for design notes. The mutex that previously forced "BC anchor OR
+compile, not both" is gone.
+
+**Fix #3 (vectorize collate_episodes) — REFUTED in S60** by microbench.
+Two variants tested: advanced-index scatter (V3) was 0.68-0.81× of V1
+(strictly SLOWER); pre-alloc + slice-assign (V2) was 0.98-1.10× of V1
+(within noise). The 55s/iter `collate_episodes` figure in §4.1 was
+viztracer-INCLUSIVE time — most of it is bandwidth-bound child C ops
+(`torch.cat`, `torch.as_tensor`) that Python-level vectorization can't
+speed up. See `memory/project_s60_fix3_refuted.md` for the data + variants
+attempted. Diagnostic scripts kept on master at `scripts/diag/bench_collate_*.py`
++ `scripts/diag/test_collate_episodes_vec_bitexact.py`.
+
+**Updated §5 action plan (priority for S61+)**:
+
+| # | Fix | Status | Notes |
+|---|---|---|---|
+| 1 | Worker↔CIS dispatch redesign | **NEXT — design session first** | 30-60% collect savings, HIGH risk, 1-2wk impl |
+| 2 | BC anchor + Tier3 + compile composition | **SHIPPED (S60)** | 9× update speedup measured; ready for Phase 2 |
+| 3 | Vectorize `collate_episodes` | **REFUTED (S60)** | Python-level vectorization doesn't pay off |
+
+For the S61 Fix #1 design session, see the §5.1 sequencing notes below
+(the original sequencing assumed Fix #3 first as a warm-up; that's been
+removed since Fix #3 doesn't pay off).
+
+---
+
+---
+
 ## TL;DR
 
 | Claim | Status | Evidence |
@@ -187,32 +223,52 @@ Tokenizer at 38% of forward is more than expected. Possibly optimizable.
 
 ---
 
-## §5. Action plan — top 3 fixes ranked by ROI
+## §5. Action plan — top 3 fixes ranked by ROI (post-S60)
 
-| # | Fix | Targets | Expected savings | Effort | Risk |
-|---|---|---|---|---|---|
-| **1** | **Worker↔CIS dispatch redesign** — aggregate submissions, reduce round-trips per turn; possibly faster IPC | 82% poll-wait on workers | **30-60% of collect** (~300-600s per iter at 800g) | **1-2 wk** (design + impl + validation) | **HIGH** — load-bearing prod path |
-| **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **15-25% of update** (~70-140s) | 1-2 days | medium (torch 2.2.x dynamo limits) |
-| **3** | **Vectorize `collate_episodes`** | 11% of update (Python loop) | ~10% of update (~50s) | 2-3 days | low (clean unit-testable optimization) |
+| # | Fix | Targets | Expected savings | Effort | Risk | Status |
+|---|---|---|---|---|---|---|
+| **1** | **Worker↔CIS dispatch redesign** — aggregate submissions, reduce round-trips per turn; possibly faster IPC | 82% poll-wait on workers | **30-60% of collect** (~300-600s per iter at 800g) | **1-2 wk** (design + impl + validation) | **HIGH** — load-bearing prod path | **NEXT** |
+| **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **15-25% of update** (~70-140s) | 1-2 days | medium (torch 2.2.x dynamo limits) | **SHIPPED S60** |
+| **3** | **Vectorize `collate_episodes`** | 11% of update (Python loop) | ~10% of update (~50s) | 2-3 days | low (clean unit-testable optimization) | **REFUTED S60** |
+
+**Fix #2 actual measurement (S60 prod-pod smoke)**: compile cache hit
+gave **9× speedup on update phase iter-2** (190s → 21s with BC anchor +
+minibatch=16). Beats the 15-25% projection by a wide margin — most of
+the iter-0 overhead was compile time, not steady-state compute.
+
+**Fix #3 actual measurement (S60 microbench)**: V3 (advanced-index
+scatter) was 0.68-0.81× of V1 — strictly SLOWER. V2 (simpler pre-alloc
++ slice-assign) was within noise (0.98-1.10×). The projected 10% savings
+were not achievable via Python-level vectorization (the 55s was
+viztracer-INCLUSIVE time including child C ops that are bandwidth-bound).
 
 **Secondary** (lower priority):
 - Compile CIS inference model — small collect gain (1-3% — workers are IPC-bound, not CIS-compute-bound)
 - Tokenizer `_encode_pokemon_block` optimization — small CIS forward gain
 - CUDA graphs for full update step — possible 10-20% but out of scope unless others tap out
 
-### §5.1 Recommended sequencing
+### §5.1 Recommended sequencing (post-S60)
 
-1. **First session after this one**: Fix #3 (collate_episodes vectorize). Low-risk independent win. Proves the profile-driven methodology delivers.
-2. **In parallel or next**: Fix #2 (compile composition). 1-2 days focused. Biggest update-phase win.
-3. **After 1+2 land**: **Design session** for Fix #1 (no code yet). We compare IPC redesign options (shared memory ring buffer vs explicit submit-aggregation vs Unix socket vs hybrid) with the user before any code.
-4. **Implementation of Fix #1**: 1-2 weeks across multiple sessions.
+1. **S61: Fix #1 design session** — no code; compare IPC redesign options
+   (worker-side submission aggregation, CIS `timeout_ms` window tuning,
+   shared-memory ring buffer, Unix socket binary protocol, hybrid).
+   Pick lowest-risk path that captures most of the 30-60% gain. Design
+   correctness A/B gate at the same time.
+2. **S62+: Fix #1 implementation** across multiple sessions with strict
+   correctness gate (A/B against current master at same init/seed; smart_avg
+   + eval signal must match within noise or strictly improve).
+3. **After Fix #1 lands**: Phase 2 prep (task #14 Metamon scaling, source
+   100-150 elite teams, etc.) on the now-fast/cheap infra.
 
-### §5.2 Combined effect (CONJECTURE — must validate per-fix)
+### §5.2 Combined effect (post-S60, projection updated)
 
-If all three fixes hit their estimates:
-- collect: 958s → ~400-600s (30-60% reduction)
-- update: 506s → ~300-370s (~25-30% reduction)
-- **iter total**: 1464s → ~700-970s = **~1.5-2× speedup**
+If Fix #1 hits its estimate (Fix #2 already shipped, Fix #3 dropped):
+- collect: 958s → ~400-600s (30-60% reduction) — pending Fix #1
+- update: 506s → much lower (Fix #2's 9× cache hit means update is no
+  longer the bottleneck; warm-cache update at 64g/2w was 21s, scaling
+  linearly to 800g/8w ~ 26s/iter)
+- **iter total at 800g**: was 1464s → projected ~430-630s = **~2.3-3.4×
+  speedup** if Fix #1 lands. Most of the remaining cost is collect.
 
 ---
 
