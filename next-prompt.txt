@@ -124,6 +124,38 @@ also mirrored in MEMORY.md + `feedback_profile_driven_method.md`):
   other formats. If a change doesn't serve that or would need touching
   again later, re-evaluate before doing it.
 
+- **Verify state BEFORE acting, not just before recommending.** SSH exit
+  codes can lie (255 on a dropped connection doesn't mean the command
+  failed). File existence can change between sessions. Before any
+  non-trivial action: check actual pgrep / ls / git rev-parse output.
+  Cheap to verify; expensive to act on wrong state.
+
+- **Save artifacts BEFORE destructive cleanup.** Always scp logs / pull
+  snapshots / write MANIFEST.txt BEFORE pkill / SIGKILL / overwriting.
+  S59 example: archived v4 run + profile JSONs before clearing pod state.
+  Cost of saving: 30s. Cost of losing irreplaceable data: hours of rework.
+  Also applies to failed/superseded attempts — keep in archive (e.g.,
+  `data/profiling/round1/`), don't delete.
+
+- **Use three-way evidence labels: CONCRETE / STRONG INFERENCE /
+  CONJECTURE.** Binary is too coarse. STRONG INFERENCE = measurement-
+  derived + a standard assumption (e.g., "70% GPU-bound" inferred from
+  python-vs-wall gap). Don't promote conjecture to concrete when
+  summarizing.
+
+- **Flag measurement confounds explicitly.** Every profiling tool adds
+  overhead; every benchmark has scaling caveats. Surface caveats alongside
+  numbers, not hidden away. S59 example: "viztracer adds 20-30% overhead
+  — absolutes inflated, relatives reliable" stated alongside every
+  viztracer number.
+
+- **Diagnostic code on isolation branch; findings/scripts on master via
+  cherry-pick.** Don't mix exploratory diagnostic code with production
+  master. S59 pattern: profile_hook + train_rl injections stayed on
+  `diag/profile-bottlenecks-s59`; docs/findings + reusable bench scripts
+  cherry-picked to master. Lets us experiment without polluting master
+  while still merging the durable value.
+
 - **Make sure next session knows exactly what to do.** This section is that.
 
 ═══════════════════════════════════════════════════════════════════════════════
