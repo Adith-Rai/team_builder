@@ -1169,16 +1169,10 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             "Use the per-episode ppo_update for warmup iters, then switch "
             "to ppo_update_batched for the main training loop."
         )
-    if compiled_step is not None and bc_ref is not None and bc_anchor_coef != 0.0:
-        raise NotImplementedError(
-            "BC anchor (bc_ref + bc_anchor_coef) is not supported with "
-            "the compiled train_step path in v1. Use --tier3 WITHOUT "
-            "--compile, or run without --bc-anchor-ckpt. The BC forward "
-            "would need to be plumbed as a tensor input through the "
-            "compile boundary — additional design work deferred until "
-            "BC anchor is validated as the Phase 2 fix (S57 isolation "
-            "experiment)."
-        )
+    # S60 Fix #2: removed NotImplementedError that blocked compiled_step +
+    # bc_ref. The compile boundary now supports BC anchor via bc_logits +
+    # bc_anchor_coef_t tensor inputs (caller plumbs bc_logits via eager BC
+    # ref forward per chunk). See make_compiled_train_step docstring.
     if not episodes:
         # No episodes — nothing to do. Return zero-stats.
         return {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
