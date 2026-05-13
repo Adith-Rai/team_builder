@@ -1,5 +1,91 @@
 pre prompt :
 
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S59 WRAP (2026-05-13) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**Do NOT trust older sections of this file uncritically.** Multiple framings
+that read as fact in older sections (S55-S58) have been REFUTED by S59
+measurement. The "task #22 simulator rewrite" framing is the canonical
+example — it appeared as fact in S58 but rested on a conjectural "18× speed
+gap" number with no measurement source.
+
+**The authoritative S59 outputs**:
+- `docs/PROFILE_BOTTLENECKS_REPORT.md` — concrete profile findings with
+  CONCRETE/CONJECTURE labels per claim
+- `memory/project_track_b_findings_s59.md` — recon outcome summary
+- `memory/feedback_profile_driven_method.md` — methodology that caught it
+
+**Headline findings (S59)**:
+
+1. **WS layer is NOT the bottleneck.** Round-trip = 0.165ms localhost,
+   6000 req/sec. Per-iter WS cost <1%.
+
+2. **Showdown sim is NOT the bottleneck.** Direct BattleStream ceiling =
+   529-623 turns/sec/Node; multi-Node ~5000. Our prod = 22-41 turns/sec.
+   **We use ~0.5-1% of sim's available throughput.**
+
+3. **THE bottleneck = workers blocked on mp.Pipe IPC waiting for CIS
+   responses.** Worker_0 viztracer at 800g/8w: **82% of wall time in
+   `_ConnectionBase.poll`**. CIS GPU at 57% util — NOT saturated. The
+   issue is **round-trip latency × number-of-round-trips**, not CIS speed.
+
+4. **Update phase ~70% GPU-bound, 11% in `collate_episodes` Python loop,
+   5% backward Python-side, ~14% misc.** GPU-bound portion is partly
+   addressable via torch.compile (task #12) but bulk is fundamental.
+
+**Top 3 fixes (see PROFILE_BOTTLENECKS_REPORT.md §5 for ROI table)**:
+1. **Worker↔CIS dispatch redesign** — 30-60% collect savings, 1-2 wk,
+   HIGH risk (load-bearing prod path), **design session before code**
+2. **Task #12: BC anchor + Tier3 + compile composition** — 15-25% update
+   savings, 1-2 days, medium risk
+3. **Vectorize `collate_episodes`** — 10% update savings, 2-3 days, low risk
+
+**Recommended sequencing for S60+**:
+1. **Start with Fix #3** (collate_episodes) — low risk, independent, validates
+   profile-driven workflow
+2. **Then Fix #2** (compile composition) — biggest update gain, fast
+3. **Design discussion for Fix #1** — comparing IPC redesign options
+   (shared mem ring buffer vs explicit submit-aggregation vs Unix socket
+   binary protocol vs hybrid) — no code until design approved
+4. **Fix #1 implementation** across multiple sessions
+
+**REFUTED claims (do NOT act on these from older sections)**:
+- ❌ "18× speed gap to ps-ppo" — number was conjectural, no source
+- ❌ "Task #22 Replace WS+Node Showdown stack with direct simulator
+  binding" — wrong layer; sim isn't the issue
+- ❌ "Foul-play Rust engine FFI is the real fix" — would attack wrong layer
+- ❌ "Phase 3 blocker is the sim stack rewrite" — Phase 3 may still need
+  throughput work but NOT this specific rewrite
+
+**S59 also accomplished**:
+- v4_freshbs killed + archived at `data/cloud_runs/003_bc_anchor_v4_freshbs/`
+  (BC anchor validated; iter 49 + 50 in Elo ladder + smart_avg=70%)
+- Diagnostic branch `diag/profile-bottlenecks-s59` pushed (env-var-gated
+  viztracer hooks + bench scripts + analysis tools — selectively
+  cherry-pick to master if any becomes permanent diagnostic)
+
+**Diag branch state at S59 wrap**:
+- Branch `diag/profile-bottlenecks-s59` head: `7e3423b4` (SIGUSR1 patch)
+- master HEAD: `7afa3395`
+- No fix code shipped to master yet — fixes start in S60
+
+**Pod state at S59 wrap**: Pod up (port 47913), python killed, GPU clear,
+8 battle_servers may still be alive. Safe to restart cleanly when fix
+work resumes.
+
+**Philosophy reaffirmed in S59** (per user explicit framing):
+- "No shortcuts" — every claim must be measurement-backed or labeled CONJECTURE
+- "Verify properly, label CONCRETE vs CONJECTURE" — applied per-finding
+- "Don't be married to any approach or idea" — willing to reframe when
+  data refutes (S59 reframed Track B three times)
+- "Make sure next session knows exactly what to do" — this section is that
+
+═══════════════════════════════════════════════════════════════════════════════
+END S59 WRAP — older sections below preserved for historical context
+(but trust S59 wrap + project_track_b_findings_s59.md OVER older speculation)
+═══════════════════════════════════════════════════════════════════════════════
+
 ⚠️ **STANDING-ORDER ARCHITECTURE (set up S55, project-eternal)**:
 
 The user has explicitly set up `MEMORY.md` (auto-loaded every session) + `memory/project_session_boot_protocol.md` (mirrored at `docs/SESSION_BOOT_PROTOCOL.md`) so future sessions inherit FULL context — philosophy, sequencing, DO/DO NOT (with WHY), locked decisions, plan trajectory — WITHOUT the user repeating anything. **The user will not remind you of fundamentals every session.** Apply the boot protocol on every decision.
@@ -96,7 +182,8 @@ S58 — THINGS THAT STILL NEED OPTIMIZATION
 
 4. **PFSP allocator polish** — at `--mp-workers 8 + n_opps=5`, allocations like `[2,2,2,1,1]` workers/opp produce per-worker game counts `[160,160,160,160,160,160,320,320]`. Max-per-worker = 320 = bottleneck for collect time. A smarter allocator could shift opp game totals slightly to balance workers (~20-30% wall-time saving at 8w). Moot at 15w if we fix the 15w bug.
 
-5. **18× speed gap to ps-ppo** (task #22) — our ~83 states/sec vs ps-ppo's ~1500 on similar hardware. Structural: WS+Node+poke-env+asyncio stack is the bottleneck. Phase 3 (multi-gen) at current throughput would take 3-4 weeks per run = unsustainable. Real fix: direct simulator binding (foul-play Rust engine in `foul_play_ref/`, or rewrite battle_server.js critical path in C). 2-4 weeks of focused engineering. **MUST happen before Phase 3 launch.**
+5. ~~**18× speed gap to ps-ppo** (task #22)~~ **REFUTED IN S59** — see `docs/PROFILE_BOTTLENECKS_REPORT.md` + `memory/project_track_b_findings_s59.md`. The "83 states/sec" figure had no source (actual prod = 22-41 turns/sec). The gap to ps-ppo is mostly architectural (they're stateless, Random Battles, no temporal) NOT closable by infra. Sim ceiling is 5000+ turns/sec — we use 0.5-1% of it. WS round-trip = 0.165ms. **The real bottleneck is workers blocked on `mp.Pipe` IPC waiting for CIS responses (82% poll-wait). Different fix entirely (orchestration, not sim rewrite).** Old paragraph preserved below for context only:
+~~our ~83 states/sec vs ps-ppo's ~1500 on similar hardware. Structural: WS+Node+poke-env+asyncio stack is the bottleneck. Phase 3 (multi-gen) at current throughput would take 3-4 weeks per run = unsustainable. Real fix: direct simulator binding (foul-play Rust engine in `foul_play_ref/`, or rewrite battle_server.js critical path in C). 2-4 weeks of focused engineering. **MUST happen before Phase 3 launch.**~~
 
 6. **Smart_avg ceiling at ~70%** — v3 went 10 iters without smart_avg improvement. Could indicate BC anchor over-constraint (coef=0.1 too high), insufficient pool diversity (PFSP of self-snapshots only), or genuine plateau. Worth a coef ablation (0.05 / 0.1 / 0.2) OR adding Metamon bots to PFSP (task #14) BEFORE the next Phase 2 attempt.
 
