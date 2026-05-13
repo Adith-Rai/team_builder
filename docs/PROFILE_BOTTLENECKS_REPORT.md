@@ -223,13 +223,17 @@ Tokenizer at 38% of forward is more than expected. Possibly optimizable.
 
 ---
 
-## §5. Action plan — top 3 fixes ranked by ROI (post-S60)
+## §5. Action plan — top 3 fixes ranked by ROI (post-S60, updated S62)
 
 | # | Fix | Targets | Expected savings | Effort | Risk | Status |
 |---|---|---|---|---|---|---|
-| **1** | **Worker↔CIS dispatch redesign** — aggregate submissions, reduce round-trips per turn; possibly faster IPC | 82% poll-wait on workers | **30-60% of collect** (~300-600s per iter at 800g) | **1-2 wk** (design + impl + validation) | **HIGH** — load-bearing prod path | **NEXT** |
+| **1** | **Worker↔CIS dispatch redesign** — Option B: bump CIS batch window (`min_batch=8→32, timeout_ms=15→50`) to fix slot-starvation (H3) | small CIS fires (maxq=2-8 → 32-35) | **-40% collect at Phase C scale** (CONCRETE, S62 3-iter A/B at 200g/4w) | 1 session (~$4) | low (defaults preserved, opt-in flags) | **SHIPPED S62 (Option B sufficient)** |
 | **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **15-25% of update** (~70-140s) | 1-2 days | medium (torch 2.2.x dynamo limits) | **SHIPPED S60** |
 | **3** | **Vectorize `collate_episodes`** | 11% of update (Python loop) | ~10% of update (~50s) | 2-3 days | low (clean unit-testable optimization) | **REFUTED S60** |
+
+**S62 Option B outcome**: tested `--cis-min-batch 32 --cis-timeout-ms 50` at 100g/2w smoke (-46% collect) + 3-iter A/B at 200g/4w (-40%/-41%/-40% per iter, mean -40%). Confirmed mechanism via per-slot CIS-STATS instrumentation (S62 A3): meanq 3.9 → 15, maxq 6 → 32-35, timeout_pct 100% → 84-94%, fire rate halved. H3 (slot starvation under one-opp-per-worker dispatch + tight 15ms timeout) was the dominant bottleneck at our scales — matches §3.4's prediction. See `memory/project_s62_fix1_b_results.md` for full data + mechanism analysis. Production launch should pass these flags.
+
+**Options A (worker-side aggregation) + C (shared-mem ring buffer)** designed in `project_s61_fix1_design.md` but skipped per S62 result — Option B captured ≥25% of collect (the Phase D threshold), so the more expensive options weren't needed. Could be revisited if production-scale (8w/conc=200) shows much smaller gain than Phase C (would imply H1/H2 contributing more than at our test scale).
 
 **Fix #2 actual measurement (S60 prod-pod smoke)**: compile cache hit
 gave **9× speedup on update phase iter-2** (190s → 21s with BC anchor +

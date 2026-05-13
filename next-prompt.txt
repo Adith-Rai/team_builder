@@ -1,6 +1,117 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S62 WRAP (2026-05-13 night) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S62 outcome: Fix #1 SHIPPED via Option B. -40% collect at Phase C scale.
+Phase 2 prep is now unblocked.**
+
+S61 produced the design memo (`memory/project_s61_fix1_design.md`) comparing
+5 IPC-redesign options. Recommended Option E (hybrid): start with Option B
+(cheap probe, $3-4) and conditionally escalate to A or C based on data.
+
+S62 executed Phase A-E:
+- **Phase A (code, ~30 min)**: added `--cis-min-batch` + `--cis-timeout-ms`
+  flags (defaults preserved); enriched `[CIS-STATS]` with `meanq`,
+  `timeout_pct`, fire-type breakdown. Branch `perf/cis-batch-window`,
+  commit `f8cc6639`. Skipped A2 (separate logit-equivalence test) per
+  right-sized-gate rationale (change is below bf16 GEMM noise floor).
+- **Phase B (smoke, ~$1)**: dev pod 100g/2w/conc=25, baseline + variant.
+  Variant collect = 64s vs baseline 119s = **-46%**. CIS-STATS confirms
+  larger batches.
+- **Phase C (3-iter A/B, ~$4)**: prod pod 200g/4w/conc=50.
+  - Iter 0: collect 94s vs 157s (-40%)
+  - Iter 1: collect 107s vs 182s (-41%)
+  - Iter 2: collect 208s vs 346s (-40%; both inflated by --pipeline tail effect)
+  - Mean: 136s vs 228s (-40%)
+  - All health checks clean (no NaN, no FATAL, kl/bc_kl/v in normal range)
+- **Phase D verdict**: -40% ≥ 25% threshold → Fix #1 sufficient via Option B.
+- **Phase E (this wrap)**: results memo + this section + PROFILE_BOTTLENECKS_REPORT §5.
+
+**Mechanism (per S62 CIS-STATS instrumentation)**:
+- meanq 3.9 → 15 (3.9× larger batches)
+- maxq 6 → 32-35 (now hits min_batch=32)
+- timeout_pct 100% → 84-94% (some fires now satisfy minbatch)
+- Fire rate halved → fewer round-trips
+- fwd time 16.7ms → 26.5ms (sub-linear GPU amortization on 4× batch)
+
+H3 (slot starvation under tight 15ms timeout + one-opp-per-worker dispatch)
+was the dominant bottleneck at our test scales. H1 (worker-side GIL/pickle)
+and Option C (shared-mem) were NOT needed. Could revisit if prod-scale
+(8w/conc=200) shows much smaller gain.
+
+═══════════════════════════════════════════════════════════════════════════════
+S62 — STATE AT WRAP
+═══════════════════════════════════════════════════════════════════════════════
+
+**Git state**:
+- master HEAD: `d0f1af2f` (unchanged from S60)
+- Branch `perf/cis-batch-window` head: `f8cc6639` (S62 Phase A code, +56 LOC, 2 files)
+- AWAITING USER DECISION on merge to master (load-bearing → user-gated)
+
+**Local doc updates** (uncommitted at S62 wrap):
+- `memory/project_s62_fix1_b_results.md` (new)
+- `memory/MEMORY.md` (added 4i pointer)
+- `memory/project_s61_fix1_design.md` (in-place updates §10.A/B per A2 skip + §10 S62 plan)
+- `docs/PROFILE_BOTTLENECKS_REPORT.md §5` (added Option B SHIPPED row)
+- `next-prompt.txt` (this section)
+
+**Pod state (port 47913)**:
+- No python training running; killed cleanly after Phase C variant
+- 8 battle_servers listening on 9000-9007 (idle)
+- GPU clear (1 MiB)
+- HEAD on pod = `perf/cis-batch-window` (commit `f8cc663`)
+- Pod-side mod still floating: `data/eval/registry/runs.jsonl` (gitignored eval-log; ignore)
+
+**Verification artifacts** (local, gitignored, in `data/s62_artifacts/`):
+- `s62_smoke_baseline.log` + `s62_smoke_variant.log` — smoke A/B
+- `s62_phaseC_baseline.log` + `s62_phaseC_variant.log` — prod-scale A/B
+
+═══════════════════════════════════════════════════════════════════════════════
+S62 — NEXT SESSION (S63) PRIORITY
+═══════════════════════════════════════════════════════════════════════════════
+
+Per [[feedback_infra_first_means_first]]: all cost-compounding infra is now
+DONE (Fix #2 S60, Fix #1 S62). **Phase 2 prep is the next priority.**
+
+**Phase 2 prep checklist** (per S60 wrap §S58 list, with S62 corrections):
+
+1. **Source 100-150 real elite gen-9-OU teams** for training pool
+   (NEVER mix with the 16 mm-competitive eval teams — data leakage rule)
+2. **lr scheduling design** — likely cosine decay or step decay; re-ablate
+   post-Tier-3 since Fix #2's compile cache changed effective work-per-step
+3. **External opps PFSP scaling** (S58 task #14 still pending)
+4. **H2H gauntlet wiring** — Kakuna/SmallRL/Minikazam adapters, ~3-4 hrs
+5. **Phase 2 launch script**: canonical stack now includes the new flags:
+   ```
+   --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
+   --bc-anchor-ckpt v10 --bc-anchor-coef 0.1 \
+   --cis-min-batch 32 --cis-timeout-ms 50
+   ```
+
+**At Phase 2 launch (S63 or later)**:
+- Recap in iter 0-1 that prod-scale (8w/conc=200) wall-time gain matches
+  our 25-40% projection. If much lower, revisit per-slot timeout or design
+  Option A (per S61 design §10.D fallback).
+- Don't propose perm-at-eval, lr-decay flags, or other speculative additions
+  until measured need (per [[feedback_perm_at_eval_wrong]]).
+
+**DO NOT propose** (per S60-S62 corrections):
+- Per-slot timeouts (Option B uniform timeout was sufficient at our scales;
+  add only if measurement at prod scale demands)
+- Worker-side aggregation (Option A) — refuted as primary need by S62 H3 data
+- Shared-mem ring buffer (Option C) — same; not needed for current bottleneck
+- Perm-at-eval (REFUTED in S60)
+- Restarting battle_servers as routine policy (was an S58 hypothesis; doesn't
+  fully restore throughput per S58 wrap; superseded by IPC fix anyway)
+
+═══════════════════════════════════════════════════════════════════════════════
+END S62 WRAP — older sections below (S60, S59, S58, ...) preserved for context
+(but trust S62 wrap + memory entries OVER older content where they conflict)
+═══════════════════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S60 WRAP (2026-05-13 evening) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
