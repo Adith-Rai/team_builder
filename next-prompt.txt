@@ -74,20 +74,21 @@ S58 — THINGS WE TRIED, WHY, AND RESULTS
 S58 — WHERE WE ARE AT (session wrap)
 ═══════════════════════════════════════════════════════════════════
 
-**The post-restart wall-time slowdown is RESOLVED.**
+**The post-restart wall-time slowdown is PARTIALLY resolved** (mixed evidence — was prematurely claimed "resolved" earlier in this doc):
 - Validation 8w iter 40 collect: 1704s = 28 min
 - Prod v3 iter 40-49 collect: 2540-3201s = 42-53 min (slowdown era)
-- **Fresh-bs iter 50 collect: 1759s = 29.3 min** ← matches validation
-- **Root cause**: stale battle_server.js state. 6 days uptime + 6 successive kill-restart cycles in S58 left node's per-connection / scheduler / account state degraded. Memory wasn't the signal (only 398MB). Wall-time-per-iter is the signal.
-- **Operational rule**: restart battle_servers any time training is killed + relaunched. Run the kill+restart procedure from `project_s58_session_narrative.md` Commands section.
+- **Fresh-bs iter 50 collect: 1759s = 29.3 min** ← matches validation (HONEYMOON)
+- **Fresh-bs iter 51 collect: 2601s = 43 min** ← drift back, but still better than v3
+- **Net read**: fresh battle_server restart helps (50min → 43min steady ≈ 14% saved), but doesn't fully restore validation pace. Iter 50 may have been a one-off post-restart fast iter.
+- **Operational rule**: still useful to restart battle_servers when training is killed (recovers SOME throughput). But don't assume it fully fixes the slowdown.
 
-**S59 first action**: SSH prod, check `/tmp/bc_anchor_1600g_v4_freshbs.log` for iter 51+ status. If iter 51 also lands at ~30 min collect → fix is stable, continue Phase 2 trajectory tracking. If iter 51 starts slowing back to 50 min → cruft re-accumulates rapidly, need stronger maintenance rule.
+**S59 first action**: SSH prod, check `/tmp/bc_anchor_1600g_v4_freshbs.log` for iter 52+ status. If iter 52 stays around 40-43 min → 43 min is the steady-state for this allocation pattern (8w with imbalanced workers). If iter 52 climbs back toward 50 min → state-accumulation is faster than expected, may need every-N-iters defensive restart (which is non-trivial coordination with in-flight training).
 
 ═══════════════════════════════════════════════════════════════════
 S58 — THINGS THAT STILL NEED OPTIMIZATION
 ═══════════════════════════════════════════════════════════════════
 
-1. **Post-restart slowdown** — RESOLVED at S58 wrap. Stale battle_server state. Fix: kill+restart procedure (see Commands section). Operational rule: always restart battle_servers after any training kill.
+1. **Post-restart slowdown** — PARTIALLY resolved. Fresh battle_server restart helps (50min → 43min steady), but doesn't fully restore validation 28min pace. Iter 50 hit 29min (one-off?), iter 51 dropped to 43min. Need iter 52+ data to see if 43min is the floor at this allocation/pool size. Long-term fix probably structural (task #22 simulator stack).
 
 2. **15-worker mid-iter crash** (task #21) — UNRESOLVED. At `--mp-workers 15`, iter 41+ had ~10 workers stall mid-iter (5/15 received at deadline). Validation iter 40 at 15w completed cleanly, so the bug is iter-41+ specific or post-resume-specific. Need controlled experiment to reproduce. MUST fix before Phase 3 launch.
 
