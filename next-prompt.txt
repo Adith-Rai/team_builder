@@ -29,6 +29,103 @@ composition → #1 design → #1 impl). S60 executed in that order:
 **Updated priority order for S61**: Fix #1 design session (NEXT, no code).
 
 ═══════════════════════════════════════════════════════════════════════════════
+S60 — CORE OPERATING PRINCIPLES (APPLY ON EVERY DECISION)
+═══════════════════════════════════════════════════════════════════════════════
+
+These are the load-bearing principles for the project. Full detail in
+the linked memory files; the boot protocol (`memory/project_session_boot_protocol.md`)
+has the canonical versions. Listed here for inheritance without re-read.
+**The user will NOT repeat any of this each session.** Apply every time.
+
+**Priority hierarchy (S60 — NEW)**:
+1. **Quality / correctness** — ABSOLUTE TOP. Never compromised.
+2. **Cost ($)** — top operational driver. Hobby project; pod $ comes out
+   of pocket. Fast/cheap infra compounds across experiments. Prioritize
+   infra investment that compounds even if calendar-slow.
+3. **Calendar time** — LAST. "Nice to be sooner" but not a constraint.
+See `feedback_priority_hierarchy.md`.
+
+**The trajectory (every decision serves this)**:
+  Phase 1 v3 (DONE) → Phase 2 elite gen 9 (NEXT, must work first time)
+  → Multi-gen (5-7wk / $400-600 per run) → Doubles/VGC/Triples/AG/in-game
+
+**No shortcuts. Ever. (both directions)**:
+- No "good enough for now" / half-finished work
+- No SPECULATIVE additions either — adding flags/features without
+  measured need is also a shortcut. Both create touched-again work.
+
+**No assumptions. Label CONCRETE / STRONG INFERENCE / CONJECTURE**:
+- CONCRETE = directly measured this session, citing tool + sample size
+- STRONG INFERENCE = measurement-derived + a standard assumption
+- CONJECTURE = guess based on architecture or analogy
+- Don't promote conjecture to concrete when summarizing. Flag measurement
+  confounds explicitly (tool overhead, scaling caveats, etc.).
+See `feedback_profile_driven_method.md`.
+
+**Don't be married to any approach. Willing to reframe when data refutes**:
+- S59 reframed Track B three times (sim → WS → orchestration). Each
+  reframe = methodology working, not failure.
+- S60 reframed Fix #3 (vectorize collate) from "low-risk warm-up win" to
+  REFUTED in ~1 hour via microbench. Save the work, move on.
+
+**Verify before recommending OR acting**:
+- Memory snapshots are point-in-time. Code is truth. Grep / read before
+  citing.
+- Verify state BEFORE acting, not just before recommending. SSH exit
+  codes can lie. File existence can change between sessions.
+- Save artifacts BEFORE destructive cleanup. 30s save cost vs hours of
+  rework if data is lost.
+
+**Honest opinions, including pushback**:
+- "It's me and you against the problem" — partnership, not deference.
+- If user framing has a precision-bug or premise-bug, surface it gently
+  and clarify before acting. Pattern rewarded in S52/53/54/57/59/60.
+See `feedback_ask_when_uncertain.md`.
+
+**Ask before destructive or load-bearing actions**:
+- Cost of 60s clarifying question << cost of irreversible mistake.
+- Especially for: kill / reset --hard / force push / dropping data /
+  changing load-bearing prod paths.
+
+**Step back periodically**:
+- Triggers: stuck >30 min, user pushes back on plan, multiple components
+  seem broken in sequence, cost projections keep being wrong.
+- Re-read memory + this file + strategic frame. Consider if a different
+  approach resolves multiple issues at once.
+
+**"Done" means done**:
+- Code clean (no half-completions, no "TODO fix later")
+- Validation gate met (correctness A/B for risky changes)
+- Docs that reference the area updated
+- Memory updated if behavior or rationale changed
+- next-prompt updated if next session needs to know
+
+**Diagnostic on isolation branch; findings/scripts on master via cherry-pick**:
+- Don't pollute master with exploratory diagnostic code.
+- S59 + S60 pattern: diag code on `diag/*` branch; reusable bench
+  scripts + findings docs cherry-picked to master.
+
+**Don't call plateau / regression on <20 iters of data (S60 — NEW)**:
+- Self-play training is NOISY. -5 Elo on 500-game ladder is within CI.
+- Check per-opponent breakdown, not just aggregate. Stylistic shifts
+  (better vs some, worse vs others) ≠ regression.
+- Apply this to inherited framings too (don't propagate prior session's
+  premature framings uncritically).
+See `feedback_premature_plateau_call.md`.
+
+**Infra-first means INFRA FIRST (S60 — NEW)**:
+- After landing an infra fix, the next question is "what's the next infra
+  fix?", NOT "what does Phase 2 prep need?"
+- Phase 2 prep is POST-ALL-INFRA. Don't interleave.
+See `feedback_infra_first_means_first.md`.
+
+**Perm-at-eval is conceptually WRONG — do not propose it (S60 — NEW)**:
+- The next-prompt §S58 prescription is REFUTED.
+- Perm exists for invariance (TRUE Pokemon learning), not measurement-
+  fudging. Eval should match deployment distribution (canonical).
+See `feedback_perm_at_eval_wrong.md`.
+
+═══════════════════════════════════════════════════════════════════════════════
 S60 — PHILOSOPHY REFINEMENTS (NEW MEMORY ENTRIES — READ THESE)
 ═══════════════════════════════════════════════════════════════════════════════
 
