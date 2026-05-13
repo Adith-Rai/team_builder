@@ -74,24 +74,20 @@ S58 — THINGS WE TRIED, WHY, AND RESULTS
 S58 — WHERE WE ARE AT (session wrap)
 ═══════════════════════════════════════════════════════════════════
 
-**The post-restart wall-time slowdown** is the open question:
+**The post-restart wall-time slowdown is RESOLVED.**
 - Validation 8w iter 40 collect: 1704s = 28 min
-- Prod v3 iter 40-49 collect: 2540-3201s = 42-53 min
-- Same hardware, same code, same flags
-- CIS-STATS shows CIS forward ~16ms healthy throughout → bottleneck is NOT inference
-- Most likely candidates: stale battle_server state (6 days uptime + 6 successive failed launches in S58), OR shared-host tenancy contention, OR something we haven't identified
+- Prod v3 iter 40-49 collect: 2540-3201s = 42-53 min (slowdown era)
+- **Fresh-bs iter 50 collect: 1759s = 29.3 min** ← matches validation
+- **Root cause**: stale battle_server.js state. 6 days uptime + 6 successive kill-restart cycles in S58 left node's per-connection / scheduler / account state degraded. Memory wasn't the signal (only 398MB). Wall-time-per-iter is the signal.
+- **Operational rule**: restart battle_servers any time training is killed + relaunched. Run the kill+restart procedure from `project_s58_session_narrative.md` Commands section.
 
-**Experiment in flight at S58 wrap**: killed all `node battle_server` processes, restarted fresh, relaunched training from `snapshot_0049.pt` with new out-dir `bc_anchor_1600g_v4_freshbs`. Watch iter 50 collect time.
-- If iter 50 = 28-30 min → stale state was the cause, continue Phase 2
-- If iter 50 = 50+ min → not stale state, deeper investigation needed (per-iter time-breakdown instrumentation)
-
-**S59 first action**: read fresh-bs experiment outcome from `/tmp/bc_anchor_1600g_v4_freshbs.log` on prod. Iter 50 line tells the story.
+**S59 first action**: SSH prod, check `/tmp/bc_anchor_1600g_v4_freshbs.log` for iter 51+ status. If iter 51 also lands at ~30 min collect → fix is stable, continue Phase 2 trajectory tracking. If iter 51 starts slowing back to 50 min → cruft re-accumulates rapidly, need stronger maintenance rule.
 
 ═══════════════════════════════════════════════════════════════════
 S58 — THINGS THAT STILL NEED OPTIMIZATION
 ═══════════════════════════════════════════════════════════════════
 
-1. **Post-restart slowdown root cause** — see above. May resolve via fresh battle_servers, may not. If not, add per-iter time-breakdown instrumentation (WS RTT, async scheduler wait, GC) to localize the bottleneck.
+1. **Post-restart slowdown** — RESOLVED at S58 wrap. Stale battle_server state. Fix: kill+restart procedure (see Commands section). Operational rule: always restart battle_servers after any training kill.
 
 2. **15-worker mid-iter crash** (task #21) — UNRESOLVED. At `--mp-workers 15`, iter 41+ had ~10 workers stall mid-iter (5/15 received at deadline). Validation iter 40 at 15w completed cleanly, so the bug is iter-41+ specific or post-resume-specific. Need controlled experiment to reproduce. MUST fix before Phase 3 launch.
 
