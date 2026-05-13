@@ -936,56 +936,21 @@ def main():
             # don't crash the run - just fall back to eager.
             print(f"torch.compile: SKIPPED ({e})", flush=True)
 
-    # Tier 3 C5 (S55+): single-graph compiled train_step for the batched PPO
-    # update. Built AFTER per-submodule compile so the per-submodule compile
-    # wrappers are transparently traced through by the outer graph (net effect
-    # is one fused forward+loss+backward+clip+optimizer.step graph). Stashed
-    # on the model object so it survives across iters and is reused (compile
-    # cache stays warm). Only built when both --tier3 + --compile are set
-    # AND the per-submodule compile succeeded; otherwise the eager batched
-    # path runs (still 4-10× faster than per-episode ppo_update).
-    #
-    # Per S56 design (no shortcuts, ship optimal once): the full train_step
-    # in one graph maximizes kernel fusion across forward/backward/step
-    # boundaries. Safety gates (NaN, KL > target × 5) are in-graph tensor
-    # masks (no host sync, no graph break). See `make_compiled_train_step`
-    # docstring for details.
-    model._tier3_step = None
-    if args.tier3 and args.compile and compiled:
-        try:
-            model._tier3_step = make_compiled_train_step(
-                model, optimizer, cfg,
-                vf_coef=args.vf_coef,
-                max_grad_norm=args.max_grad_norm,
-                normalize_advantages=False,  # build_ppo_episodes already normalizes
-            )
-            print("torch.compile: Tier 3 C5 train_step compiled "
-                  "(fwd+loss+backward+clip+step in one graph)", flush=True)
-        except Exception as e:
-            print(f"torch.compile: Tier 3 C5 train_step SKIPPED ({e}); "
-                  f"--tier3 will use eager batched path", flush=True)
-            model._tier3_step = None
-
     # BC anchor (S57): load frozen reference model into a SEPARATE local
     # variable (NOT an attribute of `model`). Storing on the model would
     # make PyTorch include the BC ref's parameters in `model.state_dict()`,
     # breaking snapshot save/load + mp_disk worker respawn (verified on
     # dev pod S57). Pass `bc_ref` directly to ppo_update_batched.
+    #
+    # S60 Fix #2: BC anchor loading was moved BEFORE make_compiled_train_step
+    # so we can pass `bc_anchor_enabled` as a compile-time flag. The previous
+    # FATAL mutex with --compile + --tier3 is REMOVED — BC anchor is now
+    # plumbed through the compile boundary (bc_logits passed at call time
+    # via eager BC ref forward per chunk; bc_anchor_coef as a 0-dim tensor
+    # so per-iter coef changes don't trigger recompile). See `make_compiled_train_step`
+    # docstring + `project_bc_anchor_design.md`.
     bc_ref = None
     if args.bc_anchor_ckpt:
-        # S57: BC anchor supported on EITHER the per-episode `ppo_update`
-        # path (battle-tested via Phase 1 v3) OR the `ppo_update_batched`
-        # eager path. NOT supported with C5 compile (would need BC logits
-        # plumbed through compile boundary; deferred until BC anchor
-        # validates as Phase 2 fix). Per-episode path is recommended for
-        # the isolation experiment because the eager batched path has
-        # OOM / index-OOB issues at 200+ games scale (task #10/#11).
-        if model._tier3_step is not None:
-            print("[FATAL] --bc-anchor-ckpt is not supported with the C5 "
-                  "compiled train_step (--compile + --tier3). Drop --compile "
-                  "to use the per-episode ppo_update path with BC anchor.",
-                  flush=True)
-            sys.exit(2)
         if args.bc_anchor_coef == 0.0:
             print("[WARN] --bc-anchor-coef is 0.0; BC anchor will be a no-op. "
                   "Set --bc-anchor-coef 0.1 (or similar) to enable.", flush=True)
@@ -998,6 +963,45 @@ def main():
         n_bc_params = sum(p.numel() for p in bc_ref.parameters())
         print(f"BC anchor: ref loaded ({n_bc_params:,} params, frozen, "
               f"coef={args.bc_anchor_coef})", flush=True)
+
+    # Tier 3 C5 (S55+): single-graph compiled train_step for the batched PPO
+    # update. Built AFTER per-submodule compile so the per-submodule compile
+    # wrappers are transparently traced through by the outer graph (net effect
+    # is one fused forward+loss+backward+clip+optimizer.step graph). Stashed
+    # on the model object so it survives across iters and is reused (compile
+    # cache stays warm). Only built when both --tier3 + --compile are set
+    # AND the per-submodule compile succeeded; otherwise the eager batched
+    # path runs (still 4-10× faster than per-episode ppo_update).
+    #
+    # S60 Fix #2: `bc_anchor_enabled` closure-bound at compile time. When
+    # True, the compiled fwd_bwd accepts bc_logits + bc_anchor_coef_t as
+    # call-time tensor inputs. When False, no BC code is in the compiled
+    # region (zero overhead on non-BC training runs).
+    #
+    # Per S56 design (no shortcuts, ship optimal once): the full train_step
+    # in one graph maximizes kernel fusion across forward/backward/step
+    # boundaries. Safety gates (NaN, KL > target × 5) are in-graph tensor
+    # masks (no host sync, no graph break). See `make_compiled_train_step`
+    # docstring for details.
+    model._tier3_step = None
+    if args.tier3 and args.compile and compiled:
+        _bc_anchor_compile_flag = (bc_ref is not None and args.bc_anchor_coef != 0.0)
+        try:
+            model._tier3_step = make_compiled_train_step(
+                model, optimizer, cfg,
+                vf_coef=args.vf_coef,
+                max_grad_norm=args.max_grad_norm,
+                normalize_advantages=False,  # build_ppo_episodes already normalizes
+                bc_anchor_enabled=_bc_anchor_compile_flag,
+            )
+            _bc_suffix = (" + BC anchor" if _bc_anchor_compile_flag else "")
+            print(f"torch.compile: Tier 3 C5 train_step compiled "
+                  f"(fwd+loss+backward+clip+step in one graph{_bc_suffix})",
+                  flush=True)
+        except Exception as e:
+            print(f"torch.compile: Tier 3 C5 train_step SKIPPED ({e}); "
+                  f"--tier3 will use eager batched path", flush=True)
+            model._tier3_step = None
 
     # External opponents — appended AFTER resume so resumed pool state stays clean
     # (resume loads only local snapshot paths; externals are re-instantiated each

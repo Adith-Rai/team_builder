@@ -452,8 +452,15 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
 
     total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
 
-    # BC anchor (S57): KL(BC || model) masked-mean over valid positions
-    if bc_logits is not None and bc_anchor_coef != 0.0:
+    # BC anchor (S57): KL(BC || model) masked-mean over valid positions.
+    # S60 Fix #2: the Python `is not None` branch resolves at trace time
+    # (eager: bc_logits=None=False; compiled with BC: bc_logits=tensor=True),
+    # so no graph break. The previous `and bc_anchor_coef != 0.0` Python
+    # compare on a tensor coef would have graph-broken — removed. When
+    # bc_anchor_coef is a 0-dim tensor with value 0.0 (BC enabled at
+    # compile time but disabled per-call), the multiply zeroes the
+    # contribution without any Python control flow.
+    if bc_logits is not None:
         bc_lp = F.log_softmax(bc_logits.float(), dim=-1)
         bc_p = F.softmax(bc_logits.float(), dim=-1)
         # KL(BC || model) per-pos = sum_a BC_p(a) * (log BC_p(a) - log model_p(a))
@@ -842,7 +849,8 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
 def make_compiled_train_step(model, optimizer, cfg, vf_coef: float = 0.5,
                               max_grad_norm: float = 0.5,
-                              normalize_advantages: bool = False):
+                              normalize_advantages: bool = False,
+                              bc_anchor_enabled: bool = False):
     """Build the Tier 3 C5 compiled train_step.
 
     Returns an eager-wrapper callable that orchestrates:
@@ -879,83 +887,169 @@ def make_compiled_train_step(model, optimizer, cfg, vf_coef: float = 0.5,
     graph spanning forward + loss + backward.
 
     Args fixed at compile time (closure-captured constants):
-        model, optimizer, cfg, vf_coef, max_grad_norm, normalize_advantages
+        model, optimizer, cfg, vf_coef, max_grad_norm, normalize_advantages,
+        bc_anchor_enabled
 
     Args passed at call time as 0-dim tensors (avoid recompile when values
     change; ent_coef in particular moves per-iter under adaptive-entropy):
-        ent_coef_t, clip_eps_t, target_kl_t
+        ent_coef_t, clip_eps_t, target_kl_t, loss_scale_t,
+        [bc_logits, bc_anchor_coef_t]  ← only when bc_anchor_enabled=True
+
+    S60 Fix #2: added bc_anchor_enabled to support BC anchor through the
+    compile boundary. When True, the compiled fwd_bwd accepts bc_logits +
+    bc_anchor_coef_t as additional inputs and routes them into the loss
+    function's BC anchor branch. Bc_logits must be supplied by caller via
+    an EAGER BC ref forward (outside the compile boundary) per chunk —
+    the BC ref is a separate frozen model that wasn't covered by the
+    primary compile and shouldn't graph-break through the trainable model's
+    aot_autograd region. See `project_bc_anchor_design.md` for rationale.
+
+    S60 Fix #2: added loss_scale_t (always required) so the same compiled
+    function supports both single-batch (loss_scale=1.0) and minibatched
+    accumulating mode (loss_scale=1/n_chunks). Caller orchestrates the
+    minibatch loop eagerly via the `accumulating` flag on the wrapper.
 
     Returns: eager callable
-        (collated, ent_coef_t, clip_eps_t, target_kl_t) -> dict
+        train_step(collated, ent_coef_t, clip_eps_t, target_kl_t,
+                   bc_logits=None, bc_anchor_coef_t=None,
+                   loss_scale_t=None, accumulating=False) -> dict
+
     All return values are TENSORS — caller (ppo_update_batched compiled
     path) calls .item() outside for stats + KL early-stop check.
 
     Returned dict keys:
         total_loss, pi_loss, entropy, v_loss, approx_kl, ratio_clip_frac,
-        value_mean, return_mean, adv_abs_mean,
+        value_mean, return_mean, adv_abs_mean, bc_kl,
         step_mask  — 1.0 if backward had nonzero grad, 0.0 if skipped
         nan_safe   — 1.0 if forward+loss finite, 0.0 if NaN/inf
         kl_safe    — 1.0 if |approx_kl| <= target_kl × 5, 0.0 if gate fired
     """
-    def fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t):
-        """Compiled inner: forward + loss + masked-backward. Compile boundary."""
-        device = collated["actions"].device
+    if bc_anchor_enabled:
+        def fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t,
+                    bc_logits, bc_anchor_coef_t, loss_scale_t):
+            """Compiled inner with BC anchor.
 
-        # Forward (Tier 3 sequence-batched) + loss (tensor-only)
-        forward_out = model.forward_ppo_sequence(collated, device)
-        loss_dict = _ppo_loss_batched_internal(
-            collated, forward_out, model, cfg,
-            ent_coef=ent_coef_t, vf_coef=vf_coef, clip_eps=clip_eps_t,
-            normalize_advantages=normalize_advantages,
-        )
+            Compile-time signature includes bc_logits + bc_anchor_coef_t.
+            The `is not None` Python branch in _ppo_loss_batched_internal
+            resolves to True here (bc_logits is always a tensor) — no graph
+            break. bc_anchor_coef_t is a 0-dim tensor so per-call coef
+            changes don't trigger recompile.
+            """
+            device = collated["actions"].device
+            forward_out = model.forward_ppo_sequence(collated, device)
+            loss_dict = _ppo_loss_batched_internal(
+                collated, forward_out, model, cfg,
+                ent_coef=ent_coef_t, vf_coef=vf_coef, clip_eps=clip_eps_t,
+                normalize_advantages=normalize_advantages,
+                bc_logits=bc_logits, bc_anchor_coef=bc_anchor_coef_t,
+            )
 
-        total_loss = loss_dict["total_loss"]
-        approx_kl_t = loss_dict["approx_kl"]
+            total_loss = loss_dict["total_loss"]
+            approx_kl_t = loss_dict["approx_kl"]
 
-        # Safety masks — in-graph tensor compares (no host sync, no graph break)
-        nan_safe = torch.isfinite(total_loss).float()
-        kl_safe = (approx_kl_t.abs() <= target_kl_t * 5.0).float()
-        step_mask = nan_safe * kl_safe
-        # nan_to_num: even if step_mask is 0, NaN × 0 = NaN. Replace with 0
-        # so backward gives clean zero gradients on the skip path.
-        loss_safe = torch.nan_to_num(total_loss * step_mask,
-                                      nan=0.0, posinf=0.0, neginf=0.0)
-        # Backward INSIDE compile so aot_autograd captures fwd+bwd graphs together
-        loss_safe.backward()
+            nan_safe = torch.isfinite(total_loss).float()
+            kl_safe = (approx_kl_t.abs() <= target_kl_t * 5.0).float()
+            step_mask = nan_safe * kl_safe
+            # loss_scale_t * step_mask = chunk weight when accumulating
+            loss_safe = torch.nan_to_num(
+                total_loss * step_mask * loss_scale_t,
+                nan=0.0, posinf=0.0, neginf=0.0)
+            loss_safe.backward()
 
-        # Drift diagnostics — in graph, eager .item() at use site
-        with torch.no_grad():
-            pad_mask_f = collated["pad_mask"].to(device).float()
-            n_valid_t = pad_mask_f.sum().clamp(min=1.0)
-            returns_t = collated["returns"].to(device).float()
-            advantages_t = collated["advantages"].to(device).float()
-            v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
-            v_pred = (v_probs * get_v_support(model)).sum(-1)
-            value_mean_t = (v_pred * pad_mask_f).sum() / n_valid_t
-            return_mean_t = (returns_t * pad_mask_f).sum() / n_valid_t
-            adv_abs_mean_t = (advantages_t.abs() * pad_mask_f).sum() / n_valid_t
+            with torch.no_grad():
+                pad_mask_f = collated["pad_mask"].to(device).float()
+                n_valid_t = pad_mask_f.sum().clamp(min=1.0)
+                returns_t = collated["returns"].to(device).float()
+                advantages_t = collated["advantages"].to(device).float()
+                v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                v_pred = (v_probs * get_v_support(model)).sum(-1)
+                value_mean_t = (v_pred * pad_mask_f).sum() / n_valid_t
+                return_mean_t = (returns_t * pad_mask_f).sum() / n_valid_t
+                adv_abs_mean_t = (advantages_t.abs() * pad_mask_f).sum() / n_valid_t
 
-        return {
-            "total_loss":      total_loss,
-            "pi_loss":         loss_dict["pi_loss"],
-            "entropy":         loss_dict["entropy"],
-            "v_loss":          loss_dict["v_loss"],
-            "approx_kl":       approx_kl_t,
-            "ratio_clip_frac": loss_dict["ratio_clip_frac"],
-            "value_mean":      value_mean_t,
-            "return_mean":     return_mean_t,
-            "adv_abs_mean":    adv_abs_mean_t,
-            "step_mask":       step_mask,
-            "nan_safe":        nan_safe,
-            "kl_safe":         kl_safe,
-        }
+            return {
+                "total_loss":      total_loss,
+                "pi_loss":         loss_dict["pi_loss"],
+                "entropy":         loss_dict["entropy"],
+                "v_loss":          loss_dict["v_loss"],
+                "approx_kl":       approx_kl_t,
+                "ratio_clip_frac": loss_dict["ratio_clip_frac"],
+                "value_mean":      value_mean_t,
+                "return_mean":     return_mean_t,
+                "adv_abs_mean":    adv_abs_mean_t,
+                "step_mask":       step_mask,
+                "nan_safe":        nan_safe,
+                "kl_safe":         kl_safe,
+                "bc_kl":           loss_dict["bc_kl"],
+            }
+    else:
+        def fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t,
+                    loss_scale_t):
+            """Compiled inner without BC anchor (no-BC variant)."""
+            device = collated["actions"].device
+            forward_out = model.forward_ppo_sequence(collated, device)
+            loss_dict = _ppo_loss_batched_internal(
+                collated, forward_out, model, cfg,
+                ent_coef=ent_coef_t, vf_coef=vf_coef, clip_eps=clip_eps_t,
+                normalize_advantages=normalize_advantages,
+            )
+
+            total_loss = loss_dict["total_loss"]
+            approx_kl_t = loss_dict["approx_kl"]
+
+            nan_safe = torch.isfinite(total_loss).float()
+            kl_safe = (approx_kl_t.abs() <= target_kl_t * 5.0).float()
+            step_mask = nan_safe * kl_safe
+            loss_safe = torch.nan_to_num(
+                total_loss * step_mask * loss_scale_t,
+                nan=0.0, posinf=0.0, neginf=0.0)
+            loss_safe.backward()
+
+            with torch.no_grad():
+                pad_mask_f = collated["pad_mask"].to(device).float()
+                n_valid_t = pad_mask_f.sum().clamp(min=1.0)
+                returns_t = collated["returns"].to(device).float()
+                advantages_t = collated["advantages"].to(device).float()
+                v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                v_pred = (v_probs * get_v_support(model)).sum(-1)
+                value_mean_t = (v_pred * pad_mask_f).sum() / n_valid_t
+                return_mean_t = (returns_t * pad_mask_f).sum() / n_valid_t
+                adv_abs_mean_t = (advantages_t.abs() * pad_mask_f).sum() / n_valid_t
+
+            return {
+                "total_loss":      total_loss,
+                "pi_loss":         loss_dict["pi_loss"],
+                "entropy":         loss_dict["entropy"],
+                "v_loss":          loss_dict["v_loss"],
+                "approx_kl":       approx_kl_t,
+                "ratio_clip_frac": loss_dict["ratio_clip_frac"],
+                "value_mean":      value_mean_t,
+                "return_mean":     return_mean_t,
+                "adv_abs_mean":    adv_abs_mean_t,
+                "step_mask":       step_mask,
+                "nan_safe":        nan_safe,
+                "kl_safe":         kl_safe,
+                "bc_kl":           loss_dict["bc_kl"],
+            }
 
     # dynamic=True so variable B/L_max don't trigger per-shape recompile.
     # mode="default" matches S51 production choice (avoids cudagraph aliasing).
     compiled_fwd_bwd = torch.compile(fwd_bwd, mode="default", dynamic=True)
 
-    def train_step(collated, ent_coef_t, clip_eps_t, target_kl_t):
-        """Eager wrapper: zero_grad → COMPILED fwd+loss+bwd → (gated) clip+step.
+    def train_step(collated, ent_coef_t, clip_eps_t, target_kl_t,
+                   bc_logits=None, bc_anchor_coef_t=None,
+                   loss_scale_t=None, accumulating: bool = False):
+        """Eager wrapper.
+
+        Single-batch mode (default, accumulating=False):
+          zero_grad → COMPILED fwd+loss+bwd → (gated) clip+step.
+
+        Minibatched mode (accumulating=True):
+          Skip zero_grad + clip + step. Caller does zero_grad once before
+          the chunk loop, then calls this per chunk to accumulate gradients
+          via the compiled fwd_bwd. After all chunks, caller does clip + step.
+          loss_scale_t should be 1/n_chunks per call so the accumulated
+          gradient matches a single-batch gradient on the mean loss.
 
         The optimizer.step is ELIDED when step_mask is 0 (safety gate fired)
         to match the eager `ppo_update_batched` semantic — `continue`-equivalent.
@@ -963,13 +1057,41 @@ def make_compiled_train_step(model, optimizer, cfg, vf_coef: float = 0.5,
         small parameter drift even on zero gradients, since the AdamW update
         is `param ← param - lr * (m_hat / (sqrt(v_hat) + eps) + wd * param)`.
         Costs one .item() host sync per step (~10 μs, negligible).
+
+        S60 Fix #2: in accumulating mode, the caller is responsible for
+        checking step_mask per chunk and bailing the epoch if any chunk
+        trips (matches eager batched semantics — see ppo_update_batched).
         """
-        optimizer.zero_grad()
-        out = compiled_fwd_bwd(collated, ent_coef_t, clip_eps_t, target_kl_t)
-        if out["step_mask"].item() > 0.5:
-            if max_grad_norm > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+        device = collated["actions"].device
+        if loss_scale_t is None:
+            loss_scale_t = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+        if not accumulating:
+            optimizer.zero_grad()
+
+        if bc_anchor_enabled:
+            assert bc_logits is not None, (
+                "make_compiled_train_step compiled with bc_anchor_enabled=True; "
+                "bc_logits is required at call time (compute eagerly via "
+                "bc_ref.forward_ppo_sequence(collated, device) outside the "
+                "compile boundary, then pass action_logits.detach() here)")
+            assert bc_anchor_coef_t is not None, (
+                "bc_anchor_coef_t is required when bc_anchor_enabled=True")
+            out = compiled_fwd_bwd(
+                collated, ent_coef_t, clip_eps_t, target_kl_t,
+                bc_logits, bc_anchor_coef_t, loss_scale_t)
+        else:
+            assert bc_logits is None, (
+                "bc_logits passed but make_compiled_train_step was compiled "
+                "with bc_anchor_enabled=False; rebuild with the flag")
+            out = compiled_fwd_bwd(
+                collated, ent_coef_t, clip_eps_t, target_kl_t, loss_scale_t)
+
+        if not accumulating:
+            if out["step_mask"].item() > 0.5:
+                if max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
         return out
 
     return train_step
@@ -1096,64 +1218,166 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
 
         if compiled_step is not None:
             # ---- Tier 3 C5 compiled path: single-graph train_step ----
+            # S60 Fix #2: minibatched + BC anchor support.
+            # Chunks episodes (matching the eager path), eagerly forwards BC ref
+            # per chunk (outside the compile boundary), then accumulates
+            # gradients across chunks via compiled_step(accumulating=True).
+            # ONE clip+step at epoch end.
+            #
+            # Behavioral note: the in-graph kl_safe mask is APPLIED PER CHUNK
+            # (matches single-batch C5 semantics). This is STRICTER than the
+            # eager-batched path which gates only on epoch-averaged KL. In
+            # production at avg_kl ≈ 0.04 (target_kl × 5 = 0.15) per-chunk
+            # trips should be rare; if observed in practice, refactor to
+            # disable per-chunk KL gating in accumulating mode (would require
+            # separate compile variants — deferred until needed).
+            if minibatch_size is None or minibatch_size >= len(episodes):
+                chunks = [episodes]
+            else:
+                chunks = [episodes[i:i + minibatch_size]
+                          for i in range(0, len(episodes), minibatch_size)]
+            n_chunks = len(chunks)
+            inv_n = 1.0 / n_chunks
+
             try:
-                # Cap L_max at cfg.temporal_context + tail-truncate (S57 bug
-                # fix): forward_ppo_sequence's temporal forward truncates to
-                # cfg.temporal_context internally; outer indexing
-                # (temporal_ctx_grid[b_idx, t_idx]) then OOBs if L_max larger.
-                # getattr fallback: test mini cfg lacks temporal_context.
-                _temp_ctx = getattr(cfg, "temporal_context", None)
-                if _temp_ctx is not None:
-                    _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
-                    collated = collate_episodes(
-                        episodes, L_max=_eff_L, device=device, tail=True,
-                    )
-                else:
-                    collated = collate_episodes(episodes, L_max=L_max, device=device)
                 # 0-dim tensors — value-change does NOT trigger recompile.
                 # Adaptive entropy moves ent_coef per iter; passing as tensor
                 # keeps the compile cache hot.
                 ent_coef_t = torch.tensor(ent_coef, device=device, dtype=torch.float32)
                 clip_eps_t = torch.tensor(clip_eps, device=device, dtype=torch.float32)
                 target_kl_t = torch.tensor(target_kl, device=device, dtype=torch.float32)
+                loss_scale_t = torch.tensor(inv_n, device=device, dtype=torch.float32)
+                bc_anchor_coef_t = (
+                    torch.tensor(bc_anchor_coef, device=device, dtype=torch.float32)
+                    if (bc_ref is not None and bc_anchor_coef != 0.0)
+                    else None
+                )
 
-                with _update_amp_ctx:
-                    out = compiled_step(collated, ent_coef_t, clip_eps_t, target_kl_t)
+                optimizer.zero_grad()
+                chunk_stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
+                               "ratio_clip_frac": 0.0, "value_mean": 0.0,
+                               "return_mean": 0.0, "adv_abs_mean": 0.0,
+                               "bc_kl": 0.0}
+                chunk_nan = False
+                chunk_kl_trip = False
 
-                # All values are tensors. .item() AFTER the compiled call
-                # — the host sync here is OUTSIDE the graph, no graph break.
-                nan_safe_v = out["nan_safe"].item()
-                kl_safe_v = out["kl_safe"].item()
-                approx_kl_v = out["approx_kl"].item()
+                for chunk_idx, chunk_eps in enumerate(chunks):
+                    # Collate this chunk only (memory-bounded by chunk size).
+                    # Cap L_max at cfg.temporal_context + tail-truncate (S57
+                    # bug fix): forward_ppo_sequence truncates internally,
+                    # outer indexing requires L_max ≤ temporal_context.
+                    _temp_ctx = getattr(cfg, "temporal_context", None)
+                    if _temp_ctx is not None:
+                        _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                        collated = collate_episodes(
+                            chunk_eps, L_max=_eff_L, device=device, tail=True,
+                        )
+                    else:
+                        collated = collate_episodes(
+                            chunk_eps, L_max=L_max, device=device,
+                        )
 
-                # Classify the skip reason from the in-graph masks
-                if nan_safe_v < 0.5:
-                    print(f"  [WARN] NaN/inf in compiled train_step "
-                          f"(epoch {ppo_ep}), step skipped via mask",
-                          flush=True)
+                    # BC ref forward EAGERLY (outside compile boundary, per
+                    # chunk). The BC ref is a separate frozen model with its
+                    # own parameters that shouldn't be folded into the
+                    # trainable model's aot_autograd region. torch.no_grad
+                    # (NOT inference_mode — S57 dead path: inference_mode +
+                    # autocast bf16 → CUDA "index OOB" via CUBLAS_STATUS).
+                    bc_logits = None
+                    if bc_ref is not None and bc_anchor_coef != 0.0:
+                        with torch.no_grad():
+                            with _update_amp_ctx:
+                                bc_out = bc_ref.forward_ppo_sequence(collated, device)
+                                bc_logits = bc_out["action_logits"].detach()
+
+                    # Compiled fwd+loss+backward (accumulating into .grad).
+                    # No zero_grad or step inside — caller handles those.
+                    with _update_amp_ctx:
+                        out = compiled_step(
+                            collated, ent_coef_t, clip_eps_t, target_kl_t,
+                            bc_logits=bc_logits,
+                            bc_anchor_coef_t=bc_anchor_coef_t,
+                            loss_scale_t=loss_scale_t,
+                            accumulating=True,
+                        )
+
+                    # Per-chunk safety check (one host sync per chunk).
+                    # On NaN: bail the epoch (eager would have failed the
+                    # chunk; matches that semantic).
+                    nan_safe_v = out["nan_safe"].item()
+                    kl_safe_v = out["kl_safe"].item()
+                    if nan_safe_v < 0.5:
+                        print(f"  [WARN] NaN/inf in compiled chunk "
+                              f"{chunk_idx}/{n_chunks} (epoch {ppo_ep})",
+                              flush=True)
+                        chunk_nan = True
+                        break
+                    if kl_safe_v < 0.5:
+                        # Per-chunk KL trip: chunk's backward already wrote
+                        # zero grads via the in-graph mask. Continue
+                        # accumulating other chunks; epoch-level avg-KL
+                        # gate (below) decides whether to step.
+                        chunk_kl_trip = True
+
+                    # Aggregate per-chunk stats (each chunk weight = inv_n)
+                    chunk_stats["pi"] += out["pi_loss"].item() * inv_n
+                    chunk_stats["v"] += out["v_loss"].item() * inv_n
+                    chunk_stats["ent"] += out["entropy"].item() * inv_n
+                    chunk_stats["kl"] += abs(out["approx_kl"].item()) * inv_n
+                    chunk_stats["ratio_clip_frac"] += out["ratio_clip_frac"].item() * inv_n
+                    chunk_stats["value_mean"] += out["value_mean"].item() * inv_n
+                    chunk_stats["return_mean"] += out["return_mean"].item() * inv_n
+                    chunk_stats["adv_abs_mean"] += out["adv_abs_mean"].item() * inv_n
+                    chunk_stats["bc_kl"] += out["bc_kl"].item() * inv_n
+
+                    # Per-chunk memory cleanup
+                    del collated, out
+                    if bc_logits is not None:
+                        del bc_logits
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+                # ---- All chunks done — decide if we step ----
+                if chunk_nan:
                     n_skipped_nan += 1
-                    continue
-                if kl_safe_v < 0.5:
-                    n_skipped_kl += 1
+                    optimizer.zero_grad()
                     continue
 
-                # Stats (one optimizer.step actually landed)
-                stats["pi"] += out["pi_loss"].item()
-                stats["v"] += out["v_loss"].item()
-                stats["ent"] += out["entropy"].item()
-                stats["kl"] += abs(approx_kl_v)
-                stats["ratio_clip_frac"] += out["ratio_clip_frac"].item()
-                stats["value_mean"] += out["value_mean"].item()
-                stats["return_mean"] += out["return_mean"].item()
-                stats["adv_abs_mean"] += out["adv_abs_mean"].item()
+                avg_kl = chunk_stats["kl"]
+
+                # Epoch-level KL gate (averaged across chunks): match eager
+                # path semantics. If avg KL too high, discard accumulated grad.
+                if avg_kl > target_kl * 5:
+                    n_skipped_kl += 1
+                    optimizer.zero_grad()
+                    continue
+
+                # Clip + ONE optimizer.step for the whole epoch (across chunks).
+                if max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+
+                # Roll up chunk averages into epoch stats
+                for k, v in chunk_stats.items():
+                    stats[k] += v
                 n += 1
 
-                # KL early-stop check (same threshold + semantics as eager path)
-                if abs(approx_kl_v) > target_kl * 1.5:
-                    print(f"    KL early stop (batched-compiled): epoch "
-                          f"{ppo_ep}, kl={abs(approx_kl_v):.4f} > "
+                # KL early-stop on averaged KL
+                if avg_kl > target_kl * 1.5:
+                    print(f"    KL early stop (batched-compiled-mb): epoch "
+                          f"{ppo_ep}, kl={avg_kl:.4f} > "
                           f"{target_kl*1.5:.4f}", flush=True)
                     kl_early_stopped = True
+
+                # Diagnostic: surface per-chunk KL trips that survived to step
+                # (epoch avg passed but some chunks had high KL — informational).
+                if chunk_kl_trip:
+                    print(f"  [INFO] epoch {ppo_ep}: one or more chunks "
+                          f"tripped per-chunk KL gate (target_kl×5={target_kl*5:.4f}); "
+                          f"epoch avg_kl={avg_kl:.4f} survived. "
+                          f"Bad-KL chunks contributed zero gradient.",
+                          flush=True)
 
             except Exception as e:
                 print(f"  [ERROR] Compiled batched PPO epoch {ppo_ep} "
@@ -1163,10 +1387,6 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 optimizer.zero_grad()
                 continue
 
-            del collated, out
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
             continue  # next ppo_ep
 
         # ---- Eager path (compiled_step is None) ----
