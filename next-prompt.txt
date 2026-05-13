@@ -74,12 +74,57 @@ gap" number with no measurement source.
 8 battle_servers may still be alive. Safe to restart cleanly when fix
 work resumes.
 
-**Philosophy reaffirmed in S59** (per user explicit framing):
-- "No shortcuts" — every claim must be measurement-backed or labeled CONJECTURE
-- "Verify properly, label CONCRETE vs CONJECTURE" — applied per-finding
-- "Don't be married to any approach or idea" — willing to reframe when
-  data refutes (S59 reframed Track B three times)
-- "Make sure next session knows exactly what to do" — this section is that
+**Philosophy reaffirmed + expanded in S59** (per user explicit framing —
+also mirrored in MEMORY.md + `feedback_profile_driven_method.md`):
+
+- **No shortcuts. Ever.** Two directions:
+  (a) Don't ship "good enough for now" / half-finished work
+  (b) **Don't ADD speculative features either.** S59 example: user rejected
+      lr-decay / perm-at-eval / SE-rate-stop / entropy-cap flags because
+      no measured need. Speculative additions are shortcuts too, just
+      inverted. Both create touched-again work.
+
+- **No assumptions. Label CONCRETE vs CONJECTURE.** Every perf claim,
+  every "X is the bottleneck", every inherited number — tag with evidence
+  source OR mark conjectural. S59 caught a multi-session "18x speed gap
+  to ps-ppo" framing with NO measurement source that would have triggered
+  a 2-4 wk rewrite of the wrong layer.
+
+- **Don't be married to any approach or idea.** Willing to reframe when
+  data refutes. S59 reframed Track B three times (sim rewrite -> WS
+  rewrite -> orchestration fix). Each reframe was the methodology
+  working, not failure.
+
+- **Verify before recommending from memory/docs.** Older sections of
+  next-prompt.txt + various docs/*.md have outdated or conjectural content.
+  Newer findings override older speculation. When in doubt, grep current
+  code or run a measurement.
+
+- **Honest opinions, including pushback when user's premise is buggy.**
+  Partnership tone — "me and you against the problem". The user has
+  explicitly rewarded pushback in S52, S53, S54, S57, S59.
+
+- **Ask before destructive or load-bearing actions.** Cost of 60s
+  clarifying question << cost of irreversible mistake on wrong premise.
+
+- **Step back periodically.** Strategic reflection on the WHOLE approach,
+  not just the file in front of you. Triggers: stuck >30 min, user
+  pushback on plan, multiple components seem broken in sequence, cost
+  projections keep being wrong. S57 + S59 both had productive step-backs.
+
+- **The pod is paid time.** Quality > speed; cost discipline =
+  thoroughness, not haste. Don't run up the bill on re-investigated
+  settled questions OR on hypothetical fixes without measurement.
+
+- **"Done" means done.** Complete + validated + documented + handoff
+  captured. Not "works for now".
+
+- **Long-term focus on every change.** Every change should serve the
+  trajectory: Phase 1 v3 (done) -> Phase 2 elite gen 9 -> multi-gen ->
+  other formats. If a change doesn't serve that or would need touching
+  again later, re-evaluate before doing it.
+
+- **Make sure next session knows exactly what to do.** This section is that.
 
 ═══════════════════════════════════════════════════════════════════════════════
 END S59 WRAP — older sections below preserved for historical context
