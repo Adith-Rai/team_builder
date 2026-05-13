@@ -711,6 +711,10 @@ def _check_early_stop(eval_history, args):
 # =============================
 
 def main():
+    # DIAG profile-bottlenecks-s59: env-var gated, no-op when PROFILE_MODE != '1'
+    from profile_hook import maybe_start_viztracer, register_timing_dump
+    maybe_start_viztracer('main')
+    register_timing_dump('main')
     args = parse_args()
     device = torch.device(args.device)
     battle_format = args.format

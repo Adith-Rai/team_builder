@@ -457,6 +457,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
       ckpt_paths: list of K+1 ckpt paths. Length is the number of slots.
                   Single-element list is the Phase 1-3 single-slot mode.
     """
+    # DIAG profile-bottlenecks-s59: env-var gated, no-op when PROFILE_MODE != '1'
+    from profile_hook import maybe_start_viztracer, register_timing_dump
+    maybe_start_viztracer('cis')
+    register_timing_dump('cis')
+
     import warnings
     from multiprocessing.connection import wait as mp_wait
     warnings.filterwarnings("ignore")
@@ -1660,6 +1665,11 @@ def _cis_worker_main(worker_id: int, ctrl_pipe, result_pipe,
     process. Worker reconstructs a CISClientHandle from these and passes
     to CISInferenceBatcher.
     """
+    # DIAG profile-bottlenecks-s59: env-var gated, no-op when PROFILE_MODE != '1'
+    from profile_hook import maybe_start_viztracer, register_timing_dump
+    maybe_start_viztracer(f'worker_{worker_id}')
+    register_timing_dump(f'worker_{worker_id}')
+
     import warnings
     warnings.filterwarnings("ignore")
 
