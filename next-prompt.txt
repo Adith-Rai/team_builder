@@ -1,7 +1,53 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S62 WRAP (2026-05-14 early AM, post-prod-validation) — AUTHORITATIVE READ FIRST
+⚠️  S62 END WRAP (2026-05-14, post-update-profile) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S62 ended with a strategic pivot. Phase 2 prep is DEFERRED. The new arc
+is a multi-session UPDATE-PHASE OPTIMIZATION SEQUENCE based on profile data.**
+
+**Read FIRST**: `memory/project_optimization_tracker.md` — authoritative
+roadmap + operating principles inline (no shortcuts, push back hard,
+us-against-the-problem). It's the new "where are we" file for this arc.
+
+**Read SECOND**: `memory/project_s62_update_profile_findings.md` — the
+torch.profiler kernel breakdown that justifies the sequence priority.
+
+**S62 update profile findings (decisive)**:
+- Update phase is NOT GPU-compute-bound. It is ORCHESTRATION-bound.
+- CUDA kernels = only 8% of update wall (147s of 1931s).
+- TWO FREE WINS available (one-line changes, zero risk):
+  - `optimizer.zero_grad(set_to_none=True)` — eliminates 13.3% CPU on
+    `aten::fill_` (160k calls/iter)
+  - `.item()` audit + batch — eliminates 9% CPU on `_local_scalar_dense`
+    (9k calls × 4.3ms each = 38s sync wait per iter)
+  - Combined: 8-15% wall, ~1 hour dev, ~$2-3 validation
+- BIG architectural opportunity: sequence packing + varlen attention
+  eliminates the 24% CPU `aten::cat` (541k calls) + 28% GPU `aten::copy_`
+  (583k calls) waste. Estimated 1.5-3× wall. 2-4 sessions, MEDIUM-HIGH risk.
+- Liger-Kernel REFUTED (we use GELU+LayerNorm not SwiGLU+RMSNorm).
+- Regional `--compile` DEMOTED (we're not compute-bound on individual
+  kernels; CUDA Graphs covers the dispatch-overhead ground better).
+
+**Stacked optimistic ceiling**: 3-5× wall reduction across the sequence.
+32 min/iter → 6-10 min/iter at prod scale.
+
+**Phase 2 launch**: deferred until optimization sequence completes (or
+hits diminishing returns). User-approved.
+
+**Branch state**:
+- master at `869ef285` — S62 prod-validation docs + canonical Phase 2 stack
+- `diag/update-profile-s62` at `ec210df` — S62 profiler instrumentation (DIAG ONLY, do not merge)
+- Profile artifacts: local `data/s62_artifacts/s62_update_profile_v2.log`; pod `/workspace/team_builder/data/s62_artifacts/update_profile_iter0.json` (5.6GB chrome trace, pull on demand)
+
+**S63 NEXT (awaiting user approval)**: land the two free wins (0a + 0b)
+on branch `perf/free-wins-zero-grad-item-audit`. Validate via 1-iter prod
+A/B vs current master. Acceptance: ≥5% wall reduction + no health drift
+(kl, bc_kl, smart_avg-iter-2 within ±5pp).
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S62 EARLIER WRAP (Fix #1 + Fix #2 prod validations) — preserved below
 ═══════════════════════════════════════════════════════════════════════════════
 
 **S62 outcome: Fix #1 SHIPPED + prod-validated (-27% collect at 1600g/8w).
