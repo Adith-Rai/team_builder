@@ -1154,23 +1154,26 @@ def main():
 
         _flow("starting PPO update")
         t_update = time.time()
-        # S62 diag: torch.profiler around ppo_update_batched, gated by env var
+        # S64 diag: torch.profiler around ppo_update_batched, gated by env var
         # PROFILE_UPDATE_ITER=N (e.g. 0 = profile iter 0). Saves chrome trace
         # to /tmp/update_profile_iter{N}.json for kernel-level breakdown.
-        # Disposable; this branch (diag/update-profile-s62) NOT for master.
+        # S64 update vs S62: with_stack=True + record_shapes=True to pinpoint
+        # callsite origin of the 541k aten::cat hot-spot (S62 reported counts
+        # but no stacks). Disposable; on diag/update-profile-s64-with-stack.
+        # Trace size will be larger (~15-25 GB at prod scale, vs S62's 5.6 GB).
         import os as _os_for_profile
         _profile_iter_str = _os_for_profile.environ.get("PROFILE_UPDATE_ITER")
         _do_profile = (_profile_iter_str is not None and
                        int(_profile_iter_str) == it - start_iter)
         if _do_profile:
             import torch.profiler as _tp
-            print(f"  [PROFILE] enabling torch.profiler for update iter {it}",
-                  flush=True)
+            print(f"  [PROFILE] enabling torch.profiler for update iter {it} "
+                  f"(with_stack=True, record_shapes=True)", flush=True)
             _prof_ctx = _tp.profile(
                 activities=[_tp.ProfilerActivity.CPU,
                             _tp.ProfilerActivity.CUDA],
-                record_shapes=False,
-                with_stack=False,
+                record_shapes=True,
+                with_stack=True,
                 profile_memory=False,
             )
         else:
@@ -1230,6 +1233,27 @@ def main():
                 print(_prof.key_averages().table(
                     sort_by="self_cpu_time_total", row_limit=20),
                     flush=True)
+                # S64: stack-grouped + shape-grouped tables for callsite origin
+                # of aten::cat / aten::copy_ hot-spots. Wrap in own try since
+                # group_by_* can fail if stacks/shapes weren't fully captured.
+                try:
+                    print("  [PROFILE] top by self CPU time, GROUPED BY STACK (n=4):",
+                          flush=True)
+                    print(_prof.key_averages(group_by_stack_n=4).table(
+                        sort_by="self_cpu_time_total", row_limit=30),
+                        flush=True)
+                except Exception as e2:
+                    print(f"  [PROFILE] stack-grouped table failed: {e2}",
+                          flush=True)
+                try:
+                    print("  [PROFILE] top by self CPU time, GROUPED BY INPUT SHAPE:",
+                          flush=True)
+                    print(_prof.key_averages(group_by_input_shape=True).table(
+                        sort_by="self_cpu_time_total", row_limit=30),
+                        flush=True)
+                except Exception as e3:
+                    print(f"  [PROFILE] shape-grouped table failed: {e3}",
+                          flush=True)
             except Exception as e:
                 print(f"  [PROFILE] export failed: {e}", flush=True)
 
