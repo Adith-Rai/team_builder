@@ -1,7 +1,83 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S62 END WRAP (2026-05-14, post-update-profile) — AUTHORITATIVE READ FIRST
+⚠️  S63 WRAP (2026-05-14, post-free-wins) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S63 outcome: free wins SHIPPED at -4.2% update wall. Below my a-priori 5%
+gate but accepted because numerically equivalent + best-practice + audit
+showed we're at the ceiling for the FREE WINS category. Big wins live in
+S64 (sequence packing).**
+
+**Read FIRST**: `memory/project_optimization_tracker.md` — sequence roadmap
++ operating principles. S63 status now SHIPPED; S64 (sequence packing) is
+NEXT.
+
+**Read SECOND**: `memory/project_s63_free_wins_results.md` — full data + the
+"why we accepted below-gate" rationale (precedent for the multi-session arc).
+
+**S63 changes shipped to master**:
+- `optimizer.zero_grad(set_to_none=True)` at 12 callsites in `ppo.py`
+- Defer chunk-stats `.item()` to epoch boundary in eager Tier3 hot path
+  (uses `_ppo_loss_batched_internal` directly, tensor accumulators, one
+  `.item()` per epoch instead of per chunk)
+- Branch `perf/free-wins-zero-grad-item-audit` (commits `ef7815ff` +
+  `22fc08f3`), merged to master at S63 wrap
+
+**S63 measurement (1600g/8w/conc=200, 1 iter, canonical Phase 2 stack)**:
+- collect: 588s (-27% from no-Option-B baseline; unchanged from S62)
+- update: 1850s vs 1931s baseline = **-81s = -4.2%**
+- Per-iter wall reduction: ~$7-8 per Phase 2 run + similar per multi-gen
+- Health stats clean (kl=0.0155, bc_kl=0.0156, no NaN, no Traceback)
+
+**Why projection was off** (8-15% projected, 4.2% actual):
+- Profile (`project_s62_update_profile_findings.md`) showed 9000 .item()
+  calls/iter at avg 4.3ms = 38s of sync wait
+- My changes eliminated ~3600 of 9000 (the obvious chunk-loop ones)
+- Remaining ~5400 are mostly NaN gates (line 1435 forward NaN check, line
+  1455 loss NaN check) — NOT removable without correctness risk (forward
+  NaN propagating into backward → corrupted gradients)
+- Wall reduction 81s exceeded direct-cost-prediction (~50s) → the changes
+  also enabled better GPU pipelining beyond direct sync elimination
+
+**Precedent established for the multi-session arc**: gates are guidelines,
+not numerical idols. When data refutes projection, reframe + ship + move on
+(per principle §0.3). Don't perform discipline by holding zero-risk
+positive changes behind arbitrary thresholds.
+
+═══════════════════════════════════════════════════════════════════════════════
+S64 NEXT — SEQUENCE PACKING (THE BIG ONE)
+═══════════════════════════════════════════════════════════════════════════════
+
+**Targets** (from S62 profile):
+- 24% CPU `aten::cat` (541k per-turn temporal stack concat calls)
+- 28% GPU `aten::copy_` (583k internal tensor copies, much from padding)
+- Most of `_efficient_attention_forward` 9.5% (padding compute waste)
+
+**Estimated payoff**: 1.5-3× update wall = $50-100 saved per Phase 2 run
++ similar per multi-gen + ablation. Compounds.
+
+**Prerequisites** (BEFORE S64 implementation):
+1. **torch upgrade 2.2.1 → 2.5.1** (LTS) — required for
+   `torch.nn.attention.varlen` API. Verify compatibility:
+   - poke-env, the BC checkpoint loader (PyTorch state_dict format)
+   - CIS subprocess code (any torch IPC pattern that may have changed)
+   - The compiled C5 train_step path in `make_compiled_train_step`
+     (we don't use --compile but the function exists; should still load)
+   - Recommend: torch upgrade in isolation on dev pod first; smoke; then
+     merge to optimization branch
+
+**Likely refactor scope**: `forward_ppo_sequence` in `model_transformer.py`
+(currently builds padded `summary_grid (B, L_max, D)` and uses standard
+attention; needs to switch to packed sequences with `cu_seqlens` boundary
+tensor + varlen attention call). Possibly cascading into how episodes are
+stored in trajectories (`build_ppo_episodes`) and collated
+(`collate_episodes`).
+
+Risk: MEDIUM-HIGH. Cascades. Could be 2-4 sessions. User authorized.
+
+═══════════════════════════════════════════════════════════════════════════════
+S62 END WRAP (post-update-profile) — preserved below for context
 ═══════════════════════════════════════════════════════════════════════════════
 
 **S62 ended with a strategic pivot. Phase 2 prep is DEFERRED. The new arc
