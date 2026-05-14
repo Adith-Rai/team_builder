@@ -1154,6 +1154,29 @@ def main():
 
         _flow("starting PPO update")
         t_update = time.time()
+        # S62 diag: torch.profiler around ppo_update_batched, gated by env var
+        # PROFILE_UPDATE_ITER=N (e.g. 0 = profile iter 0). Saves chrome trace
+        # to /tmp/update_profile_iter{N}.json for kernel-level breakdown.
+        # Disposable; this branch (diag/update-profile-s62) NOT for master.
+        import os as _os_for_profile
+        _profile_iter_str = _os_for_profile.environ.get("PROFILE_UPDATE_ITER")
+        _do_profile = (_profile_iter_str is not None and
+                       int(_profile_iter_str) == it - start_iter)
+        if _do_profile:
+            import torch.profiler as _tp
+            print(f"  [PROFILE] enabling torch.profiler for update iter {it}",
+                  flush=True)
+            _prof_ctx = _tp.profile(
+                activities=[_tp.ProfilerActivity.CPU,
+                            _tp.ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+                profile_memory=False,
+            )
+        else:
+            from contextlib import nullcontext
+            _prof_ctx = nullcontext()
+        _prof = None  # initialized; set by `with _prof_ctx as _prof` if reached
         # Tier 3 (--tier3) routes to ppo_update_batched which is a drop-in
         # replacement: same args, same returned stats. Warmup iters fall
         # back to per-episode ppo_update because ppo_update_batched does NOT
@@ -1165,6 +1188,7 @@ def main():
         # ppo_update_batched runs its eager path (still 4-10× faster than
         # ppo_update via single-step-per-epoch batching).
         if args.tier3 and not in_warmup:
+          with _prof_ctx as _prof:
             loss_info = ppo_update_batched(
                 model, optimizer, episodes, device, cfg,
                 epochs=args.ppo_epochs, clip_eps=args.clip_eps,
@@ -1189,6 +1213,25 @@ def main():
             )
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")
+
+        # S62 diag: export profile trace + key_averages summary
+        if _do_profile and _prof is not None:
+            _trace_path = f"/tmp/update_profile_iter{it}.json"
+            try:
+                _prof.export_chrome_trace(_trace_path)
+                print(f"  [PROFILE] chrome trace exported: {_trace_path}",
+                      flush=True)
+                # Top 30 ops by self_cuda_time, total_cuda_time
+                print("  [PROFILE] top by self CUDA time:", flush=True)
+                print(_prof.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=30),
+                    flush=True)
+                print("  [PROFILE] top by self CPU time:", flush=True)
+                print(_prof.key_averages().table(
+                    sort_by="self_cpu_time_total", row_limit=20),
+                    flush=True)
+            except Exception as e:
+                print(f"  [PROFILE] export failed: {e}", flush=True)
 
         # ---- Catastrophic-failure guard (Session 33) ----
         if loss_info.get("n_succeeded", 1) == 0:
