@@ -759,13 +759,13 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
 
                 if loss.isnan() or loss.isinf():
                     print(f"  [WARN] NaN/inf loss (pi={pi_loss.item():.4f} v={v_loss.item():.4f}), T={T}, aborting PPO update", flush=True)
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     kl_early_stopped = True
                     break
 
                 # Gradient accumulation: accumulate N episodes before stepping
                 if accum_count == 0:
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 accum_count += 1
 
@@ -798,7 +798,7 @@ def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
                 traceback.print_exc()
                 n_failed += 1
                 # Reset gradient state to prevent stale/partial gradients
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 continue
 
@@ -1067,7 +1067,7 @@ def make_compiled_train_step(model, optimizer, cfg, vf_coef: float = 0.5,
             loss_scale_t = torch.tensor(1.0, device=device, dtype=torch.float32)
 
         if not accumulating:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         if bc_anchor_enabled:
             assert bc_logits is not None, (
@@ -1247,7 +1247,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     else None
                 )
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 chunk_stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
                                "ratio_clip_frac": 0.0, "value_mean": 0.0,
                                "return_mean": 0.0, "adv_abs_mean": 0.0,
@@ -1335,7 +1335,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 # ---- All chunks done — decide if we step ----
                 if chunk_nan:
                     n_skipped_nan += 1
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     continue
 
                 avg_kl = chunk_stats["kl"]
@@ -1344,7 +1344,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 # path semantics. If avg KL too high, discard accumulated grad.
                 if avg_kl > target_kl * 5:
                     n_skipped_kl += 1
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     continue
 
                 # Clip + ONE optimizer.step for the whole epoch (across chunks).
@@ -1378,7 +1378,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                       f"failed: {e}", flush=True)
                 traceback.print_exc()
                 n_failed += 1
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 continue
 
             continue  # next ppo_ep
@@ -1401,7 +1401,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
         inv_n = 1.0 / n_chunks
 
         try:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             chunk_stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
                            "ratio_clip_frac": 0.0, "value_mean": 0.0,
                            "return_mean": 0.0, "adv_abs_mean": 0.0,
@@ -1494,7 +1494,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             # ---- All chunks done — decide if we step ----
             if chunk_failed:
                 n_skipped_nan += 1
-                optimizer.zero_grad()  # discard accumulated grads
+                optimizer.zero_grad(set_to_none=True)  # discard accumulated grads
                 continue
 
             avg_kl = chunk_stats["kl"]
@@ -1503,7 +1503,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             # update if policy diverged too much. Discard accumulated grads.
             if avg_kl > target_kl * 5:
                 n_skipped_kl += 1
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 continue
 
             # Clip + ONE optimizer.step for the whole epoch (across all chunks).
@@ -1526,7 +1526,7 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             print(f"  [ERROR] Batched PPO epoch {ppo_ep} failed: {e}", flush=True)
             traceback.print_exc()
             n_failed += 1
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             continue
 
     # Normalize stats by number of completed epochs
