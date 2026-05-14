@@ -1439,7 +1439,10 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_failed = True
                         break
 
-                    loss_dict = ppo_loss_batched(
+                    # S63: call _ppo_loss_batched_internal directly to get
+                    # tensor outputs (avoids 4 .item() calls in ppo_loss_batched
+                    # per chunk — see project_s62_update_profile_findings.md).
+                    loss_dict = _ppo_loss_batched_internal(
                         collated, forward_out, model, cfg,
                         ent_coef=ent_coef, vf_coef=vf_coef,
                         clip_eps=clip_eps,
@@ -1459,15 +1462,22 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 # Backward — gradients accumulate into model.parameters().grad
                 chunk_loss.backward()
 
-                # Aggregate per-chunk stats (each chunk weight = 1/n_chunks)
-                chunk_stats["pi"] += loss_dict["pi_loss"].item() * inv_n
-                chunk_stats["v"] += loss_dict["v_loss"].item() * inv_n
-                chunk_stats["ent"] += loss_dict["entropy"].item() * inv_n
-                chunk_stats["kl"] += abs(loss_dict["approx_kl"]) * inv_n
-                chunk_stats["ratio_clip_frac"] += loss_dict["ratio_clip_frac"] * inv_n
-                chunk_stats["bc_kl"] += loss_dict.get("bc_kl", 0.0) * inv_n
+                # S63: accumulate as TENSORS (not floats) to defer .item()
+                # syncs to epoch boundary. Profile (S62) showed ~9k .item()
+                # calls/iter = ~38s of pure GPU->CPU sync wait. Each sync
+                # blocks the entire pipeline ~4.3ms. By keeping tensors,
+                # we get ONE conversion per stat per epoch instead of per
+                # chunk (~9 -> 1 syncs per chunk × 100 chunks ≈ 99% reduction).
+                # First chunk: chunk_stats[k] = 0.0 + tensor → tensor (PyTorch
+                # promotes). Subsequent chunks: tensor + tensor → tensor.
+                chunk_stats["pi"]              = chunk_stats["pi"]              + loss_dict["pi_loss"] * inv_n
+                chunk_stats["v"]               = chunk_stats["v"]               + loss_dict["v_loss"] * inv_n
+                chunk_stats["ent"]             = chunk_stats["ent"]             + loss_dict["entropy"] * inv_n
+                chunk_stats["kl"]              = chunk_stats["kl"]              + loss_dict["approx_kl"].abs() * inv_n
+                chunk_stats["ratio_clip_frac"] = chunk_stats["ratio_clip_frac"] + loss_dict["ratio_clip_frac"] * inv_n
+                chunk_stats["bc_kl"]           = chunk_stats["bc_kl"]           + loss_dict["bc_kl"] * inv_n
 
-                # Drift diagnostics (per-chunk averaged into epoch totals)
+                # Drift diagnostics (tensor accumulators; .item() at epoch end)
                 with torch.no_grad():
                     pad_mask_f = collated["pad_mask"].to(device).float()
                     n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
@@ -1475,12 +1485,9 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     advantages_t = collated["advantages"].to(device).float()
                     v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
                     v_pred = (v_probs * get_v_support(model)).sum(-1)
-                    chunk_stats["value_mean"] += (
-                        (v_pred * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
-                    chunk_stats["return_mean"] += (
-                        (returns_t * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
-                    chunk_stats["adv_abs_mean"] += (
-                        (advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk).item() * inv_n
+                    chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                    chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                    chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
 
                 # Per-chunk memory cleanup — prevents activation accumulation
                 # across chunks (the whole point of minibatching).
@@ -1496,6 +1503,14 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 n_skipped_nan += 1
                 optimizer.zero_grad(set_to_none=True)  # discard accumulated grads
                 continue
+
+            # S63: convert tensor accumulators to Python scalars (ONE .item()
+            # per stat per epoch instead of per chunk). avg_kl in particular
+            # MUST be a scalar for the gate compares below. See
+            # project_s62_update_profile_findings.md §4.1 win 0b.
+            for _k in chunk_stats:
+                if isinstance(chunk_stats[_k], torch.Tensor):
+                    chunk_stats[_k] = chunk_stats[_k].item()
 
             avg_kl = chunk_stats["kl"]
 
