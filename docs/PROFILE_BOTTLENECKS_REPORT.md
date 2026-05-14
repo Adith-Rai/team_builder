@@ -228,12 +228,16 @@ Tokenizer at 38% of forward is more than expected. Possibly optimizable.
 | # | Fix | Targets | Expected savings | Effort | Risk | Status |
 |---|---|---|---|---|---|---|
 | **1** | **Worker↔CIS dispatch redesign** — Option B: bump CIS batch window (`min_batch=8→32, timeout_ms=15→50`) to fix slot-starvation (H3) | small CIS fires (maxq=2-8 → 32-35) | **-40% collect at Phase C scale** (CONCRETE, S62 3-iter A/B at 200g/4w) | 1 session (~$4) | low (defaults preserved, opt-in flags) | **SHIPPED S62 (Option B sufficient)** |
-| **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **15-25% of update** (~70-140s) | 1-2 days | medium (torch 2.2.x dynamo limits) | **SHIPPED S60** |
+| **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **smoke 9× (64g/2w); prod -8% (REFUTED, S62)** | 1-2 days | medium (torch 2.2.x dynamo limits) | **CAPABILITY shipped S60, --compile DROPPED at prod S62** |
 | **3** | **Vectorize `collate_episodes`** | 11% of update (Python loop) | ~10% of update (~50s) | 2-3 days | low (clean unit-testable optimization) | **REFUTED S60** |
 
 **S62 Option B outcome**: tested `--cis-min-batch 32 --cis-timeout-ms 50` at 100g/2w smoke (-46% collect) + 3-iter A/B at 200g/4w (-40%/-41%/-40% per iter, mean -40%). Confirmed mechanism via per-slot CIS-STATS instrumentation (S62 A3): meanq 3.9 → 15, maxq 6 → 32-35, timeout_pct 100% → 84-94%, fire rate halved. H3 (slot starvation under one-opp-per-worker dispatch + tight 15ms timeout) was the dominant bottleneck at our scales — matches §3.4's prediction. See `memory/project_s62_fix1_b_results.md` for full data + mechanism analysis. Production launch should pass these flags.
 
 **Options A (worker-side aggregation) + C (shared-mem ring buffer)** designed in `project_s61_fix1_design.md` but skipped per S62 result — Option B captured ≥25% of collect (the Phase D threshold), so the more expensive options weren't needed. Could be revisited if production-scale (8w/conc=200) shows much smaller gain than Phase C (would imply H1/H2 contributing more than at our test scale).
+
+**Fix #1 prod-scale validation (S62)**: 1600g/8w/conc=200, 1 iter A/B. Baseline collect=809s, variant collect=592s (-27%). Compression vs Phase C (-40%) was as predicted: at prod scale slot 0 baseline meanq=7.7 (vs Phase C 3.9) was already approaching min_batch=8, so 71% of baseline fires were minbatch-driven (vs Phase C's 100% timeout). Variant gain shrinks accordingly. Still above 25% Phase D threshold. See `memory/project_s62_fix1_b_results.md`.
+
+**Fix #2 prod-scale validation (S62)**: 4 data points at 1600g/8w/conc=200 confirm `--compile` is **8% SLOWER per step** than eager at prod scale. S60 "9× speedup" was a smoke-only (64g/2w) anomaly that does NOT generalize. Recompile loop hypothesis REFUTED (only 2 recompiles in 34-min update via TORCH_LOGS=recompiles). The `forward_ppo_sequence` graph break + per-call compile dispatch overhead exceeds whatever kernel-fusion savings exist at prod chunk size. **Decision: drop `--compile` from canonical Phase 2 launch stack.** The S60 capability work (BC anchor + Tier3 + compile composition + bc_anchor_enabled closure flag) is still useful as engineering — we just don't pull the `--compile` trigger in production. See `memory/project_s62_fix2_prod_validation.md`.
 
 **Fix #2 actual measurement (S60 prod-pod smoke)**: compile cache hit
 gave **9× speedup on update phase iter-2** (190s → 21s with BC anchor +

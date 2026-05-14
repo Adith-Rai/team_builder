@@ -1,7 +1,54 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S62 WRAP (2026-05-13 night) — AUTHORITATIVE READ FIRST
+⚠️  S62 WRAP (2026-05-14 early AM, post-prod-validation) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S62 outcome: Fix #1 SHIPPED + prod-validated (-27% collect at 1600g/8w).
+Fix #2 (--compile) REFUTED at prod (8% SLOWER); DROPPED from Phase 2 stack.
+Phase 2 prep is now genuinely unblocked.**
+
+**The user's "no shortcuts" pushback paid off** — without prod-scale validation
+of BOTH Fix #1 and Fix #2 we'd have launched Phase 2 with --compile adding
+~8% wall-time overhead. Saved a real ~$25-30 per Phase 2 run (5-day, $200-300
+total) and similar savings on multi-gen.
+
+**Updated canonical Phase 2 launch stack** (use this, NOT older versions):
+```
+--cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
+--bc-anchor-ckpt v10 --bc-anchor-coef 0.1 \
+--cis-min-batch 32 --cis-timeout-ms 50
+```
+**(NO --compile — REFUTED at prod scale per S62 validation)**
+
+═══════════════════════════════════════════════════════════════════════════════
+S62 — PROD-SCALE VALIDATION FINDINGS (THE NEW STUFF)
+═══════════════════════════════════════════════════════════════════════════════
+
+**Fix #1 Option B at prod scale** (see [[project_s62_fix1_b_results]] §1.1 +
+[[project_s62_fix2_prod_validation]] for context):
+- Phase C (4w/conc=50): -40% collect (3 iters consistent)
+- Prod (8w/conc=200): -27% collect (1 iter A/B)
+- Compression as predicted: at prod baseline meanq=7.7 (vs Phase C 3.9) → 71%
+  of baseline fires were minbatch-driven → variant gain shrinks but still
+  passes the 25% Phase D threshold. SHIPS.
+
+**Fix #2 (--compile) at prod scale** (see [[project_s62_fix2_prod_validation]]):
+- 4 data points all show ~27 μs/step with --compile vs 25 μs/step eager
+  → compile is **8% SLOWER per step** at prod scale, on iter 1 cache-hit too
+- S60's "9× speedup" was at 64g/2w smoke (4 chunks × 16 episodes); at 1600g/8w
+  prod (100 chunks × 16 episodes) the per-call compile dispatch overhead
+  exceeds the kernel-fusion savings
+- TORCH_LOGS=recompiles confirmed: only 2 recompile events in entire 34-min
+  update (both early on `resume_in_forward_ppo_sequence` graph-break resume).
+  Recompile loop hypothesis REFUTED.
+- Decision: DROP --compile from canonical Phase 2 stack
+- The S60 engineering work (BC anchor + Tier3 + compile composition + the
+  bc_anchor_enabled closure flag pattern) is still a real capability — we
+  just don't pull the --compile trigger at prod
+
+═══════════════════════════════════════════════════════════════════════════════
+S62 — EARLIER (PRE-PROD-VALIDATION) WRAP — preserved below for reference
 ═══════════════════════════════════════════════════════════════════════════════
 
 **S62 outcome: Fix #1 SHIPPED via Option B. -40% collect at Phase C scale.
@@ -75,20 +122,22 @@ S62 — NEXT SESSION (S63) PRIORITY
 Per [[feedback_infra_first_means_first]]: all cost-compounding infra is now
 DONE (Fix #2 S60, Fix #1 S62). **Phase 2 prep is the next priority.**
 
-**Phase 2 prep checklist** (per S60 wrap §S58 list, with S62 corrections):
+**Phase 2 prep checklist** (per S60 wrap §S58 list, with S62 corrections — NO --compile):
 
 1. **Source 100-150 real elite gen-9-OU teams** for training pool
    (NEVER mix with the 16 mm-competitive eval teams — data leakage rule)
 2. **lr scheduling design** — likely cosine decay or step decay; re-ablate
-   post-Tier-3 since Fix #2's compile cache changed effective work-per-step
+   post-S62 to confirm 1e-5 is still optimal with the updated stack (no compile,
+   eager Tier3 + BC anchor)
 3. **External opps PFSP scaling** (S58 task #14 still pending)
 4. **H2H gauntlet wiring** — Kakuna/SmallRL/Minikazam adapters, ~3-4 hrs
-5. **Phase 2 launch script**: canonical stack now includes the new flags:
+5. **Phase 2 launch script**: canonical stack (per S62 prod validation):
    ```
    --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
    --bc-anchor-ckpt v10 --bc-anchor-coef 0.1 \
    --cis-min-batch 32 --cis-timeout-ms 50
    ```
+   **(NO --compile — refuted at prod scale per S62)**
 
 **At Phase 2 launch (S63 or later)**:
 - Recap in iter 0-1 that prod-scale (8w/conc=200) wall-time gain matches
