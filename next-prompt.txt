@@ -1,12 +1,25 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S64 STEP-BACK COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
+⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
-**S64 status: ARCH-vs-seq-packing step-back FULL-CONFIRMED at prod scale in
-favor of Option A (seq-packing on existing arch). Implementation ready,
-awaiting user authorization. NO code change yet.**
+**S64 status**:
+- Step-back FULL-CONFIRMED: Option A (seq-packing on existing arch) wins.
+  See [[project_s64_arch_revisit_profile_findings]].
+- Phase 1 PASSED: torch 2.5.1+cu121 upgrade is feasible; 8/8 compat tests
+  pass on prod via isolated venv (system torch 2.2.1 untouched).
+  See [[project_s64_phase1_torch_upgrade_results]].
+- **Three operational findings baked in for Phase A onward**:
+  1. `LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH`
+     required for cuDNN 9 — bake into S64 launch script (one-line wrapper).
+  2. Varlen API path = `flex_attention` + `create_block_mask`, NOT a
+     dedicated `varlen` module. Implementation pattern: per-episode causal
+     BlockMask via `searchsorted(cu_seqlens, ...)`.
+  3. Triton bumped 2.2.0 -> 3.1.0 — re-test S56 C5 compile path at Phase B.
+
+- Awaiting user authorization to begin **Phase A: collate_episodes_packed**
+  (design + impl). NO code change yet.
 
 **Read FIRST**: `memory/project_s64_arch_revisit_profile_findings.md` — full
 step-back reasoning with triple confirmation (shape decomp + code reading +
