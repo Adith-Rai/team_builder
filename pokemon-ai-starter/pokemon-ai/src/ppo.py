@@ -709,6 +709,121 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
     }
 
 
+# =============================
+# S64 Phase B.5: packed-mode PPO loss
+# =============================
+#
+# _ppo_loss_packed_internal is the flat (sum_T,)-shape version of
+# _ppo_loss_batched_internal. Consumes Phase A's collate_episodes_packed
+# output + forward_ppo_sequence_packed's flat outputs. No pad_mask
+# multiplications because every position is valid in packed layout —
+# `(x * pad_mask).sum() / n_valid` reduces to `x.mean()`. Mathematically
+# equivalent to the legacy at matching valid positions. The C3 docstring
+# at line 355-358 stated the desired aggregation is "per-transition mean";
+# packed layout makes this the natural reduction.
+
+def _ppo_loss_packed_internal(packed_collated: dict, forward_out: dict, model, cfg,
+                               ent_coef, vf_coef, clip_eps,
+                               normalize_advantages: bool = False,
+                               bc_logits=None, bc_anchor_coef=0.0) -> dict:
+    """Packed-mode PPO loss. S64 Phase B.5.
+
+    Drop-in semantics vs `_ppo_loss_batched_internal`:
+      - Same return-dict keys, same scalar tensor types.
+      - Same numerical contract at matching valid positions: at fp32 the
+        legacy `.sum()/n_valid` and the packed `.mean()` differ only by
+        floating-point reorder.
+      - Same BC anchor formulation (KL(BC || model), unchanged direction
+        + scale).
+
+    Input contract:
+      packed_collated: output of `ppo.collate_episodes_packed()`. Reads:
+        actions       (sum_T,) long
+        old_logp      (sum_T,) float
+        advantages    (sum_T,) float
+        returns       (sum_T,) float
+      forward_out: output of `model.forward_ppo_sequence_packed()`. Reads:
+        action_logits (sum_T, n_actions)
+        v_logits      (sum_T, v_bins)
+      model: TransformerBattlePolicy — for `model.twohot_target()`.
+      cfg: model config — reads cfg.v_min, cfg.v_max.
+
+    `ent_coef`, `vf_coef`, `clip_eps`: Python floats or 0-dim tensors.
+    `bc_logits`: optional (sum_T, n_actions) — BC ref's logits on the
+        SAME packed_collated batch (computed eagerly by caller).
+    `bc_anchor_coef`: scalar (Python float or 0-dim tensor).
+    """
+    actions = packed_collated["actions"]
+    old_logp = packed_collated["old_logp"]
+    advantages = packed_collated["advantages"]
+    returns = packed_collated["returns"]
+
+    logits_all = forward_out["action_logits"]    # (sum_T, n_actions)
+    vlogits_all = forward_out["v_logits"]        # (sum_T, v_bins)
+
+    device = logits_all.device
+    sum_T = logits_all.shape[0]
+    # n_valid = sum_T (all positions valid by construction). Kept as a tensor
+    # for return-contract compat with legacy (callers may .item() it).
+    n_valid = torch.tensor(float(sum_T), device=device).clamp(min=1.0)
+
+    actions = actions.to(device)
+    old_logp = old_logp.to(device).float()
+    advantages = advantages.to(device).float()
+    returns = returns.to(device).float()
+
+    if normalize_advantages:
+        # Legacy uses biased variance (sum / N, no Bessel correction); match.
+        adv_mean = advantages.mean()
+        adv_var = (advantages - adv_mean).pow(2).mean()
+        adv_std = adv_var.clamp(min=1e-8).sqrt()
+        advantages = (advantages - adv_mean) / adv_std
+
+    lp = F.log_softmax(logits_all.float(), dim=-1)                    # (sum_T, A)
+    new_logp = lp.gather(1, actions.unsqueeze(-1)).squeeze(-1)        # (sum_T,)
+    ratio = torch.exp(new_logp - old_logp)
+
+    with torch.no_grad():
+        clipped_per_pos = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float()
+        ratio_clip_frac = clipped_per_pos.mean()
+
+    s1 = ratio * advantages
+    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+    pi_loss = (-torch.min(s1, s2)).mean()
+
+    probs = F.softmax(logits_all.float(), dim=-1)
+    entropy = (-(probs * lp).sum(-1)).mean()
+
+    ret_c = returns.clamp(cfg.v_min, cfg.v_max)                       # (sum_T,)
+    vtgt = model.twohot_target(ret_c).float()                          # (sum_T, v_bins)
+    v_loss = (-(vtgt * F.log_softmax(vlogits_all.float(), dim=-1)).sum(-1)).mean()
+
+    with torch.no_grad():
+        approx_kl = (old_logp - new_logp).mean()
+
+    total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
+
+    # BC anchor: KL(BC || model) — same direction + formulation as legacy.
+    if bc_logits is not None:
+        bc_lp = F.log_softmax(bc_logits.float(), dim=-1)               # (sum_T, A)
+        bc_p = F.softmax(bc_logits.float(), dim=-1)
+        bc_kl = ((bc_p * (bc_lp - lp)).sum(-1)).mean()
+        total_loss = total_loss + bc_anchor_coef * bc_kl
+    else:
+        bc_kl = torch.zeros((), device=device)
+
+    return {
+        "total_loss":      total_loss,
+        "pi_loss":         pi_loss,
+        "entropy":         entropy,
+        "v_loss":          v_loss,
+        "approx_kl":       approx_kl,        # TENSOR scalar
+        "ratio_clip_frac": ratio_clip_frac,  # TENSOR scalar
+        "n_valid":         n_valid,          # TENSOR scalar
+        "bc_kl":           bc_kl,            # TENSOR scalar (0 if BC off)
+    }
+
+
 def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
                      ent_coef: float = 0.02, vf_coef: float = 0.5,
                      clip_eps: float = 0.2,
