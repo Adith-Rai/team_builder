@@ -1,7 +1,140 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S63 WRAP (2026-05-14, post-free-wins) — AUTHORITATIVE READ FIRST
+⚠️  S64 STEP-BACK COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**S64 status: ARCH-vs-seq-packing step-back FULL-CONFIRMED at prod scale in
+favor of Option A (seq-packing on existing arch). Implementation ready,
+awaiting user authorization. NO code change yet.**
+
+**Read FIRST**: `memory/project_s64_arch_revisit_profile_findings.md` — full
+step-back reasoning with triple confirmation (shape decomp + code reading +
+python frame stack reconstruction). Status SMOKE-CONFIRMED, PROD-PENDING.
+
+**Read SECOND**: `memory/project_optimization_tracker.md` §1 (updated) — ARCH
+row REFUTED AS PRIORITY; technique #1 (seq-packing) now IN FLIGHT (step-back).
+
+**The step-back question**: user paused before S64 implementation because
+seq-packing is itself an arch-touching commitment (2-4 sessions of refactor).
+The question: would we want to drop the temporal stack anyway, making seq-
+packing partially sunk cost? Answer based on profile data: **NO — the cat
+hot-spot lives in collate, not in the temporal stack.**
+
+**Smoke evidence (CONCRETE)**:
+- Smoke profile: 100g/2w/conc=25, 1 iter, canonical Phase 2 stack,
+  `PROFILE_UPDATE_ITER=0` with `with_stack=True` + `record_shapes=True`
+- Total `aten::cat` self CPU = 6.56s at smoke (34,198 events)
+- **42% of cat time** = cat of `[16 × (200, 6, 285)]` -> `torch.stack` in
+  `_stack_batch_dim` (ppo.py:301) — cross-episode batch-stack
+- **6% of cat time** = pair-cats `[(X, 6, 285), (200-X, 6, 285)]` for various
+  X -> padding cat in `_stack_pad_one_episode` (ppo.py:267) — per-episode
+  pad-to-L_max-with-zeros
+- Similar patterns for feature shapes (200, 4, 109) and (200, 6, 4, 23)
+- **95% of cat time is in `collate_episodes` data prep. 5% is attn-internal
+  qkv reshapes (avg 25us, total 0.34s).**
+
+**Prod evidence (CONCRETE — FULL CONFIRMATION)**:
+- Prod profile: 1600g/8w/conc=200, 1 iter, canonical Phase 2 stack, same
+  PROFILE_UPDATE_ITER=0 + with_stack=True + record_shapes=True
+- Update wall = 3256s profiled (vs S62 ~32 min unprofiled = 1.7x overhead,
+  within projected 1.5-1.8x band)
+- Trace exported: 9.06 GB (less than projected 15-25 GB)
+- **541,593 cat events parsed (matches S62's 541k headline)**
+- **Total cat self CPU = 93.89s = 23.6% of update CPU (398s)**
+- **Decomposition**:
+  - Big batch-stack (n>=8 same shape): 60.7% (57.0s) — `_stack_batch_dim`
+  - Padding pair (2 tensors sum=200): 27.4% (25.7s) — `_stack_pad_one_episode`
+  - Attn-internal (empty Input Dims): 11.2% (10.5s) — qkv reshapes inside FA
+  - Other misc: 0.7% (0.66s)
+- **88.1% of cat self CPU in collate-driven patterns at prod scale**
+- **Top single signature**: `cat([(200, 6, 285)] x 16)` at 990 events x
+  36.66 ms avg = **38.6% of all cat time = ~9% of update CPU from one
+  callsite** (`_stack_batch_dim` line 301)
+- **Bonus finding**: 160k `aten::fill_` calls at prod = 160,486 (vs S62's
+  160,501) — essentially unchanged DESPITE S63's `set_to_none=True`. Means
+  most fill_ are NOT grad zeroing — they're padding zeros from collate
+  (`torch.zeros(pad_shape, ...)` at ppo.py:202/235/265/279). Seq-packing
+  eliminates these too. Adds 62s CPU + 4.2s GPU to savings projection.
+- **Total reachable by seq-packing: ~150s CPU + ~5s GPU = ~38% of update CPU**
+
+**Stack reconstruction (TRIPLE-CONFIRMS callsite)**: for one specific 90ms
+cat event with 16 × (200, 6, 285) inputs, extracted python_function events
+spanning the cat's ts range on the same thread:
+```
+train_rl.py:1378 <module>
+  -> train_rl.py:1194 main()
+    -> ppo.py:1104 ppo_update_batched()
+      -> ppo.py:126 collate_episodes()
+        -> ppo.py:293 _stack_batch_dim()
+          -> torch.stack()  <- the cat
+```
+
+**Code cross-check (CONCRETE)**: `ppo.py:301` is `_t.stack([d[k] for d in
+per_ep_list], dim=0)`. `ppo.py:267` is `_t.cat([stacked, pad], dim=0)`.
+Both inside `collate_episodes` (ppo.py:126). Matches the trace shapes exactly.
+
+**Implication**: Option A (seq-packing on existing arch) IS THE RIGHT CALL.
+Option B (drop temporal stack) addresses ~zero of dominant waste — temporal
+stack consumes <8% of update wall, dominant waste is in data prep.
+
+**Status at end of step-back (FULL-CONFIRMED)**:
+- Branch `diag/update-profile-s64-with-stack` at `f08e9e1c` (cherry-pick of
+  S62 diag onto master + with_stack/record_shapes flips). Pushed to origin.
+  DIAG ONLY — never merge to master.
+- Prod pod: python KILLED, GPU clear (1 MiB), 8 battle_servers up, HEAD on
+  diag branch. Pod-side trace at `/tmp/update_profile_iter0.json` (9 GB,
+  can be deleted now that local pull confirmed).
+- All artifacts pulled to local `data/s64_artifacts/`:
+  - `s64_smoke_with_stack.log` (52 KB) + `s64_smoke_trace.json` (631 MB)
+  - `s64_prod_with_stack.log` (54 KB) + `s64_prod_trace.json` (9.06 GB)
+- Local HEAD: `463827b4` (master). Uncommitted: memory file updates
+  (project_s64_arch_revisit_profile_findings.md NEW, MEMORY.md pointer,
+  tracker §1/§3/§4/§7 edits, this next-prompt section). Ready to commit
+  as one S64 step-back wrap commit when user confirms.
+
+**Canonical pre-S64 baseline (for post-S64 A/B)**:
+The S64 prod profile uses the SAME canonical Phase 2 stack as S63 (no code
+change, just env-gated profiler). So the baseline IS the S63 numbers from
+[[project_s63_free_wins_results]] §1.2:
+
+| Metric | Value |
+|---|---|
+| collect | 588s |
+| **update** | **1850s** |
+| W/L/T | 798/801/0 (49.9%) |
+| steps | 76,533 |
+| kl | 0.0155 |
+| bc_kl | 0.0156 |
+| pi | 0.0111 |
+| v | 13.9351 |
+
+Gate for S64 implementation A/B: update wall <= 1850 x 0.7 = 1295s
+(>=30% reduction) + no health drift (kl, bc_kl, smart_avg-iter-2 within
++/-5pp of these baselines).
+
+**S64 implementation plan (AFTER prod-confirmation + user authorization)**:
+1. Torch upgrade 2.2.1 -> 2.5.1 (LTS) in isolation on dev pod first; verify
+   BC v10 loads, poke-env works, CIS subprocess pattern works
+2. Design memo for packed format: explicit `collate_episodes_packed` spec
+   returning `(flat_feat_batches, cu_seqlens, max_seqlen)`
+3. Phased implementation:
+   - Phase A: `collate_episodes_packed` + unit tests
+   - Phase B: refactor `forward_ppo_sequence` for packed input + varlen attn
+   - Phase C: refactor `ppo_loss_batched` for cu_seqlens masking
+   - Phase D: wire `--seq-packed` flag in train_rl.py
+   - Phase E: A/B at canonical Phase 2 stack vs current master; gate >=30%
+     wall reduction + no health drift
+   - Phase F: merge on gate pass
+4. Estimated cost: $10-30 across 2-4 sessions
+
+**REFUTED IN S64 STEP-BACK (don't reopen)**:
+- Drop temporal stack as priority for optimization arc — refuted by
+  profile data (temporal stack <8% of update wall). May revisit
+  post-Phase-2 as a quality exercise; NOT as part of this arc.
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S63 WRAP (2026-05-14, post-free-wins) — preserved below for context
 ═══════════════════════════════════════════════════════════════════════════════
 
 **S63 outcome: free wins SHIPPED at -4.2% update wall. Below my a-priori 5%
