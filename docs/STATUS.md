@@ -1,8 +1,70 @@
 # Project Status
 
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-05-14 (S64 Phase A wrap)
 
-## Current Phase: Phase E — TRAINING at confirmed plateau, decision point: CLOUD.
+---
+
+## CURRENT STATE — S64 Phase A (sequence packing arc)
+
+**Where we are**: Phase 1 v3 DONE (diagnosed as failing via type-knowledge erosion, S57). Phase 2 DEFERRED until update-optimization sequence completes. Currently in multi-session optimization arc; S64 Phase A SHIPPED on `perf/seq-packing` branch.
+
+**Branch state**:
+- `master` at S64 Phase A wrap commit (post `1ebf45a4`, plus this STATUS refresh)
+- `perf/seq-packing` at `70fd33df` — **S64 Phase A SHIPPED**, origin pushed
+
+**Active work**: S64 Phase B NEXT (awaiting fresh session + user authorization). Sub-phases B.1-B.7 spec'd in `memory/project_s64_phase_a_results.md` §4. Estimated $3-5 pod, 1-2 sessions. Bit-equivalence gate at fp32 + bf16.
+
+**Canonical Phase 2 launch stack** (post-S62/S63 refutations):
+```
+--cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
+--bc-anchor-ckpt v10 --bc-anchor-coef 0.1 \
+--cis-min-batch 32 --cis-timeout-ms 50
+```
+NO `--compile` (REFUTED at prod S62 per REFUTED_LOG.md #1). NO perm-at-eval (REFUTED S60 per REFUTED_LOG.md #17).
+
+**Cumulative optimization arc cost**: ~$20.50 (S62 $15 + S63 $2 + S64 step-back ~$3 + S64 Phase 1 isolation $0.50 + S64 Phase A $0).
+
+**Read for full context**:
+- `next-prompt.txt` at project root — session-specific deep state (S64 Phase A wrap at top)
+- `docs/PROFILE_BOTTLENECKS_REPORT.md` — bottleneck data + optimization arc state
+- `docs/REFUTED_LOG.md` — techniques tried and refuted (don't retry these)
+- `docs/SESSION_BOOT_PROTOCOL.md` — standing orders
+- `memory/project_optimization_tracker.md` — optimization arc roadmap + session protocols
+- `memory/project_s64_phase_a_results.md` — Phase A results + §4 detailed Phase B plan
+
+---
+
+## ERA INDEX — S30-S64 high-level arc
+
+For session-by-session detail, see the historical record below this section (preserved verbatim from S33 era). For S35+ detail not in this file, see the corresponding memory files in `memory/project_session*` or session wraps in `next-prompt.txt`.
+
+| Era | Sessions | Theme | Outcome |
+|---|---|---|---|
+| BC + LSTM IQL | S20-S30 | First architecture iterations; 3.85M LSTM hits 25-30% plateau vs smart bots | Plateau identified; transformer needed |
+| Transformer + BC v6/v7 | S31-S35 | New 20M arch (CausalTransformerCore); BC v6 SmallRL-level | Established transformer baseline |
+| RL v9 self-play | S35-S43 | PPO self-play on transformer; multiple runs to 60% smart_avg ceiling | Hit perm/canonical eval distribution mismatch |
+| mp_disk + POKE_LOOP infrastructure | S43-S50 | Multi-process collection architecture; per-worker POKE_LOOP | Production-scale collection enabled |
+| S50 lr regression + Phase 1 v1/v2 | S50 | `--lr 3e-5` caused catastrophic regression on transformer arch; 4-point ablation locked `--lr 1e-5` | See `docs/PHASE1_DIAGNOSIS_REPORT.md` |
+| CIS (Centralized Inference Service) | S52-S54 | Pool-mirror multi-slot, async-dispatch, Phase 4.6 Option B full-reset | `memory/project_cis_4_6_design.md` |
+| Tier 3 sequence-batched PPO + compile | S55-S57 | C1-C5 + train_rl wiring + BC anchor + `--tier3-minibatch-size N` | All SHIPPED; required for prod scale |
+| Phase 1 v3 + collapse diagnosis | S57 | Production run to ~iter 90; diagnosed 3-stage collapse (exploration → type-knowledge erosion → strategic collapse) | BC anchor designed to prevent in Phase 2. `memory/project_phase1_v3_diagnosis.md` |
+| S58 ghost-tie fixes | S58 | `asyncio.gather` of N heterogeneous opp coros was starving small batches → wait_for cancels → `battle.won=None`; replaced with one-opp-per-worker | `memory/project_s58_session_narrative.md` |
+| S59 profile-driven Track B | S59 | Worker viztracer at prod: 82% poll-wait on CIS; bottleneck is Python orchestration, NOT sim/WS | See `docs/PROFILE_BOTTLENECKS_REPORT.md` |
+| S60-S61 Fix #1/#2/#3 design + smoke | S60-S61 | Fix #2 (--compile) shipped capability; Fix #3 (vectorize collate) REFUTED via microbench; Fix #1 design memo | `memory/project_s61_fix1_design.md` |
+| S62 prod validations + update profile | S62 | Fix #1 Option B SHIPPED at prod (-27% collect); Fix #2 REFUTED at prod (8% slower); torch.profiler reveals update is ORCHESTRATION-bound (CUDA = 8% of update wall) | `memory/project_s62_fix*.md`, `memory/project_s62_update_profile_findings.md` |
+| S63 free wins | S63 | `optimizer.zero_grad(set_to_none=True)` + `.item()` audit defer SHIPPED → -4.2% update wall. Below 8-15% projection but ceiling for the free-wins category. | `memory/project_s63_free_wins_results.md` |
+| S64 step-back + Phase 1 + Phase A (CURRENT) | S64 | Step-back: sequence packing prioritized over ARCH (drop temporal stack); torch 2.5.1 venv-isolation PASSED; `collate_episodes_packed` SHIPPED on `perf/seq-packing` at `70fd33df` with 11/11 equivalence tests | `memory/project_s64_*.md` (4 memos) |
+| S64 Phase B NEXT | (next session) | Refactor `forward_ppo_sequence` to consume packed via `flex_attention` + per-episode causal `BlockMask` | Awaiting authorization |
+
+---
+
+## Historical record (preserved from S33 era, 2026-04-08)
+
+The content below is the doc as it existed at S33 wrap. Preserved verbatim because it captures the per-session detail of the era it covers. For S35+ content, see memory files and session wraps in `next-prompt.txt`.
+
+---
+
+## Current Phase: Phase E — TRAINING at confirmed plateau, decision point: CLOUD. (S33 era — preserved)
 
 ### Session 33: Terminal-reward experiment ran 10 evals. Plateau confirmed. Cloud is next.
 
