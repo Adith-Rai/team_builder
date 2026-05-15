@@ -2590,6 +2590,102 @@ class TransformerBattlePolicy(nn.Module):
             "v_logits":      out_vlogits,
         }
 
+    def forward_ppo_sequence_packed(self, packed_collated: dict,
+                                     device: torch.device) -> Dict[str, torch.Tensor]:
+        """Sister to forward_ppo_sequence. S64 Phase B.3.
+
+        Consumes Phase A's collate_episodes_packed output (flat (sum_T, ...)
+        feat tensors + cu_seqlens) and returns flat (sum_T, ...) outputs.
+        Eliminates the scatter-gather around the temporal stack that legacy
+        forward_ppo_sequence does (Phases 1-2 + 5 + 7-8); the spatial and
+        action-context passes (legacy Phases 3-4) already operate on flat
+        (n_valid, ...) shapes so they're reused unchanged.
+
+        Input schema (from `ppo.collate_episodes_packed()`):
+            packed_collated["flat_feat_batches"]: dict, leaves (sum_T, ...)
+            packed_collated["cu_seqlens"]:        (B+1,) int32
+            packed_collated["seq_lens"]:          (B,) long   (not used here)
+            packed_collated["max_seqlen"]:        int          (not used here)
+            packed_collated["B"]:                 int
+
+        Output schema (FLAT — no scatter back to padded grid):
+            action_logits: (sum_T, n_actions)
+            value:         (sum_T,)
+            v_logits:      (sum_T, v_bins)
+
+        Phase B.5's _ppo_loss_packed_internal will consume these directly.
+        No pad_mask multiplication needed — every position is valid in
+        packed layout, so per-transition `.mean()` gives exactly the
+        Metamon-style per-transition mean the C3 docstring (ppo.py:355)
+        always targeted.
+        """
+        cfg = self.cfg
+        flat_feat = packed_collated["flat_feat_batches"]
+        cu_seqlens = packed_collated["cu_seqlens"]
+
+        # sum_T = total valid positions = cu_seqlens[-1]
+        sum_T = int(cu_seqlens[-1].item()) if cu_seqlens.numel() > 1 else 0
+
+        # Move feat_batches to device (recurse for nested dicts — matches
+        # legacy _gather_recursive). cu_seqlens handled by temporal.forward_packed.
+        def _to_device(d):
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor):
+                    out[k] = v.to(device)
+                elif isinstance(v, dict):
+                    out[k] = _to_device(v)
+                else:
+                    out[k] = v
+            return out
+        flat_feat = _to_device(flat_feat)
+
+        if sum_T == 0:
+            # Defensive (Phase A raises on zero-length episodes, but be safe).
+            n_actions = cfg.format_config.n_actions
+            return {
+                "action_logits": torch.full((0, n_actions), -100.0, device=device),
+                "value":         torch.zeros(0, device=device),
+                "v_logits":      torch.zeros(0, cfg.v_bins, device=device),
+            }
+
+        # Spatial pass — already operates on flat (N, ...) shapes. No gather.
+        spatial_out, all_summaries = self.forward_spatial(flat_feat)
+
+        # Action context — also flat. Mirrors legacy Phase 4.
+        our_full_ids = self.tokenizer._fix_ids(flat_feat, "our")  # (sum_T, 6, 7)
+        action_ctx = self._per_action_context(
+            spatial_out=spatial_out,
+            our_pokemon_move_ids=our_full_ids[..., 3:7],
+            active_move_ids=flat_feat["active_move_ids"],
+            switch_ids=flat_feat["switch_ids"],
+            our_pokemon_species_ids=our_full_ids[..., 0],
+            switch_cont=flat_feat["switch_cont"],
+        )
+
+        # Temporal stack on packed sequence (B.2's forward_packed). Replaces
+        # legacy Phases 5 (scatter into padded grid) + 6 (padded temporal
+        # forward) + 7 (gather back) with one packed call.
+        temporal_ctx = self.temporal.forward_packed(all_summaries, cu_seqlens)
+        # → (sum_T, d_temporal)
+
+        # Heads (already flat). Mirrors legacy Phase 8 minus the scatter.
+        actor_out  = spatial_out[:, 0, :]   # (sum_T, d_model)
+        critic_out = spatial_out[:, 1, :]   # (sum_T, d_model)
+        legal_valid = flat_feat["legal_mask"]  # (sum_T, n_actions)
+
+        logits = self.action_head(
+            actor_out, temporal_ctx, action_ctx, legal_mask=legal_valid,
+        )  # (sum_T, n_actions)
+        v_logits, value = self.value_head(critic_out, temporal_ctx)
+        # → (sum_T, v_bins), (sum_T,)
+
+        return {
+            "action_logits": logits,
+            "value":         value,
+            "v_logits":      v_logits,
+        }
+
 
 # =============================
 # CLI: build the lookup table
