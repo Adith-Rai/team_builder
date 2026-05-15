@@ -1,7 +1,81 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
+⚠️  S64 PHASE B SHIPPED (2026-05-15) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**FIRST ACTION FOR NEXT SESSION**: read `memory/project_s64_phase_b_results.md`
+(full Phase B wrap: B.1-B.8 outcomes + canonical Phase 2 launch with --packed +
+all numerical findings). Then ask user: continue optimization arc (#2 CUDA
+Graphs, 1.3-2× projected, 1-2 sessions, ~$2-4) or pivot to Phase 2 prep?
+Per `feedback_infra_first_means_first.md` infra-first is correct, but the
+~7.3% update wall payoff means each remaining technique has lower marginal
+ROI than #1 had — user may reasonably pivot.
+
+**Phase B sequence packing = SHIPPED + MEASURED at prod**:
+- Update wall: 1865s → 1729s = **-7.3%**
+- Overall wall: 2451s → 2320s = **-5.3%**
+- Numerical drift: small (kl/bc_kl ~-0.003), stable across smoke/prod
+- bc_kl drift is in FAVORABLE direction (lower = closer to BC anchor)
+- 200-iter Phase 2 saving: ~7.3 hr / ~$11 vs legacy
+- ALL 5 bit-equiv gates passed (B.2 temporal, B.3+B.4 fwd fp32+bf16,
+  B.5 loss 12-combo with non-zero BC anchor, B.6 e2e smoke)
+
+**CANONICAL PHASE 2 LAUNCH (UPDATED, includes --packed)**:
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+nohup ./launch_rl.sh \
+  --init-from data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-coef 0.1 \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
+  --packed \
+  --cis-min-batch 32 --cis-timeout-ms 50 \
+  --games-per-iter 1600 --max-concurrent 200 \
+  --n-iters 200 --warmup-iters 0 \
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --target-kl 0.03 \
+  --grad-accum 1 --turn-cap 300 \
+  --reward-style terminal \
+  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --eval-interval 10 --eval-games 200 --eval-team-set metamon-competitive \
+  --snapshot-interval 10 \
+  --early-stop --early-stop-patience 3 \
+  --win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50 \
+  --out-dir data/models/rl_v10/<RUN_NAME> \
+  > /tmp/<RUN_NAME>.log 2>&1 &
+```
+
+Three changes vs prior canonical: `./launch_rl.sh` wrapper (sets LD_LIBRARY_PATH
+for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), drop `--device cuda` +
+`--servers ...` (defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...`
+NOT `/workspace/team_builder/raw_data/...` (memory had it wrong).
+
+**Pre-Phase-2-launch checklist**:
+1. RESTART battle_server.js processes (per Phase B §3.3 — state degrades over
+   runs; the +86% collect regression in B.8 first-pass was env, NOT packed)
+2. Verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
+3. Verify 8 battle servers up
+4. Either --init-from BC v10 (fresh) or --resume <SNAPSHOT> (continuation)
+
+**Pod state at wrap**:
+- prod (port 47913): clean (0 python, 8 battle_server.js fresh, GPU 0% with
+  ~6 GiB CUDA leftover that's harmless), HEAD `perf/seq-packing` 6b1d4562 →
+  merging to master at this wrap. Torch 2.5.1+cu121 in-place; LD_LIBRARY_PATH
+  exported in ~/.bashrc as safety net.
+- local: all logs pulled to `data/s64_artifacts/phase_b/` (b8r_legacy.log
+  29 MB, b8r_packed.log 125 KB, fp32_* smoke logs)
+
+**Open questions for next session** (per optimization tracker §3):
+1. Attention dropout in packed path — adds F.dropout(p=0.05) post-flex shim.
+   Documented bias is ~-0.003 kl in favorable direction; likely not needed.
+   Revisit only if Phase 2 shows divergent convergence.
+2. Delete `perf/seq-packing` branch post-merge? Leaning keep (no cost).
+3. argparse `--help` bug (literal → in help string collides with % format).
+   One-line fix at a clean moment. Not blocking.
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — historical, S64 Phase B above supersedes
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**: read memory/project_s64_phase1_torch_upgrade_results.md
