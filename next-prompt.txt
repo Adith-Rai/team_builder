@@ -8,7 +8,7 @@ pre prompt :
 §4 (Phase A spec). Then ask user to authorize Phase A start before writing
 any code. Phase A = single-file change in pokemon-ai-starter/pokemon-ai/src/
 ppo.py adding `collate_episodes_packed()` on a new branch `perf/seq-packing`
-off master (master HEAD at the start of next session = `ae66c3c0`).
+off master (master HEAD at the start of next session = `5c0a40e1`).
 
 **S64 status**:
 - Step-back FULL-CONFIRMED at prod scale: Option A (seq-packing on existing
@@ -25,7 +25,7 @@ off master (master HEAD at the start of next session = `ae66c3c0`).
   3. Triton bumped 2.2.0 -> 3.1.0 — re-test S56 C5 compile path at Phase B.
 
 - Awaiting user authorization to begin **Phase A: collate_episodes_packed**
-  (design + impl). NO code change yet. Master at `ae66c3c0`.
+  (design + impl). NO code change yet. Master at `5c0a40e1`.
 
 **Read order for next session**:
 1. `memory/MEMORY.md` (auto-loaded; entries 4n + 4o cover S64 step-back + Phase 1)
