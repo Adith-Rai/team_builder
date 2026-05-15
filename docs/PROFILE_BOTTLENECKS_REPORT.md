@@ -5,6 +5,96 @@ Supersedes prior framings in `next-prompt.txt` (`§task #22 simulator rewrite`,
 `18× speed gap to ps-ppo`) which were CONJECTURE without empirical backing.
 Where this doc disagrees with prior docs, trust this one — it's measurement-based.
 
+**Last updated**: S64 Phase A wrap, 2026-05-14.
+
+**See also**: `docs/REFUTED_LOG.md` — companion doc consolidating all techniques tried + refuted across sessions, with evidence + rationale + revisit-conditions.
+
+---
+
+## S64 Phase A update (post-step-back + Phase A): collate_episodes_packed SHIPPED on perf branch
+
+**S64 status**: sequence packing is the right priority. Phase A shipped; Phase B NEXT.
+
+**S64 step-back** (full-confirmed at prod): Option A (seq-packing on existing arch) wins over Option B (drop temporal stack). Step-back was prompted because seq-packing is itself an arch-touching commitment; the question was whether we'd want to drop the temporal stack anyway (making seq-packing partially sunk cost). Profile data answered: NO — the cat hot-spot lives in `collate_episodes` data prep, not in the temporal stack.
+
+**Prod profile (CONCRETE, with_stack=True + record_shapes=True at 1600g/8w/conc=200, 1 iter)**:
+- Total `aten::cat` self CPU = 93.89s = **23.6% of update CPU** (398s) — matches S62 24% headline
+- 541,593 cat events parsed and shape-bucketed:
+  - Big batch-stack (n≥8 same shape): 60.7% (57.0s) — `_stack_batch_dim` (ppo.py:301)
+  - Padding pair (two tensors summing to 200): 27.4% (25.7s) — `_stack_pad_one_episode` (ppo.py:267)
+  - Attn-internal (empty Input Dims): 11.2% (10.5s) — qkv reshapes inside FA
+  - Other misc: 0.7%
+- **88.1% of cat self CPU lives in collate-driven patterns at prod scale.** Reachable by sequence packing.
+- Top single signature: `cat([(200, 6, 285)] × 16)` at 990 events × 36.66ms avg = **38.6% of all cat time = ~9% of update CPU from one callsite** (`_stack_batch_dim` cross-episode stack of spatial-feature tensors).
+
+**Bonus prod finding**: `aten::fill_` count at prod = 160,486 (vs S62 160,501) DESPITE S63's `set_to_none=True`. Means most fill_ calls are NOT grad zeroing — they're padding zero allocations from `collate_episodes` (`torch.zeros(pad_shape, ...)` at ppo.py:202/235/265/279). Seq-packing eliminates these too. Adds 62s CPU + 4.2s GPU to savings projection.
+
+**Total reachable by seq-packing**: ~150s CPU + ~5s GPU = **~38% of update CPU**.
+
+**Phase 1 (torch 2.5.1 upgrade isolation) PASSED**: 8/8 compat tests on prod via isolated venv. Three operational findings baked in: LD_LIBRARY_PATH wrapper for cuDNN 9, varlen API = flex_attention not dedicated module, triton 3.1.0 (re-test C5 compile path at Phase B).
+
+**Phase A SHIPPED** on branch `perf/seq-packing` at `70fd33df`: `collate_episodes_packed(episodes, max_seqlen, device, tail)` in `ppo.py:347-557` alongside legacy `collate_episodes` (untouched). 11/11 equivalence unit tests pass first run (`test_collate_packed.py`). Pure additive change — function is DEAD CODE by design until Phase B wires it. Zero pod time.
+
+**Phase B NEXT** (awaiting fresh session + user authorization): refactor `forward_ppo_sequence` to consume packed via `flex_attention` with per-episode causal `BlockMask`. Estimated 1-2 sessions, $3-5 pod, bit-equivalence gate at fp32 + bf16.
+
+**ARCH revisit REFUTED AS PRIORITY**: dropping the temporal stack addresses ~0 of dominant waste (temporal stack consumes <8% of update wall, bounded by total CUDA kernel time = 8%). May revisit post-Phase-2 as quality exercise; NOT as part of optimization arc. See `REFUTED_LOG.md` entry #33.
+
+**Memory sources**:
+- `memory/project_s64_arch_revisit_profile_findings.md` — full step-back reasoning + prod data
+- `memory/project_s64_phase1_torch_upgrade_results.md` — torch 2.5.1 venv isolation
+- `memory/project_s64_phase_a_results.md` — Phase A shipped + §4 detailed Phase B plan
+
+---
+
+## S63 update (post-free-wins): -4.2% update wall SHIPPED
+
+**S63 outcome**: free wins SHIPPED at -4.2% update wall (below the 8-15% a-priori projection from S62 profile but accepted because numerically equivalent + best-practice + audit showed remaining `.item()` calls are NaN gates that can't be safely removed).
+
+**Two changes shipped to master** (`463827b4`):
+1. `optimizer.zero_grad(set_to_none=True)` at 12 callsites in `ppo.py` — eliminates allocate-then-fill pattern for grad zeroing.
+2. Defer chunk-stats `.item()` to epoch boundary in eager Tier3 hot path — `_ppo_loss_batched_internal` called directly, tensor accumulators, one `.item()` per epoch instead of ~3600 per epoch (chunks × stats keys).
+
+**Measurement** (1600g/8w/conc=200, 1 iter, canonical Phase 2 stack):
+- collect: 588s (unchanged from S62 — same Option B)
+- update: 1850s vs 1931s baseline = **-81s = -4.2%**
+- Health stats clean (kl=0.0155, bc_kl=0.0156)
+
+**Why projection was off**: profile showed 9000 `.item()` calls/iter at avg 4.3ms = 38s sync. My changes eliminated ~3600 (the obvious chunk-loop ones). Remaining ~5400 are NaN gates (forward NaN check ppo.py:1435, loss NaN check ppo.py:1455) — NOT removable without correctness risk. The 81s wall reduction exceeded the direct sync-elimination prediction (~50s), suggesting set_to_none also enabled better GPU pipelining.
+
+**Memory source**: `memory/project_s63_free_wins_results.md`
+
+---
+
+## S62 update (post-prod-validation + update profile): orchestration-bound, optimization arc begins
+
+**S62 was decisive**: Fix #1 Option B SHIPPED (-27% collect at prod), Fix #2 (--compile) REFUTED at prod (-8% i.e. SLOWER). Update profile with torch.profiler reveals the update phase is ORCHESTRATION-bound, not GPU-compute-bound. Pivots us from one-fix-at-a-time to a multi-session optimization sequence.
+
+**Fix #1 Option B SHIPPED**: `--cis-min-batch 32 --cis-timeout-ms 50` at prod scale (1600g/8w/conc=200) → collect 809s → 592s = **-27%**. H3 (slot starvation under one-opp-per-worker + tight 15ms timeout) confirmed dominant via per-slot CIS-STATS: meanq 3.9 → 15, maxq 6 → 32-35. Update flags into canonical Phase 2 launch stack. See `memory/project_s62_fix1_b_results.md`.
+
+**Fix #2 (--compile whole-fn) REFUTED at prod**: 4 prod-scale data points at 1600g/8w showed --compile is **8% SLOWER per step** than eager (27μs vs 25μs). S60 9× speedup was a smoke-only (64g/2w) anomaly. Recompile loop hypothesis refuted via TORCH_LOGS=recompiles (only 2 recompile events in 34-min update). The S60 capability work (BC anchor + Tier3 + compile composition) stands as engineering; we just don't pull the --compile trigger. Canonical Phase 2 stack has --compile REMOVED. See `memory/project_s62_fix2_prod_validation.md`.
+
+**Update profile findings (torch.profiler kernel breakdown at prod, 38% overhead)**:
+- **CUDA kernels = only 8% of update wall** (147s of 1931s). Update is orchestration-bound, NOT GPU-compute-bound.
+- `aten::copy_`: 28% of GPU time, 583k calls/iter — most are padding copies inside `collate_episodes`
+- `aten::cat`: 24% of CPU time, 541k calls/iter — also collate-driven (confirmed S64 step-back)
+- `aten::fill_`: 13.3% CPU, 160k calls/iter — grad zeroing AND padding zero allocations
+- `_local_scalar_dense` (`.item()` syncs): 9% CPU, 9000 calls × avg 4.3ms = 38s sync wait
+- `_efficient_attention_forward`: 9.5% — some is padding compute waste
+
+**Two free wins identified** (8-15% wall projection, one-line changes):
+- `optimizer.zero_grad(set_to_none=True)` (eliminates fill_ for grad zeroing) → SHIPPED S63
+- `.item()` audit + batch (eliminates obvious chunk-loop syncs) → SHIPPED S63
+
+**Big architectural opportunity**: sequence packing + varlen attention → S64.
+
+**Demoted via profile**:
+- Liger-Kernel — we use GELU + LayerNorm, NOT SwiGLU + RMSNorm (does not apply). See REFUTED_LOG.md entry #3.
+- Regional torch.compile as primary win — not compute-bound on individual kernels; CUDA Graphs covers same ground better. See REFUTED_LOG.md DEMOTED #1.
+
+**Memory source**: `memory/project_s62_update_profile_findings.md`
+
+**Stacked optimistic ceiling across the optimization arc**: 3-5× wall reduction. 32 min/iter → 6-10 min/iter at prod scale (CONJECTURE, depends on Phase B/seq-packing landing + CUDA Graphs).
+
 ---
 
 ## S60 update (post-recon): Fix #2 SHIPPED, Fix #3 REFUTED
@@ -45,14 +135,20 @@ removed since Fix #3 doesn't pay off).
 
 ## TL;DR
 
+**Current state (S64 Phase A)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); sequence packing IN FLIGHT (Phase A SHIPPED; Phase B NEXT, awaiting auth). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
+
 | Claim | Status | Evidence |
 |---|---|---|
 | WS+Node layer is the bottleneck | **FALSE** | WS round-trip = 0.165ms localhost, 6000 req/sec |
 | Showdown sim is the bottleneck | **FALSE** | Direct BattleStream ceiling = 529-623 turns/sec/Node, multi-Node ~5000 |
 | Our throughput is 83 states/sec vs ps-ppo 1500 (18× gap) | **MISLEADING** | Our actual = 22-41 turns/sec; gap framing conflated infra + architectural confounds. Real infra-only-closable gap is smaller and entirely in **Python orchestration**, not sim/WS. |
-| **Workers blocked 82% of wall time on `mp.connection.poll()` waiting for CIS** | **TRUE** | Worker_0 viztracer, prod-scale (800g/8w) — see §1 |
+| **Workers blocked 82% of wall time on `mp.connection.poll()` waiting for CIS** (S59) | **TRUE then; FIXED S62** | Worker_0 viztracer, prod-scale (800g/8w) — Fix #1 Option B `--cis-min-batch 32 --cis-timeout-ms 50` recovers -27% at prod. See §3 + S62 update at top. |
 | GPU is bottleneck during collect | **FALSE** | 57% GPU util during collect — CIS not saturated |
-| Update is fast in prod | **FALSE** | 506s update at 800g, ~70% GPU-bound, ~11% in `collate_episodes` Python loop |
+| Update is ~70% GPU-bound (S59 inference) | **REFUTED at prod scale, S62 profile** | torch.profiler shows CUDA kernels = only 8% of update wall (147s of 1931s). Update is ORCHESTRATION-bound. See S62 update at top. |
+| Update has 11% in `collate_episodes` Python loop (S59) | **SUPERSEDED — actual prod is 24% CPU cat, 88% collate-driven** | S64 prod with_stack profile: 541k cat events, 23.6% of update CPU, 88.1% in `_stack_batch_dim` + `_stack_pad_one_episode`. Plus 160k `aten::fill_` calls (most are padding zeros from collate, not grad zeroing). Sequence packing addresses both. |
+| --compile delivers 15-25% update savings | **REFUTED at prod, S62** | 4 prod data points at 1600g/8w show --compile is 8% SLOWER per step (27μs vs 25μs). S60 9× was smoke-only anomaly. DROPPED from Phase 2 stack. |
+| Liger-Kernel drop-in saves update time | **REFUTED (arch mismatch), S62** | We use GELU + LayerNorm, not SwiGLU + RMSNorm. Drop-in doesn't apply. |
+| Dropping temporal stack saves update time | **REFUTED AS PRIORITY, S64 step-back** | Temporal stack <8% of update wall. Dominant waste is in data prep (collate_episodes), not in temporal stack. May revisit post-Phase-2. |
 
 ---
 
@@ -223,13 +319,39 @@ Tokenizer at 38% of forward is more than expected. Possibly optimizable.
 
 ---
 
-## §5. Action plan — top 3 fixes ranked by ROI (post-S60, updated S62)
+## §5. Action plan — current state of all techniques (post-S64 Phase A)
+
+### §5.0 Historical fixes (S60-S62)
 
 | # | Fix | Targets | Expected savings | Effort | Risk | Status |
 |---|---|---|---|---|---|---|
-| **1** | **Worker↔CIS dispatch redesign** — Option B: bump CIS batch window (`min_batch=8→32, timeout_ms=15→50`) to fix slot-starvation (H3) | small CIS fires (maxq=2-8 → 32-35) | **-40% collect at Phase C scale** (CONCRETE, S62 3-iter A/B at 200g/4w) | 1 session (~$4) | low (defaults preserved, opt-in flags) | **SHIPPED S62 (Option B sufficient)** |
-| **2** | **Task #12: BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | **smoke 9× (64g/2w); prod -8% (REFUTED, S62)** | 1-2 days | medium (torch 2.2.x dynamo limits) | **CAPABILITY shipped S60, --compile DROPPED at prod S62** |
-| **3** | **Vectorize `collate_episodes`** | 11% of update (Python loop) | ~10% of update (~50s) | 2-3 days | low (clean unit-testable optimization) | **REFUTED S60** |
+| **1** | **Worker↔CIS dispatch redesign** — Option B: bump CIS batch window (`min_batch=8→32, timeout_ms=15→50`) to fix slot-starvation (H3) | small CIS fires (maxq=2-8 → 32-35) | **-40% collect at Phase C scale; -27% at prod 1600g/8w** | 1 session (~$4) | low | **SHIPPED S62, in canonical Phase 2 stack** |
+| **2** | **BC anchor + Tier3 + compile composition** | ~70% GPU-bound update share | smoke 9× (64g/2w); prod -8% i.e. SLOWER | 1-2 days | medium | **CAPABILITY shipped S60, --compile DROPPED at prod S62. See REFUTED_LOG.md #1** |
+| **3** | **Vectorize `collate_episodes` (Python-side)** | 11% of update Python loop (S59 framing — superseded) | ~10% of update (~50s) | 2-3 days | low | **REFUTED S60. See REFUTED_LOG.md #2. Superseded by S64 sequence packing.** |
+
+### §5.1 Optimization arc (S63+, multi-session, profile-validated priorities)
+
+Source: `memory/project_optimization_tracker.md`. Current state below.
+
+| # | Technique | Status | Measured / projected | Effort | Risk | Branch | Memo |
+|---|---|---|---|---|---|---|---|
+| **0a** | `optimizer.zero_grad(set_to_none=True)` (12 callsites in `ppo.py`) | **SHIPPED S63** | combined w/ 0b: **-4.2% wall** | 0.25 session | ZERO | merged to master | `project_s63_free_wins_results.md` |
+| **0b** | `.item()` audit + batch (defer chunk-stats to epoch boundary in eager Tier3) | **SHIPPED S63 w/ 0a** | combined: -4.2% wall | 0.5 session | ZERO | same branch as 0a | same memo |
+| **1** | **Sequence packing + varlen attention** — eliminates 24% CPU `aten::cat`, 28% GPU `aten::copy_`, 16% CPU `aten::fill_` (padding zeros), most FA padding waste. Requires torch upgrade 2.2.1 → 2.5+. | **PHASE A SHIPPED S64; PHASE B NEXT** | **1.5-3× wall (prod-data-supported, ~38% update CPU reachable)** | 2-4 sessions total | MEDIUM-HIGH (cascades through collate + forward_ppo_sequence + loss) | `perf/seq-packing` at `70fd33df` | `project_s64_phase_a_results.md` (Phase B plan in §4) |
+| 2 | CUDA Graphs over train_step — eliminates 5.9% direct launch overhead (1.8M launches) + most of 1.4M `aten::empty` allocations | PENDING (after #1) | 1.3-2× | 1-2 sessions | MEDIUM | `perf/cuda-graphs` | tbd |
+| 3 | Investigate `cudaMemcpyAsync` 62k @ 990μs root cause | PENDING (opportunistic) | UNKNOWN | 0.5-1 session | LOW | `perf/memcpy-investigation` | tbd |
+| ❌ | ~~Liger-Kernel~~ | **REFUTED — arch mismatch (GELU + LayerNorm, not SwiGLU + RMSNorm)** | — | — | — | — |
+| ❌ | ~~Regional `torch.compile` as primary win~~ | **DEMOTED — CUDA Graphs covers same ground better** | — | — | — | — |
+| ❌ | ~~Token-bucket dynamic batching as separate technique~~ | **DEMOTED — overlaps with #1** | — | — | — | — |
+| ARCH | ~~Drop temporal stack~~ | **REFUTED AS PRIORITY (S64 step-back) — addresses ~0 of dominant waste; may revisit post-Phase-2** | — | — | — | — |
+
+**Stacked optimistic ceiling (profile-validated)**: ~3-5× wall reduction. 32 min/iter → 6-10 min/iter at prod scale.
+
+**Sequence packing reachable wall** (CONCRETE from S64 prod profile, with caveat band):
+- Padding cats (`_stack_pad_one_episode`): 27.4% of cat time = ~6.5% of update CPU — ELIMINATED
+- Padding fill_ (`torch.zeros(pad_shape, ...)`): ~16% of update CPU — ELIMINATED
+- Big batch-stack cat: ~14% of update CPU — reduced (still cats once per feature key, less dispatch overhead)
+- Realistic floor: ~25% update wall reduction. Realistic ceiling: ~40%. Phase E gate at 30% achievable but not comfortable.
 
 **S62 Option B outcome**: tested `--cis-min-batch 32 --cis-timeout-ms 50` at 100g/2w smoke (-46% collect) + 3-iter A/B at 200g/4w (-40%/-41%/-40% per iter, mean -40%). Confirmed mechanism via per-slot CIS-STATS instrumentation (S62 A3): meanq 3.9 → 15, maxq 6 → 32-35, timeout_pct 100% → 84-94%, fire rate halved. H3 (slot starvation under one-opp-per-worker dispatch + tight 15ms timeout) was the dominant bottleneck at our scales — matches §3.4's prediction. See `memory/project_s62_fix1_b_results.md` for full data + mechanism analysis. Production launch should pass these flags.
 
@@ -255,7 +377,9 @@ viztracer-INCLUSIVE time including child C ops that are bandwidth-bound).
 - Tokenizer `_encode_pokemon_block` optimization — small CIS forward gain
 - CUDA graphs for full update step — possible 10-20% but out of scope unless others tap out
 
-### §5.1 Recommended sequencing (post-S60)
+### §5.2 Historical sequencing (post-S60 era — superseded by §5.1 above)
+
+The below sequencing reflects S60-era thinking, before S62 update profile revealed update is orchestration-bound (not GPU-bound). Preserved as historical record; current authoritative sequencing is §5.1.
 
 1. **S61: Fix #1 design session** — no code; compare IPC redesign options
    (worker-side submission aggregation, CIS `timeout_ms` window tuning,
@@ -268,7 +392,9 @@ viztracer-INCLUSIVE time including child C ops that are bandwidth-bound).
 3. **After Fix #1 lands**: Phase 2 prep (task #14 Metamon scaling, source
    100-150 elite teams, etc.) on the now-fast/cheap infra.
 
-### §5.2 Combined effect (post-S60, projection updated)
+### §5.3 Combined effect (S60-era projection — partially superseded)
+
+S60-era projection assumed Fix #2 9× speedup would hold at prod (refuted S62) and that Fix #1 captured 30-60% of collect (Option B captured -27%, in range). Current authoritative projections in §5.1 above.
 
 If Fix #1 hits its estimate (Fix #2 already shipped, Fix #3 dropped):
 - collect: 958s → ~400-600s (30-60% reduction) — pending Fix #1
@@ -329,13 +455,18 @@ vizviewer data/profiling/round3/profile_worker_0_*.json
 |---|---|---|
 | WS round-trip = 0.165ms | **CONCRETE** | Bench, 10000 samples |
 | Direct BattleStream = 529 turns/sec single-thread | **CONCRETE** | Bench, 50 battles |
-| Workers 82% poll-wait | **CONCRETE** | viztracer worker_0 |
+| Workers 82% poll-wait (S59) | **CONCRETE then; REMEDIATED S62 via Fix #1 Option B (-27% collect at prod)** | viztracer worker_0; Option B batch-window tuning resolved most |
 | CIS GPU util 57% | **CONCRETE** | nvidia-smi during prod |
 | CIS forward 16ms | **CONCRETE** | CIS-STATS instrumentation in prod |
-| Update is ~70% GPU-bound | **STRONG INFERENCE** | gap between Python time + wall time; expected for transformer training |
-| compile would save 20-40% of GPU update share | **CONJECTURE** | based on typical transformer compile gains, NOT measured on our specific composition |
-| Fix #1 saves 30-60% of collect | **CONJECTURE/UPPER BOUND** | based on "82% IPC wait" with most being avoidable through aggregation |
-| Fix #2 saves 70-140s of update | **CONJECTURE** | derived from typical compile gains; verify per-fix |
-| Fix #3 saves ~50s of update | **CONJECTURE** | vectorization typically captures 80-95% of Python loop time |
-| ps-ppo at 1500 turns/sec on RTX 3090 | **CONCRETE FROM EXTERNAL DOC** | `docs/CLOUD_DEPLOY.md:65` — but irrelevant to our infra since architecturally different |
-| "18× speed gap to ps-ppo" original framing | **REFUTED** | the gap is mostly architectural (stateless, Random Battles, no temporal); infra-only closable gap is much smaller and entirely Python orchestration |
+| Update is ~70% GPU-bound (S59 inference) | **REFUTED at prod scale, S62 torch.profiler** | CUDA kernels = only 8% of update wall (147s of 1931s). Update is ORCHESTRATION-bound. |
+| `aten::cat` is 24% of update CPU, 541k calls/iter | **CONCRETE, S62 prod torch.profiler** | 1600g/8w/conc=200, no stacks, single iter |
+| 88.1% of `aten::cat` self CPU is in collate-driven patterns | **CONCRETE, S64 prod with_stack=True profile** | shape decomposition of 541,593 events + python_function frame stack reconstruction |
+| `aten::fill_` 160k calls at prod are mostly padding zeros (not grad zeroing) | **STRONG INFERENCE, S64** | Count unchanged 160,501 → 160,486 between S62 baseline and S63 post-set_to_none — implies fill_ isn't grad zeroing. Shape signatures match `torch.zeros(pad_shape, ...)` calls in collate_episodes. |
+| compile would save 20-40% of GPU update share (S59 conjecture) | **REFUTED at prod scale, S62** | 4 prod data points showed --compile is 8% SLOWER per step. Not compute-bound on individual kernels at prod scale. |
+| Liger-Kernel saves update time (S62 research candidate) | **REFUTED (arch mismatch), S62** | We use GELU + LayerNorm, not SwiGLU + RMSNorm |
+| Fix #1 saves 30-60% of collect (S59 upper bound) | **CONCRETE at prod: -27%**, S62 | Option B tuning delivered as Phase D threshold met (-27% ≥ 25% gate) |
+| Sequence packing saves 1.5-3× update wall | **CONJECTURE, prod-data-supported** | ~38% of update CPU reachable per S64 prod profile; varlen attention floor unmeasured |
+| S63 free wins save 8-15% update wall (S62 projection) | **PARTIALLY REFUTED, SHIPPED at -4.2%, S63** | Obvious .item() calls captured; remaining are NaN gates that aren't safely removable. Ceiling for the free-wins category. |
+| Drop temporal stack saves update time | **REFUTED AS PRIORITY, S64 step-back** | Temporal stack <8% of update wall; dominant waste is in data prep |
+| ps-ppo at 1500 turns/sec on RTX 3090 | **CONCRETE FROM EXTERNAL DOC** | `docs/CLOUD_DEPLOY.md:65` — but irrelevant since architecturally different |
+| "18× speed gap to ps-ppo" original framing | **REFUTED, S59** | Gap is mostly architectural (stateless, Random Battles, no temporal); infra-only closable gap is much smaller and entirely Python orchestration |
