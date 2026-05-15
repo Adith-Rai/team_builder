@@ -1,7 +1,144 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
+⚠️  S64 PHASE A COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**FIRST ACTION FOR NEXT SESSION**: read memory/project_s64_phase_a_results.md
+§4 (Phase B detailed plan + sub-phases B.1-B.7 + bit-equivalence gate spec).
+Then ask user to authorize Phase B start. Phase B is a load-bearing decision —
+it involves torch 2.5.1 in-place install on prod pod (NOT venv this time)
+AND a model-surface refactor of `forward_ppo_sequence` in `model_transformer.py`
+to consume packed input via `flex_attention` with per-episode causal BlockMask.
+
+**S64 status**:
+- Step-back FULL-CONFIRMED at prod: Option A (seq-packing on existing arch).
+- Phase 1 PASSED: torch 2.5.1+cu121 venv-isolation 8/8 compat tests.
+- **Phase A SHIPPED**: `collate_episodes_packed` on branch `perf/seq-packing`
+  at `70fd33df` (origin pushed). 11/11 equivalence unit tests pass first run.
+  Zero pod time. Pure additive — function is DEAD CODE by design until
+  Phase B wires it. Legacy `collate_episodes` untouched; all five existing
+  callsites still use legacy path. See [[project_s64_phase_a_results]].
+- **Phase B NEXT (awaiting user authorization + fresh session).**
+
+**Read order for next session**:
+1. `memory/MEMORY.md` (auto-loaded; entry 4p covers S64 Phase A; entry 13
+   updated with Phase B first-action steps)
+2. `memory/project_session_boot_protocol.md` (standing orders, philosophy)
+3. `memory/project_optimization_tracker.md` (technique #1 row → PHASE A
+   SHIPPED, PHASE B NEXT; §3.5 has Phase B remaining items)
+4. `memory/project_s64_phase_a_results.md` (Phase A results + §4 detailed
+   Phase B plan — THIS IS THE LOAD-BEARING DOC for next session)
+5. `memory/project_s64_phase1_torch_upgrade_results.md` (torch 2.5.1
+   isolation findings — §2.1 LD_LIBRARY_PATH wrapper, §2.2 flex_attention
+   API, §2.3 triton 3.1 caveats)
+6. This file (next-prompt.txt) — S64 Phase A wrap (this section); S64
+   Phase 1 / S63 / S62 / S58 wraps preserved below for context
+
+**S64 Phase A — what landed (CONCRETE)**:
+- Branch `perf/seq-packing` at `70fd33df`, off master `14376ee0`
+- `pokemon-ai-starter/pokemon-ai/src/ppo.py:347-557` — new function
+  `collate_episodes_packed(episodes, max_seqlen=None, device=None, tail=False)`
+  inserted between legacy `collate_episodes` and `_ppo_loss_batched_internal`.
+- `pokemon-ai-starter/pokemon-ai/src/test_collate_packed.py` (new file)
+  — 11 equivalence tests, all pass on local CPU in ~1s.
+- Wrap commit `70fd33df` on perf/seq-packing, pushed to origin.
+
+**Return dict** (note `seq_lens` included per pushback on Phase 1 memo §4
+spec, which omitted it — but the consumer at model_transformer.py:2316
+reads `collated["seq_lens"]` directly):
+```
+{
+  flat_feat_batches: dict, leaves (sum_T, ...) tensors (nested dict OK)
+  cu_seqlens:        (B+1,) int32 — FA varlen convention
+  max_seqlen:        int — max(seq_lens) post-truncation
+  seq_lens:          (B,) long — derivable but kept for convenience
+  actions:           (sum_T,) long
+  old_logp:          (sum_T,) float32
+  advantages:        (sum_T,) float32
+  returns:           (sum_T,) float32
+  action_masks:      (sum_T, A) float32
+  B:                 int
+}
+# Notably NO pad_mask — Phase C will switch loss masking to cu_seqlens.
+```
+
+**11 equivalence tests** (all PASS first run):
+- test_uniform_lengths (B=3 same T)
+- test_varied_lengths (Ts=[5,12,8,3,12], legacy pads, packed doesn't)
+- test_tail_truncation (T=20, max_seqlen=10, tail=True → last 10)
+- test_tail_no_truncation_needed (max_seqlen >= max(T) no-op)
+- test_no_tail_default (tail=False first-truncation)
+- test_nested_dict_feat_batches (recursion path with inner.ids + inner.weights)
+- test_single_episode (B=1, BC anchor reference case)
+- test_empty_list_raises (matches legacy)
+- test_zero_length_episode_raises (matches legacy T_actual==0 raise)
+- test_max_seqlen_int_correctness (field reflects actual max not cap arg)
+- test_device_move_cpu_noop
+
+Gate pattern in every test:
+```
+for b in range(B):
+    start, stop = cu_seqlens[b], cu_seqlens[b+1]
+    assert packed[k][start:stop] == legacy[k][b, :seq_lens[b]]
+```
+
+**S64 Phase B — DETAILED PLAN (load-bearing — read in memo §4)**:
+- B.1: torch 2.5.1 in-place install on prod pod + LD_LIBRARY_PATH wrapper
+  bake into launch script (30 min, ~$0.50 pod)
+- B.2: `forward_ppo_sequence_packed` skeleton — skip Phase 2 nonzero gather,
+  accept flat input (30 min)
+- B.3: per-episode positional encoding via cu_seqlens searchsorted (30 min)
+- B.4: temporal stack via flex_attention + per-episode causal BlockMask
+  (60-90 min — the new pattern in this codebase)
+- B.5: bit-equivalence test legacy vs packed at fp32 (30 min)
+- B.6: bf16 path validation, tolerance band ~rtol/atol=1e-2 (30 min)
+- B.7: smoke profile at 100g/2w (15 min)
+- Total estimated: 4-6 hours wall, $3-5 pod. Possibly two sessions if
+  B.4 or B.5 surfaces design issues.
+
+**Strategy** (per memo §4.2): don't replace `forward_ppo_sequence` in-place.
+Add `forward_ppo_sequence_packed` as a SISTER method. Lets us bit-equivalence
+A/B both implementations side by side until gate passes.
+
+**flex_attention BlockMask sketch** (full version in memo §4.2):
+```python
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+def per_episode_causal_mask_factory(cu_seqlens):
+    cu = cu_seqlens.to(device)
+    def mask_fn(b, h, q_idx, kv_idx):
+        q_ep = torch.searchsorted(cu, q_idx, right=True) - 1
+        kv_ep = torch.searchsorted(cu, kv_idx, right=True) - 1
+        return (q_ep == kv_ep) & (q_idx >= kv_idx)
+    return mask_fn
+block_mask = create_block_mask(
+    per_episode_causal_mask_factory(cu_seqlens),
+    B=1, H=None, Q_LEN=sum_T, KV_LEN=sum_T, device=device,
+)
+out = flex_attention(q, k, v, block_mask=block_mask)
+```
+
+**Watch-outs for Phase B (CONCRETE from reading the code this session)**:
+- `forward_ppo_sequence` (model_transformer.py:2281-2400) Phases 3-4
+  (spatial + action context) already operate on flat (n_valid, *) shapes.
+  The refactor mainly affects Phases 2/5/6/7/8 (the scatter-gather +
+  padded summary_grid + temporal forward).
+- `create_block_mask` compilation overhead — construct once per forward,
+  cache across temporal-stack layers.
+- Positional encoding: per-episode position resets, derive from cu_seqlens.
+- BC anchor path (ppo.py:737) also calls `forward_ppo_sequence` —
+  Phase B must update BC anchor path too OR keep BC anchor on legacy.
+
+**State at S64 Phase A wrap**:
+- master: at the wrap commit on top of `14376ee0` (only next-prompt.txt
+  updated — no code change to master)
+- `perf/seq-packing` at `70fd33df` — Phase A code + tests, origin pushed
+- Pod: untouched by Phase A. Prod pod state as left in Phase 1 wrap
+  (system torch=2.2.1, GPU clean, no orphans)
+- Cumulative arc cost: $20.50 (Phase A = $0)
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — preserved below for context
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**: read memory/project_s64_phase1_torch_upgrade_results.md
