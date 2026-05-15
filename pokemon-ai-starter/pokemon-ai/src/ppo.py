@@ -345,6 +345,233 @@ def collate_episodes(episodes, L_max=None, device=None, tail: bool = False) -> d
 
 
 # =============================
+# S64 Phase A: sequence-packed collation (sister to collate_episodes)
+# =============================
+#
+# Produces flat (sum_T, ...) tensors + cu_seqlens instead of padded
+# (B, L_max, ...) + pad_mask. Consumed by the sequence-packed PPO path
+# (S64+, Phase B onward). Eliminates the padding cat + padding fill_
+# zero-allocations identified in the S64 step-back profile as ~38% of
+# update CPU reachable. Input contract is identical to collate_episodes.
+#
+# Acceptance gate (Phase A): for any input `episodes` and matching
+# (max_seqlen, tail, device) args, the packed output unpacked via
+# cu_seqlens equals the unpadded prefix of legacy collate_episodes.
+# Tests in test_collate_packed.py.
+
+def collate_episodes_packed(episodes, max_seqlen=None, device=None,
+                             tail: bool = False) -> dict:
+    """Pack B episode dicts into flat (sum_T, ...) tensors + cu_seqlens.
+
+    Sister to `collate_episodes`. Same input contract; different output
+    shape. The packed format eliminates padding waste — no per-episode
+    pad-to-L_max cat, no padding zero allocations, no per-position
+    pad_mask. Phase B will refactor `forward_ppo_sequence` to consume
+    this directly via varlen attention (flex_attention BlockMask).
+
+    Args:
+      episodes: list of episode dicts from `build_ppo_episodes`. Each must
+        contain: feat_batches (list of T per-turn feat dicts with (1, *)
+        tensor leaves and optionally one level of nested dict),
+        actions/old_logp/advantages/returns (length-T sequences),
+        action_masks (list of T arrays/lists of length A).
+      max_seqlen: optional cap on individual episode length. Defaults to
+        max episode length in the bundle. Episodes longer than max_seqlen
+        are truncated.
+      device: optional torch.device — if given, output tensors are moved
+        there. If None, stays on CPU.
+      tail: when True AND max_seqlen is given, truncate to the LAST
+        max_seqlen turns of each episode (keep recent context). Mirrors
+        legacy `collate_episodes` tail semantics — required for paths
+        feeding forward_ppo_sequence (whose temporal forward caps at
+        cfg.temporal_context).
+
+    Returns:
+      dict with the following keys:
+        flat_feat_batches: dict — each leaf is (sum_T, ...) tensor.
+          Nested dicts are recursed; non-tensor leaves are dropped
+          (matches legacy collate_episodes silently-skip-non-tensor).
+        cu_seqlens:   (B+1,) int32 tensor with [0, T_0, T_0+T_1, ...,
+                      sum_T]. Standard FA/flex_attention varlen format.
+        max_seqlen:   int — max(T_i) over episodes after truncation.
+                      Useful for flex_attention BlockMask construction.
+        seq_lens:     (B,) long tensor — actual T per episode
+                      (post-truncation). Derivable as cu_seqlens.diff();
+                      kept here for caller convenience + downstream
+                      consumers (forward_ppo_sequence currently reads it
+                      directly — Phase B may drop this).
+        actions:      (sum_T,) long tensor
+        old_logp:     (sum_T,) float tensor
+        advantages:   (sum_T,) float tensor
+        returns:      (sum_T,) float tensor
+        action_masks: (sum_T, A) float tensor
+        B:            int — batch size (number of episodes)
+
+    Memory notes:
+      - sum_T = sum of valid turns, no padding. At prod scale
+        (B≈16, mean T≈120, L_max=200), packed is ≈ (120/200)·legacy
+        memory = 40% smaller per feature tensor.
+      - Eliminates the ~160k aten::fill_ padding-zero allocations and
+        the ~270k padding cat events identified in S64 prod profile.
+
+    Equivalence gate (the unit test):
+      legacy = collate_episodes(eps, L_max=L, device=d, tail=t)
+      packed = collate_episodes_packed(eps, max_seqlen=L, device=d, tail=t)
+      For every feature key k, every batch index b:
+        start, stop = packed["cu_seqlens"][b], packed["cu_seqlens"][b+1]
+        packed[...key][start:stop] == legacy[...key][b, :seq_lens[b]]
+    """
+    import torch as _t
+
+    if not episodes:
+        raise ValueError("collate_episodes_packed: empty episode list")
+
+    # 1. Determine per-episode T + start-offsets (matches legacy semantics)
+    full_lens_list = [len(ep["actions"]) for ep in episodes]
+    if max_seqlen is None:
+        max_seqlen_eff = max(full_lens_list)
+    else:
+        max_seqlen_eff = max_seqlen
+    if tail:
+        start_idx_list = [max(0, T - max_seqlen_eff) for T in full_lens_list]
+    else:
+        start_idx_list = [0] * len(episodes)
+    seq_lens_list = [min(T, max_seqlen_eff) for T in full_lens_list]
+
+    if any(s == 0 for s in seq_lens_list):
+        raise ValueError("collate_episodes_packed: T_actual==0 episode "
+                         "(should be filtered upstream)")
+
+    B = len(episodes)
+    sum_T = sum(seq_lens_list)
+    max_seqlen_out = max(seq_lens_list)
+
+    seq_lens = _t.tensor(seq_lens_list, dtype=_t.long)
+    # cu_seqlens[0]=0, cu_seqlens[i]=sum(seq_lens[:i]). int32 = FA convention.
+    cu_seqlens = _t.zeros(B + 1, dtype=_t.int32)
+    if B > 0:
+        cu_seqlens[1:] = _t.tensor(seq_lens_list, dtype=_t.int32).cumsum(0)
+
+    # 2. Flatten scalar-per-turn fields (actions/old_logp/advantages/returns)
+    #    Each ep[k] is a length-T python list (or numpy array — see
+    #    build_ppo_episodes line 103 .tolist() conversion).
+    def _flat_1d(field_key, dtype):
+        parts = []
+        for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list):
+            arr = list(ep[field_key])[st:st + T_act]
+            parts.append(_t.as_tensor(arr, dtype=dtype))
+        return _t.cat(parts, dim=0)
+
+    actions = _flat_1d("actions", _t.long)
+    old_logp = _flat_1d("old_logp", _t.float32)
+    advantages = _flat_1d("advantages", _t.float32)
+    returns = _flat_1d("returns", _t.float32)
+
+    # 3. action_masks: per-turn (A,) array/list → (sum_T, A)
+    A = None
+    for ep in episodes:
+        if ep["action_masks"]:
+            first_m = ep["action_masks"][0]
+            A = (first_m.shape[0] if hasattr(first_m, "shape")
+                 else len(first_m))
+            break
+    if A is None:
+        raise ValueError("collate_episodes_packed: no action_masks found")
+
+    am_parts = []
+    for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list):
+        per_ep = _t.stack(
+            [_t.as_tensor(m, dtype=_t.float32)
+             for m in ep["action_masks"][st:st + T_act]],
+            dim=0,
+        )
+        am_parts.append(per_ep)
+    action_masks = _t.cat(am_parts, dim=0)
+
+    # 4. feat_batches: per-episode list of T per-turn dicts. Each per-turn
+    #    dict has tensor leaves of shape (1, ...) and possibly one level
+    #    of nested dict with same-shape leaves. Mirror legacy nested-dict
+    #    recursion path (one level deep, no further recursion).
+    #
+    #    Strategy: per-episode, cat T per-turn (1, *) tensors → (T, *).
+    #    Across episodes, cat → (sum_T, *). One cat-per-key + one cat-
+    #    across-episodes per key, vs legacy's per-turn cat + padding cat
+    #    + cross-episode stack. Padding cat + fill_ eliminated entirely.
+    def _flat_feat_one_episode(turn_dicts, start, T_actual):
+        sample = turn_dicts[start]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                out[k] = _t.cat([turn_dicts[start + t][k]
+                                 for t in range(T_actual)], dim=0)
+            elif isinstance(v, dict):
+                inner_out = {}
+                for inner_k, inner_v in v.items():
+                    if isinstance(inner_v, _t.Tensor):
+                        inner_out[inner_k] = _t.cat(
+                            [turn_dicts[start + t][k][inner_k]
+                             for t in range(T_actual)], dim=0)
+                    # else: pass (matches legacy silent-skip)
+                out[k] = inner_out
+        return out
+
+    per_episode_flat = [
+        _flat_feat_one_episode(ep["feat_batches"], st, T_act)
+        for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list)
+    ]
+
+    def _cat_across_episodes(per_ep_list):
+        sample = per_ep_list[0]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                out[k] = _t.cat([d[k] for d in per_ep_list], dim=0)
+            elif isinstance(v, dict):
+                inner_out = {}
+                for inner_k in v:
+                    inner_out[inner_k] = _t.cat(
+                        [d[k][inner_k] for d in per_ep_list], dim=0)
+                out[k] = inner_out
+        return out
+
+    flat_feat_batches = _cat_across_episodes(per_episode_flat)
+
+    # 5. Optional device move
+    if device is not None:
+        def _to_device(d):
+            r = {}
+            for k, v in d.items():
+                if isinstance(v, _t.Tensor):
+                    r[k] = v.to(device, non_blocking=True)
+                elif isinstance(v, dict):
+                    r[k] = _to_device(v)
+                else:
+                    r[k] = v
+            return r
+        flat_feat_batches = _to_device(flat_feat_batches)
+        actions = actions.to(device, non_blocking=True)
+        old_logp = old_logp.to(device, non_blocking=True)
+        advantages = advantages.to(device, non_blocking=True)
+        returns = returns.to(device, non_blocking=True)
+        action_masks = action_masks.to(device, non_blocking=True)
+        cu_seqlens = cu_seqlens.to(device, non_blocking=True)
+        seq_lens = seq_lens.to(device, non_blocking=True)
+
+    return {
+        "flat_feat_batches": flat_feat_batches,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen_out,
+        "seq_lens": seq_lens,
+        "actions": actions,
+        "old_logp": old_logp,
+        "advantages": advantages,
+        "returns": returns,
+        "action_masks": action_masks,
+        "B": B,
+    }
+
+
+# =============================
 # Tier 3 C3 (Phase 4.7+, S55): masked PPO loss for sequence-batched update
 # =============================
 #
