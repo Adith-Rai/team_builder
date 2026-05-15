@@ -89,6 +89,18 @@ def test_temporal_packed_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}, torch={torch.__version__}")
 
+    # Disable nn.TransformerEncoderLayer's fast path so legacy goes through
+    # _sa_block + _ff_block (which is what _packed_layer_forward mirrors).
+    # The fast path (`torch._transformer_encoder_layer_fwd`, a fused C++
+    # kernel) is enabled in eval mode + batch_first + norm_first and produces
+    # numerically-near-but-not-identical results due to operation fusion.
+    # Comparing fast-path-legacy vs slow-path-packed gives misleading drift
+    # at ~1e-3 even when the math is correct. Disabling fast path makes the
+    # bit-equiv comparison apples-to-apples.
+    if hasattr(torch.backends, "mha"):
+        torch.backends.mha.set_fastpath_enabled(False)
+        print(f"mha fastpath disabled: {not torch.backends.mha.get_fastpath_enabled()}")
+
     print("Loading BC v10...")
     model, cfg, _ = load_checkpoint("data/models/bc/v10_padded_for_cis_dev.pt", device)
     model.eval()  # CRITICAL: dropout must be identity for bit-equiv
