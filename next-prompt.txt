@@ -4,9 +4,15 @@ pre prompt :
 ⚠️  S64 PHASE 1 COMPLETE (2026-05-14) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
+**FIRST ACTION FOR NEXT SESSION**: read memory/project_s64_phase1_torch_upgrade_results.md
+§4 (Phase A spec). Then ask user to authorize Phase A start before writing
+any code. Phase A = single-file change in pokemon-ai-starter/pokemon-ai/src/
+ppo.py adding `collate_episodes_packed()` on a new branch `perf/seq-packing`
+off master (master HEAD at the start of next session = `ae66c3c0`).
+
 **S64 status**:
-- Step-back FULL-CONFIRMED: Option A (seq-packing on existing arch) wins.
-  See [[project_s64_arch_revisit_profile_findings]].
+- Step-back FULL-CONFIRMED at prod scale: Option A (seq-packing on existing
+  arch) wins. See [[project_s64_arch_revisit_profile_findings]].
 - Phase 1 PASSED: torch 2.5.1+cu121 upgrade is feasible; 8/8 compat tests
   pass on prod via isolated venv (system torch 2.2.1 untouched).
   See [[project_s64_phase1_torch_upgrade_results]].
@@ -19,14 +25,15 @@ pre prompt :
   3. Triton bumped 2.2.0 -> 3.1.0 — re-test S56 C5 compile path at Phase B.
 
 - Awaiting user authorization to begin **Phase A: collate_episodes_packed**
-  (design + impl). NO code change yet.
+  (design + impl). NO code change yet. Master at `ae66c3c0`.
 
-**Read FIRST**: `memory/project_s64_arch_revisit_profile_findings.md` — full
-step-back reasoning with triple confirmation (shape decomp + code reading +
-python frame stack reconstruction). Status SMOKE-CONFIRMED, PROD-PENDING.
-
-**Read SECOND**: `memory/project_optimization_tracker.md` §1 (updated) — ARCH
-row REFUTED AS PRIORITY; technique #1 (seq-packing) now IN FLIGHT (step-back).
+**Read order for next session**:
+1. `memory/MEMORY.md` (auto-loaded; entries 4n + 4o cover S64 step-back + Phase 1)
+2. `memory/project_session_boot_protocol.md` (standing orders, philosophy)
+3. `memory/project_optimization_tracker.md` (sequence roadmap; technique #1 row + §3 Open Questions current)
+4. `memory/project_s64_arch_revisit_profile_findings.md` (full step-back reasoning, status FULL-CONFIRMED)
+5. `memory/project_s64_phase1_torch_upgrade_results.md` (Phase 1 results + Phase A spec in §4)
+6. This file (next-prompt.txt) — S64 wrap below + S63/S62/S58 wraps preserved further down for context
 
 **The step-back question**: user paused before S64 implementation because
 seq-packing is itself an arch-touching commitment (2-4 sessions of refactor).
