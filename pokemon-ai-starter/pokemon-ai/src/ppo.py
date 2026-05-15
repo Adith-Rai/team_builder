@@ -1452,7 +1452,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        in_warmup: bool = False,
                        compiled_step=None,
                        bc_ref=None, bc_anchor_coef: float = 0.0,
-                       minibatch_size: Optional[int] = None) -> dict:
+                       minibatch_size: Optional[int] = None,
+                       packed: bool = False) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1510,6 +1511,18 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             "ppo_update_batched does not support in_warmup=True yet. "
             "Use the per-episode ppo_update for warmup iters, then switch "
             "to ppo_update_batched for the main training loop."
+        )
+    if packed and compiled_step is not None:
+        # S64 Phase B.6: packed path is eager-only in v1. --compile was
+        # REFUTED at prod (S62, 8% slower) so the compile boundary is not
+        # on the canonical Phase 2 stack; we don't need a compiled packed
+        # variant. If both flags are set, fail loudly rather than silently
+        # taking one path.
+        raise NotImplementedError(
+            "ppo_update_batched: --packed is not supported with the "
+            "compiled Tier 3 train_step (eager-only in v1). Drop "
+            "--compile or drop --packed. Canonical Phase 2 stack uses "
+            "--packed without --compile per S62 refutation."
         )
     # S60 Fix #2: removed NotImplementedError that blocked compiled_step +
     # bc_ref. The compile boundary now supports BC anchor via bc_logits +
@@ -1752,9 +1765,17 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
 
             for chunk_idx, chunk_eps in enumerate(chunks):
                 # Collate this chunk only (memory-bounded by chunk size).
+                # S64 B.6: packed mode uses collate_episodes_packed (flat
+                # sum_T layout, no pad_mask waste); legacy mode uses the
+                # padded (B, L_max) layout.
                 _temp_ctx = getattr(cfg, "temporal_context", None)
-                if _temp_ctx is not None:
-                    _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                _eff_L = (min(L_max, _temp_ctx) if (L_max and _temp_ctx) else
+                          (_temp_ctx if _temp_ctx is not None else L_max))
+                if packed:
+                    collated = collate_episodes_packed(
+                        chunk_eps, max_seqlen=_eff_L, device=device, tail=True,
+                    )
+                elif _temp_ctx is not None:
                     collated = collate_episodes(
                         chunk_eps, L_max=_eff_L, device=device, tail=True,
                     )
@@ -1764,15 +1785,24 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     )
 
                 # BC ref forward (per chunk; same memory bound as model)
+                # S64 B.6: packed routes through forward_ppo_sequence_packed
+                # and feeds the SAME packed_collated dict the trainable model
+                # consumes — both paths see flat (sum_T, n_actions) bc_logits.
                 bc_logits = None
                 if bc_ref is not None and bc_anchor_coef != 0.0:
                     with torch.no_grad():
                         with _update_amp_ctx:
-                            bc_out = bc_ref.forward_ppo_sequence(collated, device)
+                            if packed:
+                                bc_out = bc_ref.forward_ppo_sequence_packed(collated, device)
+                            else:
+                                bc_out = bc_ref.forward_ppo_sequence(collated, device)
                             bc_logits = bc_out["action_logits"].detach()
 
                 with _update_amp_ctx:
-                    forward_out = model.forward_ppo_sequence(collated, device)
+                    if packed:
+                        forward_out = model.forward_ppo_sequence_packed(collated, device)
+                    else:
+                        forward_out = model.forward_ppo_sequence(collated, device)
 
                     if (forward_out["action_logits"].isnan().any()
                             or forward_out["v_logits"].isnan().any()):
@@ -1781,10 +1811,14 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_failed = True
                         break
 
-                    # S63: call _ppo_loss_batched_internal directly to get
-                    # tensor outputs (avoids 4 .item() calls in ppo_loss_batched
-                    # per chunk — see project_s62_update_profile_findings.md).
-                    loss_dict = _ppo_loss_batched_internal(
+                    # S63: call the loss internal directly for tensor outputs
+                    # (avoids 4 .item() calls in the public wrapper per chunk
+                    # — see project_s62_update_profile_findings.md).
+                    # S64 B.6: packed routes through _ppo_loss_packed_internal
+                    # which expects flat (sum_T,...) shapes from collated.
+                    _loss_fn = (_ppo_loss_packed_internal if packed
+                                else _ppo_loss_batched_internal)
+                    loss_dict = _loss_fn(
                         collated, forward_out, model, cfg,
                         ent_coef=ent_coef, vf_coef=vf_coef,
                         clip_eps=clip_eps,
@@ -1820,16 +1854,28 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 chunk_stats["bc_kl"]           = chunk_stats["bc_kl"]           + loss_dict["bc_kl"] * inv_n
 
                 # Drift diagnostics (tensor accumulators; .item() at epoch end)
+                # S64 B.6: packed has no pad_mask; every position is valid →
+                # .mean() over (sum_T,) replaces the (x*pad_mask).sum()/n_valid
+                # pattern. Mathematically equivalent at matching valid positions.
                 with torch.no_grad():
-                    pad_mask_f = collated["pad_mask"].to(device).float()
-                    n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
-                    returns_t = collated["returns"].to(device).float()
-                    advantages_t = collated["advantages"].to(device).float()
-                    v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
-                    v_pred = (v_probs * get_v_support(model)).sum(-1)
-                    chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
-                    chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
-                    chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                    if packed:
+                        returns_t = collated["returns"].to(device).float()       # (sum_T,)
+                        advantages_t = collated["advantages"].to(device).float()  # (sum_T,)
+                        v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)  # (sum_T, v_bins)
+                        v_pred = (v_probs * get_v_support(model)).sum(-1)             # (sum_T,)
+                        chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + v_pred.mean() * inv_n
+                        chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + returns_t.mean() * inv_n
+                        chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + advantages_t.abs().mean() * inv_n
+                    else:
+                        pad_mask_f = collated["pad_mask"].to(device).float()
+                        n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
+                        returns_t = collated["returns"].to(device).float()
+                        advantages_t = collated["advantages"].to(device).float()
+                        v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                        v_pred = (v_probs * get_v_support(model)).sum(-1)
+                        chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
 
                 # Per-chunk memory cleanup — prevents activation accumulation
                 # across chunks (the whole point of minibatching).
