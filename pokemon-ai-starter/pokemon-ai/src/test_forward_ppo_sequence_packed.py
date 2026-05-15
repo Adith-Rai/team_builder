@@ -30,11 +30,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ppo import load_checkpoint, collate_episodes, collate_episodes_packed
 
 
-# Tolerance band: same rationale as test_temporal_packed.py — cross-kernel
-# fp32 reorder is unavoidable; rtol=1e-4 atol=1e-5 catches real bugs (which
-# show as max_abs >= 1e-3) while accommodating legitimate compose drift.
+# Tolerance bands. fp32: cross-kernel reorder (flex_attention/Triton vs
+# SDPA-slow-path/cuDNN) unavoidable at ~7e-6 max-abs after 4 layers; real
+# bugs show as max_abs >= 1e-3. bf16: 7-bit mantissa = ~6e-3 representable
+# precision; reasonable transformer-output spread (~1.0) means absolute
+# diff up to ~1e-2 is expected with no semantic bug. Tolerance bands
+# match the Phase A memo §4-R.2 spec for B.4.
 FP32_RTOL = 1e-4
 FP32_ATOL = 1e-5
+BF16_RTOL = 1e-2
+BF16_ATOL = 1e-2
 
 
 def _make_synthetic_turn(rng: np.random.RandomState, A: int = 9) -> dict:
@@ -176,15 +181,23 @@ def test_forward_ppo_sequence_packed():
     # Three cases mirroring test_temporal_packed.py: B=1, B=3 varied, B=5 edge.
     # Episode T values kept modest (max 50) to keep test wall low — the
     # B.2 gate already validated the temporal stack at T=200.
+    # Each case runs at both fp32 (no autocast) and bf16 (autocast — the
+    # production path under --bf16). Different tolerance bands per dtype.
     cases = [
         ("B=1",         [25]),
         ("B=3 varied",  [10, 30, 20]),
         ("B=5 mixed",   [5, 15, 1, 40, 25]),
     ]
+    dtypes = [
+        ("fp32", None,                FP32_RTOL, FP32_ATOL),
+        ("bf16", torch.bfloat16,      BF16_RTOL, BF16_ATOL),
+    ]
 
     all_pass = True
     for label, T_list in cases:
-        print(f"Case {label}: T_list={T_list}")
+      for dtype_label, autocast_dtype, rtol, atol in dtypes:
+        full_label = f"{label}/{dtype_label}"
+        print(f"Case {full_label}: T_list={T_list}")
         episodes = [_make_synthetic_episode(T, A=cfg.format_config.n_actions, seed=i)
                     for i, T in enumerate(T_list)]
 
@@ -200,8 +213,12 @@ def test_forward_ppo_sequence_packed():
         assert legacy_collated["B"] == packed_collated["B"] == len(T_list), \
             f"B mismatch: legacy={legacy_collated['B']} packed={packed_collated['B']}"
 
-        # Run both forwards in eval + no_grad + fp32
-        with torch.no_grad():
+        # Run both forwards — eval + no_grad. fp32: no autocast. bf16: with
+        # autocast (matches production ppo_update_batched _update_amp_ctx path).
+        from contextlib import nullcontext
+        autocast_ctx = (torch.autocast("cuda", dtype=autocast_dtype)
+                         if autocast_dtype is not None else nullcontext())
+        with torch.no_grad(), autocast_ctx:
             legacy_out = model.forward_ppo_sequence(legacy_collated, device)
             packed_out = model.forward_ppo_sequence_packed(packed_collated, device)
 
@@ -226,7 +243,7 @@ def test_forward_ppo_sequence_packed():
         # Bit-equiv check at valid positions (B.4 gate)
         passed = _check_forward_equiv(
             legacy_out, packed_out, T_list, packed_collated["cu_seqlens"],
-            rtol=FP32_RTOL, atol=FP32_ATOL, label=label,
+            rtol=rtol, atol=atol, label=full_label,
         )
         if not passed:
             all_pass = False
