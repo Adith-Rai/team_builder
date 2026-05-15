@@ -1751,6 +1751,181 @@ class TemporalTransformer(nn.Module):
             return x.gather(1, idx).squeeze(1)
         return x[:, -1, :]
 
+    def forward_packed(
+        self,
+        summaries: torch.Tensor,    # (sum_T, d_temporal) flat packed
+        cu_seqlens: torch.Tensor,   # (B+1,) int32 or long
+    ) -> torch.Tensor:
+        """Packed-mode forward — sister to forward(). S64 Phase B.
+
+        Operates on flat (sum_T, d_temporal) input + cu_seqlens; returns
+        (sum_T, d_temporal). Used by forward_ppo_sequence_packed to replace
+        the (B, L_max, d) padded → causal + key_padding_mask pattern with
+        per-episode causal flex_attention BlockMask over the packed sequence.
+
+        Pre-condition: per-episode T_i <= cfg.temporal_context. Phase A's
+        collate_episodes_packed enforces this via tail truncation. No internal
+        re-truncation; if violated, pos_embed lookup will index OOB and raise.
+
+        Training-mode numerical difference from forward() (DOCUMENTED, gated at B.7):
+        legacy nn.MultiheadAttention applies F.dropout(attn_weights, p=cfg.dropout)
+        post-softmax pre-@V. flex_attention has no native attention-dropout
+        support, so the packed path omits it. Residual dropouts (dropout1,
+        dropout2 within each layer) still apply. Eval-mode equivalence is
+        preserved (dropout is identity in eval). At p=0.05 the regularization
+        delta is small; B.7 statistical A/B (\|kl_packed - kl_legacy\| < 0.005)
+        gates whether it matters for training dynamics.
+        """
+        sum_T, _D = summaries.shape
+        device = summaries.device
+
+        # cu_seqlens arrives as int32 from collate_episodes_packed; cast to
+        # long for searchsorted + indexing arithmetic.
+        cu_long = cu_seqlens.to(device=device, dtype=torch.long)
+
+        # Per-episode position-within-episode index. ep_idx[i] = episode of
+        # flat-position i = searchsorted(cu_long, i, right=True) - 1.
+        # pos_in_ep[i] = i - cu_long[ep_idx[i]].
+        pos_flat = torch.arange(sum_T, device=device, dtype=torch.long)
+        ep_idx = torch.searchsorted(cu_long, pos_flat, right=True) - 1
+        pos_in_ep = pos_flat - cu_long[ep_idx]
+
+        # Position embedding lookup. Max pos_in_ep = max_seqlen - 1 which
+        # the collate caller caps at cfg.temporal_context - 1 (matches
+        # legacy forward's `summaries[:, -temporal_context:]` semantics).
+        x = summaries + self.pos_embed(pos_in_ep)  # (sum_T, D)
+
+        # Per-episode causal BlockMask. Constructed once per forward call
+        # and shared across all 4 temporal layers (Phase A memo §4.2:
+        # create_block_mask has triton-compile overhead; one construction
+        # amortizes across the layer stack).
+        block_mask = _make_per_episode_causal_block_mask(cu_long, sum_T, device)
+
+        # Manual layer-iter; mirrors what nn.TransformerEncoder's slow path
+        # does. gradient_checkpoint preserves legacy semantics (one whole-
+        # encoder checkpoint region; see forward() at lines 1738-1741).
+        if self.cfg.gradient_checkpoint and self.training:
+            x = torch.utils.checkpoint.checkpoint(
+                _packed_encoder_forward,
+                self.transformer.layers, x, block_mask,
+                use_reentrant=False,
+            )
+        else:
+            x = _packed_encoder_forward(self.transformer.layers, x, block_mask)
+
+        return x
+
+
+# =============================
+# S64 Phase B: packed-mode helpers for TemporalTransformer.forward_packed
+# =============================
+#
+# These mirror the torch 2.5.1 nn.TransformerEncoderLayer slow-path with
+# norm_first=True (transformer.py:_sa_block + _ff_block + the post-norm-first
+# residual sequence) but substitute flex_attention for self_attn so we can
+# attend over a flat (sum_T, d) packed sequence with a per-episode causal
+# BlockMask. All math reads the legacy modules' weights directly — NO new
+# parameters, NO state_dict additions. BC v10 loads unchanged.
+#
+# Why not rewrap as a custom nn.Module subclass: it would force a different
+# state_dict layout (transformer.layers.{i}.* vs our_subclass.layers.{i}.*).
+# Module-level functions that pull from the existing layer modules sidestep
+# the state_dict question entirely.
+
+def _make_per_episode_causal_block_mask(cu_seqlens_long, sum_T, device):
+    """flex_attention BlockMask: position attends to prior positions IN
+    THE SAME EPISODE. Episode boundaries derived from cu_seqlens (the
+    standard FA varlen convention)."""
+    from torch.nn.attention.flex_attention import create_block_mask
+    cu = cu_seqlens_long  # caller guarantees long + on device
+
+    def mask_fn(b, h, q_idx, kv_idx):
+        q_ep = torch.searchsorted(cu, q_idx, right=True) - 1
+        kv_ep = torch.searchsorted(cu, kv_idx, right=True) - 1
+        return (q_ep == kv_ep) & (q_idx >= kv_idx)
+
+    return create_block_mask(
+        mask_fn, B=1, H=None, Q_LEN=sum_T, KV_LEN=sum_T, device=device,
+    )
+
+
+def _packed_mha_forward(mha, x, block_mask):
+    """Run nn.MultiheadAttention's slow-path computation but with
+    flex_attention substituted for the attention call. Reads the legacy
+    MHA module's trained weights directly (in_proj_weight, in_proj_bias,
+    out_proj) — no parameter copies.
+
+    x: (sum_T, d) flat packed sequence
+    block_mask: per-episode causal BlockMask from _make_per_episode_causal_block_mask
+    Returns: (sum_T, d)
+    """
+    from torch.nn.attention.flex_attention import flex_attention
+
+    sum_T, d = x.shape
+    h = mha.num_heads
+    head_dim = mha.head_dim
+    # Sanity: nn.MultiheadAttention asserts this at __init__, but explicit
+    # is better than implicit for the packed path.
+    assert h * head_dim == d, (
+        f"_packed_mha_forward: d ({d}) != h*head_dim ({h*head_dim})"
+    )
+
+    # Combined Q/K/V projection (matches the nn.MultiheadAttention internal
+    # call: F.linear(input, in_proj_weight, in_proj_bias) then chunk(3)).
+    qkv = torch.nn.functional.linear(x, mha.in_proj_weight, mha.in_proj_bias)
+    q, k, v = qkv.chunk(3, dim=-1)  # each (sum_T, d)
+
+    # Reshape (sum_T, d) → (1, h, sum_T, head_dim) as flex_attention expects
+    # (B=1 batch dimension; episode boundaries live in the BlockMask).
+    def _reshape(t):
+        return t.view(sum_T, h, head_dim).transpose(0, 1).unsqueeze(0).contiguous()
+    q = _reshape(q)
+    k = _reshape(k)
+    v = _reshape(v)
+
+    # Per-episode causal attention. flex_attention applies 1/sqrt(head_dim)
+    # scaling internally, matching SDPA convention.
+    out = flex_attention(q, k, v, block_mask=block_mask)  # (1, h, sum_T, head_dim)
+
+    # Reshape back: (1, h, sum_T, head_dim) → (sum_T, d).
+    out = out.squeeze(0).transpose(0, 1).contiguous().view(sum_T, d)
+
+    # Final output projection (the legacy out_proj nn.Linear).
+    return mha.out_proj(out)
+
+
+def _packed_layer_forward(layer, x, block_mask):
+    """Replay nn.TransformerEncoderLayer.forward (norm_first=True slow path)
+    on flat packed input. Source: torch 2.5.1 transformer.py:894-898 +
+    _sa_block (lines 911-928) + _ff_block (lines 930-933).
+
+    The norm_first=True sequence (verified from prod torch 2.5.1 source):
+        x = x + _sa_block(norm1(x))
+        x = x + _ff_block(norm2(x))
+    where _sa_block = dropout1(MHA(...)) and _ff_block = dropout2(linear2(
+    dropout(activation(linear1(x))))).
+    """
+    sa_in = layer.norm1(x)
+    sa_out = _packed_mha_forward(layer.self_attn, sa_in, block_mask)
+    sa_out = layer.dropout1(sa_out)
+    x = x + sa_out
+
+    ff_in = layer.norm2(x)
+    ff_inner = layer.activation(layer.linear1(ff_in))
+    ff_inner = layer.dropout(ff_inner)
+    ff_out = layer.linear2(ff_inner)
+    ff_out = layer.dropout2(ff_out)
+    return x + ff_out
+
+
+def _packed_encoder_forward(layers, x, block_mask):
+    """Stack of _packed_layer_forward calls. Callable shape (positional
+    args only) so torch.utils.checkpoint.checkpoint can wrap it as one
+    region — matches legacy gradient-checkpoint semantics."""
+    for layer in layers:
+        x = _packed_layer_forward(layer, x, block_mask)
+    return x
+
 
 # =============================
 # Switch context encoder (action head, switch slots 4-8)
@@ -2413,6 +2588,102 @@ class TransformerBattlePolicy(nn.Module):
             "action_logits": out_logits,
             "value":         out_value,
             "v_logits":      out_vlogits,
+        }
+
+    def forward_ppo_sequence_packed(self, packed_collated: dict,
+                                     device: torch.device) -> Dict[str, torch.Tensor]:
+        """Sister to forward_ppo_sequence. S64 Phase B.3.
+
+        Consumes Phase A's collate_episodes_packed output (flat (sum_T, ...)
+        feat tensors + cu_seqlens) and returns flat (sum_T, ...) outputs.
+        Eliminates the scatter-gather around the temporal stack that legacy
+        forward_ppo_sequence does (Phases 1-2 + 5 + 7-8); the spatial and
+        action-context passes (legacy Phases 3-4) already operate on flat
+        (n_valid, ...) shapes so they're reused unchanged.
+
+        Input schema (from `ppo.collate_episodes_packed()`):
+            packed_collated["flat_feat_batches"]: dict, leaves (sum_T, ...)
+            packed_collated["cu_seqlens"]:        (B+1,) int32
+            packed_collated["seq_lens"]:          (B,) long   (not used here)
+            packed_collated["max_seqlen"]:        int          (not used here)
+            packed_collated["B"]:                 int
+
+        Output schema (FLAT — no scatter back to padded grid):
+            action_logits: (sum_T, n_actions)
+            value:         (sum_T,)
+            v_logits:      (sum_T, v_bins)
+
+        Phase B.5's _ppo_loss_packed_internal will consume these directly.
+        No pad_mask multiplication needed — every position is valid in
+        packed layout, so per-transition `.mean()` gives exactly the
+        Metamon-style per-transition mean the C3 docstring (ppo.py:355)
+        always targeted.
+        """
+        cfg = self.cfg
+        flat_feat = packed_collated["flat_feat_batches"]
+        cu_seqlens = packed_collated["cu_seqlens"]
+
+        # sum_T = total valid positions = cu_seqlens[-1]
+        sum_T = int(cu_seqlens[-1].item()) if cu_seqlens.numel() > 1 else 0
+
+        # Move feat_batches to device (recurse for nested dicts — matches
+        # legacy _gather_recursive). cu_seqlens handled by temporal.forward_packed.
+        def _to_device(d):
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor):
+                    out[k] = v.to(device)
+                elif isinstance(v, dict):
+                    out[k] = _to_device(v)
+                else:
+                    out[k] = v
+            return out
+        flat_feat = _to_device(flat_feat)
+
+        if sum_T == 0:
+            # Defensive (Phase A raises on zero-length episodes, but be safe).
+            n_actions = cfg.format_config.n_actions
+            return {
+                "action_logits": torch.full((0, n_actions), -100.0, device=device),
+                "value":         torch.zeros(0, device=device),
+                "v_logits":      torch.zeros(0, cfg.v_bins, device=device),
+            }
+
+        # Spatial pass — already operates on flat (N, ...) shapes. No gather.
+        spatial_out, all_summaries = self.forward_spatial(flat_feat)
+
+        # Action context — also flat. Mirrors legacy Phase 4.
+        our_full_ids = self.tokenizer._fix_ids(flat_feat, "our")  # (sum_T, 6, 7)
+        action_ctx = self._per_action_context(
+            spatial_out=spatial_out,
+            our_pokemon_move_ids=our_full_ids[..., 3:7],
+            active_move_ids=flat_feat["active_move_ids"],
+            switch_ids=flat_feat["switch_ids"],
+            our_pokemon_species_ids=our_full_ids[..., 0],
+            switch_cont=flat_feat["switch_cont"],
+        )
+
+        # Temporal stack on packed sequence (B.2's forward_packed). Replaces
+        # legacy Phases 5 (scatter into padded grid) + 6 (padded temporal
+        # forward) + 7 (gather back) with one packed call.
+        temporal_ctx = self.temporal.forward_packed(all_summaries, cu_seqlens)
+        # → (sum_T, d_temporal)
+
+        # Heads (already flat). Mirrors legacy Phase 8 minus the scatter.
+        actor_out  = spatial_out[:, 0, :]   # (sum_T, d_model)
+        critic_out = spatial_out[:, 1, :]   # (sum_T, d_model)
+        legal_valid = flat_feat["legal_mask"]  # (sum_T, n_actions)
+
+        logits = self.action_head(
+            actor_out, temporal_ctx, action_ctx, legal_mask=legal_valid,
+        )  # (sum_T, n_actions)
+        v_logits, value = self.value_head(critic_out, temporal_ctx)
+        # → (sum_T, v_bins), (sum_T,)
+
+        return {
+            "action_logits": logits,
+            "value":         value,
+            "v_logits":      v_logits,
         }
 
 

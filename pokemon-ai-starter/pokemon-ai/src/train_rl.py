@@ -178,6 +178,15 @@ def parse_args():
                         "production scale, 8 for tighter memory. None "
                         "= one chunk = old mega-batch behavior (smoke "
                         "scale only).")
+    p.add_argument("--packed", action="store_true",
+                   help="S64: route the Tier 3 eager update through the "
+                        "packed-sequence path (collate_episodes_packed + "
+                        "forward_ppo_sequence_packed + _ppo_loss_packed_internal). "
+                        "Eliminates pad_mask waste in the collate+temporal+loss "
+                        "stack (~38%% of update CPU at prod scale per S64 step-back "
+                        "profile). Requires --tier3. NOT supported with --compile "
+                        "(eager-only in v1). Bit-equivalent to legacy at fp32 eval "
+                        "and within bf16 noise at training (B.2-B.5 gates).")
     p.add_argument("--bc-anchor-coef", type=float, default=0.1,
                    help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
@@ -1175,6 +1184,7 @@ def main():
                 bc_ref=bc_ref,
                 bc_anchor_coef=args.bc_anchor_coef,
                 minibatch_size=args.tier3_minibatch_size,
+                packed=args.packed,
             )
         else:
             loss_info = ppo_update(

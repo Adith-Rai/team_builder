@@ -345,6 +345,233 @@ def collate_episodes(episodes, L_max=None, device=None, tail: bool = False) -> d
 
 
 # =============================
+# S64 Phase A: sequence-packed collation (sister to collate_episodes)
+# =============================
+#
+# Produces flat (sum_T, ...) tensors + cu_seqlens instead of padded
+# (B, L_max, ...) + pad_mask. Consumed by the sequence-packed PPO path
+# (S64+, Phase B onward). Eliminates the padding cat + padding fill_
+# zero-allocations identified in the S64 step-back profile as ~38% of
+# update CPU reachable. Input contract is identical to collate_episodes.
+#
+# Acceptance gate (Phase A): for any input `episodes` and matching
+# (max_seqlen, tail, device) args, the packed output unpacked via
+# cu_seqlens equals the unpadded prefix of legacy collate_episodes.
+# Tests in test_collate_packed.py.
+
+def collate_episodes_packed(episodes, max_seqlen=None, device=None,
+                             tail: bool = False) -> dict:
+    """Pack B episode dicts into flat (sum_T, ...) tensors + cu_seqlens.
+
+    Sister to `collate_episodes`. Same input contract; different output
+    shape. The packed format eliminates padding waste — no per-episode
+    pad-to-L_max cat, no padding zero allocations, no per-position
+    pad_mask. Phase B will refactor `forward_ppo_sequence` to consume
+    this directly via varlen attention (flex_attention BlockMask).
+
+    Args:
+      episodes: list of episode dicts from `build_ppo_episodes`. Each must
+        contain: feat_batches (list of T per-turn feat dicts with (1, *)
+        tensor leaves and optionally one level of nested dict),
+        actions/old_logp/advantages/returns (length-T sequences),
+        action_masks (list of T arrays/lists of length A).
+      max_seqlen: optional cap on individual episode length. Defaults to
+        max episode length in the bundle. Episodes longer than max_seqlen
+        are truncated.
+      device: optional torch.device — if given, output tensors are moved
+        there. If None, stays on CPU.
+      tail: when True AND max_seqlen is given, truncate to the LAST
+        max_seqlen turns of each episode (keep recent context). Mirrors
+        legacy `collate_episodes` tail semantics — required for paths
+        feeding forward_ppo_sequence (whose temporal forward caps at
+        cfg.temporal_context).
+
+    Returns:
+      dict with the following keys:
+        flat_feat_batches: dict — each leaf is (sum_T, ...) tensor.
+          Nested dicts are recursed; non-tensor leaves are dropped
+          (matches legacy collate_episodes silently-skip-non-tensor).
+        cu_seqlens:   (B+1,) int32 tensor with [0, T_0, T_0+T_1, ...,
+                      sum_T]. Standard FA/flex_attention varlen format.
+        max_seqlen:   int — max(T_i) over episodes after truncation.
+                      Useful for flex_attention BlockMask construction.
+        seq_lens:     (B,) long tensor — actual T per episode
+                      (post-truncation). Derivable as cu_seqlens.diff();
+                      kept here for caller convenience + downstream
+                      consumers (forward_ppo_sequence currently reads it
+                      directly — Phase B may drop this).
+        actions:      (sum_T,) long tensor
+        old_logp:     (sum_T,) float tensor
+        advantages:   (sum_T,) float tensor
+        returns:      (sum_T,) float tensor
+        action_masks: (sum_T, A) float tensor
+        B:            int — batch size (number of episodes)
+
+    Memory notes:
+      - sum_T = sum of valid turns, no padding. At prod scale
+        (B≈16, mean T≈120, L_max=200), packed is ≈ (120/200)·legacy
+        memory = 40% smaller per feature tensor.
+      - Eliminates the ~160k aten::fill_ padding-zero allocations and
+        the ~270k padding cat events identified in S64 prod profile.
+
+    Equivalence gate (the unit test):
+      legacy = collate_episodes(eps, L_max=L, device=d, tail=t)
+      packed = collate_episodes_packed(eps, max_seqlen=L, device=d, tail=t)
+      For every feature key k, every batch index b:
+        start, stop = packed["cu_seqlens"][b], packed["cu_seqlens"][b+1]
+        packed[...key][start:stop] == legacy[...key][b, :seq_lens[b]]
+    """
+    import torch as _t
+
+    if not episodes:
+        raise ValueError("collate_episodes_packed: empty episode list")
+
+    # 1. Determine per-episode T + start-offsets (matches legacy semantics)
+    full_lens_list = [len(ep["actions"]) for ep in episodes]
+    if max_seqlen is None:
+        max_seqlen_eff = max(full_lens_list)
+    else:
+        max_seqlen_eff = max_seqlen
+    if tail:
+        start_idx_list = [max(0, T - max_seqlen_eff) for T in full_lens_list]
+    else:
+        start_idx_list = [0] * len(episodes)
+    seq_lens_list = [min(T, max_seqlen_eff) for T in full_lens_list]
+
+    if any(s == 0 for s in seq_lens_list):
+        raise ValueError("collate_episodes_packed: T_actual==0 episode "
+                         "(should be filtered upstream)")
+
+    B = len(episodes)
+    sum_T = sum(seq_lens_list)
+    max_seqlen_out = max(seq_lens_list)
+
+    seq_lens = _t.tensor(seq_lens_list, dtype=_t.long)
+    # cu_seqlens[0]=0, cu_seqlens[i]=sum(seq_lens[:i]). int32 = FA convention.
+    cu_seqlens = _t.zeros(B + 1, dtype=_t.int32)
+    if B > 0:
+        cu_seqlens[1:] = _t.tensor(seq_lens_list, dtype=_t.int32).cumsum(0)
+
+    # 2. Flatten scalar-per-turn fields (actions/old_logp/advantages/returns)
+    #    Each ep[k] is a length-T python list (or numpy array — see
+    #    build_ppo_episodes line 103 .tolist() conversion).
+    def _flat_1d(field_key, dtype):
+        parts = []
+        for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list):
+            arr = list(ep[field_key])[st:st + T_act]
+            parts.append(_t.as_tensor(arr, dtype=dtype))
+        return _t.cat(parts, dim=0)
+
+    actions = _flat_1d("actions", _t.long)
+    old_logp = _flat_1d("old_logp", _t.float32)
+    advantages = _flat_1d("advantages", _t.float32)
+    returns = _flat_1d("returns", _t.float32)
+
+    # 3. action_masks: per-turn (A,) array/list → (sum_T, A)
+    A = None
+    for ep in episodes:
+        if ep["action_masks"]:
+            first_m = ep["action_masks"][0]
+            A = (first_m.shape[0] if hasattr(first_m, "shape")
+                 else len(first_m))
+            break
+    if A is None:
+        raise ValueError("collate_episodes_packed: no action_masks found")
+
+    am_parts = []
+    for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list):
+        per_ep = _t.stack(
+            [_t.as_tensor(m, dtype=_t.float32)
+             for m in ep["action_masks"][st:st + T_act]],
+            dim=0,
+        )
+        am_parts.append(per_ep)
+    action_masks = _t.cat(am_parts, dim=0)
+
+    # 4. feat_batches: per-episode list of T per-turn dicts. Each per-turn
+    #    dict has tensor leaves of shape (1, ...) and possibly one level
+    #    of nested dict with same-shape leaves. Mirror legacy nested-dict
+    #    recursion path (one level deep, no further recursion).
+    #
+    #    Strategy: per-episode, cat T per-turn (1, *) tensors → (T, *).
+    #    Across episodes, cat → (sum_T, *). One cat-per-key + one cat-
+    #    across-episodes per key, vs legacy's per-turn cat + padding cat
+    #    + cross-episode stack. Padding cat + fill_ eliminated entirely.
+    def _flat_feat_one_episode(turn_dicts, start, T_actual):
+        sample = turn_dicts[start]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                out[k] = _t.cat([turn_dicts[start + t][k]
+                                 for t in range(T_actual)], dim=0)
+            elif isinstance(v, dict):
+                inner_out = {}
+                for inner_k, inner_v in v.items():
+                    if isinstance(inner_v, _t.Tensor):
+                        inner_out[inner_k] = _t.cat(
+                            [turn_dicts[start + t][k][inner_k]
+                             for t in range(T_actual)], dim=0)
+                    # else: pass (matches legacy silent-skip)
+                out[k] = inner_out
+        return out
+
+    per_episode_flat = [
+        _flat_feat_one_episode(ep["feat_batches"], st, T_act)
+        for ep, st, T_act in zip(episodes, start_idx_list, seq_lens_list)
+    ]
+
+    def _cat_across_episodes(per_ep_list):
+        sample = per_ep_list[0]
+        out = {}
+        for k, v in sample.items():
+            if isinstance(v, _t.Tensor):
+                out[k] = _t.cat([d[k] for d in per_ep_list], dim=0)
+            elif isinstance(v, dict):
+                inner_out = {}
+                for inner_k in v:
+                    inner_out[inner_k] = _t.cat(
+                        [d[k][inner_k] for d in per_ep_list], dim=0)
+                out[k] = inner_out
+        return out
+
+    flat_feat_batches = _cat_across_episodes(per_episode_flat)
+
+    # 5. Optional device move
+    if device is not None:
+        def _to_device(d):
+            r = {}
+            for k, v in d.items():
+                if isinstance(v, _t.Tensor):
+                    r[k] = v.to(device, non_blocking=True)
+                elif isinstance(v, dict):
+                    r[k] = _to_device(v)
+                else:
+                    r[k] = v
+            return r
+        flat_feat_batches = _to_device(flat_feat_batches)
+        actions = actions.to(device, non_blocking=True)
+        old_logp = old_logp.to(device, non_blocking=True)
+        advantages = advantages.to(device, non_blocking=True)
+        returns = returns.to(device, non_blocking=True)
+        action_masks = action_masks.to(device, non_blocking=True)
+        cu_seqlens = cu_seqlens.to(device, non_blocking=True)
+        seq_lens = seq_lens.to(device, non_blocking=True)
+
+    return {
+        "flat_feat_batches": flat_feat_batches,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen_out,
+        "seq_lens": seq_lens,
+        "actions": actions,
+        "old_logp": old_logp,
+        "advantages": advantages,
+        "returns": returns,
+        "action_masks": action_masks,
+        "B": B,
+    }
+
+
+# =============================
 # Tier 3 C3 (Phase 4.7+, S55): masked PPO loss for sequence-batched update
 # =============================
 #
@@ -479,6 +706,121 @@ def _ppo_loss_batched_internal(collated: dict, forward_out: dict, model, cfg,
         "ratio_clip_frac": ratio_clip_frac,  # TENSOR scalar
         "n_valid":         n_valid,          # TENSOR scalar
         "bc_kl":           bc_kl,            # TENSOR scalar (0 if bc anchor off)
+    }
+
+
+# =============================
+# S64 Phase B.5: packed-mode PPO loss
+# =============================
+#
+# _ppo_loss_packed_internal is the flat (sum_T,)-shape version of
+# _ppo_loss_batched_internal. Consumes Phase A's collate_episodes_packed
+# output + forward_ppo_sequence_packed's flat outputs. No pad_mask
+# multiplications because every position is valid in packed layout —
+# `(x * pad_mask).sum() / n_valid` reduces to `x.mean()`. Mathematically
+# equivalent to the legacy at matching valid positions. The C3 docstring
+# at line 355-358 stated the desired aggregation is "per-transition mean";
+# packed layout makes this the natural reduction.
+
+def _ppo_loss_packed_internal(packed_collated: dict, forward_out: dict, model, cfg,
+                               ent_coef, vf_coef, clip_eps,
+                               normalize_advantages: bool = False,
+                               bc_logits=None, bc_anchor_coef=0.0) -> dict:
+    """Packed-mode PPO loss. S64 Phase B.5.
+
+    Drop-in semantics vs `_ppo_loss_batched_internal`:
+      - Same return-dict keys, same scalar tensor types.
+      - Same numerical contract at matching valid positions: at fp32 the
+        legacy `.sum()/n_valid` and the packed `.mean()` differ only by
+        floating-point reorder.
+      - Same BC anchor formulation (KL(BC || model), unchanged direction
+        + scale).
+
+    Input contract:
+      packed_collated: output of `ppo.collate_episodes_packed()`. Reads:
+        actions       (sum_T,) long
+        old_logp      (sum_T,) float
+        advantages    (sum_T,) float
+        returns       (sum_T,) float
+      forward_out: output of `model.forward_ppo_sequence_packed()`. Reads:
+        action_logits (sum_T, n_actions)
+        v_logits      (sum_T, v_bins)
+      model: TransformerBattlePolicy — for `model.twohot_target()`.
+      cfg: model config — reads cfg.v_min, cfg.v_max.
+
+    `ent_coef`, `vf_coef`, `clip_eps`: Python floats or 0-dim tensors.
+    `bc_logits`: optional (sum_T, n_actions) — BC ref's logits on the
+        SAME packed_collated batch (computed eagerly by caller).
+    `bc_anchor_coef`: scalar (Python float or 0-dim tensor).
+    """
+    actions = packed_collated["actions"]
+    old_logp = packed_collated["old_logp"]
+    advantages = packed_collated["advantages"]
+    returns = packed_collated["returns"]
+
+    logits_all = forward_out["action_logits"]    # (sum_T, n_actions)
+    vlogits_all = forward_out["v_logits"]        # (sum_T, v_bins)
+
+    device = logits_all.device
+    sum_T = logits_all.shape[0]
+    # n_valid = sum_T (all positions valid by construction). Kept as a tensor
+    # for return-contract compat with legacy (callers may .item() it).
+    n_valid = torch.tensor(float(sum_T), device=device).clamp(min=1.0)
+
+    actions = actions.to(device)
+    old_logp = old_logp.to(device).float()
+    advantages = advantages.to(device).float()
+    returns = returns.to(device).float()
+
+    if normalize_advantages:
+        # Legacy uses biased variance (sum / N, no Bessel correction); match.
+        adv_mean = advantages.mean()
+        adv_var = (advantages - adv_mean).pow(2).mean()
+        adv_std = adv_var.clamp(min=1e-8).sqrt()
+        advantages = (advantages - adv_mean) / adv_std
+
+    lp = F.log_softmax(logits_all.float(), dim=-1)                    # (sum_T, A)
+    new_logp = lp.gather(1, actions.unsqueeze(-1)).squeeze(-1)        # (sum_T,)
+    ratio = torch.exp(new_logp - old_logp)
+
+    with torch.no_grad():
+        clipped_per_pos = ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).float()
+        ratio_clip_frac = clipped_per_pos.mean()
+
+    s1 = ratio * advantages
+    s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+    pi_loss = (-torch.min(s1, s2)).mean()
+
+    probs = F.softmax(logits_all.float(), dim=-1)
+    entropy = (-(probs * lp).sum(-1)).mean()
+
+    ret_c = returns.clamp(cfg.v_min, cfg.v_max)                       # (sum_T,)
+    vtgt = model.twohot_target(ret_c).float()                          # (sum_T, v_bins)
+    v_loss = (-(vtgt * F.log_softmax(vlogits_all.float(), dim=-1)).sum(-1)).mean()
+
+    with torch.no_grad():
+        approx_kl = (old_logp - new_logp).mean()
+
+    total_loss = pi_loss - ent_coef * entropy + vf_coef * v_loss
+
+    # BC anchor: KL(BC || model) — same direction + formulation as legacy.
+    if bc_logits is not None:
+        bc_lp = F.log_softmax(bc_logits.float(), dim=-1)               # (sum_T, A)
+        bc_p = F.softmax(bc_logits.float(), dim=-1)
+        bc_kl = ((bc_p * (bc_lp - lp)).sum(-1)).mean()
+        total_loss = total_loss + bc_anchor_coef * bc_kl
+    else:
+        bc_kl = torch.zeros((), device=device)
+
+    return {
+        "total_loss":      total_loss,
+        "pi_loss":         pi_loss,
+        "entropy":         entropy,
+        "v_loss":          v_loss,
+        "approx_kl":       approx_kl,        # TENSOR scalar
+        "ratio_clip_frac": ratio_clip_frac,  # TENSOR scalar
+        "n_valid":         n_valid,          # TENSOR scalar
+        "bc_kl":           bc_kl,            # TENSOR scalar (0 if BC off)
     }
 
 
@@ -1110,7 +1452,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        in_warmup: bool = False,
                        compiled_step=None,
                        bc_ref=None, bc_anchor_coef: float = 0.0,
-                       minibatch_size: Optional[int] = None) -> dict:
+                       minibatch_size: Optional[int] = None,
+                       packed: bool = False) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1168,6 +1511,18 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             "ppo_update_batched does not support in_warmup=True yet. "
             "Use the per-episode ppo_update for warmup iters, then switch "
             "to ppo_update_batched for the main training loop."
+        )
+    if packed and compiled_step is not None:
+        # S64 Phase B.6: packed path is eager-only in v1. --compile was
+        # REFUTED at prod (S62, 8% slower) so the compile boundary is not
+        # on the canonical Phase 2 stack; we don't need a compiled packed
+        # variant. If both flags are set, fail loudly rather than silently
+        # taking one path.
+        raise NotImplementedError(
+            "ppo_update_batched: --packed is not supported with the "
+            "compiled Tier 3 train_step (eager-only in v1). Drop "
+            "--compile or drop --packed. Canonical Phase 2 stack uses "
+            "--packed without --compile per S62 refutation."
         )
     # S60 Fix #2: removed NotImplementedError that blocked compiled_step +
     # bc_ref. The compile boundary now supports BC anchor via bc_logits +
@@ -1410,9 +1765,17 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
 
             for chunk_idx, chunk_eps in enumerate(chunks):
                 # Collate this chunk only (memory-bounded by chunk size).
+                # S64 B.6: packed mode uses collate_episodes_packed (flat
+                # sum_T layout, no pad_mask waste); legacy mode uses the
+                # padded (B, L_max) layout.
                 _temp_ctx = getattr(cfg, "temporal_context", None)
-                if _temp_ctx is not None:
-                    _eff_L = min(L_max, _temp_ctx) if L_max else _temp_ctx
+                _eff_L = (min(L_max, _temp_ctx) if (L_max and _temp_ctx) else
+                          (_temp_ctx if _temp_ctx is not None else L_max))
+                if packed:
+                    collated = collate_episodes_packed(
+                        chunk_eps, max_seqlen=_eff_L, device=device, tail=True,
+                    )
+                elif _temp_ctx is not None:
                     collated = collate_episodes(
                         chunk_eps, L_max=_eff_L, device=device, tail=True,
                     )
@@ -1422,15 +1785,24 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     )
 
                 # BC ref forward (per chunk; same memory bound as model)
+                # S64 B.6: packed routes through forward_ppo_sequence_packed
+                # and feeds the SAME packed_collated dict the trainable model
+                # consumes — both paths see flat (sum_T, n_actions) bc_logits.
                 bc_logits = None
                 if bc_ref is not None and bc_anchor_coef != 0.0:
                     with torch.no_grad():
                         with _update_amp_ctx:
-                            bc_out = bc_ref.forward_ppo_sequence(collated, device)
+                            if packed:
+                                bc_out = bc_ref.forward_ppo_sequence_packed(collated, device)
+                            else:
+                                bc_out = bc_ref.forward_ppo_sequence(collated, device)
                             bc_logits = bc_out["action_logits"].detach()
 
                 with _update_amp_ctx:
-                    forward_out = model.forward_ppo_sequence(collated, device)
+                    if packed:
+                        forward_out = model.forward_ppo_sequence_packed(collated, device)
+                    else:
+                        forward_out = model.forward_ppo_sequence(collated, device)
 
                     if (forward_out["action_logits"].isnan().any()
                             or forward_out["v_logits"].isnan().any()):
@@ -1439,10 +1811,14 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_failed = True
                         break
 
-                    # S63: call _ppo_loss_batched_internal directly to get
-                    # tensor outputs (avoids 4 .item() calls in ppo_loss_batched
-                    # per chunk — see project_s62_update_profile_findings.md).
-                    loss_dict = _ppo_loss_batched_internal(
+                    # S63: call the loss internal directly for tensor outputs
+                    # (avoids 4 .item() calls in the public wrapper per chunk
+                    # — see project_s62_update_profile_findings.md).
+                    # S64 B.6: packed routes through _ppo_loss_packed_internal
+                    # which expects flat (sum_T,...) shapes from collated.
+                    _loss_fn = (_ppo_loss_packed_internal if packed
+                                else _ppo_loss_batched_internal)
+                    loss_dict = _loss_fn(
                         collated, forward_out, model, cfg,
                         ent_coef=ent_coef, vf_coef=vf_coef,
                         clip_eps=clip_eps,
@@ -1478,16 +1854,28 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 chunk_stats["bc_kl"]           = chunk_stats["bc_kl"]           + loss_dict["bc_kl"] * inv_n
 
                 # Drift diagnostics (tensor accumulators; .item() at epoch end)
+                # S64 B.6: packed has no pad_mask; every position is valid →
+                # .mean() over (sum_T,) replaces the (x*pad_mask).sum()/n_valid
+                # pattern. Mathematically equivalent at matching valid positions.
                 with torch.no_grad():
-                    pad_mask_f = collated["pad_mask"].to(device).float()
-                    n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
-                    returns_t = collated["returns"].to(device).float()
-                    advantages_t = collated["advantages"].to(device).float()
-                    v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
-                    v_pred = (v_probs * get_v_support(model)).sum(-1)
-                    chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
-                    chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
-                    chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                    if packed:
+                        returns_t = collated["returns"].to(device).float()       # (sum_T,)
+                        advantages_t = collated["advantages"].to(device).float()  # (sum_T,)
+                        v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)  # (sum_T, v_bins)
+                        v_pred = (v_probs * get_v_support(model)).sum(-1)             # (sum_T,)
+                        chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + v_pred.mean() * inv_n
+                        chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + returns_t.mean() * inv_n
+                        chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + advantages_t.abs().mean() * inv_n
+                    else:
+                        pad_mask_f = collated["pad_mask"].to(device).float()
+                        n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
+                        returns_t = collated["returns"].to(device).float()
+                        advantages_t = collated["advantages"].to(device).float()
+                        v_probs = F.softmax(forward_out["v_logits"].float(), dim=-1)
+                        v_pred = (v_probs * get_v_support(model)).sum(-1)
+                        chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
 
                 # Per-chunk memory cleanup — prevents activation accumulation
                 # across chunks (the whole point of minibatching).
