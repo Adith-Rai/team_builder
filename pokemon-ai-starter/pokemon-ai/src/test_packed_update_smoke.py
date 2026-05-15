@@ -96,14 +96,20 @@ def test_packed_update_smoke():
     # correctness here).
     bc_ref = model
 
-    # Common kwargs for both runs
+    # Common kwargs for both runs.
+    # target_kl bumped to 100.0 (effectively disables KL early-stop) because
+    # synthetic episodes have RANDOM old_logp that doesn't match the model's
+    # actual logits → approx_kl is large by construction, which would trip
+    # the production gate (target_kl=0.03) and result in n_succeeded=0. This
+    # smoke checks WIRING, not PPO dynamics — production target_kl is
+    # exercised by B.7 prod smoke A/B on real episodes from a CIS rollout.
     common = dict(
         epochs=1,
         clip_eps=0.2,
         ent_coef=0.02,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        target_kl=0.03,
+        target_kl=100.0,
         normalize_advantages=False,
         compiled_step=None,
         bc_ref=bc_ref,
