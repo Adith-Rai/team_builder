@@ -27,6 +27,23 @@ sys.path.insert(0, '.')
 
 from ppo import load_checkpoint
 
+# Tolerance band rationale: flex_attention (Triton-kernel) and the
+# nn.MultiheadAttention slow path (cuDNN/aten math) compute the same
+# attention but cannot be bit-identical at fp32 — different kernels, different
+# accumulation orders. With BC v10 weights through 4 temporal layers, observed
+# max_abs grows from ~2e-6 at T=1 (fp32 noise floor — math is correct) up to
+# ~7e-6 at T=200 (legitimate compose drift). rtol=1e-4 atol=1e-5 catches real
+# semantic bugs (which produce ~1e-3 or worse — verified empirically by the
+# earlier fast-path-vs-slow-path failure at max_abs ~2e-3) while accommodating
+# unavoidable cross-kernel reorder. bf16 would widen further (1e-2).
+#
+# Note on max_rel reporting: max_rel is informational, NOT a pass criterion.
+# allclose uses |a-b| <= atol + rtol*|b|. When legacy outputs are near zero
+# (typical for some transformer output positions), max_rel blows up at tiny
+# absolute diffs — misleading.
+FP32_RTOL = 1e-4
+FP32_ATOL = 1e-5
+
 
 def _build_paired_summaries(T_list, D, device, dtype=torch.float32, seed=0):
     """Build (legacy_padded, packed, cu_seqlens, seq_lens) from the SAME
@@ -121,7 +138,7 @@ def test_temporal_packed_equivalence():
         out_packed_1 = model.temporal.forward_packed(packed_1, cu_1)
     pass_1, abs_1, rel_1 = _check_equiv(
         out_legacy_1, out_packed_1, T_list_1, cu_1,
-        label="B=1", rtol=1e-5, atol=1e-6,
+        label="B=1", rtol=FP32_RTOL, atol=FP32_ATOL,
     )
     print()
 
@@ -135,7 +152,7 @@ def test_temporal_packed_equivalence():
         out_packed_2 = model.temporal.forward_packed(packed_2, cu_2)
     pass_2, abs_2, rel_2 = _check_equiv(
         out_legacy_2, out_packed_2, T_list_2, cu_2,
-        label="B=3", rtol=1e-5, atol=1e-6,
+        label="B=3", rtol=FP32_RTOL, atol=FP32_ATOL,
     )
     print()
 
@@ -149,7 +166,7 @@ def test_temporal_packed_equivalence():
         out_packed_3 = model.temporal.forward_packed(packed_3, cu_3)
     pass_3, abs_3, rel_3 = _check_equiv(
         out_legacy_3, out_packed_3, T_list_3, cu_3,
-        label="B=5/edge", rtol=1e-5, atol=1e-6,
+        label="B=5/edge", rtol=FP32_RTOL, atol=FP32_ATOL,
     )
     print()
 
