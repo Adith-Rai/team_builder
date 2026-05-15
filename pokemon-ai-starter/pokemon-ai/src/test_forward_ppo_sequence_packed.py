@@ -205,13 +205,15 @@ def test_forward_ppo_sequence_packed():
             legacy_out = model.forward_ppo_sequence(legacy_collated, device)
             packed_out = model.forward_ppo_sequence_packed(packed_collated, device)
 
-        # Shape checks (B.3-equivalent gate)
+        # Shape checks (B.3-equivalent gate). legacy collate with L_max=
+        # cfg.temporal_context pads to 200, NOT max(T_list) — matches what
+        # ppo_update_batched does in production (ppo.py:1266-1268).
         sum_T = sum(T_list)
-        L_max = max(T_list)
+        legacy_L = legacy_collated["L_max"]
         B = len(T_list)
         n_actions = cfg.format_config.n_actions
         v_bins = cfg.v_bins
-        assert legacy_out["action_logits"].shape == (B, L_max, n_actions), \
+        assert legacy_out["action_logits"].shape == (B, legacy_L, n_actions), \
             f"legacy action_logits shape: {legacy_out['action_logits'].shape}"
         assert packed_out["action_logits"].shape == (sum_T, n_actions), \
             f"packed action_logits shape: {packed_out['action_logits'].shape}"
@@ -219,7 +221,7 @@ def test_forward_ppo_sequence_packed():
             f"packed value shape: {packed_out['value'].shape}"
         assert packed_out["v_logits"].shape == (sum_T, v_bins), \
             f"packed v_logits shape: {packed_out['v_logits'].shape}"
-        print(f"  shapes OK: legacy=(B={B}, L={L_max}, ...) packed=(sum_T={sum_T}, ...)")
+        print(f"  shapes OK: legacy=(B={B}, L={legacy_L}, ...) packed=(sum_T={sum_T}, ...)")
 
         # Bit-equiv check at valid positions (B.4 gate)
         passed = _check_forward_equiv(
