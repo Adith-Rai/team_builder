@@ -124,15 +124,36 @@ def test_loss_packed():
               legacy_fwd = model.forward_ppo_sequence(legacy_collated, device)
               packed_fwd = model.forward_ppo_sequence_packed(packed_collated, device)
 
-              # BC ref logits: use the model itself as BC ref (KL exactly 0
-              # against trainable model when forward outputs are bit-identical;
-              # both paths get the same bc_logits format as their forward
-              # output). Detached, no grad. This is a STRUCTURAL test: legacy
-              # and packed paths must compute bc_kl identically given matching
-              # bc_logits shapes.
+              # BC ref logits: build per-episode random tensors (seeded for
+              # determinism), then unpack the SAME data into both legacy
+              # (B, L_max, A) padded layout and packed (sum_T, A) flat layout.
+              # Both bc_logits hold identical values at valid positions but
+              # come from a distribution different from the model's logits,
+              # so bc_kl evaluates to a NON-ZERO value — actually exercises
+              # the `total_loss + bc_anchor_coef * bc_kl` path.
               if bc_on:
-                  legacy_bc = legacy_fwd["action_logits"].detach()
-                  packed_bc = packed_fwd["action_logits"].detach()
+                  A = cfg.format_config.n_actions
+                  L_max = legacy_collated["L_max"]
+                  B = len(T_list)
+                  sum_T = sum(T_list)
+                  # Seed by case+dtype to get a different draw per combo (and
+                  # avoid the trivial-identity bc_logits==fwd_logits case).
+                  g = torch.Generator(device=device).manual_seed(
+                      0xBC ^ hash(full_label) % (2**31)
+                  )
+                  per_ep_bc = [
+                      torch.randn(T_b, A, generator=g, device=device,
+                                  dtype=torch.float32) * 3.0
+                      for T_b in T_list
+                  ]
+                  packed_bc = torch.cat(per_ep_bc, dim=0)            # (sum_T, A)
+                  legacy_bc = torch.zeros(B, L_max, A, device=device,
+                                           dtype=torch.float32)
+                  for b, (T_b, bc_ep) in enumerate(zip(T_list, per_ep_bc)):
+                      legacy_bc[b, :T_b] = bc_ep
+                  # Cast to match forward output dtype (matters for bf16).
+                  packed_bc = packed_bc.to(packed_fwd["action_logits"].dtype)
+                  legacy_bc = legacy_bc.to(legacy_fwd["action_logits"].dtype)
               else:
                   legacy_bc = None
                   packed_bc = None
