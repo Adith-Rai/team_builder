@@ -42,6 +42,9 @@ def main():
                    help="Enable bf16 autocast (matches canonical Phase 2 stack). "
                         "Without this, runs at fp32 default which uses DIFFERENT "
                         "cuBLAS kernel paths than prod — comparison may not transfer.")
+    p.add_argument("--no-per-chunk-gc", action="store_true",
+                   help="S64 2b experiment: disable per-chunk gc.collect() + "
+                        "torch.cuda.empty_cache() in eager Tier3.")
     p.add_argument("--with-bc", action="store_true", default=True,
                    help="Enable BC anchor (matches canonical Phase 2 stack)")
     p.add_argument("--out-prefix", default="/tmp/profile_smoke",
@@ -109,6 +112,7 @@ def main():
         bc_anchor_coef=0.1 if args.with_bc else 0.0,
         minibatch_size=args.minibatch_size,
         packed=args.packed,
+        per_chunk_gc=not args.no_per_chunk_gc,
     )
 
     optim = torch.optim.AdamW(model.parameters(), lr=1e-5)
