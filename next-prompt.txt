@@ -17,22 +17,29 @@ user which is next:
   even without further optimization. Source 100-150 real elite gen-9 OU teams,
   lr re-ablation, external opps PFSP, H2H gauntlet wiring.
 
-**Phase B + 2a (minibatch=32) BOTH SHIPPED — MEASURED at prod**:
+**Phase B + 2a (minibatch=64 at bf16) BOTH SHIPPED — MEASURED at prod**:
 
-| Config | Update wall | Δ vs pre-arc legacy |
-|---|---|---|
-| Legacy mb=16 | 1865s | — |
-| Packed mb=16 | 1729s | -7.3% |
-| **Packed mb=32** | **1005s** | **-46%** |
+| Config | Collect | Update | Total | Δ update vs legacy |
+|---|---|---|---|---|
+| Legacy mb=16 | 573s | 1865s | 2438s | — |
+| Packed mb=16 | 573s | 1729s | 2302s | -7.3% |
+| Packed mb=32 (initial 2a ship) | 578s | 1054s | 1632s | -43.5% |
+| Packed mb=48 (bf16 sweep) | 560s | 660s | 1220s | -64.6% |
+| **Packed mb=64 (final 2a ship)** | **550s** | **551s** | **1101s** | **-70.5% / 3.38×** |
 
-- Overall wall: 2451s → 1558s at mb=32 = **-36% per iter**
-- 200-iter Phase 2: ~5.7 days / ~$200 → **~3.6 days / ~$130** (saves ~50 hr / ~$70)
+- Overall wall: 2438s → 1101s at mb=64 = **-55% per iter**
+- 200-iter Phase 2: ~5.7 days / ~$200 → **~2.5 days / ~$90** (saves ~80 hr / ~$110)
 - Numerical drift: kl/bc_kl ~-0.003 vs legacy, within bf16 noise; **favorable
   direction** for bc_kl (closer to BC anchor)
 - ALL 5 Phase B bit-equiv gates passed (B.2 temporal, B.3+B.4 fwd fp32+bf16,
   B.5 loss 12-combo with non-zero BC anchor, B.6 e2e smoke)
-- 2a finding: **mb=32 is the empirical sweet spot**. mb=48 SLOWER at smoke
-  (cuDNN kernel selection or BlockMask compile overhead). mb=64 OOMs.
+- 2a learning: **fp32 smoke does NOT transfer to bf16 prod for kernel-
+  selection-bound questions.** cuBLAS picks qualitatively different kernels
+  per precision. Initial mb=32 ship was based on fp32 smoke; corrected to
+  mb=64 after bf16 sweep showed mb=48 and mb=64 both faster.
+- 2a operational learning: **clean-state ritual must include `pkill -9 python`
+  (no filter), not `pkill -9 -f 'python.*train_rl'`.** The filter misses
+  multiprocessing-fork children. Orphan CIS workers contaminated several runs.
 
 **CANONICAL PHASE 2 LAUNCH (UPDATED, includes --packed)**:
 ```bash
@@ -41,7 +48,7 @@ nohup ./launch_rl.sh \
   --init-from data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-coef 0.1 \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 32 \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 \
   --packed \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -60,10 +67,11 @@ nohup ./launch_rl.sh \
 ```
 
 Four changes vs prior canonical: `./launch_rl.sh` wrapper (sets LD_LIBRARY_PATH
-for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), **`--tier3-minibatch-size 32`
-instead of 16** (2a SHIPPED — 1.72× update wall at prod), drop `--device cuda` +
-`--servers ...` (defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...`
-NOT `/workspace/team_builder/raw_data/...` (memory had it wrong).
+for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), **`--tier3-minibatch-size 64`
+instead of 16** (2a SHIPPED at bf16 — 3.14× update wall at prod), drop
+`--device cuda` + `--servers ...` (defaults). PROCEDURAL-TEAMS PATH is
+`/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...` (memory
+had it wrong).
 
 **Pre-Phase-2-launch checklist**:
 1. RESTART battle_server.js processes (per Phase B §3.3 — state degrades over

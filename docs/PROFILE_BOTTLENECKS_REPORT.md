@@ -161,7 +161,7 @@ removed since Fix #3 doesn't pay off).
 
 ## TL;DR
 
-**Current state (S64 Phase B + 2a BOTH SHIPPED)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); **sequence packing SHIPPED** at prod (-7.3% update via S64 Phase A+B `--packed` flag, merged to master at `ba2ced64`); **2a (minibatch=32) SHIPPED** at prod (-41.9% additional update wall = 1.72×). Cumulative -46% update wall at packed mb=32 vs legacy mb=16. NEXT: 2b (gc/empty_cache audit, est 1.05-1.20×), 2c (BC anchor caching, est 1.05-1.10×), #2 CUDA Graphs (honest 5-15%). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
+**Current state (S64 Phase B + 2a BOTH SHIPPED at mb=64)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); **sequence packing SHIPPED** at prod (-7.3% update via S64 Phase A+B `--packed` flag, merged to master at `ba2ced64`); **2a (minibatch=64 at bf16) SHIPPED** at prod after bf16 sweep (mb=16→551s, **-68.1% / 3.14× incremental**; corrects initial mb=32 ship from fp32-smoke defect). **Cumulative -70.5% / 3.38× update wall at packed mb=64 vs legacy mb=16.** 200-iter Phase 2: ~$200/5.7d → ~$90/2.5d. NEXT: 2b (gc/empty_cache audit), 2c (BC anchor caching), #2 CUDA Graphs. --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
 
 | Claim | Status | Evidence |
 |---|---|---|
