@@ -24,5 +24,11 @@ set -e
 # If you move python versions or torch installs, update this path.
 export LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}
 
+# expandable_segments baked in by S64 2b (project_s64_phase_b_results.md §3.6).
+# Required when --no-per-chunk-gc is on: multi-iter runs without expandable
+# segments OOM at iter 1 due to allocator fragmentation. Harmless otherwise.
+# Allow override via env if caller already set it.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Exec preserves the PID + signal semantics nohup expects.
 exec python -u train_rl.py "$@"
