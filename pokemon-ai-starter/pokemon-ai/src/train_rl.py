@@ -187,6 +187,14 @@ def parse_args():
                         "profile). Requires --tier3. NOT supported with --compile "
                         "(eager-only in v1). Bit-equivalent to legacy at fp32 eval "
                         "and within bf16 noise at training (B.2-B.5 gates).")
+    p.add_argument("--no-per-chunk-gc", action="store_true",
+                   help="S64 2b experiment: disable per-chunk gc.collect() + "
+                        "torch.cuda.empty_cache() in the Tier 3 eager update path. "
+                        "Default is per-chunk gc ON (matches legacy). At mb=64+ "
+                        "with packed memory savings, per-chunk gc may be redundant "
+                        "(activation memory is well-bounded by Python ref counting "
+                        "alone). If this flag is set: faster wall but risk OOM if "
+                        "memory accumulates. Test at prod before shipping.")
     p.add_argument("--bc-anchor-coef", type=float, default=0.1,
                    help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
@@ -1185,6 +1193,7 @@ def main():
                 bc_anchor_coef=args.bc_anchor_coef,
                 minibatch_size=args.tier3_minibatch_size,
                 packed=args.packed,
+                per_chunk_gc=not args.no_per_chunk_gc,
             )
         else:
             loss_info = ppo_update(

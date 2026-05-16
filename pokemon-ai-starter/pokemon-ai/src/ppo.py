@@ -1453,7 +1453,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        compiled_step=None,
                        bc_ref=None, bc_anchor_coef: float = 0.0,
                        minibatch_size: Optional[int] = None,
-                       packed: bool = False) -> dict:
+                       packed: bool = False,
+                       per_chunk_gc: bool = True) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1877,14 +1878,21 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
                         chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
 
-                # Per-chunk memory cleanup — prevents activation accumulation
-                # across chunks (the whole point of minibatching).
+                # Per-chunk memory cleanup. `del` releases Python refs so
+                # PyTorch's caching allocator can reuse the buffers next
+                # chunk. Whether the explicit `gc.collect()` +
+                # `torch.cuda.empty_cache()` are NECESSARY is the S64 2b
+                # audit question — they have non-trivial per-call cost
+                # (gc walks the whole heap; empty_cache forces cudaFree
+                # which next chunk has to cudaMalloc again). Gated by
+                # `per_chunk_gc` (default True = legacy behavior).
                 del collated, forward_out, loss_dict, chunk_loss
                 if bc_logits is not None:
                     del bc_logits
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                if per_chunk_gc:
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
             # ---- All chunks done — decide if we step ----
             if chunk_failed:
