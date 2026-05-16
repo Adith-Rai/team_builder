@@ -1962,6 +1962,29 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
         print(f"  [NOTICE] Value drift (batched): value_mean={vm:.3f} vs "
               f"return_mean={rm:.3f} (gap={abs(vm-rm):.3f}). Critic may be "
               f"miscalibrated.", flush=True)
+
+    # S64 2b: per-iter cleanup. Always-on regardless of per_chunk_gc flag.
+    # Resets the caching allocator state between iters, which is where
+    # inter-iter fragmentation actually accumulates (BG collect mixes its
+    # allocation pattern with update's, fragmenting the cache by next
+    # update). Cost is ~5s per iter regardless of mb — single cleanup
+    # vs the 75 per-chunk cleanups (~375s at mb=64).
+    if device.type == "cuda":
+        if not per_chunk_gc:
+            # Only useful as defragmentation point when per-chunk is OFF.
+            # When per-chunk is ON, the per-chunk cleanups already handle it;
+            # this becomes a small redundant cost.
+            gc.collect()
+            torch.cuda.empty_cache()
+        # Print memory state for monitoring (cheap; one syncing API call)
+        try:
+            mem_alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+            mem_reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+            print(f"  [MEM] post-update: allocated={mem_alloc_gb:.2f} GB, "
+                  f"reserved={mem_reserved_gb:.2f} GB", flush=True)
+        except Exception:
+            pass
+
     return stats
 
 
