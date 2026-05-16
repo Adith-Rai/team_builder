@@ -27,13 +27,7 @@ pre prompt :
 - Precise pipeline overlap mechanics — iter 2 wall ~820s ≠ pure max(collect, update). Reported "collect=1224s" is BG's parallel-wall, not iter-2's wait. Need explicit `_join_background` timing to separate.
 - Steady-state asymptotic per-iter wall — 3 iters not enough; need 5-10 iter steady-state.
 
-**Step 1: merge `perf/2b-gc-audit` to master** (option 2 SHIPPED):
-```powershell
-git checkout master
-git merge --no-ff perf/2b-gc-audit -m "perf: ship --no-per-chunk-gc + expandable_segments (2b)"
-git push origin master
-```
-Then update launch_rl.sh on local + prod to export `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by default (bake into wrapper so future runs are correct by default).
+**Step 1: DONE — perf/2b-gc-audit merged to master at `4917789f`. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` baked into `launch_rl.sh` at `c03af174`. Both pushed to origin/master.** Prod still on `perf/2b-gc-audit` — on prod do `git checkout master && git pull` to pick up the canonical state. `perf/2b-gc-audit` branch still exists on origin (delete optional).
 
 **Step 2: pivot decision**:
 - User's stop criterion: "<10 min/iter steady state, then pivot to multi-gen prep." Our worst-case 3-iter avg = 16 min/iter (skewed by iter 1 post-update overhead). Best-case iter 2 = 13.7 min. **We have NOT cleanly crossed the threshold.** But also the remaining techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) won't materially change this — the binding constraint at steady state is *collect*, not update.
@@ -78,10 +72,10 @@ Then update launch_rl.sh on local + prod to export `PYTORCH_CUDA_ALLOC_CONF=expa
   (no filter), not `pkill -9 -f 'python.*train_rl'`.** The filter misses
   multiprocessing-fork children. Orphan CIS workers contaminated several runs.
 
-**CANONICAL PHASE 2 LAUNCH (UPDATED post-2b, includes --no-per-chunk-gc + expandable_segments)**:
+**CANONICAL PHASE 2 LAUNCH (UPDATED post-2b — env var now baked into launch_rl.sh, no prefix needed)**:
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
+nohup ./launch_rl.sh \
   --init-from data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-coef 0.1 \
@@ -103,16 +97,12 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
 
-Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for
-cuDNN 9 on torch 2.5.1), `--packed` (Phase B), `--tier3-minibatch-size 64`
-instead of 16 (2a, 3.14× update), `--no-per-chunk-gc` (2b), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-env prefix (2b — solves multi-iter fragmentation that --no-per-chunk-gc
-otherwise causes), drop `--device cuda` + `--servers ...` (defaults).
-PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...` NOT
+Five changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for
+cuDNN 9 + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` both baked in),
+`--packed` (Phase B), `--tier3-minibatch-size 64` instead of 16 (2a, 3.14×
+update), `--no-per-chunk-gc` (2b), drop `--device cuda` + `--servers ...`
+(defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...` NOT
 `/workspace/team_builder/raw_data/...` (memory had it wrong).
-
-**Better: bake `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` into launch_rl.sh
-itself** so future invocations can't forget it. One line at the top of the script.
 
 **Pre-Phase-2-launch checklist**:
 1. RESTART battle_server.js processes (per Phase B §3.3 — state degrades over
