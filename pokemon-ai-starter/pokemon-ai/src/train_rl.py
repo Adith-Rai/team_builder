@@ -202,6 +202,12 @@ def parse_args():
                         "direction (S57 isolation experiment starting point).")
     p.add_argument("--pipeline", action="store_true",
                    help="Pipeline collection and PPO update (overlap on GPU)")
+    p.add_argument("--profile-iters", type=str, default="",
+                   help="S64 forensics: comma-separated list of iter indices "
+                        "to capture with torch.profiler around ppo_update_batched. "
+                        "Trace saved as {out_dir}/profile_iter{N}.json. Adds "
+                        "~20-30%% wall overhead during profiled iters. Use sparingly. "
+                        "Example: --profile-iters 0,2")
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
     p.add_argument("--eval-interval", type=int, default=20)
     p.add_argument("--eval-games", type=int, default=200)
@@ -1181,6 +1187,22 @@ def main():
         # ppo_update_batched dispatches to it via compiled_step kwarg. Else
         # ppo_update_batched runs its eager path (still 4-10× faster than
         # ppo_update via single-step-per-epoch batching).
+        _profile_this_iter = (
+            args.profile_iters
+            and it in {int(x) for x in args.profile_iters.split(",") if x.strip()}
+        )
+        if _profile_this_iter:
+            import torch.profiler as _tp
+            _prof_ctx = _tp.profile(
+                activities=[_tp.ProfilerActivity.CPU, _tp.ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+            )
+            _prof_ctx.__enter__()
+            _flow(f"profiler ENABLED for iter {it}")
+        else:
+            _prof_ctx = None
+
         if args.tier3 and not in_warmup:
             loss_info = ppo_update_batched(
                 model, optimizer, episodes, device, cfg,
@@ -1206,6 +1228,15 @@ def main():
                 bc_ref=bc_ref,
                 bc_anchor_coef=args.bc_anchor_coef,
             )
+
+        if _prof_ctx is not None:
+            _prof_ctx.__exit__(None, None, None)
+            _prof_dir = Path(args.out_dir)
+            _prof_dir.mkdir(parents=True, exist_ok=True)
+            _prof_path = str(_prof_dir / f"profile_iter{it}.json")
+            _prof_ctx.export_chrome_trace(_prof_path)
+            _flow(f"profiler trace saved: {_prof_path}")
+
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")
 
