@@ -27,7 +27,9 @@ pre prompt :
 - Precise pipeline overlap mechanics — iter 2 wall ~820s ≠ pure max(collect, update). Reported "collect=1224s" is BG's parallel-wall, not iter-2's wait. Need explicit `_join_background` timing to separate.
 - Steady-state asymptotic per-iter wall — 3 iters not enough; need 5-10 iter steady-state.
 
-**Step 1: DONE — perf/2b-gc-audit merged to master at `4917789f`. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` baked into `launch_rl.sh` at `c03af174`. Both pushed to origin/master.** Prod still on `perf/2b-gc-audit` — on prod do `git checkout master && git pull` to pick up the canonical state. `perf/2b-gc-audit` branch still exists on origin (delete optional).
+**Step 1: DONE — perf/2b-gc-audit merged to master at `4917789f`. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` baked into `launch_rl.sh` at `c03af174`. Both pushed to origin/master.** Prod synced to master. `perf/2b-gc-audit` branch still exists on origin (delete optional).
+
+**Step 1b: DONE — `--pipeline` REFUTED at our scale (S64 A/B, 2026-05-16)**: Ran `--no-pipeline` 3-iter vs option 2 `--pipeline` 3-iter, same config, fresh battle servers both. Result: **2191s vs 2880s = -24% wall savings without pipeline**. Confirmed three contention vectors: BG inference on shared GPU costs +63% on update (156s → 254s), shared battle servers cost +17% on collect (559s → 674s), drain-wait at iter end costs +288-577s per iter. Pipeline was a 21% win at Session 32 (conc=10, ~14M model); silently degraded as scale grew. CIS Phase 4.3b re-enabled it on the CONJECTURE that low-priority CUDA streams would prevent contention — never validated at prod scale until now. **Canonical Phase 2 launch updated to drop `--pipeline`**. Logs saved at `/workspace/team_builder/data/s64_artifacts/2b_validation/`.
 
 **Step 2: pivot decision**:
 - User's stop criterion: "<10 min/iter steady state, then pivot to multi-gen prep." Our worst-case 3-iter avg = 16 min/iter (skewed by iter 1 post-update overhead). Best-case iter 2 = 13.7 min. **We have NOT cleanly crossed the threshold.** But also the remaining techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) won't materially change this — the binding constraint at steady state is *collect*, not update.
@@ -72,14 +74,14 @@ pre prompt :
   (no filter), not `pkill -9 -f 'python.*train_rl'`.** The filter misses
   multiprocessing-fork children. Orphan CIS workers contaminated several runs.
 
-**CANONICAL PHASE 2 LAUNCH (UPDATED post-2b — env var now baked into launch_rl.sh, no prefix needed)**:
+**CANONICAL PHASE 2 LAUNCH (UPDATED post-2b — `--pipeline` DROPPED based on S64 A/B)**:
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
 nohup ./launch_rl.sh \
   --init-from data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-coef 0.1 \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 \
+  --cis --bf16 --tier3 --tier3-minibatch-size 64 \
   --packed --no-per-chunk-gc \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -97,12 +99,14 @@ nohup ./launch_rl.sh \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
 
-Five changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for
+Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for
 cuDNN 9 + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` both baked in),
 `--packed` (Phase B), `--tier3-minibatch-size 64` instead of 16 (2a, 3.14×
-update), `--no-per-chunk-gc` (2b), drop `--device cuda` + `--servers ...`
-(defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...` NOT
-`/workspace/team_builder/raw_data/...` (memory had it wrong).
+update), `--no-per-chunk-gc` (2b), **`--pipeline` REMOVED** (S64 A/B: pipeline
+costs 24% wall at our scale — CIS GPU contention + battle server contention +
+BG drain wait. See `data/s64_artifacts/2b_validation/`), drop `--device cuda` +
+`--servers ...` (defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...`
+NOT `/workspace/team_builder/raw_data/...` (memory had it wrong).
 
 **Pre-Phase-2-launch checklist**:
 1. RESTART battle_server.js processes (per Phase B §3.3 — state degrades over

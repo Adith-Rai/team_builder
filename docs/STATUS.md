@@ -1,6 +1,6 @@
 # Project Status
 
-**Last Updated:** 2026-05-16 (S64 Phase B + 2a + 2b ALL SHIPPED)
+**Last Updated:** 2026-05-16 (S64 Phase B + 2a + 2b SHIPPED; `--pipeline` REFUTED at scale, dropped from canonical)
 
 ---
 
@@ -32,6 +32,8 @@
 
 **Recommended next step**: pivot to Phase 2 prep / multi-gen. Update wall is no longer the dominant cost — collect bound is. Remaining optimization techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) have diminishing marginal return vs the 3.38× already shipped.
 
+**S64 pipeline-A/B finding (2026-05-16, CONCRETE)**: dropped `--pipeline` after measured -24% wall savings without it. Three contention vectors at our scale (single A100 + CIS + conc=200 + 8 battle servers + mb=64): (1) CIS BG inference contends with update on GPU (update wall 156s → 254s = +63%), (2) BG workers share battle servers with foreground collect (collect wall 559s → 674s = +17%), (3) drain-pending-BG wait at iter end (+288-577s per intermediate iter). Pipeline was a 21% win at Session 32 (conc=10, ~14M model); silently degraded as scale grew. CIS Phase 4.3b re-enabled it on the CONJECTURE that low-priority CUDA streams would prevent contention — never validated end-to-end until now. Logs in `data/s64_artifacts/2b_validation/`.
+
 **Scaling caveat** (load-bearing — surfaced at Phase B wrap, captured in `memory/project_s64_phase_b_results.md` §3.4 + `memory/project_optimization_tracker.md` §1.1):
 
 | Phase | 100g smoke | 1600g prod | Ratio | Linear-expected (16×) |
@@ -41,11 +43,11 @@
 
 Update is orchestration-bound at prod (S62 profile: 92% Python/CPU, only 8% CUDA). Per-chunk Python overhead (`gc.collect`, `empty_cache`, dict construction, loop iteration) is **plausibly** ~constant per chunk; at prod 300 chunks vs smoke 21 chunks = 14× more overhead invocations. **CAVEAT**: decomposition is from prod profile only; smoke profile to validate is Step A of post-wrap investigation. **CORRECTED**: my initial claim "CUDA Graphs attacks the per-chunk Python loop" was wrong — CUDA Graphs attacks per-CUDA-launch overhead. The per-chunk Python loop is attacked by larger minibatch / gc audit / BC caching (2a/2b/2c).
 
-**Canonical Phase 2 launch stack** (UPDATED post-2b — adds `--no-per-chunk-gc` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`):
+**Canonical Phase 2 launch stack** (UPDATED post-S64 pipeline-A/B — `--pipeline` DROPPED):
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 --packed --no-per-chunk-gc \
+nohup ./launch_rl.sh \
+  --cis --bf16 --tier3 --tier3-minibatch-size 64 --packed --no-per-chunk-gc \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt --bc-anchor-coef 0.1 \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -57,7 +59,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
   --out-dir data/models/rl_v10/<RUN_NAME> \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
-Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for cuDNN 9 on torch 2.5.1), `--packed` (Phase B), `--tier3-minibatch-size 64` (2a), `--no-per-chunk-gc` (2b), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` env prefix (2b — required for multi-iter without OOM), procedural-teams path is `/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...`. NO `--compile` (REFUTED at prod S62). NO perm-at-eval (REFUTED S60). **TODO**: bake `PYTORCH_CUDA_ALLOC_CONF` into `launch_rl.sh` itself so future invocations can't forget it.
+Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for cuDNN 9 + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` both baked in), `--packed` (Phase B), `--tier3-minibatch-size 64` (2a), `--no-per-chunk-gc` (2b), **`--pipeline` REMOVED** (S64 A/B: -24% wall without pipeline — see `data/s64_artifacts/2b_validation/`), procedural-teams path is `/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...`. NO `--compile` (REFUTED at prod S62). NO perm-at-eval (REFUTED S60).
 
 **Pre-Phase-2-launch checklist** (per Phase B §3.3): restart `battle_server.js` processes before measurement-critical runs; battle server state degradation between back-to-back runs is the real explanation for the +86% Run B collect regression in B.8 first-pass.
 

@@ -7,7 +7,7 @@
 - Adding a new entry? Cite the session and the evidence. Don't just say "didn't work."
 - A REFUTED item is rebuttable only with NEW evidence (different scale, different arch, different hardware). "We should try again because it's been a while" is not new evidence.
 
-**Last updated**: S64 Phase A wrap, 2026-05-14.
+**Last updated**: S64 post-Phase-B `--pipeline` A/B, 2026-05-16.
 
 **Authoritative status (where these decisions live)**:
 - `memory/project_optimization_tracker.md` §2 — optimization-arc refutations (with current session links)
@@ -27,6 +27,21 @@
 ## REFUTED
 
 ### Performance / training-loop optimizations
+
+#### 0. `--pipeline` at current scale (single A100 + CIS + conc=200 + 8 battle servers + packed mb=64)
+- **Refuted**: S64 (2026-05-16), 3-iter prod A/B at `data/s64_artifacts/2b_validation/`
+- **Evidence**: Same config (packed mb=64, BC v10 init, 1600g/200conc, fresh battle servers, 3 iters), only difference is `--pipeline` on vs off.
+  - **Total run wall: 2880s with --pipeline → 2191s without = -24% savings.**
+  - Iter 1 collect: 674s on → 559s off (-17% battle-server contention removed)
+  - Iter 1 update: **254s on → 156s off (-39% GPU contention removed)**
+  - Plus drain-pending-BG wait: +288s at iter 1 end, +577s at iter 2 end
+- **Three contention vectors**:
+  1. **GPU contention (CONCRETE)**: BG CIS inference and update share the GPU. CIS Phase 4.3b's low-priority CUDA stream design was supposed to prevent this — measurement shows the streams don't fully isolate at our scale (root cause: memory bandwidth / scheduler / allocator not separately profiled).
+  2. **Battle-server contention (STRONG INFERENCE)**: BG workers and foreground collect workers share 8 battle servers.
+  3. **Drain wait (CONCRETE from FLOW timestamps)**: must drain current BG before launching next BG; drain runs after update, blocking iter exit.
+- **Historical context**: pipeline was a 21% win at Session 32 (conc=10, ~14M model, RTX 3060). Session 50 found it broken at conc=200 + 20M transformer. CIS Phase 4.3b (S54) re-enabled it on the CONJECTURE that low-priority CUDA streams would fix the contention; **end-to-end validation deferred at S54 until now**.
+- **Could revisit if**: multi-GPU configuration available (BG inference on GPU2, training on GPU1) — would eliminate vector #1, potentially restoring the 10-22% win. At single-A100 + current concurrency/server count, don't reopen.
+- **Memory source**: `project_optimization_tracker.md` §1.2, `project_s64_phase_b_results.md` §3.7
 
 #### 1. `--compile` (whole-function `torch.compile` on `forward_ppo_sequence`) at prod scale
 - **Refuted**: S62 (`869ef285`)
