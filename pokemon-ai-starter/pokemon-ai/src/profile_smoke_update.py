@@ -27,6 +27,7 @@ import torch.profiler as tp
 sys.path.insert(0, os.path.dirname(__file__))
 
 from ppo import load_checkpoint, ppo_update_batched
+from precision_config import set_amp_dtype, get_amp_dtype
 from test_forward_ppo_sequence_packed import _make_synthetic_episode
 
 
@@ -37,6 +38,10 @@ def main():
     p.add_argument("--minibatch-size", type=int, default=16,
                    help="--tier3-minibatch-size; chunks = ceil(n_episodes/this)")
     p.add_argument("--packed", action="store_true", help="Use --packed path")
+    p.add_argument("--bf16", action="store_true",
+                   help="Enable bf16 autocast (matches canonical Phase 2 stack). "
+                        "Without this, runs at fp32 default which uses DIFFERENT "
+                        "cuBLAS kernel paths than prod — comparison may not transfer.")
     p.add_argument("--with-bc", action="store_true", default=True,
                    help="Enable BC anchor (matches canonical Phase 2 stack)")
     p.add_argument("--out-prefix", default="/tmp/profile_smoke",
@@ -51,8 +56,17 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}, torch={torch.__version__}")
+
+    # Set bf16 autocast globally (matches what train_rl.py --bf16 does); ppo_update_batched
+    # reads this via precision_config.get_amp_dtype() to gate its internal autocast.
+    if args.bf16:
+        set_amp_dtype(torch.bfloat16)
+        print(f"amp_dtype: bf16 (matches canonical Phase 2 stack)")
+    else:
+        print(f"amp_dtype: fp32 (default; DIFFERENT kernel path than prod --bf16)")
+
     print(f"config: n_episodes={args.n_episodes}, minibatch={args.minibatch_size}, "
-          f"packed={args.packed}, with_bc={args.with_bc}, "
+          f"packed={args.packed}, with_bc={args.with_bc}, bf16={args.bf16}, "
           f"with_stack={args.with_stack}, record_shapes={args.record_shapes}")
 
     if hasattr(torch.backends, "mha"):
