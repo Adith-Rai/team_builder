@@ -4,18 +4,55 @@ pre prompt :
 ⚠️  S64 PHASE B SHIPPED (2026-05-15) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
-**FIRST ACTION FOR NEXT SESSION**: read `memory/project_s64_phase_b_results.md`
-(includes Phase B SHIPPED + §3.5 post-wrap 2a investigation outcome). Then ask
-user which is next:
-- **Step C (2b)** — audit per-chunk `gc.collect()` + `torch.cuda.empty_cache()`.
-  Est 1.05-1.20× incremental. ~$1 / 30 min. Risk: medium (memory bound assumption).
-- **Step D (2c)** — BC anchor caching (once per iter instead of per chunk×epoch).
-  Est 1.05-1.10× incremental if BC anchor on. ~$1 / 1 hour code.
-- **Step E (#2)** — CUDA Graphs. Honest projection 5-15% (corrected from over-
-  projection at Phase B wrap). ~$2-4 / 1-2 sessions.
-- **OR pivot to Phase 2 prep** — at mb=32 prod is ~3.6 days / ~$130; very tractable
-  even without further optimization. Source 100-150 real elite gen-9 OU teams,
-  lr re-ablation, external opps PFSP, H2H gauntlet wiring.
+**FIRST ACTION FOR NEXT SESSION**:
+
+**Option 2 PASSED ✓** — 3-iter prod run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + `--no-per-chunk-gc` + per-iter cleanup at mb=64 bf16 completed cleanly. Results captured before handover.
+
+**Results headline** (full data in [[project_s64_phase_b_results]] §3.6):
+
+| Iter | Reported collect | Reported update | Real-clock wall | `[MEM] post-update reserved` |
+|---|---|---|---|---|
+| 0 | 564s | 160s | ~752s | 0.78 GB |
+| 1 | 674s | 254s | ~1226s | 0.73 GB |
+| 2 | 1224s (BG parallel) | 227s | ~820s | 0.71 GB |
+
+- Total run wall: 2880s = 48 min (vs my projected ~2015s; +43% from underestimated post-iter overhead)
+- Memory STABLE/SLIGHTLY DECREASING across iters — expandable_segments solves fragmentation natively
+- GPU memory peaks 63-72 GiB during update, drops to 7.5 GiB between iters
+- RAM 254-264 GB stable over the run (no growth)
+- Numerics: clean across all 3 iters (pi/v/ent/kl/bc_kl within bf16 noise)
+- NO OOM (vs 3 prior 3-iter attempts that all OOMed)
+
+**What's NOT confirmed by this run**:
+- Precise pipeline overlap mechanics — iter 2 wall ~820s ≠ pure max(collect, update). Reported "collect=1224s" is BG's parallel-wall, not iter-2's wait. Need explicit `_join_background` timing to separate.
+- Steady-state asymptotic per-iter wall — 3 iters not enough; need 5-10 iter steady-state.
+
+**Step 1: merge `perf/2b-gc-audit` to master** (option 2 SHIPPED):
+```powershell
+git checkout master
+git merge --no-ff perf/2b-gc-audit -m "perf: ship --no-per-chunk-gc + expandable_segments (2b)"
+git push origin master
+```
+Then update launch_rl.sh on local + prod to export `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by default (bake into wrapper so future runs are correct by default).
+
+**Step 2: pivot decision**:
+- User's stop criterion: "<10 min/iter steady state, then pivot to multi-gen prep." Our worst-case 3-iter avg = 16 min/iter (skewed by iter 1 post-update overhead). Best-case iter 2 = 13.7 min. **We have NOT cleanly crossed the threshold.** But also the remaining techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) won't materially change this — the binding constraint at steady state is *collect*, not update.
+- **Strong recommendation: pivot to Phase 2 prep / multi-gen now.** The update wall is no longer the dominant cost. Further optimization arc work has diminishing marginal return.
+- If user wants to continue: 2c (BC anchor caching) is cleanest; #2 (CUDA Graphs) is highest variance.
+
+**Step 3: before any Phase 2 launch**:
+- Restart battle_server.js processes (state degrades — verified in Phase B §3.3)
+- Re-verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
+- Use the canonical launch block below
+
+**Pod state at handover**:
+- `perf/2b-gc-audit` branch at `a642ca43` — READY TO MERGE
+- Master at `b416a32c` (2a SHIPPED state — `--tier3-minibatch-size 64`, no expandable_segments)
+- Prod git HEAD: `perf/2b-gc-audit`. After merge, `git checkout master && git pull` on prod.
+- Option 2 bg task: completed at `[2880s] Training complete`, then nuclear-killed (cleanup)
+- Memory monitor: still running on prod, kill via `pkill -9 -f mem_monitor`
+- 8 battle_servers running on ports 9000-9007 (may need restart before next prod run)
+- Logs: `/tmp/opt2_3iter.log` + `/tmp/option2_memory.log` on prod — scp before pod cleanup
 
 **Phase B + 2a (minibatch=64 at bf16) BOTH SHIPPED — MEASURED at prod**:
 
@@ -41,15 +78,15 @@ user which is next:
   (no filter), not `pkill -9 -f 'python.*train_rl'`.** The filter misses
   multiprocessing-fork children. Orphan CIS workers contaminated several runs.
 
-**CANONICAL PHASE 2 LAUNCH (UPDATED, includes --packed)**:
+**CANONICAL PHASE 2 LAUNCH (UPDATED post-2b, includes --no-per-chunk-gc + expandable_segments)**:
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
-nohup ./launch_rl.sh \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
   --init-from data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-coef 0.1 \
   --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 \
-  --packed \
+  --packed --no-per-chunk-gc \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
   --n-iters 200 --warmup-iters 0 \
@@ -66,12 +103,16 @@ nohup ./launch_rl.sh \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
 
-Four changes vs prior canonical: `./launch_rl.sh` wrapper (sets LD_LIBRARY_PATH
-for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), **`--tier3-minibatch-size 64`
-instead of 16** (2a SHIPPED at bf16 — 3.14× update wall at prod), drop
-`--device cuda` + `--servers ...` (defaults). PROCEDURAL-TEAMS PATH is
-`/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...` (memory
-had it wrong).
+Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for
+cuDNN 9 on torch 2.5.1), `--packed` (Phase B), `--tier3-minibatch-size 64`
+instead of 16 (2a, 3.14× update), `--no-per-chunk-gc` (2b), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+env prefix (2b — solves multi-iter fragmentation that --no-per-chunk-gc
+otherwise causes), drop `--device cuda` + `--servers ...` (defaults).
+PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...` NOT
+`/workspace/team_builder/raw_data/...` (memory had it wrong).
+
+**Better: bake `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` into launch_rl.sh
+itself** so future invocations can't forget it. One line at the top of the script.
 
 **Pre-Phase-2-launch checklist**:
 1. RESTART battle_server.js processes (per Phase B §3.3 — state degrades over
