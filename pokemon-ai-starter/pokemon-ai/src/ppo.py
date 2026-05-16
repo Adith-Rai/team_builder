@@ -1453,7 +1453,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        compiled_step=None,
                        bc_ref=None, bc_anchor_coef: float = 0.0,
                        minibatch_size: Optional[int] = None,
-                       packed: bool = False) -> dict:
+                       packed: bool = False,
+                       per_chunk_gc: bool = True) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1877,14 +1878,21 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
                         chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
 
-                # Per-chunk memory cleanup — prevents activation accumulation
-                # across chunks (the whole point of minibatching).
+                # Per-chunk memory cleanup. `del` releases Python refs so
+                # PyTorch's caching allocator can reuse the buffers next
+                # chunk. Whether the explicit `gc.collect()` +
+                # `torch.cuda.empty_cache()` are NECESSARY is the S64 2b
+                # audit question — they have non-trivial per-call cost
+                # (gc walks the whole heap; empty_cache forces cudaFree
+                # which next chunk has to cudaMalloc again). Gated by
+                # `per_chunk_gc` (default True = legacy behavior).
                 del collated, forward_out, loss_dict, chunk_loss
                 if bc_logits is not None:
                     del bc_logits
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                if per_chunk_gc:
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
             # ---- All chunks done — decide if we step ----
             if chunk_failed:
@@ -1954,6 +1962,29 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
         print(f"  [NOTICE] Value drift (batched): value_mean={vm:.3f} vs "
               f"return_mean={rm:.3f} (gap={abs(vm-rm):.3f}). Critic may be "
               f"miscalibrated.", flush=True)
+
+    # S64 2b: per-iter cleanup. Always-on regardless of per_chunk_gc flag.
+    # Resets the caching allocator state between iters, which is where
+    # inter-iter fragmentation actually accumulates (BG collect mixes its
+    # allocation pattern with update's, fragmenting the cache by next
+    # update). Cost is ~5s per iter regardless of mb — single cleanup
+    # vs the 75 per-chunk cleanups (~375s at mb=64).
+    if device.type == "cuda":
+        if not per_chunk_gc:
+            # Only useful as defragmentation point when per-chunk is OFF.
+            # When per-chunk is ON, the per-chunk cleanups already handle it;
+            # this becomes a small redundant cost.
+            gc.collect()
+            torch.cuda.empty_cache()
+        # Print memory state for monitoring (cheap; one syncing API call)
+        try:
+            mem_alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+            mem_reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+            print(f"  [MEM] post-update: allocated={mem_alloc_gb:.2f} GB, "
+                  f"reserved={mem_reserved_gb:.2f} GB", flush=True)
+        except Exception:
+            pass
+
     return stats
 
 

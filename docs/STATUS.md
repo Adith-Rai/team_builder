@@ -1,6 +1,6 @@
 # Project Status
 
-**Last Updated:** 2026-05-15 (S64 Phase B wrap — SHIPPED + merged to master)
+**Last Updated:** 2026-05-16 (S64 Phase B + 2a + 2b ALL SHIPPED)
 
 ---
 
@@ -28,7 +28,9 @@
 - **Empirical sweet spot at bf16 prod is mb=64** (the curve flattens at mb=64 where update wall ≈ collect wall; further mb gains diminish + push into collect-bound territory)
 - **Critical learning**: fp32 smoke comparisons DO NOT transfer to bf16 prod. Initial mb=32 ship was based on fp32 smoke where mb=48 looked slower; at bf16 prod tensor cores collapse GPU work and bigger mb keeps winning. cuBLAS picks qualitatively different kernels per precision.
 
-**Active work**: User authorized post-wrap investigation of the super-linear scaling. **CUDA Graphs projection initially claimed 1.5-3× has been WALKED BACK** to honest 5-15% (it attacks launch overhead, not the per-chunk Python loop). Correct sequence per `memory/project_optimization_tracker.md` (post-correction): 2a `--tier3-minibatch-size 32` experiment first (1.2-1.4× est, $0.50), 2b gc.collect/empty_cache audit (1.05-1.20× est), 2c BC anchor caching (1.05-1.10× est), THEN #2 CUDA Graphs (5-15%). They stack. Combined ceiling ~1.5-2.5× update wall.
+**Active work**: 2a (mb=64) + 2b (`--no-per-chunk-gc` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) BOTH SHIPPED with 3.38× cumulative update wall reduction. 2b validated via 3-iter prod run (2880s total wall): all 3 iters completed cleanly, NO OOM, `[MEM] post-update reserved` STABLE/SLIGHTLY DECREASING (0.78 → 0.73 → 0.71 GB), GPU peaks bounded, RAM stable, numerics clean. expandable_segments solves the fragmentation that --no-per-chunk-gc alone caused. **Pipeline benefit precision (`max(collect, update)` claim) remains INCONCLUSIVE from this run** — iter walls were dominated by post-update overhead (snapshot/eval/BG-join) bigger than projected. Total wall 2880s vs my 2015s projection (+43%). Decision-relevant outcomes (memory bounded, update savings real, NO OOM) all confirmed.
+
+**Recommended next step**: pivot to Phase 2 prep / multi-gen. Update wall is no longer the dominant cost — collect bound is. Remaining optimization techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) have diminishing marginal return vs the 3.38× already shipped.
 
 **Scaling caveat** (load-bearing — surfaced at Phase B wrap, captured in `memory/project_s64_phase_b_results.md` §3.4 + `memory/project_optimization_tracker.md` §1.1):
 
@@ -39,11 +41,11 @@
 
 Update is orchestration-bound at prod (S62 profile: 92% Python/CPU, only 8% CUDA). Per-chunk Python overhead (`gc.collect`, `empty_cache`, dict construction, loop iteration) is **plausibly** ~constant per chunk; at prod 300 chunks vs smoke 21 chunks = 14× more overhead invocations. **CAVEAT**: decomposition is from prod profile only; smoke profile to validate is Step A of post-wrap investigation. **CORRECTED**: my initial claim "CUDA Graphs attacks the per-chunk Python loop" was wrong — CUDA Graphs attacks per-CUDA-launch overhead. The per-chunk Python loop is attacked by larger minibatch / gc audit / BC caching (2a/2b/2c).
 
-**Canonical Phase 2 launch stack** (UPDATED — `--packed` now part of canonical):
+**Canonical Phase 2 launch stack** (UPDATED post-2b — adds `--no-per-chunk-gc` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`):
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
-nohup ./launch_rl.sh \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 --packed \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup ./launch_rl.sh \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 64 --packed --no-per-chunk-gc \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt --bc-anchor-coef 0.1 \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -55,7 +57,7 @@ nohup ./launch_rl.sh \
   --out-dir data/models/rl_v10/<RUN_NAME> \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
-Three changes vs prior canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), procedural-teams path is `/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...`. NO `--compile` (REFUTED at prod S62). NO perm-at-eval (REFUTED S60).
+Six changes vs pre-S64 canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for cuDNN 9 on torch 2.5.1), `--packed` (Phase B), `--tier3-minibatch-size 64` (2a), `--no-per-chunk-gc` (2b), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` env prefix (2b — required for multi-iter without OOM), procedural-teams path is `/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...`. NO `--compile` (REFUTED at prod S62). NO perm-at-eval (REFUTED S60). **TODO**: bake `PYTORCH_CUDA_ALLOC_CONF` into `launch_rl.sh` itself so future invocations can't forget it.
 
 **Pre-Phase-2-launch checklist** (per Phase B §3.3): restart `battle_server.js` processes before measurement-critical runs; battle server state degradation between back-to-back runs is the real explanation for the +86% Run B collect regression in B.8 first-pass.
 
