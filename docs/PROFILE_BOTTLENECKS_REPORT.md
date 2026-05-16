@@ -5,15 +5,41 @@ Supersedes prior framings in `next-prompt.txt` (`§task #22 simulator rewrite`,
 `18× speed gap to ps-ppo`) which were CONJECTURE without empirical backing.
 Where this doc disagrees with prior docs, trust this one — it's measurement-based.
 
-**Last updated**: S64 Phase A wrap, 2026-05-14.
+**Last updated**: S64 Phase B wrap, 2026-05-15 (sequence packing SHIPPED + merged to master).
 
 **See also**: `docs/REFUTED_LOG.md` — companion doc consolidating all techniques tried + refuted across sessions, with evidence + rationale + revisit-conditions.
 
 ---
 
-## S64 Phase A update (post-step-back + Phase A): collate_episodes_packed SHIPPED on perf branch
+## S64 Phase B update (SHIPPED): sequence packing measured at prod, merged to master
 
-**S64 status**: sequence packing is the right priority. Phase A shipped; Phase B NEXT.
+**S64 Phase B status**: full pipeline SHIPPED. Measured at prod (1600g/200conc, BC v10 init, fresh battle servers, 1-iter A/B):
+
+- **Update wall: 1865s → 1729s = -7.3%**
+- **Overall wall: 2451s → 2320s = -5.3%** (collect ~unchanged, packed only affects update)
+- 200-iter Phase 2 saving: ~7.3 hr / ~$11
+- Numerical drift: small (kl/bc_kl ~-0.003), stable across smoke/prod scales, **favorable direction** for bc_kl (closer to BC anchor)
+
+5 bit-equiv gates passed (B.2 temporal, B.3+B.4 forward fp32+bf16, B.5 loss 12-combo with non-zero BC anchor, B.6 e2e smoke). Code is pure additive — legacy `forward_ppo_sequence` / `collate_episodes` / `_ppo_loss_batched_internal` untouched; `--packed` flag opts in. Compiled-path branch raises NotImplementedError if `--packed + --compile` (compile REFUTED at prod anyway).
+
+Master at **`ba2ced64`** (merge commit `cf0963fc` + launch_rl.sh exec-mode fix). Canonical Phase 2 launch updated to include `--packed` + `./launch_rl.sh` wrapper. See `memory/project_s64_phase_b_results.md` for full details.
+
+### S64 Phase B finding — update phase is ~4× super-linear in B
+
+Surfaced at Phase B wrap (user question). Update wall scaling 100g smoke (30s) → 1600g prod (1865s) is **62× for 16× games**. Collect scales correctly (15.4×). Decomposition under S62 profile data:
+
+- GPU compute: scales ~linearly (~25× for 16× games)
+- **Python/CPU orchestration: scales 71×** — this is the super-linearity
+
+Mechanism: Tier 3 minibatch=16 → ceil(B/16) chunks. Smoke 100g = 21 chunks, prod 1600g = 300 chunks (14× more). Per-chunk Python overhead is ~constant per chunk (`gc.collect`, `torch.cuda.empty_cache`, dict construction, loop iteration, tensor accumulation). Each per-chunk invocation has a large constant overhead, so 14× more invocations → 14× more overhead pile-up.
+
+**Implication for #2 CUDA Graphs projection**: revised UP from 1.3-2× to **1.5-3×**. The original projection accounted for direct launch overhead (5.9% per S62) only; the new projection accounts for the per-chunk Python loop itself. CUDA Graphs hoists the per-chunk Python OUT of the hot loop — directly attacks the orchestration share that drives the super-linearity.
+
+---
+
+## S64 Phase A historical (precursor to Phase B): collate_episodes_packed shipped to branch
+
+**S64 status pre-Phase-B**: sequence packing was the right priority. Phase A shipped; Phase B was next.
 
 **S64 step-back** (full-confirmed at prod): Option A (seq-packing on existing arch) wins over Option B (drop temporal stack). Step-back was prompted because seq-packing is itself an arch-touching commitment; the question was whether we'd want to drop the temporal stack anyway (making seq-packing partially sunk cost). Profile data answered: NO — the cat hot-spot lives in `collate_episodes` data prep, not in the temporal stack.
 
@@ -135,7 +161,7 @@ removed since Fix #3 doesn't pay off).
 
 ## TL;DR
 
-**Current state (S64 Phase A)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); sequence packing IN FLIGHT (Phase A SHIPPED; Phase B NEXT, awaiting auth). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
+**Current state (S64 Phase B SHIPPED)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); **sequence packing SHIPPED** at prod (-7.3% update / -5.3% overall via S64 Phase A+B `--packed` flag, merged to master at `ba2ced64`). NEXT: #2 CUDA Graphs (revised projection 1.5-3× — see S64 Phase B finding above). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
 
 | Claim | Status | Evidence |
 |---|---|---|

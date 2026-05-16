@@ -6,7 +6,7 @@ originSessionId: 6e4e7261-a0cf-4003-8f1a-3206900c7ce2
 ---
 # SESSION BOOT PROTOCOL — read first, every session, no exceptions
 
-**Last refreshed**: S64 Phase A wrap, 2026-05-14. Sections §2, §3, §6, §9, §11 are project-eternal and largely unchanged since S55. Sections §1, §4, §5, §7, §8, §10 refreshed to current state (post-S64 Phase A).
+**Last refreshed**: S64 Phase B wrap, 2026-05-15 (sequence packing SHIPPED + merged to master). Sections §2, §3, §6, §9, §11 are project-eternal and largely unchanged since S55. Sections §1, §4, §5, §7, §8, §10 refreshed to current state (post-S64 Phase B).
 
 This file consolidates the project's standing orders. **The user will NOT repeat any of this each session.** They have explicitly asked that you internalize it permanently. Apply on every decision. If a user request seems to conflict with a rule below, surface the conflict — don't silently reconcile.
 
@@ -107,9 +107,10 @@ The project has a strict order. Items LATER must not start before items EARLIER 
    - S63 free wins SHIPPED at -4.2% wall (set_to_none + .item() defer)
    - S64 step-back: sequence packing prioritized; ARCH (drop temporal stack) refuted as priority
    - S64 Phase 1 PASSED: torch 2.5.1 venv-isolation
-   - **S64 Phase A SHIPPED**: `collate_episodes_packed` on `perf/seq-packing` at `70fd33df` (origin pushed). 11/11 equivalence tests pass.
-   - **S64 Phase B NEXT** (awaiting auth): refactor `forward_ppo_sequence` to consume packed via `flex_attention` + per-episode causal BlockMask.
-   - Then: CUDA Graphs (#2 in tracker), `cudaMemcpyAsync` investigation (#3, opportunistic).
+   - S64 Phase A SHIPPED: `collate_episodes_packed` on `perf/seq-packing`. 11/11 equivalence tests pass.
+   - **S64 Phase B SHIPPED + MERGED**: full `--packed` pipeline. Master at `ba2ced64`. **Measured -7.3% update wall / -5.3% overall at prod** (1600g/200conc). 5/5 bit-equiv gates passed. Canonical Phase 2 launch now `./launch_rl.sh ... --packed ...`. See `memory/project_s64_phase_b_results.md`.
+   - **Phase B wrap surfaced finding**: update phase is ~4× super-linear in B (62× wall for 16× games; collect 15.4× ✓). Update is orchestration-bound (S62 profile: 92% Python/CPU). #2 CUDA Graphs projection REVISED UP to **1.5-3×** (was 1.3-2×) — attacks the per-chunk Python loop that drives the super-linearity.
+   - Then: CUDA Graphs (#2 in tracker, revised projection), `cudaMemcpyAsync` investigation (#3, opportunistic).
 
 6. **Phase 2 prep — DEFERRED until optimization sequence completes (or hits diminishing returns).** Per user. When sequence completes:
    - Source 100-150 real elite gen-9-OU teams (Smogon archive / ladder replays / tournament posts — copy verbatim, NEVER mix with the 16 mm-competitive eval set)
@@ -279,17 +280,16 @@ These are the load-bearing choices that have been made + validated. Don't reliti
 
 ---
 
-## §8. Plan trajectory — in flight + deferred (current at S64 Phase A)
+## §8. Plan trajectory — in flight + deferred (current at S64 Phase B)
 
-### In flight (S64 — sequence packing optimization arc)
+### Recently completed (S64 — sequence packing optimization arc)
 
-- **S64 Phase A SHIPPED** — `collate_episodes_packed` on `perf/seq-packing` at `70fd33df`. 11/11 equivalence tests pass. Dead code by design until Phase B wires it.
-- **S64 Phase B NEXT** — awaiting fresh session + user authorization. Refactor `forward_ppo_sequence` to consume packed via `flex_attention` + per-episode causal BlockMask. Sub-phases B.1-B.7 in `memory/project_s64_phase_a_results.md` §4. Est. $3-5 pod, 1-2 sessions.
-- **Bit-equivalence gate (Phase B)** — `forward_ppo_sequence_packed` vs legacy `forward_ppo_sequence` at fp32 (rtol=1e-5, atol=1e-6) and bf16 (rtol=1e-2, atol=1e-2).
+- S64 Phase A SHIPPED — `collate_episodes_packed` on `perf/seq-packing`. 11/11 equivalence tests pass.
+- **S64 Phase B SHIPPED + MERGED TO MASTER** at `ba2ced64`. Full pipeline: `TemporalTransformer.forward_packed` (flex_attention + per-episode causal BlockMask), `forward_ppo_sequence_packed`, `_ppo_loss_packed_internal`, `--packed` flag, `./launch_rl.sh` wrapper. 5/5 bit-equiv gates passed (B.2-B.6), smoke + prod A/B at 1600g/200conc. **Measured -7.3% update wall / -5.3% overall at prod.** Numerical drift small (~-0.003 kl/bc_kl), bc_kl in favorable direction. See `memory/project_s64_phase_b_results.md` for full details + the surfaced super-linear update scaling finding.
 
-### Next (after Phase B/C/D/E/F)
+### Next (user-decided)
 
-- **CUDA Graphs over train_step** (#2 in tracker) — pending after sequence packing. 1.3-2× projected. 1-2 sessions.
+- **CUDA Graphs over train_step** (#2 in tracker) — **projection REVISED UP to 1.5-3×** (was 1.3-2×) at Phase B wrap. Accounts for the per-chunk Python orchestration that drives the super-linear update scaling. 1-2 sessions.
 - **`cudaMemcpyAsync` 62k @ 990μs root cause** — pending opportunistic investigation.
 
 ### Phase 2 prep (deferred until optimization arc completes)

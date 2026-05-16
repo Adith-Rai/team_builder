@@ -1,36 +1,64 @@
 # Project Status
 
-**Last Updated:** 2026-05-14 (S64 Phase A wrap)
+**Last Updated:** 2026-05-15 (S64 Phase B wrap — SHIPPED + merged to master)
 
 ---
 
-## CURRENT STATE — S64 Phase A (sequence packing arc)
+## CURRENT STATE — S64 Phase B SHIPPED (sequence packing complete)
 
-**Where we are**: Phase 1 v3 DONE (diagnosed as failing via type-knowledge erosion, S57). Phase 2 DEFERRED until update-optimization sequence completes. Currently in multi-session optimization arc; S64 Phase A SHIPPED on `perf/seq-packing` branch.
+**Where we are**: Phase 1 v3 DONE (diagnosed as type-knowledge erosion, S57). Phase 2 DEFERRED until optimization arc has diminishing returns. Currently in multi-session optimization arc; **S64 Phase B SHIPPED and merged to master**. Sequence packing is now in production-ready code; opt-in via `--packed` flag.
 
 **Branch state**:
-- `master` at S64 Phase A wrap commit (post `1ebf45a4`, plus this STATUS refresh)
-- `perf/seq-packing` at `70fd33df` — **S64 Phase A SHIPPED**, origin pushed
+- `master` at **`ba2ced64`** — Phase A + Phase B merged + `launch_rl.sh` exec-mode fix. **Production-ready.**
+- `perf/seq-packing` at `85309859` on origin — retained as historical reference (delete optional next session)
 
-**Active work**: S64 Phase B NEXT (awaiting fresh session + user authorization). Sub-phases B.1-B.7 spec'd in `memory/project_s64_phase_a_results.md` §4. Estimated $3-5 pod, 1-2 sessions. Bit-equivalence gate at fp32 + bf16.
+**Measured payoff at prod (1600g/200conc, BC v10 init, fresh battle servers, 1 iter A/B)**:
+- Update wall: **1865s → 1729s = -7.3%**
+- Overall wall: **2451s → 2320s = -5.3%** (collect unchanged, packed only affects update)
+- 200-iter Phase 2 saving: ~7.3 hr / ~$11
+- Numerical drift: small (kl/bc_kl ~-0.003), stable, **favorable direction** for bc_kl (closer to BC anchor)
 
-**Canonical Phase 2 launch stack** (post-S62/S63 refutations):
+**Active work**: User to decide at next session: continue optimization arc (technique #2 CUDA Graphs, **projection REVISED UP to 1.5-3×** because of newly surfaced super-linear update scaling — see "scaling caveat" below) OR pivot to Phase 2 prep.
+
+**Scaling caveat** (load-bearing — surfaced at Phase B wrap, captured in `memory/project_s64_phase_b_results.md` §3.4 + `memory/project_optimization_tracker.md` §1.1):
+
+| Phase | 100g smoke | 1600g prod | Ratio | Linear-expected (16×) |
+|---|---|---|---|---|
+| Collect | 38s | 586s | 15.4× ✓ | 16× |
+| Update | 30s | 1865s | **62×** ❌ | 16× (**~4× super-linear**) |
+
+Update is orchestration-bound (S62 profile: 92% Python/CPU, only 8% CUDA). Per-chunk Python overhead (`gc.collect`, `empty_cache`, dict construction, loop iteration) is ~constant per chunk; at prod 300 chunks vs smoke 21 chunks = 14× more overhead invocations. This is exactly what CUDA Graphs (#2) is designed to attack — captures train_step once, replays without per-call Python.
+
+**Canonical Phase 2 launch stack** (UPDATED — `--packed` now part of canonical):
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+nohup ./launch_rl.sh \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 --packed \
+  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt --bc-anchor-coef 0.1 \
+  --cis-min-batch 32 --cis-timeout-ms 50 \
+  --games-per-iter 1600 --max-concurrent 200 \
+  --n-iters 200 --warmup-iters 0 \
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --target-kl 0.03 \
+  --grad-accum 1 --turn-cap 300 --reward-style terminal \
+  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --out-dir data/models/rl_v10/<RUN_NAME> \
+  > /tmp/<RUN_NAME>.log 2>&1 &
 ```
---cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
---bc-anchor-ckpt v10 --bc-anchor-coef 0.1 \
---cis-min-batch 32 --cis-timeout-ms 50
-```
-NO `--compile` (REFUTED at prod S62 per REFUTED_LOG.md #1). NO perm-at-eval (REFUTED S60 per REFUTED_LOG.md #17).
+Three changes vs prior canonical: `./launch_rl.sh` wrapper (LD_LIBRARY_PATH for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), procedural-teams path is `/workspace/raw_data/...` NOT `/workspace/team_builder/raw_data/...`. NO `--compile` (REFUTED at prod S62). NO perm-at-eval (REFUTED S60).
 
-**Cumulative optimization arc cost**: ~$20.50 (S62 $15 + S63 $2 + S64 step-back ~$3 + S64 Phase 1 isolation $0.50 + S64 Phase A $0).
+**Pre-Phase-2-launch checklist** (per Phase B §3.3): restart `battle_server.js` processes before measurement-critical runs; battle server state degradation between back-to-back runs is the real explanation for the +86% Run B collect regression in B.8 first-pass.
+
+**Cumulative optimization arc cost**: ~$26.50 (S62 $15 + S63 $2 + S64 step-back ~$3 + S64 Phase 1 isolation $0.50 + S64 Phase A $0 + S64 Phase B $6).
 
 **Read for full context**:
-- `next-prompt.txt` at project root — session-specific deep state (S64 Phase A wrap at top)
+- `next-prompt.txt` at project root — session-specific deep state (S64 Phase B wrap at top)
 - `docs/PROFILE_BOTTLENECKS_REPORT.md` — bottleneck data + optimization arc state
 - `docs/REFUTED_LOG.md` — techniques tried and refuted (don't retry these)
 - `docs/SESSION_BOOT_PROTOCOL.md` — standing orders
 - `memory/project_optimization_tracker.md` — optimization arc roadmap + session protocols
-- `memory/project_s64_phase_a_results.md` — Phase A results + §4 detailed Phase B plan
+- `memory/project_s64_phase_b_results.md` — Phase B results (CURRENT — read first)
+- `memory/project_s64_phase_a_results.md` — Phase A precursor + §4-REVISED addendum
 
 ---
 
@@ -53,8 +81,9 @@ For session-by-session detail, see the historical record below this section (pre
 | S60-S61 Fix #1/#2/#3 design + smoke | S60-S61 | Fix #2 (--compile) shipped capability; Fix #3 (vectorize collate) REFUTED via microbench; Fix #1 design memo | `memory/project_s61_fix1_design.md` |
 | S62 prod validations + update profile | S62 | Fix #1 Option B SHIPPED at prod (-27% collect); Fix #2 REFUTED at prod (8% slower); torch.profiler reveals update is ORCHESTRATION-bound (CUDA = 8% of update wall) | `memory/project_s62_fix*.md`, `memory/project_s62_update_profile_findings.md` |
 | S63 free wins | S63 | `optimizer.zero_grad(set_to_none=True)` + `.item()` audit defer SHIPPED → -4.2% update wall. Below 8-15% projection but ceiling for the free-wins category. | `memory/project_s63_free_wins_results.md` |
-| S64 step-back + Phase 1 + Phase A (CURRENT) | S64 | Step-back: sequence packing prioritized over ARCH (drop temporal stack); torch 2.5.1 venv-isolation PASSED; `collate_episodes_packed` SHIPPED on `perf/seq-packing` at `70fd33df` with 11/11 equivalence tests | `memory/project_s64_*.md` (4 memos) |
-| S64 Phase B NEXT | (next session) | Refactor `forward_ppo_sequence` to consume packed via `flex_attention` + per-episode causal `BlockMask` | Awaiting authorization |
+| S64 step-back + Phase 1 + Phase A | S64 | Step-back: sequence packing prioritized over ARCH (drop temporal stack); torch 2.5.1 venv-isolation PASSED; `collate_episodes_packed` SHIPPED on `perf/seq-packing` at `70fd33df` with 11/11 equivalence tests | `memory/project_s64_*.md` (4 memos) |
+| **S64 Phase B SHIPPED (CURRENT)** | S64 | Full pipeline: `TemporalTransformer.forward_packed` (flex_attention + per-episode causal BlockMask) + `forward_ppo_sequence_packed` + `_ppo_loss_packed_internal` + `--packed` flag. 5/5 bit-equiv gates passed (B.2-B.6) + smoke + prod A/B. **Measured -7.3% update wall / -5.3% overall at prod**. Merged to master at `ba2ced64`. Surfaced finding: update phase is ~4× super-linear in B (CUDA Graphs has more headroom than originally projected). | `memory/project_s64_phase_b_results.md` |
+| #2 CUDA Graphs NEXT | (next session, user-decided) | Capture train_step once, replay without per-call Python overhead. **Projection REVISED UP to 1.5-3×** (was 1.3-2×) — accounts for the per-chunk Python orchestration that drives the super-linear scaling. | `memory/project_optimization_tracker.md` §1 row 2 |
 
 ---
 
