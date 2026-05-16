@@ -94,15 +94,32 @@ prod 1600g=300 chunks (14× more). Per-chunk Python overhead is ~constant
 per chunk (gc.collect, empty_cache, dict construction, loop iteration, tensor
 accumulation). 14× more chunks → 14× more overhead invocations.
 
-**Implication for #2 (CUDA Graphs) projection**: revised UP from 1.3-2× to
-**1.5-3×**. Original projection assumed only launch-overhead removal (5.9%
-per S62). New projection accounts for the per-chunk Python loop ITSELF.
-CUDA Graphs captures train_step once + replays without per-call Python,
-directly attacking the orchestration share that drives super-linear scaling.
+**CORRECTION (post-wrap, user pushback)**: my "revised UP to 1.5-3×" was
+an over-projection. CUDA Graphs eliminates per-CUDA-launch and per-alloc
+overhead — NOT Python control flow. Honest projection: **5-15%** wall
+reduction on the launch+alloc share (~110s at prod). It does NOT remove
+gc.collect, empty_cache, dict construction, or the for-loop.
 
-This makes #2 the highest-marginal-ROI remaining technique. If we get the
-projection: 200-iter Phase 2 drops from ~5.7 days (~$200) to ~3 days
-(~$110). Material vs the packed-only -7.3% saving.
+To actually attack the per-chunk Python loop, separate techniques (added
+to tracker as 2a/2b/2c):
+- **2a**: `--tier3-minibatch-size 32` (or higher) with packed memory
+  savings → halves chunk count → halves per-chunk Python overhead.
+  Est. 1.2-1.4×. Cheapest experiment.
+- **2b**: audit `gc.collect()` + `torch.cuda.empty_cache()` per chunk —
+  possibly removable or per-epoch-only. Est. 1.05-1.20×.
+- **2c**: BC anchor caching: compute BC logits once per iter, not per
+  chunk × epoch. Est. 1.05-1.10× if BC anchor is on.
+
+These stack additively. Combined ceiling 2a×2b×2c×#2 ≈ 1.5-2.5× update
+wall (NOT from any single technique).
+
+ALSO: the "92% Python orchestration" decomposition is INFERRED from S62
+prod profile alone. At smoke scale the split may differ. **Step A** of
+the post-wrap investigation profiles smoke + compares to S62 prod. Until
+that data is in hand, treat decomposition as STRONG INFERENCE not CONCRETE.
+
+If 2a/2b/2c land projections: Phase 2 drops from ~5.7 days (~$200) to
+~3-4 days (~$120). Material vs packed-only -7.3% saving.
 
 Captured in:
 - `memory/project_s64_phase_b_results.md` §3.4

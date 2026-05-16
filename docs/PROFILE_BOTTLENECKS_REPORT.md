@@ -33,7 +33,7 @@ Surfaced at Phase B wrap (user question). Update wall scaling 100g smoke (30s) �
 
 Mechanism: Tier 3 minibatch=16 → ceil(B/16) chunks. Smoke 100g = 21 chunks, prod 1600g = 300 chunks (14× more). Per-chunk Python overhead is ~constant per chunk (`gc.collect`, `torch.cuda.empty_cache`, dict construction, loop iteration, tensor accumulation). Each per-chunk invocation has a large constant overhead, so 14× more invocations → 14× more overhead pile-up.
 
-**Implication for #2 CUDA Graphs projection**: revised UP from 1.3-2× to **1.5-3×**. The original projection accounted for direct launch overhead (5.9% per S62) only; the new projection accounts for the per-chunk Python loop itself. CUDA Graphs hoists the per-chunk Python OUT of the hot loop — directly attacks the orchestration share that drives the super-linearity.
+**Implication for technique projections — CORRECTED**: my initial revision to 1.5-3× for CUDA Graphs was OVER-projection. CUDA Graphs eliminates per-launch/per-alloc CUDA overhead (5-15% honest range). It does NOT eliminate the Python control flow (gc.collect, empty_cache, dict construction, loop iteration). The per-chunk Python loop is attacked by separate techniques in the tracker: **2a `--tier3-minibatch-size 32`** (halves chunk count if memory fits, est. 1.2-1.4×), **2b gc.collect/empty_cache audit** (est. 1.05-1.20×), **2c BC anchor caching** (est. 1.05-1.10×). They stack additively. Combined optimistic ceiling 2a×2b×2c×#2 ≈ 1.5-2.5× update wall. **ALSO**: the "92% Python orchestration" decomposition is from S62 prod profile only — at smoke scale the split may differ. Step A of post-wrap investigation profiles smoke + compares.
 
 ---
 
@@ -161,7 +161,7 @@ removed since Fix #3 doesn't pay off).
 
 ## TL;DR
 
-**Current state (S64 Phase B SHIPPED)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); **sequence packing SHIPPED** at prod (-7.3% update / -5.3% overall via S64 Phase A+B `--packed` flag, merged to master at `ba2ced64`). NEXT: #2 CUDA Graphs (revised projection 1.5-3× — see S64 Phase B finding above). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
+**Current state (S64 Phase B SHIPPED + post-wrap investigation in flight)**: collect-side fix SHIPPED (-27% via Fix #1 Option B); update-side free wins SHIPPED (-4.2% via S63 set_to_none + .item() defer); **sequence packing SHIPPED** at prod (-7.3% update / -5.3% overall via S64 Phase A+B `--packed` flag, merged to master at `ba2ced64`). NEXT: post-wrap investigation of the super-linear update scaling via 2a (minibatch=32 experiment), 2b (gc audit), 2c (BC anchor caching), 2 (CUDA Graphs with honest 5-15% projection — corrected from earlier 1.5-3× over-projection). --compile DROPPED from canonical Phase 2 stack (S62 prod-refuted).
 
 | Claim | Status | Evidence |
 |---|---|---|

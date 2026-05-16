@@ -109,8 +109,8 @@ The project has a strict order. Items LATER must not start before items EARLIER 
    - S64 Phase 1 PASSED: torch 2.5.1 venv-isolation
    - S64 Phase A SHIPPED: `collate_episodes_packed` on `perf/seq-packing`. 11/11 equivalence tests pass.
    - **S64 Phase B SHIPPED + MERGED**: full `--packed` pipeline. Master at `ba2ced64`. **Measured -7.3% update wall / -5.3% overall at prod** (1600g/200conc). 5/5 bit-equiv gates passed. Canonical Phase 2 launch now `./launch_rl.sh ... --packed ...`. See `memory/project_s64_phase_b_results.md`.
-   - **Phase B wrap surfaced finding**: update phase is ~4× super-linear in B (62× wall for 16× games; collect 15.4× ✓). Update is orchestration-bound (S62 profile: 92% Python/CPU). #2 CUDA Graphs projection REVISED UP to **1.5-3×** (was 1.3-2×) — attacks the per-chunk Python loop that drives the super-linearity.
-   - Then: CUDA Graphs (#2 in tracker, revised projection), `cudaMemcpyAsync` investigation (#3, opportunistic).
+   - **Phase B wrap surfaced finding**: update phase is ~4× super-linear in B (62× wall for 16× games; collect 15.4× ✓). Update is orchestration-bound at prod (S62 profile: 92% Python/CPU). **CORRECTION (post-wrap)**: my "CUDA Graphs revised up to 1.5-3×" was over-projection — walked back. CUDA Graphs attacks per-launch/per-alloc overhead (~5-15% honest); does NOT eliminate Python control flow. The per-chunk Python loop is attacked by: **2a** (`--tier3-minibatch-size 32` if memory fits — 1.2-1.4× est), **2b** (gc.collect/empty_cache audit — 1.05-1.20×), **2c** (BC anchor caching — 1.05-1.10×). Stack additively. Combined ceiling ~1.5-2.5× update wall.
+   - Then: 2a/2b/2c (cheap experiments), then #2 CUDA Graphs (5-15%), then `cudaMemcpyAsync` investigation (#3, opportunistic).
 
 6. **Phase 2 prep — DEFERRED until optimization sequence completes (or hits diminishing returns).** Per user. When sequence completes:
    - Source 100-150 real elite gen-9-OU teams (Smogon archive / ladder replays / tournament posts — copy verbatim, NEVER mix with the 16 mm-competitive eval set)
@@ -289,7 +289,8 @@ These are the load-bearing choices that have been made + validated. Don't reliti
 
 ### Next (user-decided)
 
-- **CUDA Graphs over train_step** (#2 in tracker) — **projection REVISED UP to 1.5-3×** (was 1.3-2×) at Phase B wrap. Accounts for the per-chunk Python orchestration that drives the super-linear update scaling. 1-2 sessions.
+- **CUDA Graphs over train_step** (#2 in tracker) — **honest projection 5-15%** (corrected from earlier 1.5-3× over-projection). Attacks launch+alloc overhead; does NOT eliminate Python control flow. Pending after 2a/2b/2c. 1-2 sessions.
+- **2a/2b/2c** — per-chunk overhead reductions, attack the Python loop directly (NOT what CUDA Graphs targets). Higher likely ROI than #2.
 - **`cudaMemcpyAsync` 62k @ 990μs root cause** — pending opportunistic investigation.
 
 ### Phase 2 prep (deferred until optimization arc completes)

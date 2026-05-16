@@ -18,7 +18,7 @@
 - 200-iter Phase 2 saving: ~7.3 hr / ~$11
 - Numerical drift: small (kl/bc_kl ~-0.003), stable, **favorable direction** for bc_kl (closer to BC anchor)
 
-**Active work**: User to decide at next session: continue optimization arc (technique #2 CUDA Graphs, **projection REVISED UP to 1.5-3×** because of newly surfaced super-linear update scaling — see "scaling caveat" below) OR pivot to Phase 2 prep.
+**Active work**: User authorized post-wrap investigation of the super-linear scaling. **CUDA Graphs projection initially claimed 1.5-3× has been WALKED BACK** to honest 5-15% (it attacks launch overhead, not the per-chunk Python loop). Correct sequence per `memory/project_optimization_tracker.md` (post-correction): 2a `--tier3-minibatch-size 32` experiment first (1.2-1.4× est, $0.50), 2b gc.collect/empty_cache audit (1.05-1.20× est), 2c BC anchor caching (1.05-1.10× est), THEN #2 CUDA Graphs (5-15%). They stack. Combined ceiling ~1.5-2.5× update wall.
 
 **Scaling caveat** (load-bearing — surfaced at Phase B wrap, captured in `memory/project_s64_phase_b_results.md` §3.4 + `memory/project_optimization_tracker.md` §1.1):
 
@@ -27,7 +27,7 @@
 | Collect | 38s | 586s | 15.4× ✓ | 16× |
 | Update | 30s | 1865s | **62×** ❌ | 16× (**~4× super-linear**) |
 
-Update is orchestration-bound (S62 profile: 92% Python/CPU, only 8% CUDA). Per-chunk Python overhead (`gc.collect`, `empty_cache`, dict construction, loop iteration) is ~constant per chunk; at prod 300 chunks vs smoke 21 chunks = 14× more overhead invocations. This is exactly what CUDA Graphs (#2) is designed to attack — captures train_step once, replays without per-call Python.
+Update is orchestration-bound at prod (S62 profile: 92% Python/CPU, only 8% CUDA). Per-chunk Python overhead (`gc.collect`, `empty_cache`, dict construction, loop iteration) is **plausibly** ~constant per chunk; at prod 300 chunks vs smoke 21 chunks = 14× more overhead invocations. **CAVEAT**: decomposition is from prod profile only; smoke profile to validate is Step A of post-wrap investigation. **CORRECTED**: my initial claim "CUDA Graphs attacks the per-chunk Python loop" was wrong — CUDA Graphs attacks per-CUDA-launch overhead. The per-chunk Python loop is attacked by larger minibatch / gc audit / BC caching (2a/2b/2c).
 
 **Canonical Phase 2 launch stack** (UPDATED — `--packed` now part of canonical):
 ```bash
@@ -83,7 +83,7 @@ For session-by-session detail, see the historical record below this section (pre
 | S63 free wins | S63 | `optimizer.zero_grad(set_to_none=True)` + `.item()` audit defer SHIPPED → -4.2% update wall. Below 8-15% projection but ceiling for the free-wins category. | `memory/project_s63_free_wins_results.md` |
 | S64 step-back + Phase 1 + Phase A | S64 | Step-back: sequence packing prioritized over ARCH (drop temporal stack); torch 2.5.1 venv-isolation PASSED; `collate_episodes_packed` SHIPPED on `perf/seq-packing` at `70fd33df` with 11/11 equivalence tests | `memory/project_s64_*.md` (4 memos) |
 | **S64 Phase B SHIPPED (CURRENT)** | S64 | Full pipeline: `TemporalTransformer.forward_packed` (flex_attention + per-episode causal BlockMask) + `forward_ppo_sequence_packed` + `_ppo_loss_packed_internal` + `--packed` flag. 5/5 bit-equiv gates passed (B.2-B.6) + smoke + prod A/B. **Measured -7.3% update wall / -5.3% overall at prod**. Merged to master at `ba2ced64`. Surfaced finding: update phase is ~4× super-linear in B (CUDA Graphs has more headroom than originally projected). | `memory/project_s64_phase_b_results.md` |
-| #2 CUDA Graphs NEXT | (next session, user-decided) | Capture train_step once, replay without per-call Python overhead. **Projection REVISED UP to 1.5-3×** (was 1.3-2×) — accounts for the per-chunk Python orchestration that drives the super-linear scaling. | `memory/project_optimization_tracker.md` §1 row 2 |
+| #2/2a/2b/2c NEXT | (in flight, user-authorized post-wrap investigation) | **Corrected**: #2 CUDA Graphs is 5-15% (attacks kernel launch+alloc overhead). Per-chunk Python loop attacked by 2a `--tier3-minibatch-size 32` (1.2-1.4× est), 2b gc.collect/empty_cache audit (1.05-1.20×), 2c BC anchor caching (1.05-1.10×). Stack additively to ~1.5-2.5×. | `memory/project_optimization_tracker.md` §1 rows 2/2a/2b/2c |
 
 ---
 
