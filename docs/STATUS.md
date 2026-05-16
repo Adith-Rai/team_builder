@@ -13,10 +13,17 @@
 - `perf/seq-packing` at `85309859` on origin — retained as historical reference (delete optional next session)
 
 **Measured payoff at prod (1600g/200conc, BC v10 init, fresh battle servers, 1 iter A/B)**:
-- Update wall: **1865s → 1729s = -7.3%**
-- Overall wall: **2451s → 2320s = -5.3%** (collect unchanged, packed only affects update)
-- 200-iter Phase 2 saving: ~7.3 hr / ~$11
-- Numerical drift: small (kl/bc_kl ~-0.003), stable, **favorable direction** for bc_kl (closer to BC anchor)
+
+| Config | Update wall | Δ vs pre-arc legacy |
+|---|---|---|
+| Legacy mb=16 (pre-arc baseline) | 1865s | — |
+| Packed mb=16 (Phase B alone) | 1729s | -7.3% |
+| **Packed mb=32 (Phase B + 2a SHIPPED)** | **1005s** | **-46%** |
+
+- Overall wall: 2451s → 1558s = **-36%** at packed mb=32
+- 200-iter Phase 2: ~5.7 days / ~$200 → **~3.6 days / ~$130** (saves ~50 hr / ~$70 per run)
+- Numerical drift: small (kl/bc_kl ~-0.003 vs legacy, ~-0.003 mb=32 vs mb=16 packed), stable across smoke/prod, **favorable direction** for bc_kl
+- Empirical sweet spot: mb=32. mb=48 was tested at smoke and is SLOWER (CUDA kernel selection / BlockMask compile overhead). mb=64 OOMs at smoke.
 
 **Active work**: User authorized post-wrap investigation of the super-linear scaling. **CUDA Graphs projection initially claimed 1.5-3× has been WALKED BACK** to honest 5-15% (it attacks launch overhead, not the per-chunk Python loop). Correct sequence per `memory/project_optimization_tracker.md` (post-correction): 2a `--tier3-minibatch-size 32` experiment first (1.2-1.4× est, $0.50), 2b gc.collect/empty_cache audit (1.05-1.20× est), 2c BC anchor caching (1.05-1.10× est), THEN #2 CUDA Graphs (5-15%). They stack. Combined ceiling ~1.5-2.5× update wall.
 
@@ -33,7 +40,7 @@ Update is orchestration-bound at prod (S62 profile: 92% Python/CPU, only 8% CUDA
 ```bash
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
 nohup ./launch_rl.sh \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 --packed \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 32 --packed \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt --bc-anchor-coef 0.1 \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -82,8 +89,9 @@ For session-by-session detail, see the historical record below this section (pre
 | S62 prod validations + update profile | S62 | Fix #1 Option B SHIPPED at prod (-27% collect); Fix #2 REFUTED at prod (8% slower); torch.profiler reveals update is ORCHESTRATION-bound (CUDA = 8% of update wall) | `memory/project_s62_fix*.md`, `memory/project_s62_update_profile_findings.md` |
 | S63 free wins | S63 | `optimizer.zero_grad(set_to_none=True)` + `.item()` audit defer SHIPPED → -4.2% update wall. Below 8-15% projection but ceiling for the free-wins category. | `memory/project_s63_free_wins_results.md` |
 | S64 step-back + Phase 1 + Phase A | S64 | Step-back: sequence packing prioritized over ARCH (drop temporal stack); torch 2.5.1 venv-isolation PASSED; `collate_episodes_packed` SHIPPED on `perf/seq-packing` at `70fd33df` with 11/11 equivalence tests | `memory/project_s64_*.md` (4 memos) |
-| **S64 Phase B SHIPPED (CURRENT)** | S64 | Full pipeline: `TemporalTransformer.forward_packed` (flex_attention + per-episode causal BlockMask) + `forward_ppo_sequence_packed` + `_ppo_loss_packed_internal` + `--packed` flag. 5/5 bit-equiv gates passed (B.2-B.6) + smoke + prod A/B. **Measured -7.3% update wall / -5.3% overall at prod**. Merged to master at `ba2ced64`. Surfaced finding: update phase is ~4× super-linear in B (CUDA Graphs has more headroom than originally projected). | `memory/project_s64_phase_b_results.md` |
-| #2/2a/2b/2c NEXT | (in flight, user-authorized post-wrap investigation) | **Corrected**: #2 CUDA Graphs is 5-15% (attacks kernel launch+alloc overhead). Per-chunk Python loop attacked by 2a `--tier3-minibatch-size 32` (1.2-1.4× est), 2b gc.collect/empty_cache audit (1.05-1.20×), 2c BC anchor caching (1.05-1.10×). Stack additively to ~1.5-2.5×. | `memory/project_optimization_tracker.md` §1 rows 2/2a/2b/2c |
+| S64 Phase B SHIPPED | S64 | Full pipeline: `TemporalTransformer.forward_packed` (flex_attention + per-episode causal BlockMask) + `forward_ppo_sequence_packed` + `_ppo_loss_packed_internal` + `--packed` flag. 5/5 bit-equiv gates passed (B.2-B.6) + smoke + prod A/B. **Measured -7.3% update wall at prod**. Merged to master at `ba2ced64`. | `memory/project_s64_phase_b_results.md` |
+| **S64 post-wrap 2a SHIPPED (CURRENT)** | S64 | `--tier3-minibatch-size 32` (was 16). Smoke profile (Step A) validated decomposition mechanism: chunk count drives super-linear scaling, not constant orchestration share. mb=32 prod measurement: **1729s → 1005s = -41.9% / 1.72×**. **Cumulative -46% update wall vs pre-arc legacy mb=16.** Counterintuitive finding: mb=48 SLOWER at smoke than mb=32 (cuDNN kernel selection / BlockMask compile overhead); mb=64 OOMs. mb=32 is empirical sweet spot. | `memory/project_s64_phase_b_results.md` §3.5 |
+| 2b/2c/#2 NEXT | (next session, user-decided) | **2b**: gc/empty_cache audit (1.05-1.20×). **2c**: BC anchor caching (1.05-1.10×). **#2**: CUDA Graphs (honest 5-15%, corrected from 1.5-3× over-projection). OR pivot to Phase 2 prep (already ~3.6 days/$130 tractable at mb=32). | `memory/project_optimization_tracker.md` §1 rows 2b/2c/#2 |
 
 ---
 

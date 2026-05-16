@@ -5,21 +5,34 @@ pre prompt :
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**: read `memory/project_s64_phase_b_results.md`
-(full Phase B wrap: B.1-B.8 outcomes + canonical Phase 2 launch with --packed +
-all numerical findings). Then ask user: continue optimization arc (#2 CUDA
-Graphs, 1.3-2× projected, 1-2 sessions, ~$2-4) or pivot to Phase 2 prep?
-Per `feedback_infra_first_means_first.md` infra-first is correct, but the
-~7.3% update wall payoff means each remaining technique has lower marginal
-ROI than #1 had — user may reasonably pivot.
+(includes Phase B SHIPPED + §3.5 post-wrap 2a investigation outcome). Then ask
+user which is next:
+- **Step C (2b)** — audit per-chunk `gc.collect()` + `torch.cuda.empty_cache()`.
+  Est 1.05-1.20× incremental. ~$1 / 30 min. Risk: medium (memory bound assumption).
+- **Step D (2c)** — BC anchor caching (once per iter instead of per chunk×epoch).
+  Est 1.05-1.10× incremental if BC anchor on. ~$1 / 1 hour code.
+- **Step E (#2)** — CUDA Graphs. Honest projection 5-15% (corrected from over-
+  projection at Phase B wrap). ~$2-4 / 1-2 sessions.
+- **OR pivot to Phase 2 prep** — at mb=32 prod is ~3.6 days / ~$130; very tractable
+  even without further optimization. Source 100-150 real elite gen-9 OU teams,
+  lr re-ablation, external opps PFSP, H2H gauntlet wiring.
 
-**Phase B sequence packing = SHIPPED + MEASURED at prod**:
-- Update wall: 1865s → 1729s = **-7.3%**
-- Overall wall: 2451s → 2320s = **-5.3%**
-- Numerical drift: small (kl/bc_kl ~-0.003), stable across smoke/prod
-- bc_kl drift is in FAVORABLE direction (lower = closer to BC anchor)
-- 200-iter Phase 2 saving: ~7.3 hr / ~$11 vs legacy
-- ALL 5 bit-equiv gates passed (B.2 temporal, B.3+B.4 fwd fp32+bf16,
+**Phase B + 2a (minibatch=32) BOTH SHIPPED — MEASURED at prod**:
+
+| Config | Update wall | Δ vs pre-arc legacy |
+|---|---|---|
+| Legacy mb=16 | 1865s | — |
+| Packed mb=16 | 1729s | -7.3% |
+| **Packed mb=32** | **1005s** | **-46%** |
+
+- Overall wall: 2451s → 1558s at mb=32 = **-36% per iter**
+- 200-iter Phase 2: ~5.7 days / ~$200 → **~3.6 days / ~$130** (saves ~50 hr / ~$70)
+- Numerical drift: kl/bc_kl ~-0.003 vs legacy, within bf16 noise; **favorable
+  direction** for bc_kl (closer to BC anchor)
+- ALL 5 Phase B bit-equiv gates passed (B.2 temporal, B.3+B.4 fwd fp32+bf16,
   B.5 loss 12-combo with non-zero BC anchor, B.6 e2e smoke)
+- 2a finding: **mb=32 is the empirical sweet spot**. mb=48 SLOWER at smoke
+  (cuDNN kernel selection or BlockMask compile overhead). mb=64 OOMs.
 
 **CANONICAL PHASE 2 LAUNCH (UPDATED, includes --packed)**:
 ```bash
@@ -28,7 +41,7 @@ nohup ./launch_rl.sh \
   --init-from data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
   --bc-anchor-coef 0.1 \
-  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 16 \
+  --cis --pipeline --bf16 --tier3 --tier3-minibatch-size 32 \
   --packed \
   --cis-min-batch 32 --cis-timeout-ms 50 \
   --games-per-iter 1600 --max-concurrent 200 \
@@ -46,8 +59,9 @@ nohup ./launch_rl.sh \
   > /tmp/<RUN_NAME>.log 2>&1 &
 ```
 
-Three changes vs prior canonical: `./launch_rl.sh` wrapper (sets LD_LIBRARY_PATH
-for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), drop `--device cuda` +
+Four changes vs prior canonical: `./launch_rl.sh` wrapper (sets LD_LIBRARY_PATH
+for cuDNN 9 on torch 2.5.1), `--packed` (the new flag), **`--tier3-minibatch-size 32`
+instead of 16** (2a SHIPPED — 1.72× update wall at prod), drop `--device cuda` +
 `--servers ...` (defaults). PROCEDURAL-TEAMS PATH is `/workspace/raw_data/...`
 NOT `/workspace/team_builder/raw_data/...` (memory had it wrong).
 
