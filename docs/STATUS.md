@@ -1,6 +1,6 @@
 # Project Status
 
-**Last Updated:** 2026-05-16 (S64 Phase B + 2a + 2b SHIPPED; `--pipeline` REFUTED at scale, dropped from canonical)
+**Last Updated:** 2026-05-17 (S64 ARC COMPLETE — overnight 7-iter A/B confirms pipeline-cost CONCRETE; pool-growth slowdown surfaced as Phase 2 prep task)
 
 ---
 
@@ -33,6 +33,8 @@
 **Recommended next step**: pivot to Phase 2 prep / multi-gen. Update wall is no longer the dominant cost — collect bound is. Remaining optimization techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) have diminishing marginal return vs the 3.38× already shipped.
 
 **S64 pipeline-A/B finding (2026-05-16, CONCRETE)**: dropped `--pipeline` after measured -24% wall savings without it. Three contention vectors at our scale (single A100 + CIS + conc=200 + 8 battle servers + mb=64): (1) CIS BG inference contends with update on GPU (update wall 156s → 254s = +63%), (2) BG workers share battle servers with foreground collect (collect wall 559s → 674s = +17%), (3) drain-pending-BG wait at iter end (+288-577s per intermediate iter). Pipeline was a 21% win at Session 32 (conc=10, ~14M model); silently degraded as scale grew. CIS Phase 4.3b re-enabled it on the CONJECTURE that low-priority CUDA streams would prevent contention — never validated end-to-end until now. Logs in `data/s64_artifacts/2b_validation/`.
+
+**S64 overnight 7-iter confirmation (2026-05-17)**: 3-iter STRONG INFERENCE upgraded to CONCRETE. Pipeline-OFF steady-state 728s/iter (iters 0-4 pool=1), pipeline-ON 867s/iter — pipeline +19% per iter at steady state, +23% over 7-iter total wall (91 vs 112 min). Updates with pipeline: 221-256s; without: 150-158s (BG GPU contention adds +50-66%). **New finding surfaced**: pool>1 causes +17-30% collect slowdown (CIS timeout-bound batching when per-opp-slot fan-in drops). S62 32/50 tuning was measured for pool=1 only — `project_s62_fix1_b_results.md` §8 documents this as a Phase 2 prep task. Three open Phase 2 prep wins: PFSP allocator polish (8w, $0, 20-30%); 15w retest (post-S58 fixes may have already fixed task #21 crash); CIS pool-aware retune. Plus: CIS-worker shutdown hang on Training-complete needs proper fix (caused 8hr overnight loss, mitigated with watchdog). Profiler trace `data/s64_artifacts/pipeline_steady_state/profile_iter2.json` (2.0 GB) available for future multi-GPU revisit forensics.
 
 **Scaling caveat** (load-bearing — surfaced at Phase B wrap, captured in `memory/project_s64_phase_b_results.md` §3.4 + `memory/project_optimization_tracker.md` §1.1):
 

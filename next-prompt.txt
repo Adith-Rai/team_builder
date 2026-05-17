@@ -6,30 +6,42 @@ pre prompt :
 
 **FIRST ACTION FOR NEXT SESSION**:
 
-**Option 2 PASSED ✓** — 3-iter prod run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + `--no-per-chunk-gc` + per-iter cleanup at mb=64 bf16 completed cleanly. Results captured before handover.
+**S64 optimization arc COMPLETE.** Phase B + 2a (mb=64) + 2b (no-per-chunk-gc + expandable_segments) shipped + `--pipeline` REFUTED at our scale. Three rounds of measurement (3-iter A/B + 7-iter A/B + profiler run) all CONCRETE. Read [[project_s64_phase_b_results]] §3.6-3.7.1 for full data. **Next session should pivot to Phase 2 prep — but with caveats from S64 forensics (below).**
 
-**Results headline** (full data in [[project_s64_phase_b_results]] §3.6):
+**S64 final findings (2026-05-16 → 2026-05-17, full overnight 7-iter A/B)**:
 
-| Iter | Reported collect | Reported update | Real-clock wall | `[MEM] post-update reserved` |
-|---|---|---|---|---|
-| 0 | 564s | 160s | ~752s | 0.78 GB |
-| 1 | 674s | 254s | ~1226s | 0.73 GB |
-| 2 | 1224s (BG parallel) | 227s | ~820s | 0.71 GB |
+| Config | Steady-state wall (pool=1, iters 2-4 avg) | 7-iter total | Δ |
+|---|---|---|---|
+| Pipeline-OFF | **728s/iter** | 91 min | baseline |
+| Pipeline-ON | **867s/iter** | 112 min | **+19% per iter, +23% over 7-iter run** |
 
-- Total run wall: 2880s = 48 min (vs my projected ~2015s; +43% from underestimated post-iter overhead)
-- Memory STABLE/SLIGHTLY DECREASING across iters — expandable_segments solves fragmentation natively
-- GPU memory peaks 63-72 GiB during update, drops to 7.5 GiB between iters
-- RAM 254-264 GB stable over the run (no growth)
-- Numerics: clean across all 3 iters (pi/v/ent/kl/bc_kl within bf16 noise)
-- NO OOM (vs 3 prior 3-iter attempts that all OOMed)
+- Pipeline cost validated CONCRETE: GPU contention adds ~+50-66% to update wall (155 → 221-256s); battle-server contention adds ~+17% to collect; BG drain wait at iter end adds 288-577s per intermediate iter.
+- Steady-state wall (pipeline-OFF): **~12.1 min/iter at pool=1, ~14.5 min/iter at pool=2**. **Crosses user's "<10 min/iter" stop criterion at pool=1 except for pool>1 territory** — but the pool>1 slowdown is a CIS-tuning issue (see Phase 2 prep below), NOT inherent.
+- Profiler trace `data/s64_artifacts/pipeline_steady_state/profile_iter2.json` (2.0 GB, 7.7M events) captured at iter 2 update with BG running. Available for future GPU-contention root-cause investigation if/when multi-GPU revisit happens.
 
-**What's NOT confirmed by this run**:
-- Precise pipeline overlap mechanics — iter 2 wall ~820s ≠ pure max(collect, update). Reported "collect=1224s" is BG's parallel-wall, not iter-2's wait. Need explicit `_join_background` timing to separate.
-- Steady-state asymptotic per-iter wall — 3 iters not enough; need 5-10 iter steady-state.
+**S64 incidental findings to ADD to Phase 2 prep (per [[project_s62_fix1_b_results]] §8)**:
 
-**Step 1: DONE — perf/2b-gc-audit merged to master at `4917789f`. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` baked into `launch_rl.sh` at `c03af174`. Both pushed to origin/master.** Prod synced to master. `perf/2b-gc-audit` branch still exists on origin (delete optional).
+1. **Pool growth at pool=2 causes +17-30% collect-time slowdown** (run 1 iters 5-6 went 565s → 688s → 733s). CIS-STATS show timeout_pct went from 55-65% (pool=1) → 95-100% (pool=2) due to per-opp-slot fan-in dropping. The S62 32/50 tuning was measured for pool=1 only; pool>1 was explicitly flagged as untested. **Phase 2 will spend most iters at pool>1.**
 
-**Step 1b: DONE — `--pipeline` REFUTED at our scale (S64 A/B, 2026-05-16)**: Ran `--no-pipeline` 3-iter vs option 2 `--pipeline` 3-iter, same config, fresh battle servers both. Result: **2191s vs 2880s = -24% wall savings without pipeline**. Confirmed three contention vectors: BG inference on shared GPU costs +63% on update (156s → 254s), shared battle servers cost +17% on collect (559s → 674s), drain-wait at iter end costs +288-577s per iter. Pipeline was a 21% win at Session 32 (conc=10, ~14M model); silently degraded as scale grew. CIS Phase 4.3b re-enabled it on the CONJECTURE that low-priority CUDA streams would prevent contention — never validated at prod scale until now. **Canonical Phase 2 launch updated to drop `--pipeline`**. Logs saved at `/workspace/team_builder/data/s64_artifacts/2b_validation/`.
+2. **Two documented but unshipped wins from S58 narrative**:
+   - **PFSP allocator polish at 8w** ($0, ~20-30% wall savings documented). Allocations like [2,2,2,1,1] workers/opp create unbalanced game counts — better allocator = free win.
+   - **15-worker config validated faster at iter 40 cold start** (collect 20 min, 3 workers/opp at pool=5, max/min ratio 1.07× vs 8w's 1.25×). Broke at iter 41+ with pipe-cascade mid-iter crashes (task #21, unresolved). **The 15w investigation predates S58 ghost-tie + heartbeat fixes** — bug may already be fixed.
+
+3. **Python shutdown hang on Training-complete (CIS workers don't exit)**. Hit twice in overnight runs; cost 8 hr first time. Mitigated overnight with `cleanup_watchdog.sh` (90s grace then SIGKILL). **This is unresolved and would block any sequential prod chain — needs investigation as Phase 2 prep task.** Probably same lifecycle issue as task #21.
+
+**Step 1: DONE — perf/2b-gc-audit merged to master at `4917789f`. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` baked into `launch_rl.sh` at `c03af174`. `--profile-iters` flag in train_rl.py at `45d756b9`.** All pushed to origin/master.
+
+**Step 2: pivot decision — Phase 2 prep recommended sequence**:
+
+Per quality-first standard, do these BEFORE launching Phase 2 (each is a separate session with its own gate):
+
+1. **PFSP allocator polish at 8w** — $0, documented 20-30% saving. Genuinely free money.
+2. **Re-test 15w with post-S58 fixes** — 1-2 hours of controlled experiment (cold start + sustained 5-10 iters). If works → another 10-20% saving. If breaks → diagnose with current observability.
+3. **CIS retune for pool>1 regime** — design depends on outcomes of 1+2. Per-slot tuning at minimum; cross-slot batching (deferred S62 Option C) if 15-16 opp cap requires.
+4. **Diagnose CIS-worker shutdown hang** — blocks any chained prod runs. Probably same root as task #21.
+5. **Other Phase 2 prep**: source 100-150 real gen-9-OU teams, lr schedule design, external opp adapters, H2H gauntlet wiring (from [[project_s62_fix1_b_results]] §7).
+
+**Phase 2 cost projection (with new data + caveats)**: at avg pool=8-10 over a 200-iter run with current 32/50 CIS tuning (NO fix to pool>1 timeout pressure): ~46 hr / **~$70**. With PFSP allocator polish + 15w + CIS retune all shipped: could plausibly drop to ~30 hr / ~$45.
 
 **Step 2: pivot decision**:
 - User's stop criterion: "<10 min/iter steady state, then pivot to multi-gen prep." Our worst-case 3-iter avg = 16 min/iter (skewed by iter 1 post-update overhead). Best-case iter 2 = 13.7 min. **We have NOT cleanly crossed the threshold.** But also the remaining techniques (2c BC caching ~5-10%, #2 CUDA Graphs ~5-15%) won't materially change this — the binding constraint at steady state is *collect*, not update.
@@ -41,13 +53,16 @@ pre prompt :
 - Re-verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
 - Use the canonical launch block below
 
-**Pod state at handover**:
-- `perf/2b-gc-audit` branch at `a642ca43` — READY TO MERGE
-- Master at `b416a32c` (2a SHIPPED state — `--tier3-minibatch-size 64`, no expandable_segments)
-- Prod git HEAD: `perf/2b-gc-audit`. After merge, `git checkout master && git pull` on prod.
-- Option 2 bg task: completed at `[2880s] Training complete`, then nuclear-killed (cleanup)
-- Memory monitor: still running on prod, kill via `pkill -9 -f mem_monitor`
-- 8 battle_servers running on ports 9000-9007 (may need restart before next prod run)
+**Pod state at handover (2026-05-17 post-overnight)**:
+- Master at `45d756b9` (full optimization arc + profiler patch shipped)
+- Prod git HEAD: master (synced via run3_chain.sh pull)
+- All python + watchers + monitors killed; pod is IDLE
+- 8 battle_servers running on ports 9000-9007 (restart recommended before next prod run)
+- Artifacts at `/workspace/team_builder/data/s64_artifacts/pipeline_steady_state/`:
+  - `run1_nopipe_7iter.log` (327 KB) — pipeline-OFF 7-iter baseline
+  - `run2_pipe_7iter.log` (795 KB) — pipeline-ON 7-iter A/B
+  - `run3_pipe_profiled.log` (284 KB) — profiler run training log
+  - `profile_iter2.json` (**2.0 GB**, 7.7M events) — kernel trace for future forensics
 - Logs: `/tmp/opt2_3iter.log` + `/tmp/option2_memory.log` on prod — scp before pod cleanup
 
 **Phase B + 2a (minibatch=64 at bf16) BOTH SHIPPED — MEASURED at prod**:
