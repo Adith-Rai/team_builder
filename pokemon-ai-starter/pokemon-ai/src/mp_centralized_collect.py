@@ -2956,7 +2956,41 @@ def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
     return out
 
 
+# PFSP allocator mode — set by train_rl via set_pfsp_allocator_mode(). Defaults
+# to "legacy" so any external caller / test that imports this module without
+# explicitly setting the mode gets the pre-S64-polish behavior.
+_PFSP_ALLOCATOR_MODE: str = "legacy"
+
+
+def set_pfsp_allocator_mode(mode: str) -> None:
+    """Set which allocator implementation _allocate_opps_to_workers dispatches to.
+
+    Args:
+        mode: "legacy" (S58 F behavior, possibly imbalanced per-worker games)
+              or "balanced" (S64 polish, minimizes max-per-worker game count).
+
+    Must be called BEFORE any collect iteration. The dispatcher reads the
+    module-level flag at call time, so this can be re-set mid-run for
+    ablation (though that's not the intended usage).
+    """
+    global _PFSP_ALLOCATOR_MODE
+    if mode not in ("legacy", "balanced"):
+        raise ValueError(f"unknown PFSP allocator mode: {mode!r}")
+    _PFSP_ALLOCATOR_MODE = mode
+
+
 def _allocate_opps_to_workers(
+    opp_pool_msg: List[dict],
+    n_workers: int,
+    total_games: int,
+) -> List[dict]:
+    """Dispatcher — see set_pfsp_allocator_mode for selection."""
+    if _PFSP_ALLOCATOR_MODE == "balanced":
+        return _allocate_opps_to_workers_balanced(opp_pool_msg, n_workers, total_games)
+    return _allocate_opps_to_workers_legacy(opp_pool_msg, n_workers, total_games)
+
+
+def _allocate_opps_to_workers_legacy(
     opp_pool_msg: List[dict],
     n_workers: int,
     total_games: int,
@@ -2983,6 +3017,14 @@ def _allocate_opps_to_workers(
       - n_workers <  n_opps: top-N by weight get workers; skipped opps'
         games redistribute proportionally to included opps. Skipped opps
         will rise in PFSP weight next iter (less played => higher weight).
+
+    KNOWN ISSUE (S58 narrative §6, fixed in _allocate_opps_to_workers_balanced):
+        Per-worker game counts can be imbalanced when n_workers >= n_opps and
+        target games don't divide evenly. Example: 8w, 5 opps uniform weight,
+        1600 games → workers_per_opp=[2,2,2,1,1] → per-worker games
+        [160,160,160,160,160,160,320,320]. Max-per-worker = 320 = bottleneck
+        worker; ideal balanced is 200/worker. Wall time bounded by max worker
+        → 20-30% wall-time penalty documented.
 
     Returns a list of length n_workers; each entry is
         {"opp": <opp_msg_dict_or_None>, "n_games": <int>}.
@@ -3042,6 +3084,125 @@ def _allocate_opps_to_workers(
             })
 
     # Defensive: pad to n_workers (shouldn't trigger if math is right).
+    while len(assignments) < n_workers:
+        assignments.append({"opp": opp_pool_msg[0], "n_games": 0})
+    return assignments[:n_workers]
+
+
+def _allocate_opps_to_workers_balanced(
+    opp_pool_msg: List[dict],
+    n_workers: int,
+    total_games: int,
+) -> List[dict]:
+    """S64 polish: per-worker-balanced opp -> worker assignment.
+
+    Fixes the legacy allocator's imbalance bug: when target games per opp
+    don't divide cleanly across workers, some workers get 2× the work of
+    others (max-per-worker bottleneck). This version guarantees every worker
+    gets exactly games_per_worker_base or games_per_worker_base+1 games.
+
+    Algorithm:
+      1. workers_per_opp: distribute n_workers across opps proportional to
+         PFSP weight, respecting min=1 when n_workers >= n_opps. When
+         n_workers < n_opps, only top-N opps by weight get a worker
+         (skipped opps rise in PFSP weight next iter — same rotation
+         behavior as legacy).
+      2. Each worker plays games_per_worker_base = total_games // n_workers
+         games of its assigned opp. The remainder = total_games -
+         games_per_worker_base * n_workers is distributed +1 each to the
+         first `remainder` workers.
+
+    Resulting invariants:
+      - max(per_worker_games) - min(per_worker_games) <= 1 (perfectly balanced)
+      - sum(per_worker_games) == total_games (exact)
+      - Each worker plays exactly one opp
+      - PFSP weight is approximated via workers-per-opp distribution; some
+        precision loss at extreme weight skew is accepted because rotation
+        across iters preserves long-run proportions.
+
+    Compared to legacy (the imbalance case 8w/5opp uniform/1600g):
+      - legacy: per-worker [160,160,160,160,160,160,320,320] (max=320)
+      - balanced: per-worker [200,200,200,200,200,200,200,200] (max=200)
+      - 1.6× max-per-worker reduction → ~37% theoretical wall-time saving
+        on the collect phase if per-game time is constant.
+
+    Returns the same shape as legacy: List of length n_workers, each
+    {"opp": <opp_msg_dict_or_None>, "n_games": <int>}.
+    """
+    n_opps = len(opp_pool_msg)
+    if n_opps == 0 or n_workers == 0:
+        return [{"opp": None, "n_games": 0} for _ in range(n_workers)]
+
+    weights = [max(o.get("weight", 1.0), 1e-6) for o in opp_pool_msg]
+
+    # Step 1: decide workers_per_opp.
+    if n_workers >= n_opps:
+        # All opps get >=1 worker; extras go proportional to weight.
+        total_w = sum(weights)
+        target_w_float = [n_workers * w / total_w for w in weights]
+        workers_per_opp = [max(1, int(t)) for t in target_w_float]
+        delta = n_workers - sum(workers_per_opp)
+        if delta > 0:
+            # Need MORE workers — add to opps with largest fractional remainder.
+            order = sorted(
+                range(n_opps),
+                key=lambda i: -(target_w_float[i] - int(target_w_float[i])),
+            )
+            for i in order[:delta]:
+                workers_per_opp[i] += 1
+        elif delta < 0:
+            # Need FEWER workers. Repeatedly reduce from the opp that least
+            # deserves its current share (smallest fractional remainder), with
+            # min=1 floor. If all opps with frac-remainder are at floor, fall
+            # back to reducing the opp with most workers (e.g., extreme skew
+            # like weights [100,1,1,1] with n_workers=8: initial=[7,1,1,1]
+            # sum=10, need to drop to sum=8 by reducing opp0 alone since opps
+            # 1-3 are already at floor=1).
+            while delta < 0:
+                candidates = [i for i in range(n_opps) if workers_per_opp[i] > 1]
+                if not candidates:
+                    break  # All at floor; can't reduce further (pathological).
+                # Pick by smallest fractional remainder first; on ties, pick
+                # the opp with the MOST workers (so we shrink the bloated one).
+                best_i = min(
+                    candidates,
+                    key=lambda i: (
+                        target_w_float[i] - int(target_w_float[i]),
+                        -workers_per_opp[i],
+                    ),
+                )
+                workers_per_opp[best_i] -= 1
+                delta += 1
+    else:
+        # n_workers < n_opps: top-N by weight get one worker each.
+        top_idx = set(sorted(range(n_opps), key=lambda i: -weights[i])[:n_workers])
+        workers_per_opp = [1 if i in top_idx else 0 for i in range(n_opps)]
+
+    # Step 2: per-worker games — exactly base or base+1.
+    games_per_worker_base = total_games // n_workers
+    remainder_games = total_games - games_per_worker_base * n_workers
+
+    # Step 3: build assignments. Walk opps in order; for each, emit
+    # workers_per_opp[i] entries.
+    assignments: List[dict] = []
+    for opp_idx in range(n_opps):
+        n_w = workers_per_opp[opp_idx]
+        if n_w == 0:
+            continue
+        for _ in range(n_w):
+            assignments.append({
+                "opp": opp_pool_msg[opp_idx],
+                "n_games": games_per_worker_base,
+            })
+
+    # Distribute remainder games (+1 each) to the first `remainder` workers.
+    # This is balanced: max-min difference across workers <= 1.
+    for i in range(remainder_games):
+        if i < len(assignments):
+            assignments[i]["n_games"] += 1
+
+    # Defensive: if sum(workers_per_opp) somehow != n_workers (shouldn't
+    # trigger), pad with zero-game placeholders to keep the contract.
     while len(assignments) < n_workers:
         assignments.append({"opp": opp_pool_msg[0], "n_games": 0})
     return assignments[:n_workers]

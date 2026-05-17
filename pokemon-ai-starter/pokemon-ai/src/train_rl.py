@@ -208,6 +208,17 @@ def parse_args():
                         "Trace saved as {out_dir}/profile_iter{N}.json. Adds "
                         "~20-30%% wall overhead during profiled iters. Use sparingly. "
                         "Example: --profile-iters 0,2")
+    p.add_argument("--pfsp-allocator", choices=["legacy", "balanced"],
+                   default="legacy",
+                   help="S64 PFSP allocator polish: select opp-to-worker "
+                        "assignment algorithm. 'legacy' (default) is the S58 F "
+                        "behavior — correct but can produce per-worker game-count "
+                        "imbalance (e.g., 8w/5opp/1600g yields [160x6, 320x2] "
+                        "where max-worker bottlenecks collect time). 'balanced' "
+                        "(S64 polish) guarantees per-worker games differ by at "
+                        "most 1, eliminating the imbalance. Documented 20-30%% "
+                        "wall savings at 8w (S58 narrative §6); A/B at prod "
+                        "before changing default.")
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
     p.add_argument("--eval-interval", type=int, default=20)
     p.add_argument("--eval-games", type=int, default=200)
@@ -774,6 +785,18 @@ def main():
     # that read fp16 bool still get autocast enabled (with the right dtype).
     args.fp16 = args.fp16 or args.bf16
     print(f"AMP dtype: {args.amp_dtype_name}", flush=True)
+
+    # S64: configure PFSP allocator mode for mp_centralized_collect. Must
+    # happen before any collect iter dispatches. Default is "legacy" — flip
+    # to "balanced" via --pfsp-allocator balanced to use the per-worker-balanced
+    # version (S58 narrative §6 polish, documented 20-30% wall savings at 8w).
+    try:
+        from mp_centralized_collect import set_pfsp_allocator_mode
+        set_pfsp_allocator_mode(args.pfsp_allocator)
+        print(f"PFSP allocator: {args.pfsp_allocator}", flush=True)
+    except ImportError:
+        # mp_centralized_collect may not be available in some smoke contexts
+        pass
 
     # Resolve initial checkpoint source. Require at least one of --init-from / --resume
     # (previously --init-from was always required; making it fallback-friendly so you
