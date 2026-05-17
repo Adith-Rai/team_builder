@@ -902,19 +902,21 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         # Compute earliest deadline across all slots with pending. We must
         # wake up by then so a pending slot's timeout-fire isn't starved
         # by quiet pipes elsewhere.
+        # S64 task #46: timeout read from _runtime_params (dynamic).
         now = time.time()
         any_pending = False
-        earliest_deadline = now + timeout_s
+        _wait_timeout_s = _runtime_params["timeout_ms"] / 1000.0
+        earliest_deadline = now + _wait_timeout_s
         for s in range(n_slots):
             if pending_per_slot[s]:
                 any_pending = True
-                slot_deadline = last_fire_t_per_slot[s] + timeout_s
+                slot_deadline = last_fire_t_per_slot[s] + _wait_timeout_s
                 if slot_deadline < earliest_deadline:
                     earliest_deadline = slot_deadline
         if any_pending:
             wait_to = max(0.0, earliest_deadline - now)
         else:
-            wait_to = timeout_s
+            wait_to = _wait_timeout_s
 
         ready = mp_wait(active_pipes, timeout=wait_to)
 
