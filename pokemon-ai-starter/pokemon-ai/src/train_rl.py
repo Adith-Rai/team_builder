@@ -258,6 +258,18 @@ def parse_args():
     p.add_argument("--cis-timeout-ms", type=int, default=15,
                    help="CIS per-slot batch-fire timeout in ms. See "
                         "--cis-min-batch. Default 15 = pre-S62 production.")
+    p.add_argument("--cis-adaptive", action="store_true",
+                   help="S64 task #46: enable pool-aware adaptive CIS "
+                        "batching params. When set, --cis-min-batch and "
+                        "--cis-timeout-ms are recomputed each iter based on "
+                        "current pool_size via mp_centralized_collect."
+                        "_compute_adaptive_cis_params. The CLI values become "
+                        "the FALLBACK (used only if the adaptive call fails). "
+                        "At gen 9 OU prod config: pool=1→min_batch=10; "
+                        "pool=3→min_batch=3; pool=5+→min_batch=2 (floor); "
+                        "timeout fixed at 25ms. Recalibrate the per-game "
+                        "inference rate constant if changing model size or "
+                        "battle format. Only effective with --cis.")
     p.add_argument("--reward-style", choices=["dense", "sparse", "terminal"], default="dense",
                    help="Reward shaping style: dense (KO+HP+terminal), sparse (terminal+immune), terminal (win/loss only)")
     p.add_argument("--external-adapters", default=None,
@@ -433,6 +445,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             amp_dtype=getattr(args, 'amp_dtype_name', None),
             cis_min_batch=args.cis_min_batch,
             cis_timeout_ms=args.cis_timeout_ms,
+            cis_adaptive=args.cis_adaptive,
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1120,6 +1133,8 @@ def main():
         # sync + bg paths consistent.
         "cis_min_batch": args.cis_min_batch,
         "cis_timeout_ms": args.cis_timeout_ms,
+        # S64 task #46: BG path adaptive flag — read by CISBgCollector.start.
+        "cis_adaptive": args.cis_adaptive,
     }
     pending_collection = None
     # Background collector for --mp/--cis + --pipeline. Mirrors the

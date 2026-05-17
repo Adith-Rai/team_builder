@@ -107,6 +107,72 @@ def torch_dict_to_numpy(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# S64 task #46: adaptive CIS batching parameters calibrated for our scale.
+# Calibration constant `per_game_inf_rate` derived from Run A's CIS-STATS
+# at pool=1: meanq=23 with timeout=50ms → arrival_rate ≈ 460 inf/sec for
+# 1600 concurrent games × 0.3 inf/sec/game. Recalibrate if format changes
+# (gen 9 OU → multi-gen or doubles) or model size changes substantially.
+_CIS_PER_GAME_INF_RATE = 0.3  # inferences/sec/game, gen 9 OU 20M model
+_CIS_ADAPTIVE_TIMEOUT_MS = 25  # held fixed; min_batch scales with pool
+_CIS_ADAPTIVE_SAFETY = 0.8  # safety margin so batches hit threshold not timeout
+
+
+def _compute_adaptive_cis_params(
+    pool_size: int,
+    games_per_iter: int,
+    n_workers: int,
+    max_concurrent: int,
+    per_game_inf_rate: float = _CIS_PER_GAME_INF_RATE,
+    timeout_ms: int = _CIS_ADAPTIVE_TIMEOUT_MS,
+    safety: float = _CIS_ADAPTIVE_SAFETY,
+) -> Tuple[int, int]:
+    """S64 (task #46): compute pool-aware CIS batching params.
+
+    The fix for the pool-growth slowdown identified in the 15w retest:
+    at higher pool sizes, per-opp-slot fan-in drops below the static
+    min_batch=32 → every fire is timeout-bound → 5x more GPU time per
+    inference. This formula scales min_batch with pool_size so opp slots
+    fire at-or-near their natural arrival rate.
+
+    Formula:
+      arrival_rate_total = min(games_per_iter, n_workers * max_concurrent)
+                         * per_game_inf_rate
+      per_opp_slot_rate = arrival_rate_total / max(1, pool_size)
+      target_batch = per_opp_slot_rate * timeout_ms / 1000 * safety
+      min_batch = max(2, round(target_batch))
+      timeout_ms = fixed (25ms — short enough not to over-batch at low pool,
+                   long enough to accumulate at high pool)
+
+    At our config (1600g, 15w, max_conc=200, gen 9 OU):
+      pool=1: per-slot=480/sec → min_batch=10, timeout=25ms
+      pool=2: per-slot=240/sec → min_batch=5, timeout=25ms
+      pool=3: per-slot=160/sec → min_batch=3, timeout=25ms
+      pool=5: per-slot=96/sec  → min_batch=2 (floor), timeout=25ms
+      pool=10: per-slot=48/sec → min_batch=2 (floor), timeout=25ms
+
+    Args:
+      pool_size: current opp pool size (= n_opp_slots). At pool=0 (no opp),
+        falls back to min_batch=2 (degenerate but safe).
+      games_per_iter: concurrent games total (1600 typical).
+      n_workers: MP worker count, used to bound games_per_iter by
+        n_workers * max_concurrent if applicable.
+      max_concurrent: per-worker concurrency cap.
+      per_game_inf_rate: calibration constant. Default 0.3 for gen 9 OU at
+        our model size. Recalibrate if format/model changes substantially.
+      timeout_ms: fixed timeout. Default 25ms.
+      safety: 0-1 fudge factor. Default 0.8 (target batches fill at 80% of
+        expected steady-state queue depth → likely hits batch before timeout).
+
+    Returns: (min_batch, timeout_ms) — both ints, both >= 1.
+    """
+    concurrent = min(games_per_iter, n_workers * max_concurrent)
+    arrival_rate = concurrent * per_game_inf_rate
+    per_slot_rate = arrival_rate / max(1, pool_size)
+    target_batch = per_slot_rate * timeout_ms / 1000.0 * safety
+    min_batch = max(2, round(target_batch))
+    return int(min_batch), int(timeout_ms)
+
+
 def numpy_dict_to_torch(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Inverse of torch_dict_to_numpy: numpy back to torch tensors on device.
 
@@ -563,7 +629,11 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     # for slot s. Each slot accumulates and fires independently.
     pending_per_slot: List[list] = [[] for _ in range(n_slots)]
     last_fire_t_per_slot: List[float] = [time.time()] * n_slots
-    timeout_s = timeout_ms / 1000.0
+    # S64 (task #46) — wrap batching params in a mutable dict so they can be
+    # updated at runtime via the "set_batch_params" ctrl command. This enables
+    # per-iter adaptive tuning based on current pool size (orchestrator computes
+    # new values each iter via _compute_adaptive_cis_params).
+    _runtime_params = {"min_batch": min_batch, "timeout_ms": timeout_ms}
     closed_workers: set = set()
 
     # S58 CIS latency instrumentation — proves/disproves the "low-pri stream
@@ -957,6 +1027,37 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     _send_resp(err_msg)
                 continue
 
+            if cmd == "set_batch_params":
+                # S64 task #46: update min_batch / timeout_ms without
+                # respawning. Used by adaptive tuning to scale params per-iter
+                # based on current pool size (orchestrator computes via
+                # _compute_adaptive_cis_params).
+                try:
+                    new_min_batch = int(req["min_batch"])
+                    new_timeout_ms = int(req["timeout_ms"])
+                    if new_min_batch < 1:
+                        raise ValueError(f"min_batch must be >= 1, got {new_min_batch}")
+                    if new_timeout_ms < 1:
+                        raise ValueError(f"timeout_ms must be >= 1, got {new_timeout_ms}")
+                    _runtime_params["min_batch"] = new_min_batch
+                    _runtime_params["timeout_ms"] = new_timeout_ms
+                    resp_msg = {"status": "ok",
+                                "min_batch": new_min_batch,
+                                "timeout_ms": new_timeout_ms}
+                    if req.get("req_id") is not None:
+                        resp_msg["req_id"] = req.get("req_id")
+                    _send_resp(resp_msg)
+                except Exception as e:
+                    err_msg = {
+                        "status": "error",
+                        "exc_msg": f"set_batch_params failed: {e}",
+                        "traceback": traceback.format_exc(),
+                    }
+                    if req.get("req_id") is not None:
+                        err_msg["req_id"] = req.get("req_id")
+                    _send_resp(err_msg)
+                continue
+
             if cmd == "infer":
                 if is_ctrl:
                     # Infer should never come via ctrl pipe — that's parent-only,
@@ -1003,13 +1104,17 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         # independently — slot 0 (player) typically fires first because it
         # accumulates fastest (all workers contribute), slots 1..K fire when
         # their subset of workers reaches min_batch or hits timeout.
+        # S64 (task #46): read from _runtime_params so set_batch_params can
+        # adjust thresholds adaptively per-iter without re-spawning.
         now = time.time()
+        _cur_min_batch = _runtime_params["min_batch"]
+        _cur_timeout_s = _runtime_params["timeout_ms"] / 1000.0
         for s in range(n_slots):
             if not pending_per_slot[s]:
                 continue
             accumulated = sum(p[2] for p in pending_per_slot[s])
-            timed_out = (now - last_fire_t_per_slot[s]) >= timeout_s
-            hit_minbatch = accumulated >= min_batch
+            timed_out = (now - last_fire_t_per_slot[s]) >= _cur_timeout_s
+            hit_minbatch = accumulated >= _cur_min_batch
             if hit_minbatch or timed_out:
                 # S62: classify fire reason for slot-starvation diagnostic.
                 # If both true, prefer "minbatch" — the threshold was the
@@ -1235,6 +1340,29 @@ class CISClientHandle:
             return resp
         raise RuntimeError(f"CIS reload error: {resp.get('exc_msg')}\n"
                            f"{resp.get('traceback','')}")
+
+    def set_batch_params(self, min_batch: int, timeout_ms: int,
+                         timeout_s: float = 10.0) -> Dict[str, Any]:
+        """S64 task #46: update the CIS subprocess's min_batch / timeout_ms
+        without re-spawning. Routes through the CTRL pipe (same as reload).
+        Used by adaptive tuning to scale params per-iter based on pool size.
+
+        Blocks until CIS confirms the update. Fast (< 5ms typical).
+        """
+        msg = {"cmd": "set_batch_params",
+               "min_batch": int(min_batch),
+               "timeout_ms": int(timeout_ms)}
+        if self._recv_thread is not None:
+            fut = self._send_with_future(msg)
+            resp = self._await_future(fut, timeout_s, "set_batch_params")
+        else:
+            resp = self._sync_send_recv(msg, timeout_s, "set_batch_params")
+        if resp.get("status") == "ok":
+            return resp
+        raise RuntimeError(
+            f"CIS set_batch_params error: {resp.get('exc_msg')}\n"
+            f"{resp.get('traceback', '')}"
+        )
 
     def shutdown(self) -> None:
         # Mark stopped first so recv_loop exits cleanly when pipe closes.
@@ -1489,6 +1617,21 @@ class CISServer:
             raise RuntimeError("CIS not spawned (no ctrl handle)")
         return self._ctrl_handle.reload(weights_path, timeout_s=timeout_s,
                                          slot=slot)
+
+    def set_batch_params(self, min_batch: int, timeout_ms: int,
+                          timeout_s: float = 10.0) -> Dict[str, Any]:
+        """S64 task #46: update the CIS subprocess's batching thresholds
+        (min_batch + timeout_ms) at runtime without re-spawning. Used by
+        adaptive tuning to scale per-iter based on current pool size.
+
+        Routes through the dedicated CTRL pipe (same as reload_weights —
+        no race with worker recv_loops). Blocks until CIS confirms (fast).
+        """
+        if self._ctrl_handle is None:
+            raise RuntimeError("CIS not spawned (no ctrl handle)")
+        return self._ctrl_handle.set_batch_params(
+            min_batch=min_batch, timeout_ms=timeout_ms, timeout_s=timeout_s
+        )
 
     def is_alive(self) -> bool:
         """Phase 4.6 (S54): used by orchestrator failure-detection path.
@@ -2334,12 +2477,19 @@ def mp_centralized_collect_sync(
     cis_min_batch: int = 8,
     cis_timeout_ms: int = 15,
     max_pool_size: int = 16,
+    cis_adaptive: bool = False,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
 
     Drop-in replacement for mp_disk_collect_sync when --cis flag is set.
     Returns the same tuple shape: (trajs, w, l, t, steps, opp_name,
     elapsed, opp_records).
+
+    S64 task #46: when cis_adaptive=True, computes pool-aware
+    min_batch/timeout_ms via _compute_adaptive_cis_params at iter start
+    (after the opp pool size for this iter is known) and pushes them to
+    the CIS subprocess via set_batch_params. Overrides the cis_min_batch /
+    cis_timeout_ms args.
     """
     if device.type == "cpu":
         raise ValueError("--cis not supported on CPU; use --pipeline or sync collect.")
@@ -2416,6 +2566,28 @@ def mp_centralized_collect_sync(
         n_alive = len(alive_wids)
         if n_alive == 0:
             raise RuntimeError(f"[cis-orch] iter {iter_n}: no alive workers")
+
+        # S64 task #46: when adaptive mode is on, recompute CIS batching
+        # params for THIS iter based on current pool size. Pushes new values
+        # to the CIS subprocess via the CTRL pipe — no respawn needed.
+        if cis_adaptive:
+            pool_size = max(1, len(opp_pool_full))
+            new_mb, new_to = _compute_adaptive_cis_params(
+                pool_size=pool_size,
+                games_per_iter=n_games,
+                n_workers=n_alive,
+                max_concurrent=max_concurrent,
+            )
+            try:
+                g["server"].set_batch_params(min_batch=new_mb, timeout_ms=new_to)
+                print(f"[cis-orch] iter {iter_n}: adaptive params "
+                      f"pool={pool_size} → min_batch={new_mb} "
+                      f"timeout_ms={new_to}", flush=True)
+            except Exception as e:
+                print(f"[cis-orch] iter {iter_n}: adaptive params WARN "
+                      f"set_batch_params failed: {e}; using static values",
+                      flush=True)
+
         assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games)
 
         # Log per-iter distribution for visibility (one line, sorted by games).
@@ -2758,6 +2930,25 @@ class CISBgCollector:
             raise RuntimeError(f"[cis-bg] iter {iter_n}: no alive workers")
         n_games = ctx["n_games"]
 
+        # S64 task #46: adaptive CIS batching params if enabled (BG path).
+        if ctx.get("cis_adaptive", False):
+            pool_size = max(1, len(opp_pool_msg))
+            new_mb, new_to = _compute_adaptive_cis_params(
+                pool_size=pool_size,
+                games_per_iter=n_games,
+                n_workers=n_alive,
+                max_concurrent=ctx["max_concurrent"],
+            )
+            try:
+                g["server"].set_batch_params(min_batch=new_mb, timeout_ms=new_to)
+                print(f"[cis-bg] iter {iter_n}: adaptive params "
+                      f"pool={pool_size} → min_batch={new_mb} "
+                      f"timeout_ms={new_to}", flush=True)
+            except Exception as e:
+                print(f"[cis-bg] iter {iter_n}: adaptive params WARN "
+                      f"set_batch_params failed: {e}; using static values",
+                      flush=True)
+
         # S58 (F): one opp per worker. See _allocate_opps_to_workers docstring
         # for rationale. Mirrors the regular orchestrator dispatch path.
         assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games)
@@ -2821,6 +3012,7 @@ class CISBgCollector:
         max_pool_size = args_dict.get("max_pool_size", 16)
         cis_min_batch = args_dict.get("cis_min_batch", 8)
         cis_timeout_ms = args_dict.get("cis_timeout_ms", 15)
+        cis_adaptive = args_dict.get("cis_adaptive", False)
         rng_seed = args_dict.get("rng_seed") or random.randint(0, 1_000_000)
 
         if device.type == "cpu":
@@ -2860,6 +3052,7 @@ class CISBgCollector:
             "max_pool_size": max_pool_size,
             "cis_min_batch": cis_min_batch,
             "cis_timeout_ms": cis_timeout_ms,
+            "cis_adaptive": cis_adaptive,
             "rng_seed": rng_seed,
             "server_pool": server_pool,
         }
