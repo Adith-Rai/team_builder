@@ -1,3 +1,162 @@
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S66 COLLECT ARCH INVESTIGATION (2026-05-18) — AUTHORITATIVE READ FIRST
+═══════════════════════════════════════════════════════════════════════════════
+
+**FIRST ACTION FOR NEXT SESSION**:
+
+1. Read `memory/project_s66_collect_arch_findings.md` BEFORE anything else.
+2. Read `docs/SHARED_BACKBONE_INVESTIGATION.md` (on branch `perf/multi-process-cis-mps`) for continuation plan.
+3. Read `docs/MULTI_PROCESS_CIS_DESIGN.md` STATUS UPDATE section (top of file) to understand the pivot.
+4. Open task list — tasks #16-21 are the investigation steps.
+
+═══════════════════════════════════════════════════════════════════════════════
+S66 SUMMARY — what we found, what was refuted, where we are
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION GOAL**: Re-investigate S65's "pool growth unsolved, all tuning levers exhausted" impasse against source-of-truth (raw logs + code), not the wrap memos which were written context-collapsed.
+
+**THREE BIG FINDINGS**:
+
+1. **S65's per-fire overhead claim was REFUTED by raw data.** Memo claimed "3-5ms fixed cost." Direct A/B at pool=1 prod scale from `data/s65_artifacts/runA_15w_retest.log` vs `stage_a_test.log`:
+   - Run A (32, 50ms): mean_fire=57.6ms, fwd=21.1ms, **overhead=36.5ms** at batch=24
+   - Stage A (10, 25ms): mean_fire=39.9ms, fwd=18.8ms, **overhead=21.1ms** at batch=14
+   - **Per-fire overhead is 21-37ms at prod (4-7× memo's claim).**
+   - Mechanism: `mp_centralized_collect.py:770-784` is a tight loop calling `worker_resp_writers[widx].send(msg)` once per request. At batch=24 with 15 workers = 24 separate IPC sends per fire. Plus `_stack_numpy_batches` (line 667) + `numpy_dict_to_torch` (line 668).
+
+2. **Multi-process CIS via CUDA MPS at N=6 REFUTED via direct Phase A bench.** Created `bench_mps_inference.py` on branch `perf/multi-process-cis-mps`, ran on prod with MPS daemon active.
+   - N=2 batch=4: 1.93× (matches Databricks H100 sweet spot ✓)
+   - N=2 batch=16: 1.75× ✓
+   - **N=6 batch=4: 0.90× (WORSE than N=1)** ✗
+   - **N=6 batch=16: 0.74× (significantly worse)** ✗
+   - Per-process slowdown 6.6× at N=6. MPS scheduler thrashes with 6 concurrent clients each wanting 100% SMs.
+   - User clarified pool can reach 17 currently and possibly 33+ later — N=17+ won't recover from N=6 failure.
+   - **Original design "1 player + N opp processes" architecture is DEAD.**
+
+3. **Model is temporal-heavy, tokenizer-bottlenecked (S1 finding).** Measured on prod:
+   - temporal: 12.7M params (64%) — BIGGEST
+   - spatial: 4.7M (24%)
+   - tokenizer: 1.0M (5%) BUT 64% of forward_spatial wall time (7.17ms at B=4, 7.31ms at B=16 — near-fixed!)
+   - This means **per-fire compute is dominated by FIXED Python+kernel overhead, not batch-dependent compute**
+   - Implication: shared backbone amortization gives big wins (run tokenizer+spatial once on mega-batch instead of N times per slot)
+
+**ARCHITECTURAL PIVOT (user-approved direction)**:
+
+- **Shared backbone with frozen spatial during PPO** (Option C)
+- BACKBONE (frozen): tokenizer + spatial + summary_to_temporal (6.2M params, 31%)
+- SPECIALIZED (per-snapshot, PPO-trained): temporal + heads (13.7M params, 69%)
+- **NO BC retrain** — user explicit: long-term goal cannot be hurt. Use BC v10 as-is; only PPO modified to freeze spatial.
+- **Quality validation experiment is the gate** before commit (~$10-30 pod, 20-30 iter A/B)
+- S57 erosion data (`project_phase1_v3_diagnosis.md`) suggests freezing spatial may HELP quality (stronger version of BC anchor anti-erosion), but this is plausible not proven — empirical validation required.
+
+**REFUTED THIS SESSION** (recorded in `docs/REFUTED_LOG.md`):
+- Multi-process CIS per slot via MPS at N=6+ (Phase A bench)
+- CPU opp inference (S65 + S66 reconfirmation — model is temporal-heavy, CPU is bad at this)
+- Triton Inference Server (gRPC IPC regression + export pain + no strategic gain)
+- MPS thread-percentage tuning (not tested — wouldn't help at N=17+ even if it rescued N=6)
+- BC retrain (user explicit)
+
+**POOL SIZE WORKING ASSUMPTION** (user clarified 2026-05-18):
+- Self-play only: pool 6-8 likely fine (each opp needs enough training signal)
+- Self-play + external opps: tight, unclear — may need more capacity
+- Don't over-engineer for pool=33+. Goal is enabling pool size EXPERIMENTATION cheaply.
+
+═══════════════════════════════════════════════════════════════════════════════
+NEXT SESSION'S WORK — Investigation S2-S5 (continue from Inv S1 partial)
+═══════════════════════════════════════════════════════════════════════════════
+
+Tasks #16-21 in the task list. In order:
+
+**S2 — Training-side mechanism (task #17)**
+- Read `train_rl.py` + `ppo.py` to find where optimizer updates parameters
+- Choose: freeze-spatial via `param.requires_grad=False` vs param-group exclusion vs LoRA
+- Verify BC anchor compatibility with frozen spatial (should be fine — BC ref's spatial weights match frozen spatial weights)
+- Output: concrete code change spec
+
+**S3 — External opp compat (task #18)**
+- Read `external_adapters.py` + `external_opponent_manager.py` + `metamon_accept_serve.py` + `foul_play_accept_serve.py`
+- Verify external opps use SEPARATE inference paths (NOT CIS) — strongly inferred but not yet code-verified
+- Output: confirmation + integration boundary doc
+
+**S4 — Precedent survey (task #19)**
+- Brief: VGC-Bench, RLlib, AMago for shared-backbone patterns in self-play
+- LLM serving multi-LoRA as analogous pattern
+- Output: brief notes; don't go deep unless surprising
+
+**S5 — Synthesis + new design memo (task #20)**
+- Write `docs/SHARED_BACKBONE_CIS_DESIGN.md` superseding the multi-process memo
+- Stages: training change → smoke validation → quality validation experiment → impl → e2e validation
+- Each stage with risk gate
+
+**S5b — Quality validation experiment design (task #21)**
+- Two PPO runs: current full-finetune vs frozen-spatial variant
+- Init: BC v10, 20-30 iters
+- Track: smart_avg, win rate, kl, bc_kl, eval results
+- Gate: variant must match baseline within noise
+- **CRITICAL**: this is the gate. Don't ship without passing.
+
+═══════════════════════════════════════════════════════════════════════════════
+POD STATE AT HANDOVER (2026-05-18)
+═══════════════════════════════════════════════════════════════════════════════
+
+- **Prod port 47913**: IDLE
+- No python running, GPU clean
+- MPS daemon STOPPED (was active during Phase A, cleanly shut down)
+- 8 battle_server.js on 9000-9007 (restart before any prod run)
+- HEAD on `perf/multi-process-cis-mps` branch (commits 366df111 + ba60d42e + S66 wrap commits)
+- Branch synced to origin
+
+**Local artifacts** (`pokemon-ai-starter/pokemon-ai/src/data/s65_artifacts/`):
+- `stage_a_test.log` — S65 Stage A adaptive batching prod (CIS-STATS data, GROUND TRUTH for per-fire claims)
+- `battle_server_diag/runA_15w_retest.log` — S65 baseline (CIS-STATS data)
+- `bench_cpu.log` — S65 CPU bench output
+- `bench_mps_n1_2_6.log` — S66 Phase A MPS bench output (the gate-fail data)
+
+═══════════════════════════════════════════════════════════════════════════════
+GUIDANCE FOR NEXT SESSION (READ + INTERNALIZE)
+═══════════════════════════════════════════════════════════════════════════════
+
+**The plans here are GUIDES, not gospel.** Use your own judgment. If the data or code reveals something that suggests a different path, push back. The S66 path is well-reasoned but could be wrong — empirical reality > my predictions.
+
+**Source of truth hierarchy**:
+1. Raw logs and code (always)
+2. Memory files written within the session that observed it (close to source)
+3. Wrap memos from prior sessions (decay over time, may be context-collapsed)
+4. Older docs (lots of stale framings — check S59+ findings before trusting)
+
+**Quality is non-negotiable.** Any training-side change must pass empirical validation before commit. Doesn't matter how fast it makes things — quality > cost > calendar.
+
+**"It's me and you against the problem"** — partnership, not deference. Push back when premise is buggy. Surface uncertainty. The user explicitly rewards good pushback.
+
+**Pool sizing**: 6-8 for self-play likely fine. Combined with external opps may need more. Don't over-engineer for pool=33+ — the architecture should ENABLE experimentation with pool sizes, not assume a specific large one.
+
+**Mandatory principles** (from MEMORY.md "ABSOLUTE NON-NEGOTIABLES"):
+- No shortcuts. Ever.
+- No assumptions. Label CONCRETE / STRONG INFERENCE / CONJECTURE.
+- Quality > cost > calendar.
+- Verify before recommending OR acting. Memory snapshots decay.
+- Every decision serves the long-term goal: elite gen 9 → multi-gen → all formats.
+
+**Don't reopen** (this session added to the list):
+- Multi-process CIS per slot via MPS at N=6+ (Phase A refuted)
+- Triton Inference Server (analysis-only rejection, documented)
+- BC retrain (user explicit)
+
+═══════════════════════════════════════════════════════════════════════════════
+HANDOVER MEMO ANCHORS
+═══════════════════════════════════════════════════════════════════════════════
+
+- `memory/project_s66_collect_arch_findings.md` — comprehensive S66 findings (READ FIRST)
+- `docs/SHARED_BACKBONE_INVESTIGATION.md` — current direction + S2-S5 plan
+- `docs/MULTI_PROCESS_CIS_DESIGN.md` — preserved for decision-log value; has STATUS UPDATE at top noting pivot
+- `docs/REFUTED_LOG.md` — multi-process MPS + Triton + CPU all updated
+- Branch `perf/multi-process-cis-mps` — bench script + design memo + investigation notes
+
+
+
+═══════════════════════════════════════════════════════════════════════════════
+S65 ARC IMPASSE (2026-05-18 PRIOR) — preserved below, superseded by S66 above
+═══════════════════════════════════════════════════════════════════════════════
+
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════

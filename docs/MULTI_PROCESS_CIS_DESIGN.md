@@ -3,7 +3,34 @@
 **Branch**: `perf/multi-process-cis-mps`
 **Authored**: S66 (2026-05-18), from master `fe9df8b9`
 **Goal**: solve the pool-growth collect-time slowdown that left Phase 2 not launch-ready at S65 wrap.
-**Status**: DESIGN — Phase A experiments pending.
+**Status**: ⚠️ **SUPERSEDED — see STATUS UPDATE below before reading the original design.**
+
+---
+
+## ⚠️ STATUS UPDATE (S66 wrap, 2026-05-18) — READ FIRST
+
+**This memo's proposed architecture (1 player + N opp processes via CUDA MPS) is REFUTED at our pool scale.**
+
+Phase A bench measured:
+- N=2: 1.93× throughput @ batch=4, 1.75× @ batch=16 (matches Databricks H100 sweet spot ✓)
+- N=6: **0.90× @ batch=4, 0.74× @ batch=16** (WORSE than single process)
+
+MPS scheduler thrashes when 6+ clients each want 100% of SMs. Combined with the user's clarification that pool can reach 17 currently and possibly 33+ later, the multi-process-per-slot pattern is not viable for our pool target.
+
+**Pivoted direction**: shared backbone with frozen spatial during PPO, per-snapshot temporal+heads trainable. See `docs/SHARED_BACKBONE_INVESTIGATION.md` (next session continues there) and `memory/project_s66_collect_arch_findings.md` for full context.
+
+**What still applies from this memo**:
+- §1 raw-data findings (per-fire overhead 21-37ms, mechanism: N×mp.send) — VERIFIED CONCRETE, source-of-truth checked
+- §2.1-§2.3 options analysis — STILL valid as decision log
+- §3 (CUDA MPS technical context) — partially valid; sweet spot is N=2 not N=6 for us
+- §5 operational concerns — apply to ANY multi-process approach; relevant for future hardware change
+
+**What's REFUTED from this memo**:
+- §2.4 Option D (multi-process per slot for our pool scale)
+- §4 staged plan (Phase A.3 gate failed, B/C/D obsolete as written)
+- §0 "this is the correct architecture" claim
+
+Investigation continues. The original design below is preserved for the decision-log value (why we explored this, what we measured, what we learned).
 
 ---
 

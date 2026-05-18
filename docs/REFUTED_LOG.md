@@ -91,10 +91,40 @@
 ### CIS / collection infrastructure
 
 #### 8. `--opponent-device cpu` (`--opp-cpu`)
-- **Refuted**: S50
-- **Evidence**: Broke at production scale. CPU 20M-param forward × conc=200 exceeded WS keepalive limits.
-- **Why not retry**: We need GPU forward at scale; CPU can't keep up.
-- **Source**: `docs/PPO_CLOUD_COOKBOOK.md §3h`
+- **Refuted**: S50 (per-worker inline CPU); S65 (centralized CPU service); S66 (reconfirmed after S1 model breakdown).
+- **Evidence**:
+  - S50: per-worker inline CPU forward × conc=200 exceeded WS keepalive limits.
+  - S65: `bench_cpu_inference.py` (commit `2c188c91`) measured 344 inf/s peak aggregate at 32 workers — under the 500-inf/s viability threshold. Note bench was OPTIMISTIC for CPU (tested only `forward_spatial`, which is 31% of the model by params; real production CIS runs the full path).
+  - S66 follow-up: model is temporal-heavy (12.7M params = 64% of total). CPU is poor at transformer matmuls — the full-forward CPU throughput is even lower than 344 inf/s, likely 150-200 inf/s aggregate. Doesn't scale to pool=6+ regime.
+- **Why not retry**: Two refutations from different angles converge. Our 20M temporal-heavy transformer is fundamentally GPU-favored. CPU pattern only works for architectures without temporal stack (e.g., ps-ppo) — we can't drop temporal.
+- **Could revisit if**: We move to a substantially smaller opp model via distillation (but that has training-side quality risk).
+- **Source**: `docs/PPO_CLOUD_COOKBOOK.md §3h`; `memory/project_s65_arch_impasse.md` §2.3; `memory/project_s66_collect_arch_findings.md` §3.1.
+
+#### 8b. Multi-process CIS per slot via CUDA MPS (1 player + N opp processes on single A100)
+- **Refuted**: S66 (2026-05-18), Phase A bench `bench_mps_inference.py` on `perf/multi-process-cis-mps` branch.
+- **Evidence**: Direct measurement on prod A100 with MPS daemon active:
+  - N=2 throughput: 1.93× @ batch=4, 1.75× @ batch=16 (matches Databricks H100 sweet spot ✓)
+  - **N=6 throughput: 0.90× @ batch=4, 0.74× @ batch=16 (WORSE than single process)**
+  - Per-process slowdown 6.6× at N=6 vs N=1. MPS scheduler thrashes when each client wants 100% of SMs.
+  - Hardware limit is 60 MPS clients (Ampere) — we have headroom in client COUNT but not in EFFICIENT SHARING for our specific workload (small transformer forwards, high fire rate).
+- **Why not retry**: User's pool target reaches 17 currently and possibly higher. If N=6 fails, N=17+ is worse. Phase A.3 N=6 gate failed → architecture refuted for our pool scale.
+- **Could revisit if**: Hardware change (multi-GPU could put each MPS client on its own GPU's MPS daemon, avoiding contention); OR our workload changes to compute-bound (currently it's orchestration-bound, see `project_s66_collect_arch_findings.md` §2).
+- **MPS thread-percentage tuning NOT tested**: deferred because even if it rescued N=6 to ~2×, it wouldn't help at N=17+.
+- **Sources**:
+  - `pokemon-ai-starter/pokemon-ai/src/data/s65_artifacts/bench_mps_n1_2_6.log` — raw bench output
+  - `docs/MULTI_PROCESS_CIS_DESIGN.md` — original design memo (with STATUS UPDATE at top noting the pivot)
+  - `memory/project_s66_collect_arch_findings.md` §2.2 — comprehensive context
+- **Lesson**: Don't extrapolate from small-N benchmarks to large-N without measurement. Databricks N=2 → our N=6 extrapolation failed; same trap should be avoided in future architecture decisions.
+
+#### 8c. NVIDIA Triton Inference Server as CIS replacement
+- **Refuted**: S66 (2026-05-18) — analysis-only, not bench
+- **Evidence**:
+  - IPC latency regression risk: mp.Pipe ~100µs vs gRPC ~1-5ms even local. At 6 processes × 10-22 fires/sec, the gRPC delta compounds. Triton's shared-memory feature avoids this but requires meaningful integration work.
+  - Model export pain: `forward_ppo_sequence` has Python control flow (history conditional, padded temporal, BC anchor logic). TorchScript export fragile. ONNX typically can't handle dynamic shapes.
+  - Triton Python backend avoids export but then we're wrapping our existing code in Triton's API — most of Triton's value disappears.
+  - Triton's dynamic batching is across-request-to-same-model. We have across-slot-different-models. Configuring separate instances per opp = not really using Triton strategically.
+- **Why not retry**: "Already installed on pod" doesn't remove the integration, export, or IPC-latency arguments. Custom CIS + appropriate architectural patterns is more tailored to our specific needs.
+- **Memory source**: `docs/MULTI_PROCESS_CIS_DESIGN.md` §2.3
 
 #### 9. REBIND_WORKER ctrl protocol for CIS worker respawn
 - **Refuted**: Phase 4.6, S54
