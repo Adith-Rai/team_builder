@@ -580,12 +580,19 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     #   dispatch_total_ms  — output slice + N*mp.send to workers (lines 770-784)
     # Residual at print time = total - sum(buckets) captures any_history check
     # + try-block setup (negligible in healthy fires; spikes on exception path).
+    # S67 patch 2 adds the fwd-internal split (setup / hist / output) so we
+    # can identify whether the ~17ms fwd floor at small batch is GPU
+    # kernel launches (Track B amortization helps), Python history-prep
+    # loop (compile/vectorize that loop instead), or GPU compute completion
+    # at the output .cpu().numpy() sync (genuine GPU compute, hard to cut).
     _cis_stats: List[Dict[str, float]] = [
         {"n_fires": 0, "total_ms": 0.0, "max_ms": 0.0, "max_q": 0,
          "fwd_total_ms": 0.0, "n_timeout_fires": 0, "n_minbatch_fires": 0,
          "q_total": 0,
          "stack_total_ms": 0.0, "to_torch_total_ms": 0.0,
-         "dispatch_total_ms": 0.0}
+         "dispatch_total_ms": 0.0,
+         "fwd_setup_total_ms": 0.0, "fwd_hist_total_ms": 0.0,
+         "fwd_output_total_ms": 0.0}
         for _ in range(n_slots)
     ]
     _last_stats_dump_t: List[float] = [time.time()]  # mutable single-element box
@@ -643,6 +650,22 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                       f"dispatch={dispatch_mean:.2f}ms "
                       f"residual={residual_mean:.2f}ms "
                       f"(total={mean:.2f}ms)", flush=True)
+                # S67 patch 2: fwd-internal split. "setup" is the Python
+                # overhead to queue forward_spatial + action_encoder; "hist"
+                # is the history prep loop wall (Python with embedded GPU
+                # index-assigns); "output" includes temporal + heads + the
+                # GPU sync at .cpu().numpy() so it captures the bulk of
+                # actual GPU compute time. sum should match fwd within
+                # rounding.
+                fwd_setup_mean = st["fwd_setup_total_ms"] / st["n_fires"]
+                fwd_hist_mean = st["fwd_hist_total_ms"] / st["n_fires"]
+                fwd_output_mean = st["fwd_output_total_ms"] / st["n_fires"]
+                fwd_sum = fwd_setup_mean + fwd_hist_mean + fwd_output_mean
+                print(f"[CIS-FWD] slot={s} setup={fwd_setup_mean:.2f}ms "
+                      f"hist={fwd_hist_mean:.2f}ms "
+                      f"output={fwd_output_mean:.2f}ms "
+                      f"(sum={fwd_sum:.2f}ms, fwd={fwd_mean:.2f}ms)",
+                      flush=True)
             st["n_fires"] = 0
             st["total_ms"] = 0.0
             st["fwd_total_ms"] = 0.0
@@ -654,6 +677,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             st["stack_total_ms"] = 0.0
             st["to_torch_total_ms"] = 0.0
             st["dispatch_total_ms"] = 0.0
+            st["fwd_setup_total_ms"] = 0.0
+            st["fwd_hist_total_ms"] = 0.0
+            st["fwd_output_total_ms"] = 0.0
 
     def _fire_batch(slot: int, fire_reason: str = "unknown"):
         """Fire one batched forward over `pending_per_slot[slot]` using
@@ -688,6 +714,8 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         _t_fwd_start = None
         _t_fwd_end = None
         _t_after_stack = None  # S67 stage profile (between stack and to_torch)
+        _t_after_setup = None  # S67 patch 2 (after forward_spatial+action_encoder)
+        _t_after_hist = None   # S67 patch 2 (after history prep loop, before temporal)
         try:
             # Are any requests carrying a non-empty history?
             any_history = any(p[4] is not None and p[4].shape[1] > 0
@@ -719,6 +747,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                     N = len(pending)
                     spatial_out, summaries = slot_model.forward_spatial(torch_batch)
                     action_ctx = call_action_encoder(slot_model, torch_batch, spatial_out)
+                    _t_after_setup = time.perf_counter()  # S67 patch 2
 
                     # Build padded all_summaries with per-request histories.
                     # Per-request bsize is always 1 in worker submits (one
@@ -765,6 +794,7 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                         else:
                             all_summaries[i, 0] = summaries[i]
 
+                    _t_after_hist = time.perf_counter()  # S67 patch 2
                     temporal_ctx = slot_model.temporal(
                         all_summaries.float(), seq_lens_t
                     ).to(summaries.dtype)
@@ -840,6 +870,21 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         _to_torch_ms = (((_t_fwd_start or _t_after_stack or _t_fire_end)
                          - (_t_after_stack or _t_fire_start)) * 1000.0)
         _dispatch_ms = ((_t_fire_end - (_t_fwd_end or _t_fire_end)) * 1000.0)
+
+        # S67 patch 2: fwd-internal sub-buckets. History-aware path sets
+        # both _t_after_setup and _t_after_hist; simple path (history-free)
+        # leaves them None -> all fwd time attributed to fwd_output bucket.
+        if _t_after_setup is not None and _t_fwd_start is not None:
+            _fwd_setup_ms = (_t_after_setup - _t_fwd_start) * 1000.0
+            _hist_end = _t_after_hist or _t_after_setup
+            _fwd_hist_ms = (_hist_end - _t_after_setup) * 1000.0
+            _fwd_output_ms = ((_t_fwd_end or _t_fire_end)
+                              - _hist_end) * 1000.0
+        else:
+            _fwd_setup_ms = 0.0
+            _fwd_hist_ms = 0.0
+            _fwd_output_ms = _fwd_ms
+
         st = _cis_stats[slot]
         st["n_fires"] += 1
         st["total_ms"] += _fire_ms
@@ -847,6 +892,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         st["stack_total_ms"] += _stack_ms
         st["to_torch_total_ms"] += _to_torch_ms
         st["dispatch_total_ms"] += _dispatch_ms
+        st["fwd_setup_total_ms"] += _fwd_setup_ms
+        st["fwd_hist_total_ms"] += _fwd_hist_ms
+        st["fwd_output_total_ms"] += _fwd_output_ms
         st["q_total"] += _n_reqs_at_fire
         if fire_reason == "timeout":
             st["n_timeout_fires"] += 1
