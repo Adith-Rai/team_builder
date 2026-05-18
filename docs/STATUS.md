@@ -1,10 +1,40 @@
 # Project Status
 
-**Last Updated:** 2026-05-18 (S65 ARCH IMPASSE — pool-growth slowdown is fundamental; all cheap tuning levers REFUTED; Phase 2 NOT launch-ready; research task open)
+**Last Updated:** 2026-05-18 (S66 — shared-backbone investigation, pivot from multi-process-MPS-refuted; Phase 2 still NOT launch-ready; investigation S2-S5 open for next session)
 
 ---
 
-## CURRENT STATE — S64 Phase B SHIPPED (sequence packing complete)
+## CURRENT STATE — S66 SHARED-BACKBONE INVESTIGATION
+
+**Where we are**: S65's "pool-growth impasse" re-investigated against raw logs at S66. Three findings overturned the S65 framing:
+1. Per-fire overhead at prod is 21-37ms (not 3-5ms as S65 memo claimed) — 4-7× higher. Mechanism is `mp_centralized_collect.py:770-784` N×mp.send loop.
+2. Multi-process CIS via CUDA MPS at N=6 REFUTED (Phase A bench: 0.74-0.90× vs N=1; N=2 works at 1.93× but doesn't scale past 2-3 clients).
+3. Model is temporal-heavy (12.7M params = 64%); tokenizer dominates forward time (64% wall, near-fixed across batch).
+
+**Pivoted direction**: shared backbone with frozen spatial during PPO. No BC retrain. Quality validation experiment is the gate.
+
+**Pool target (user-clarified S66)**: 6-8 for self-play; combined with external opps may need more.
+
+**Branch state**:
+- `master` at `fe9df8b9` — S64 + S65 artifacts. Production-ready until shared-backbone work commits.
+- `perf/multi-process-cis-mps` at `596ae1c9` — investigation working surface. Contains:
+  - `docs/MULTI_PROCESS_CIS_DESIGN.md` (multi-process design memo with STATUS UPDATE noting pivot)
+  - `docs/SHARED_BACKBONE_INVESTIGATION.md` (current direction)
+  - `pokemon-ai-starter/pokemon-ai/src/bench_mps_inference.py` (Phase A bench)
+
+**Open tasks** (in user task list, #16-21): Investigation S2 (training-side mechanism), S3 (external opp compat), S4 (precedent survey), S5 (synthesis memo), S5b (quality validation experiment design).
+
+**Refuted at S66** (in `docs/REFUTED_LOG.md`):
+- Multi-process CIS per slot via MPS at N=6+ (Phase A bench)
+- CPU opp inference (S65 + S66 reconfirmation — model temporal-heavy, CPU bad at this)
+- Triton Inference Server (gRPC IPC regression, export pain, no strategic gain)
+- BC retrain as part of shared-backbone (user explicit: long-term goal cannot be hurt; freeze-spatial doesn't require retrain)
+
+**See for full context**: `memory/project_s66_collect_arch_findings.md`, `next-prompt.txt` S66 wrap section.
+
+---
+
+## HISTORICAL — S64 Phase B SHIPPED (sequence packing complete)
 
 **Where we are**: Phase 1 v3 DONE (diagnosed as type-knowledge erosion, S57). Phase 2 DEFERRED until optimization arc has diminishing returns. Currently in multi-session optimization arc; **S64 Phase B SHIPPED and merged to master**. Sequence packing is now in production-ready code; opt-in via `--packed` flag.
 
