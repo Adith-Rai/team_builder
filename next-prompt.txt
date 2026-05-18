@@ -1,12 +1,98 @@
 pre prompt :
 
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S64 PHASE B SHIPPED (2026-05-15) — AUTHORITATIVE READ FIRST
+⚠️  S65 ARCH IMPASSE (2026-05-18) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**:
 
-**S64 optimization arc COMPLETE.** Phase B + 2a (mb=64) + 2b (no-per-chunk-gc + expandable_segments) shipped + `--pipeline` REFUTED at our scale. Three rounds of measurement (3-iter A/B + 7-iter A/B + profiler run) all CONCRETE. Read [[project_s64_phase_b_results]] §3.6-3.7.1 for full data. **Next session should pivot to Phase 2 prep — but with caveats from S64 forensics (below).**
+**Read `memory/project_s65_arch_impasse.md` BEFORE anything else.** Comprehensive
+summary of S65 (2026-05-17 / 2026-05-18) findings.
+
+**Phase 2 IS NOT LAUNCH-READY.** The pool-growth collect-time ballooning
+(555s pool=1 → 1048s pool=5) is unsolved. All cheap tuning levers exhausted
+this session:
+- CIS adaptive batching (Stage A) REFUTED — every iter +14-37% slower
+- CPU opp inference REFUTED — 344 inf/s aggregate vs 2300 GPU baseline
+- Battle server degradation REFUTED concretely (warm-BS iter 0 ≈ fresh-BS)
+- Multi-GPU ruled out by budget
+- Pool size cap user-rejected ("will hinder training, unacceptable")
+
+User assessment: "back to the drawing board kinda thing now."
+
+**Next session task: RESEARCH, not implementation.**
+
+Study how similar implementations handle multi-opp PFSP inference scaling at
+our regime (single GPU, conc=200, 1600g/iter, 20M transformer):
+1. **Metamon** — code at `metamon_ref/metamon/rl/self_play/` in this repo.
+   Their `launch_models.py` uses subprocess.Popen per opp; see how inference
+   batching works at their scale.
+2. **OpenAI Five** — Dota 5v5 self-play, massive distributed inference. Public
+   blog posts + arxiv.
+3. **AlphaStar / AlphaGo Zero** — DeepMind league self-play. Papers + blog.
+4. **ps-ppo** — explicit PPO self-play library; inference design.
+5. **VGC-Bench** — Pokemon-specific; we used as Tier 3 reference earlier but
+   didn't study their PFSP inference path.
+
+Key questions to answer from each:
+- N opps per iter, hardware assumed, how they batch across opps
+- Centralized vs distributed inference
+- Per-iter wall at scale (compare to our 12-20 min/iter)
+- Architecture-level patterns that AREN'T just "throw more hardware at it"
+
+**Output should be a concrete architecture proposal** informed by what works
+elsewhere. NOT another tuning iteration. 2-3 hours of careful research.
+
+═══════════════════════════════════════════════════════════════════════════════
+S65 SUMMARY (what shipped, what was refuted)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SHIPPED (code on branches, opt-in / unmerged):**
+- `perf/pfsp-allocator-polish` @ 24067045 — `--pfsp-allocator balanced` flag.
+  15/15 unit tests pass. Prod A/B not run. Modest impact at 15w (7-10% on
+  new-snapshot iters); biggest impact at 8w/3-5 opp (25-37% max-worker
+  reduction). Not the pool-growth fix, but a real improvement.
+- `perf/cis-adaptive-batching` @ 4699a030 — `--cis-adaptive` flag. REFUTED
+  in prod testing but retained as runtime-mutation infrastructure (could
+  support a different formula if one emerges from research).
+- `bench/cpu-inference` @ 2c188c91 — `bench_cpu_inference.py` standalone
+  benchmark. REFUTED CPU service but useful diagnostic tool.
+
+**REFUTED THIS SESSION:**
+- Battle server within-run degradation (task #44) — fully refuted by Run B
+  warm-BS iter 0 = 568s vs Run A fresh-BS iter 0 = 555s. 13s noise.
+- CIS adaptive batching (task #46) — measured worse across all iters. Per-fire
+  fixed overhead (mp.send + GPU launch + Python dispatch) dominates the
+  throughput-per-fire savings my formula optimized for.
+- CPU opp inference service (task #49 / #50) — benchmark showed 344 inf/s
+  aggregate at 32 workers, far below the 2000 inf/s viability threshold. 20M
+  transformer is fundamentally GPU-favored.
+
+**VALIDATED:**
+- 15w retest (task #42) — 10 iters at 15w with snapshot-interval=2.
+  Task #21 (iter-41+ pipe cascade) did NOT reproduce. CIS Phase 4.6 recovery
+  caught a partial stall at iter 9 cleanly. **15w is viable.**
+
+**LESSONS:**
+- Stage A failed because py_compile catches syntax but not runtime NameError
+  (3 references to a removed variable in a function I refactored). Caught by
+  prod test, not by my smoke validation. Task #51 added: write a real
+  integration test for CIS runtime mutation before any future runtime-param
+  work.
+- The pool-growth slowdown is fundamentally architectural. Tuning the single
+  knob (min_batch / timeout) doesn't help because of fixed per-fire costs.
+
+═══════════════════════════════════════════════════════════════════════════════
+POD STATE AT HANDOVER (2026-05-18 03:30 UTC)
+═══════════════════════════════════════════════════════════════════════════════
+
+- Master at `d7845354` (S64 arc complete + drop-pipeline shipped)
+- All test runs killed. No python running.
+- Battle servers up. May want fresh restart before next prod run.
+- Lingering `cleanup_watchdog.sh` from earlier — harmless. Kill via
+  `pkill -9 -f cleanup_watchdog`.
+- Artifacts at `/workspace/team_builder/data/s64_artifacts/` (multiple
+  subdirectories with run logs + profile trace from this arc).
 
 **S64 final findings (2026-05-16 → 2026-05-17, full overnight 7-iter A/B)**:
 
