@@ -11,9 +11,12 @@
 2. Multi-process CIS via CUDA MPS at N=6 REFUTED (Phase A bench: 0.74-0.90× vs N=1; N=2 works at 1.93× but doesn't scale past 2-3 clients).
 3. Model is temporal-heavy (12.7M params = 64%); tokenizer dominates forward time (64% wall, near-fixed across batch).
 
-**Pivoted direction**: shared backbone with frozen spatial during PPO. No BC retrain. Quality validation experiment is the gate.
+**Pivoted direction (TWO TRACKS, evaluate both)**:
+- **Track A — Wave-based CIS** (lower risk, investigate first): refactor CIS to hold K=6-8 active opp slots, cycle through pool in waves. Mirrors `rl_collection.py:476-483` local pattern that user noted was pool-invariant. ZERO quality risk. Tasks #22-26.
+- **Track B — Shared backbone with frozen spatial during PPO**: tokenizer+spatial frozen, temporal+heads per-snapshot. Quality validation experiment required. Tasks #17-21.
+- Decision logic: Track A first; pivot to B only if A doesn't hit threshold OR pool >> 15 needed.
 
-**Pool target (user-clarified S66)**: 6-8 for self-play; combined with external opps may need more.
+**Pool target (user-clarified S66)**: 6-8 for self-play; combined with external opps may need more. Local pattern handled pool 15+ active and 100+ total — that's the existence proof we want to match.
 
 **Branch state**:
 - `master` at `fe9df8b9` — S64 + S65 artifacts. Production-ready until shared-backbone work commits.

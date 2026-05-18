@@ -39,14 +39,33 @@ S66 SUMMARY — what we found, what was refuted, where we are
    - This means **per-fire compute is dominated by FIXED Python+kernel overhead, not batch-dependent compute**
    - Implication: shared backbone amortization gives big wins (run tokenizer+spatial once on mega-batch instead of N times per slot)
 
-**ARCHITECTURAL PIVOT (user-approved direction)**:
+**ARCHITECTURAL DIRECTION — TWO TRACKS** (Track A added at session END after user reminded that local pre-CIS pattern was pool-invariant in timing):
 
-- **Shared backbone with frozen spatial during PPO** (Option C)
+⚠️ **READ BOTH `docs/WAVE_BASED_CIS_INVESTIGATION.md` (Track A) AND `docs/SHARED_BACKBONE_INVESTIGATION.md` (Track B)** — Track A discovered late-session and is the recommended FIRST track because of lower risk.
+
+**Track A — Wave-based CIS (LOWER RISK, investigate first)**:
+- Local code in `rl_collection.py:476-483` processes opps in WAVES of n_servers (=6-8 active at a time), not all-pool-live like CIS. **This is why local was pool-invariant.**
+- Refactor CIS to hold K=6-8 active opp slots, cycle through pool waves within an iter
+- **ZERO quality risk** (orchestration change only, no model/training change)
+- Estimated pool=15 wall ≈ 666s (~11 min), matches user's "flat 10-12 min" acceptance
+- Tasks #22-26 (W1 read local code, W2 design, W3 smoke validate, W4 prod validate, decision gate)
+
+**Track B — Shared backbone with frozen spatial during PPO (HIGHER CEILING, investigate if Track A doesn't suffice)**:
 - BACKBONE (frozen): tokenizer + spatial + summary_to_temporal (6.2M params, 31%)
 - SPECIALIZED (per-snapshot, PPO-trained): temporal + heads (13.7M params, 69%)
-- **NO BC retrain** — user explicit: long-term goal cannot be hurt. Use BC v10 as-is; only PPO modified to freeze spatial.
-- **Quality validation experiment is the gate** before commit (~$10-30 pod, 20-30 iter A/B)
-- S57 erosion data (`project_phase1_v3_diagnosis.md`) suggests freezing spatial may HELP quality (stronger version of BC anchor anti-erosion), but this is plausible not proven — empirical validation required.
+- NO BC retrain — user explicit: long-term goal cannot be hurt
+- Quality validation experiment is the gate (~$10-30 pod, 20-30 iter A/B)
+- True pool-invariance (constant compute regardless of pool size)
+- Tasks #17-21 (S2-S5 + S5b)
+- S57 erosion data (`project_phase1_v3_diagnosis.md`) suggests frozen spatial may HELP quality (stronger BC-anchor-style anti-erosion), but plausible not proven — empirical validation required.
+
+**Decision logic**:
+1. Investigate Track A first
+2. If Track A W3 smoke + W4 prod validate → ship Track A, defer Track B unless pool >> 15 ever required
+3. If Track A doesn't hit threshold → pivot to Track B
+4. Combined (A + B) reserved for if pool ever routinely exceeds ~15
+
+**Both tracks share the Stage 1 widx-batched mp.send fix** (`mp_centralized_collect.py:770-784` refactor) — apply this in either implementation; it's not separate work.
 
 **REFUTED THIS SESSION** (recorded in `docs/REFUTED_LOG.md`):
 - Multi-process CIS per slot via MPS at N=6+ (Phase A bench)

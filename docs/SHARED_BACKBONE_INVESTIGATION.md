@@ -1,8 +1,9 @@
-# Shared Backbone CIS — Investigation State
+# Shared Backbone CIS — Investigation State (Track B)
 
 **Branch**: `perf/multi-process-cis-mps` (kept on this branch for continuity with Phase A bench artifacts; can fork to `perf/shared-backbone` when committing to impl)
 **Authored**: S66 (2026-05-18) — wrap of session
 **Status**: INVESTIGATION IN FLIGHT — S1 partial, S2-S5 pending for next session
+**Sibling**: `docs/WAVE_BASED_CIS_INVESTIGATION.md` (Track A) — discovered end of S66, lower-risk simpler path. Next session should evaluate BOTH tracks; Track A may suffice. This memo (Track B) remains the longer-term architecturally-pure path.
 **Supersedes**: `docs/MULTI_PROCESS_CIS_DESIGN.md` (which has its own STATUS UPDATE at top)
 
 ---
