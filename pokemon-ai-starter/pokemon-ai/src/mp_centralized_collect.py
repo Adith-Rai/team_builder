@@ -572,10 +572,20 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
     # impact; pure timing/counters around the existing fire path.
     # S62: also tracks fire-trigger type (timeout vs min_batch) + mean queue
     # size — H3 (slot starvation) evidence for the Fix #1 design decision.
+    # S67 per-fire stage breakdown (emitted under CIS_STAGE_PROFILE env var):
+    #   stack_total_ms     — _stack_numpy_batches (line 667)
+    #   to_torch_total_ms  — numpy_dict_to_torch  (line 668)
+    #   fwd_total_ms       — forward + history prep + output dict construction
+    #                        (existing; sits between _t_fwd_start and _t_fwd_end)
+    #   dispatch_total_ms  — output slice + N*mp.send to workers (lines 770-784)
+    # Residual at print time = total - sum(buckets) captures any_history check
+    # + try-block setup (negligible in healthy fires; spikes on exception path).
     _cis_stats: List[Dict[str, float]] = [
         {"n_fires": 0, "total_ms": 0.0, "max_ms": 0.0, "max_q": 0,
          "fwd_total_ms": 0.0, "n_timeout_fires": 0, "n_minbatch_fires": 0,
-         "q_total": 0}
+         "q_total": 0,
+         "stack_total_ms": 0.0, "to_torch_total_ms": 0.0,
+         "dispatch_total_ms": 0.0}
         for _ in range(n_slots)
     ]
     _last_stats_dump_t: List[float] = [time.time()]  # mutable single-element box
@@ -618,6 +628,21 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
                   f"meanq={mean_q:.1f} timeout_pct={to_pct:.0f}% "
                   f"(to={n_to}/mb={n_mb})",
                   flush=True)
+            # S67: gated per-fire stage breakdown. Lets us identify whether
+            # the 21-37ms per-fire overhead is dominated by stack, to_torch,
+            # the dispatch (mp.send) loop, or the forward path itself.
+            if os.environ.get("CIS_STAGE_PROFILE", "").lower() not in (
+                "", "0", "false", "no"):
+                stack_mean = st["stack_total_ms"] / st["n_fires"]
+                to_torch_mean = st["to_torch_total_ms"] / st["n_fires"]
+                dispatch_mean = st["dispatch_total_ms"] / st["n_fires"]
+                residual_mean = (mean - stack_mean - to_torch_mean
+                                 - fwd_mean - dispatch_mean)
+                print(f"[CIS-STAGES] slot={s} stack={stack_mean:.2f}ms "
+                      f"to_torch={to_torch_mean:.2f}ms fwd={fwd_mean:.2f}ms "
+                      f"dispatch={dispatch_mean:.2f}ms "
+                      f"residual={residual_mean:.2f}ms "
+                      f"(total={mean:.2f}ms)", flush=True)
             st["n_fires"] = 0
             st["total_ms"] = 0.0
             st["fwd_total_ms"] = 0.0
@@ -626,6 +651,9 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
             st["n_timeout_fires"] = 0
             st["n_minbatch_fires"] = 0
             st["q_total"] = 0
+            st["stack_total_ms"] = 0.0
+            st["to_torch_total_ms"] = 0.0
+            st["dispatch_total_ms"] = 0.0
 
     def _fire_batch(slot: int, fire_reason: str = "unknown"):
         """Fire one batched forward over `pending_per_slot[slot]` using
@@ -659,12 +687,14 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
         _t_fire_start = time.perf_counter()
         _t_fwd_start = None
         _t_fwd_end = None
+        _t_after_stack = None  # S67 stage profile (between stack and to_torch)
         try:
             # Are any requests carrying a non-empty history?
             any_history = any(p[4] is not None and p[4].shape[1] > 0
                               for p in pending)
 
             stacked = _stack_numpy_batches([p[3] for p in pending])
+            _t_after_stack = time.perf_counter()  # S67 stage profile
             torch_batch = numpy_dict_to_torch(stacked, device)
             _t_fwd_start = time.perf_counter()
 
@@ -798,14 +828,25 @@ def _cis_main_multi(worker_req_readers, worker_resp_writers,
 
         # S58 instrumentation: update per-slot latency stats
         # S62: also track fire-trigger type + cumulative queue for mean_q
+        # S67: per-fire stage decomposition (stack / to_torch / dispatch).
+        # Defaults make exception paths attribute conservatively; in healthy
+        # fires all timestamps are set and the buckets sum to ~total_ms.
         _t_fire_end = time.perf_counter()
         _fire_ms = (_t_fire_end - _t_fire_start) * 1000.0
         _fwd_ms = (((_t_fwd_end or _t_fire_end) -
                     (_t_fwd_start or _t_fire_start)) * 1000.0)
+        _stack_ms = (((_t_after_stack or _t_fwd_start or _t_fire_end)
+                      - _t_fire_start) * 1000.0)
+        _to_torch_ms = (((_t_fwd_start or _t_after_stack or _t_fire_end)
+                         - (_t_after_stack or _t_fire_start)) * 1000.0)
+        _dispatch_ms = ((_t_fire_end - (_t_fwd_end or _t_fire_end)) * 1000.0)
         st = _cis_stats[slot]
         st["n_fires"] += 1
         st["total_ms"] += _fire_ms
         st["fwd_total_ms"] += _fwd_ms
+        st["stack_total_ms"] += _stack_ms
+        st["to_torch_total_ms"] += _to_torch_ms
+        st["dispatch_total_ms"] += _dispatch_ms
         st["q_total"] += _n_reqs_at_fire
         if fire_reason == "timeout":
             st["n_timeout_fires"] += 1
