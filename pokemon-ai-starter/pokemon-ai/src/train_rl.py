@@ -200,6 +200,20 @@ def parse_args():
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
                         "Default 0.1 — caps drift without capping PPO improvement "
                         "direction (S57 isolation experiment starting point).")
+    p.add_argument("--freeze-spatial", action="store_true",
+                   help="S67 Track B quality validation: freeze the 'backbone' "
+                        "(tokenizer + spatial + summary_to_temporal, ~6.2M params, "
+                        "31%% of model) during PPO. Only the 'specialized' modules "
+                        "(temporal + switch_encoder + action_head + value_head) "
+                        "remain trainable. Frozen params are excluded from the "
+                        "AdamW optimizer entirely so weight_decay does NOT drift "
+                        "them (S56 limit 3 gotcha). Validates the shared-backbone "
+                        "CIS architecture: if quality matches full-finetune within "
+                        "noise, the runtime CIS can amortize the 12ms forward_spatial "
+                        "compute across all snapshots in one mega-batch. Requires "
+                        "--bc-anchor-ckpt (otherwise the frozen-spatial-only update "
+                        "may diverge unbounded — see project_phase1_v3_diagnosis.md "
+                        "for the erosion mechanism BC anchor mitigates).")
     p.add_argument("--pipeline", action="store_true",
                    help="Pipeline collection and PPO update (overlap on GPU)")
     p.add_argument("--profile-iters", type=str, default="",
@@ -790,6 +804,43 @@ def main():
     model, cfg, _ = load_checkpoint(init_path, device)
     model.to(device)
 
+    # S67 Track B quality validation: freeze the backbone modules. Done
+    # BEFORE optimizer construction so the frozen params are excluded
+    # from the optimizer entirely (filtering only on requires_grad in
+    # model.parameters() below). This prevents AdamW weight_decay from
+    # silently drifting frozen params via the optimizer.step path (S56
+    # limit 3). Sanity-check after compile (compile preserves
+    # requires_grad on the wrapped submodules).
+    if args.freeze_spatial:
+        _backbone_names = ("tokenizer", "spatial", "summary_to_temporal")
+        _frozen_n = 0
+        _trainable_n = 0
+        _trainable_modules = []
+        for name, mod in model.named_children():
+            if name in _backbone_names:
+                for p in mod.parameters():
+                    p.requires_grad = False
+                    _frozen_n += p.numel()
+            else:
+                _trainable_modules.append(name)
+                for p in mod.parameters():
+                    if p.requires_grad:
+                        _trainable_n += p.numel()
+        _total_n = _frozen_n + _trainable_n
+        print(f"[freeze-spatial] FROZEN backbone modules: {list(_backbone_names)}",
+              flush=True)
+        print(f"[freeze-spatial] TRAINABLE modules: {_trainable_modules}",
+              flush=True)
+        print(f"[freeze-spatial] frozen params:    {_frozen_n:>12,} "
+              f"({100.0*_frozen_n/_total_n:5.1f}%)", flush=True)
+        print(f"[freeze-spatial] trainable params: {_trainable_n:>12,} "
+              f"({100.0*_trainable_n/_total_n:5.1f}%)", flush=True)
+        if args.bc_anchor_ckpt is None or args.bc_anchor_coef <= 0.0:
+            print(f"[freeze-spatial] WARNING: --freeze-spatial without "
+                  f"--bc-anchor-ckpt (coef>0) — frozen-spatial PPO may "
+                  f"diverge unbounded. Strongly recommend BC anchor for "
+                  f"this run.", flush=True)
+
     # NOTE: torch.compile() is applied AFTER `_resume_from_checkpoint` (see
     # below near line ~820). Wrapping submodules with torch.compile rewrites
     # their state_dict keys to include `_orig_mod.` - if compile happens
@@ -801,9 +852,13 @@ def main():
     # fused=True uses CUDA-native fused AdamW kernel on supported devices
     # (Ampere+ A100 supports it). 3-7% saving on optimizer.step. Falls back
     # to non-fused on CPU/older GPUs automatically.
+    # S67: under --freeze-spatial we filter model.parameters() down to only
+    # the trainable params so frozen backbone is excluded from weight_decay
+    # entirely (not just from the gradient update).
     _fused_supported = device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    _opt_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=1e-4,
+        _opt_params, lr=args.lr, weight_decay=1e-4,
         fused=_fused_supported,
     )
     if _fused_supported:
