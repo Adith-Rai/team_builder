@@ -7,17 +7,22 @@
 
 ---
 
-## TL;DR
+## TL;DR (REVISION 2 — 2026-05-21 evening)
 
-**SHIP: `--mp-workers 48 --pool-anchors 11` (12 active opps per iter, mb=64).**
-**Wall: 18.0 min/iter iter 0 (Exp 1m), steady-state ~18.5-19 min/iter projected.**
-**Phase 2 cost: ~$155 (8w) → ~$93 (48w/pool=12). Save $62/run.**
-**Fallback if 1m iter 1 OOMs: `--mp-workers 30` at pool=15, 23.7 min/iter → $115/run.**
-**User-decided: 10-12 active opps per iter, snapshot-interval 5-10, 10-iter warmup.**
-**Zero quality compromise. Zero code change required (just launch flags).**
+**SHIP: `--mp-workers 30` (LOCKED, architectural ceiling at mb=64).**
+**Wall: 23.7 min/iter. Phase 2 cost: ~$155 (8w baseline) → ~$118 (30w). Save $37/run.**
+**Pool unbounded. 10 active opps per iter (composition design — see docs/PHASE2_LAUNCH_PLAN.md).**
+**OOM monitor wrapper detect+notify only (NO auto-fallback, S67 option A).**
 
-**Architectural ceiling confirmed**: per-worker CUDA context = ~490 MB GPU. 48 workers
-fit only if active opps capped to 12 (pool=15 OOMs on update at 48 workers).
+**RETRACTION**: This doc's first version claimed 48w/pool=12 (Exp 1m) as ship at $93/run.
+**REFUTED** later same day: Exp 1m iter 2 OOM'd on update; subsequent 40w/pool=10 sanity
+test (2026-05-21 evening) also OOM'd on iter 1 update. **The real architectural ceiling
+is 30 workers at mb=64.** See §3.1 for the new ceiling derivation + §3.0 for the iter-count-fluke explanation.
+
+**Architectural ceiling**: per-worker CUDA context = ~490 MB GPU. Main-process steady-state
+update = ~57 GB (iter 0 is KL-early-stopped at ~54 GB — the source of confusion). At 30 workers:
+14.7 GB worker + 57 GB main + 1.4 GB CIS = 73 GB total, **6 GB margin** ✓. At 40 workers:
+0.4 GB margin → OOM. At 48 workers: overflows.
 
 ---
 
@@ -79,24 +84,35 @@ Notes:
 
 ## §3. Findings
 
-### §3.1 SHIPPED (NEW): 48 workers + pool=12 (Exp 1m)
+### §3.0 The 48w/40w retraction (don't repeat this mistake)
 
-48 workers (`--mp-workers 48`) + pool=12 (`--pool-anchors 11` + init) gives a
-clean **4:1 worker:opp ratio** and **fits at mb=64** (the prior conjectured
-ceiling was mb=64 + 30 workers).
+S67-mid claimed 48w/pool=12 (Exp 1m) was the ship after iter 0+1 succeeded. Then:
+- Exp 1m iter 2 OOM'd on update (main proc 53.8 GB, 0.2 GB margin)
+- 40w/pool=10 sanity test 2026-05-21 evening: OOM'd on iter 1 update (main proc 57.4 GB, 0.4 GB margin)
+
+**Root cause diagnosed**: iter 0 update is KL-early-stopped (smaller memory peak ~54 GB).
+Iter 1+ steady-state full update is ~57 GB. The "smooth 48w/pool=8" from Exp 1j (3 iters
+complete) was iter-count fluke — would have OOM'd by iter 5+ as the steady-state pattern
+established. Earlier wave-A wraps (variant A pool=1→5, Exp 1d/1f at pool=15) all ran with
+fewer or smaller-effective updates and never hit the ceiling.
+
+**Lesson**: 3-iter tests are NOT enough for memory validation. Run 5+ iters minimum.
+
+### §3.1 SHIP (FINAL): 30 workers, pool unbounded, 10 active opps
+
+`--mp-workers 30` is the architectural ceiling at mb=64 with current CUDA-touching worker
+design. Pool grows unbounded (CIS slots fixed at 17 default, independent of pool size).
+Active opps per iter capped at 10 by Stage 1/Stage 2 composition (see PHASE2_LAUNCH_PLAN.md).
 
 | Step | Wall reduction (vs 8w/32 min baseline) |
 |---|---|
-| 8w → 15w (1:1 → 1:1) | -9% |
+| 8w → 15w (1:1 → 1:1, more workers) | -9% |
 | 15w → 24w (1.6:1 mixed) | -20% |
-| 24w → 30w (2:1 clean) | -30% |
-| 30w pool=15 → 48w pool=12 (4:1 clean) | -47% (iter 0; ~-42% steady projected) |
+| 24w → **30w** (**2:1 clean** — FINAL SHIP) | **-30%** |
+| 30w → 40w | proven OOM (0.4 GB margin, iter 1 update) |
+| 30w → 48w | proven OOM (overflows by ~3 GB) |
 
-### §3.1b FALLBACK SHIP: 30 workers at pool=15 (Exp 1d)
-
-If Exp 1m iter 1 OOMs or steady-state wall > 20 min (validate before launch):
-fall back to 30 workers at pool=15. -30% vs 8w baseline. 23.7 min/iter, $115/run.
-Safer ceiling, no memory risk. Use as fallback only.
+To push past 30w needs **CPU-only-workers refactor** (~50-150 LOC). Defer — not urgent.
 
 ### §3.2 REFUTED: per-worker concurrency confounder (Exp 1g)
 
@@ -221,37 +237,48 @@ worker-side effects. Confirmed by Exp 1g (concurrency control).
 
 ## §5. Implications for Phase 2
 
-### Updated cost projection (post-Exp 1m)
+### Updated cost projection (REVISION 2)
 
-| Stack | Per-iter wall | 200-iter cost @ $1.50/hr | Savings vs status quo |
+| Stack | Per-iter wall | 200-iter cost @ $1.50/hr | Savings vs baseline |
 |---|---|---|---|
-| 8w status quo (pre-S67 canonical) | 32 min | $155 | — |
-| 30w (S67 fallback ship) | 21.2 min | $115 | -$40 |
-| **48w + pool=12 (S67 NEW SHIP — Exp 1m)** | **~18.5 min** | **~$93** | **-$62** |
+| 8w status quo (pre-S67) | 32 min | $155 | — |
+| **30w (FINAL SHIP)** | **23.7 min** | **$118** | **-$37** |
+| 40w (proven OOM 2026-05-21) | N/A | N/A | — |
+| 48w (proven OOM Exp 1m) | N/A | N/A | — |
 | Multi-GPU (not pursued) | <15 min projected | hardware cost trades back | — |
 
-### Canonical launch (UPDATED post-Exp 1m)
+### Canonical launch (REVISION 2)
 
-See `memory/project_s67_final_handover.md` §2.
+See `docs/PHASE2_LAUNCH_PLAN.md` (and the auto-loaded `memory/project_phase2_launch_plan.md`)
+for the comprehensive Phase 2 design including Stage 1 + Stage 2 + curriculum.
 
-**User decisions (2026-05-21) integrated**:
-- `--mp-workers 48 --pool-anchors 11` → 12 active opps per iter (user target 10-12)
-- `--warmup-iters 10` → stabilize value head over first 10 iters before main training
-- `--snapshot-interval 10` → user accepts 5-10 range; keep default 10
+Use the **OOM monitor wrapper**:
+```bash
+# Stage 1:
+STAGE=stage1 bash launch_phase2_with_oom_fallback.sh stage1_run1
 
-**One key flag change vs S64 canonical**: `--mp-workers 48`. Plus `--pool-anchors 11`
-sized to 12 active opps + `--warmup-iters 10`.
+# Stage 2:
+STAGE=stage2 INIT_CKPT=<best stage1 snap path> \
+  bash launch_phase2_with_oom_fallback.sh stage2_run1
+```
 
-### Pre-launch checklist (UPDATED per S67)
+**User decisions LOCKED (2026-05-21 final)**:
+- `--mp-workers 30` (architectural ceiling, no fallback)
+- Pool unbounded (no `--pool-max-current-run`)
+- 10 active opps per iter (composition design)
+- `--warmup-iters 10`, `--snapshot-interval 10`
+- OOM detect+notify only (no auto-fallback)
 
-1. **Verify Exp 1m iter 1 steady-state wall** (`/tmp/exp1m_48w_pool12.log` on prod).
-   If update wall > 200s or OOM, fall back to `--mp-workers 30` at pool=15.
-2. Restart 8 battle_server.js processes (state degrades after kills, per
+### Pre-launch checklist (REVISION 2)
+
+1. Restart 8 battle_server.js processes (wrapper does this automatically; pattern in
    `feedback_battle_server_restart_after_kill`)
-3. Verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
-4. Verify all 8 battle servers listening on 9000-9007
-5. Either `--init-from BC v10` (fresh) or `--resume <SNAPSHOT>` (continuation)
-6. Use the updated canonical stack with `--mp-workers 48 --pool-anchors 11 --warmup-iters 10`
+2. Verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
+3. For Stage 2: confirm `external_adapters_phase2_day1.yaml` exists in src/ and
+   INIT_CKPT path is the best Stage 1 Elo snapshot
+4. Run a 5-iter smoke test of the canonical stack at 30w (memory validation) if
+   anything in the model size, sequence packing, or batch composition has changed
+   since 2026-05-21
 
 ---
 

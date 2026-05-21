@@ -1,26 +1,35 @@
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S67 FINAL COMPLETE (2026-05-21) — AUTHORITATIVE READ FIRST
+⚠️  S67 FINAL COMPLETE — REVISION 2 (2026-05-21 evening) — READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**:
 
-1. Read `memory/project_s67_final_handover.md` BEFORE anything else. This is the
-   single comprehensive handover for the entire S67 arc (worker scaling + Track B
-   rejection + architectural ceiling + user decisions + reinforced principles).
-2. Then check Exp 1m iter 1 result on prod: `tail /tmp/exp1m_48w_pool12.log`.
-   - If iter 1 update wall ≤ 200s and no OOM → ship `--mp-workers 48 --pool-anchors 11`.
-   - If OOM or update > 200s → fall back to `--mp-workers 30` at pool=15.
-3. ALL prior wraps below (S67-mid, S66, S65) are SUPERSEDED by this header + the
-   final handover memo. Don't act on them as authoritative.
+1. Read `memory/project_phase2_launch_plan.md` BEFORE anything else. That's the
+   comprehensive Phase 2 design (Stage 1 + Stage 2 + Elo poller + curriculum +
+   OOM wrapper). Single source of truth.
+2. Also load `memory/project_s67_final_handover.md` for the worker scaling
+   experiment data + architectural ceiling derivation.
+3. Check 30w validation result on prod: `tail /tmp/exp30w_validate.log` +
+   `grep "Iter " /tmp/exp30w_validate.log`. If clean 5 iters → 30w fully
+   confirmed for Phase 2 ship. If OOM → architectural change happened, urgent
+   investigation needed (30w has 6 GB margin, OOM = real shift).
+4. ALL prior wraps below (S67-mid claiming 48w/pool=12, S66, S65) are SUPERSEDED.
 
 ═══════════════════════════════════════════════════════════════════════════════
-S67 FINAL SUMMARY — what we measured, what shipped, what's REFUTED, principles
+S67 FINAL SUMMARY (REVISION 2) — REAL architectural ceiling at 30w
 ═══════════════════════════════════════════════════════════════════════════════
 
-**SESSION OUTCOME**: Phase 2 wall reduced from 32 min/iter (8w baseline) to
-**~18.5 min/iter (48w + pool=12)** at user's diversity target. ~$62 saved per
-200-iter Phase 2 (~$93/run vs $155 baseline). Two flag changes; no code change.
-Zero quality compromise.
+**RETRACTION**: Earlier S67-mid wrap claimed `--mp-workers 48 --pool-anchors 11`
+as ship after Exp 1m iter 0+1 succeeded. REFUTED later same day:
+  - Exp 1m iter 2 OOM'd on update (12.5 GB main proc grew from 53.8 → 57.4 GB)
+  - 40w/pool=10 sanity test (2026-05-21 evening) also OOM'd on iter 1 update
+  - Diagnosis: iter 0 is KL-early-stopped (~54 GB main); iter 1+ steady-state
+    full update is ~57 GB. The "smooth 48w/pool=8" from Exp 1j was iter-count
+    fluke — would have OOM'd by iter 5+.
+
+**SESSION OUTCOME (REVISED)**: Phase 2 wall reduced from 32 min/iter (8w baseline)
+to **23.7 min/iter (30w/active=10)**. ~$37 saved per 200-iter Phase 2 (~$118/run
+vs $155 baseline). One flag change; no code change. Zero quality compromise.
 
 ═══════════════════════════════════════════════════════════════════════════════
 CANONICAL Phase 2 LAUNCH (UPDATED — post-Exp 1m)
@@ -28,54 +37,28 @@ CANONICAL Phase 2 LAUNCH (UPDATED — post-Exp 1m)
 
 ```bash
 # PRE-LAUNCH (mandatory):
-# 1. Verify Exp 1m iter 1 result: tail /tmp/exp1m_48w_pool12.log
-# 2. Cleanup if any python running:
-#    pkill -9 python; sleep 5; pkill -9 -f battle_server.js; sleep 5
-#    for p in 9000 9001 9002 9003 9004 9005 9006 9007; do
-#      nohup node battle_server.js --port $p > /tmp/bs_$p.log 2>&1 &
-#    done; sleep 10
-# 3. Verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
-
-cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
-nohup ./launch_rl.sh \
-  --init-from data/models/bc/v10_padded_for_cis_dev.pt \
-  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
-  --bc-anchor-coef 0.1 \
-  --cis --bf16 --tier3 --tier3-minibatch-size 64 \
-  --packed --no-per-chunk-gc \
-  --cis-min-batch 32 --cis-timeout-ms 50 \
-  --mp-workers 48 \                              # ← S67 NEW SHIP (was default 8)
-  --pool-anchors 11 \                            # ← 11 anchors + init = 12 active opps
-  --games-per-iter 1600 --max-concurrent 200 \
-  --n-iters 200 --warmup-iters 10 \              # ← USER DECISION: 10 warmup iters
-  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --target-kl 0.03 \
-  --grad-accum 1 --turn-cap 300 \
-  --reward-style terminal \
-  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
-  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
-  --eval-interval 10 --eval-games 200 --eval-team-set metamon-competitive \
-  --snapshot-interval 10 \                        # ← USER DECISION: 5-10 OK; 10 default
-  --early-stop --early-stop-patience 3 \
-  --win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50 \
-  --out-dir data/models/rl_v10/<RUN_NAME> \
-  > /tmp/<RUN_NAME>.log 2>&1 &
-```
-
-**Fallback if Exp 1m iter 1 fails**: drop `--pool-anchors 11`, change to
-`--mp-workers 30`. Pool defaults to 15 active. 23.7 min/iter → $115/run.
+[OBSOLETED — see top of file for the REVISION 2 launch instructions]
+[The 48w/pool=12 stack below was RETRACTED 2026-05-21 after Exp 1m iter 2 OOM]
+[Use the OOM monitor wrapper: STAGE=stage1 bash launch_phase2_with_oom_fallback.sh <run_name>]
+[Or direct launch with --mp-workers 30 (LOCKED) and no --pool-anchors flag]
 
 ═══════════════════════════════════════════════════════════════════════════════
-USER DECISIONS (2026-05-21) — DON'T RE-LITIGATE
+USER DECISIONS (REVISION 2 — 2026-05-21 final) — DON'T RE-LITIGATE
 ═══════════════════════════════════════════════════════════════════════════════
 
 | Setting | Decided value | User rationale |
 |---|---|---|
 | Total games/iter | 1600 | Matches ps-ppo/VGC-Bench rollout size. Don't reduce. |
-| Active opps/iter target | **10-12** | Stable PFSP weights + ample diversity. 133-160 g/opp. |
-| Snapshot interval | **5-10 iters** | Frequent refresh, low rotation overhead. |
-| Warmup iters | **10** | Stabilize value head before main training. |
-| Acceptable per-iter wall | "<10 min ideal, otherwise architectural floor" | Below 13-14 min needs multi-GPU. ~18.5 min is best practical without architecture change. |
-| Phase 2 budget per run | $93 (48w/pool=12) / $115 (30w fallback) | Acceptable. |
+| Active opps/iter | **10** | Composition: Stage 1 = 2 anchors + 2 random + 6 PFSP. Stage 2 = 4 PFSP ext + 1 random ext + 2 anchors + 2 PFSP sp + 1 random sp. |
+| Pool size | **Unbounded** (no --pool-max-current-run) | CIS slots fixed at 17 regardless |
+| Snapshot interval | **10 iters** | 20 snapshots over 200 iters; clean PFSP distinctness |
+| Warmup iters | **10** | Stabilize value head |
+| Workers | **30 (LOCKED)** | Architectural ceiling at mb=64 (proven 40w/48w OOM) |
+| OOM auto-fallback | **NO** (option A) | 6 GB margin at 30w; OOM signals architectural change |
+| Per-iter wall | **~23.7 min** | $118/run, $150-180 across full Phase 2 |
+| External pool day-1 | **6 bots** | 2 mcts + 4 metamon (Mini/SmallIL/SmallRL/MediumIL). New tiers added manually based on WR triggers. |
+| Stage transitions | **Restart from best Elo** | Not hot-add. ~10 iter re-warm cost worth value-head stability |
+| Elo poller | Use existing `eval_elo_ladder.py --add-to` | Drop 3 abandoned. 15 anchors curated. 500 g/opp. 3-server sharded local. |
 
 ═══════════════════════════════════════════════════════════════════════════════
 RATIO CURVE (CONCRETE measurements — pool=15 operating point + diagnostics)
@@ -90,10 +73,15 @@ At pool=15 (user diversity floor):
 | **30** | **15** | **2:1 clean** | **21.2 min** ← fallback ship |
 | 48 | 15 | 3.2:1 mixed | **OOM (mb=64 update)** |
 
-At pool=12 (Exp 1m, NEW SHIP):
+At pool=12 (Exp 1m — RETRACTED after iter 2 OOM):
 | Workers | Active | Ratio | Wall |
 |---|---|---|---|
-| **48** | **12** | **4:1 clean** | **18.0 min iter 0 / ~18.5 steady projected** ← SHIP |
+| 48 | 12 | 4:1 clean | iter 0+1 ran (18 min) → **iter 2 OOM on update** |
+
+40w/pool=1 sanity (2026-05-21 evening — also OOM):
+| Workers | Active | Wall iter 0 | Iter 1 |
+|---|---|---|---|
+| 40 | 1 (test) | 8.5 min collect, 41s update (KL-stop) | **OOM update epoch 1, 57.4 GB main proc** |
 
 At pool=8 (diagnostic only — below user diversity floor):
 | Workers | Active | Ratio | Wall |
@@ -108,17 +96,24 @@ ARCHITECTURAL CEILING — per-worker CUDA context
 ═══════════════════════════════════════════════════════════════════════════════
 
 **Each Python worker process consumes ~490 MB GPU memory** (PyTorch CUDA primary
-context + lazy-loaded cuBLAS + cuDNN). Loaded the moment any worker touches CUDA,
-lives for process lifetime, can't be released.
+context + lazy-loaded cuBLAS + cuDNN). Plus main process update peak: **~57 GB**
+at iter 1+ steady-state (iter 0 is KL-early-stopped at ~54 GB — the iter-count
+fluke that made 48w/pool=8 "look smooth" for 3 iters in Exp 1j).
 
-| Workers | Worker GPU | Update budget | mb=64 fit? |
-|---|---|---|---|
-| 8 | ~4 GB | ~73 GB | ✓ |
-| 30 | ~15 GB | ~62 GB | ✓ tight |
-| 48 + pool=15 | ~24 GB | ~53 GB | ❌ OOM (Exp 1k confirmed) |
-| **48 + pool=12** | **~24 GB** | **~54 GB** | **✓ (Exp 1m confirmed iter 0)** |
+| Workers | Worker GPU | Total peak | Margin (79.14-total) | Verdict |
+|---|---|---|---|---|
+| 8 | 3.9 GB | ~63 GB | 16 GB | ✓ |
+| 24 | 11.8 GB | ~71 GB | 8 GB | ✓ |
+| **30 (LOCKED SHIP)** | **14.7 GB** | **~73 GB** | **6 GB** ✓ | **SHIP** |
+| **40 (PROVEN OOM)** | **19.6 GB** | **~78.4 GB** | **0.4 GB** ❌ | iter 1 OOM verified 2026-05-21 |
+| 48 (PROVEN OOM) | 23.5 GB | ~82 GB | overflows | Exp 1m iter 3 OOM verified |
 
-To push past 48 workers needs **CPU-only-workers refactor** (~50-150 LOC). NOT urgent.
+Pool size does NOT meaningfully affect main-process update memory. 40w/pool=1 OOM'd
+at 57.4 GB main proc (vs Exp 1m's 53.8 GB at pool=12) — workers + steady-state
+update is the killer; CIS is bounded at ~1.4 GB.
+
+To push past 30w needs **CPU-only-workers refactor** (workers build CPU tensors
+only, never touch CUDA — frees ~15 GB GPU at 30w). ~50-150 LOC. NOT urgent.
 
 ═══════════════════════════════════════════════════════════════════════════════
 CONCLUSIVELY REFUTED in S67 — do NOT reopen without new evidence
@@ -135,6 +130,8 @@ CONCLUSIVELY REFUTED in S67 — do NOT reopen without new evidence
 8. **Diminishing returns past 3:1** — earlier S67 framing, REFUTED by Exp 1j (6:1 ratio
    continued scaling at -14% from 4:1)
 9. **Larger minibatch (80/96/128)** — OOM at 30+ workers (worker contexts eat GPU)
+10. **48w/pool=12 ship (S67-mid claim)** — REFUTED 2026-05-21. Exp 1m iter 2 OOM'd; "smooth 48w/pool=8" was 3-iter undercount. Real ceiling at 30w.
+11. **40w/pool=10 ship (S67-mid second attempt)** — REFUTED 2026-05-21 evening. 0.4 GB margin; iter 1 update OOM'd. 30w is the actual ceiling.
 
 ═══════════════════════════════════════════════════════════════════════════════
 PRINCIPLES (reinforced, re-read every session)
