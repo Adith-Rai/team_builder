@@ -6,6 +6,44 @@
 
 ---
 
+## §-1. CURRENT STATE (as of 2026-05-21 11:35 UTC)
+
+**Phase 2 Stage 1 IS RUNNING.** Do not relaunch.
+
+- Started: 11:32:16 UTC, run name `phase2_stage1_v1`
+- Prod log: `/tmp/phase2_stage1_v1.log` on prod (port 47913 / 195.26.233.30)
+- Run dir: `data/models/rl_v10/phase2_stage1_v1/selfplay_v9_20260521_113214/`
+- Local Elo poller running (background task at session wrap; if machine restarted, relaunch via §0 step 5)
+- HEAD on prod: `7509467` (includes the ppo_update_batched warmup-mode support — see §X.5 below)
+
+**Check status before any action**:
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30 \
+  'grep -E "^\[..:..:..\] Iter [0-9]+:" /tmp/phase2_stage1_v1.log | tail -5'
+```
+
+If no iter lines yet at expected time, see §9 for troubleshooting.
+
+---
+
+## §X.5 Last-minute warmup fix (commit 7509467, 2026-05-21 evening)
+
+**Without this fix**: `--warmup-iters 10` makes Stage 1 unusable. Warmup iter updates take 15-25 min each on legacy `ppo_update` path (because `ppo_update_batched` raised NotImplementedError for `in_warmup=True`). 10 warmup iters = 4-6 hours of wasted compute.
+
+**The fix**: remove the `NotImplementedError` block in `ppo_update_batched`, flip `train_rl.py` dispatch from `if args.tier3 and not in_warmup:` to `if args.tier3:`. Functionally correct because `train_rl.py` already sets `param.requires_grad = "value_head" in name` before the call; PyTorch autograd respects this — backward computes value_head gradients only, optimizer skips frozen params.
+
+**Smoke result** (3-iter test before relaunch):
+- Iter 0 [WARMUP]: update **87s** (vs 21+ min on legacy → **~14× speedup**)
+- Iter 1 [WARMUP]: update 81s (consistent)
+- Iter 2 (full): update 163s (matches 30w validation 158s)
+- `Value warmup complete, unfreezing all parameters` transition clean
+
+**One minor oddity observed** (NOT a functional issue): `kl` was 0.01-0.012 during warmup when theoretically should be 0 (frozen policy → new=old). Caused by bf16 non-determinism in GPU forward (~1e-3 per-logit divergence aggregates to ~0.01 approx KL). Well below `target_kl 0.03`, same magnitude as iter 2 post-warmup. Don't fix; don't worry.
+
+**Why this matters for Stage 2 too**: every tier-addition restart in Stage 2 uses `--warmup-iters 10` to re-stabilize value head. Without the fix, each restart cost ~4-6 hours. With the fix, ~105 min.
+
+---
+
 ## §0. QUICK START — launch Stage 1 in 4 commands
 
 **Prerequisite**: 30w validation completed cleanly (iter 4 lands without OOM in

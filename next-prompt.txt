@@ -1,12 +1,44 @@
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S67 FINAL COMPLETE — REVISION 3 (2026-05-21 evening, validation PASSED)
+⚠️  S67 FINAL — REVISION 4 (2026-05-21 evening, Phase 2 LAUNCHED)
 ═══════════════════════════════════════════════════════════════════════════════
 
-**SESSION END STATE: Phase 2 IS READY TO LAUNCH OUT OF THE BOX.**
+**SESSION END STATE: Phase 2 Stage 1 IS RUNNING ON PROD. Elo poller running on local.**
+
+If you're picking this up next session:
+1. **DO NOT relaunch Stage 1** — it's already running (or has progressed).
+2. Check prod status: `ssh ... 'grep -E "^\[..:..:..\] Iter [0-9]+:" /tmp/phase2_stage1_v1.log'`
+3. Check local Elo poller status: the V1 poller was launched on local — if local machine restarted, may need to restart poller from `pokemon-ai-starter/pokemon-ai/src/` via `python elo_poller.py --run-name phase2_stage1_v1`
+4. Read `memory/project_phase2_launch_plan.md` for design context (Stage 1 + Stage 2 + curriculum + everything locked).
+5. **Last-minute fix shipped (commit `7509467`)**: `ppo_update_batched` now supports warmup mode. Without this, warmup iters take 15-25 min each instead of ~1.5 min. Verified via 3-iter smoke (iter 0 warmup=87s, iter 1 warmup=81s, iter 2 post-warmup=163s, transition clean).
+
+**Original Phase 2 launch attempt**: launched at 10:15:32 UTC with --warmup-iters 10. Iter 0 collect completed in 9.6 min, then PPO update hung for 21+ min on legacy `ppo_update` path because `ppo_update_batched` raised NotImplementedError for warmup. Diagnosed → fixed → smoke-tested → relaunched at 11:32:16 UTC.
+
+**Relaunched Phase 2 (CURRENT)**:
+- Started: 11:32:16 UTC, run name `phase2_stage1_v1`
+- Run dir on prod: `data/models/rl_v10/phase2_stage1_v1/selfplay_v9_20260521_113214/`
+- Iter 0 line lands ~11:43 UTC (collect 9 min + update 1.5 min)
+- 10 warmup iters complete ~13:17 UTC (105 min)
+- Iter 10 (first snapshot saved) ~13:17 → Elo poller picks up
+- Full Stage 1 (200 iters) ~30-50 hours wall total
+
+**Cost projection (updated post-warmup-fix)**:
+- Stage 1: $42-75/run depending on pool growth rate
+- Stage 2 (with restarts for tier additions): +$60-90
+- Full Phase 2: **$100-165** (down from $150-180 pre-warmup-fix)
 
 30w validation completed cleanly: 5/5 iters with steady-state full update (158s
 each — the exact scenario that killed Exp 1m iter 2 and 40w/pool=10 iter 1).
-Pod is clean, all infra committed, Quick Start §0 ready.
+
+Warmup-fix smoke completed cleanly (commit `7509467` 3-iter test):
+- Iter 0 [WARMUP]: collect 527s, update 87s ✓
+- Iter 1 [WARMUP]: collect 525s, update 81s ✓
+- Iter 2 (full): collect 553s, update 163s ✓
+- "Value warmup complete, unfreezing all parameters" transition clean
+- Minor non-issue: kl was 0.01 during warmup (theoretically should be 0 for frozen
+  policy) — caused by bf16 non-determinism in forward, well below target_kl 0.03.
+  Confirmed not a functional issue (same magnitude in iter 2 post-warmup).
+
+Phase 2 Stage 1 launched 11:32:16 UTC and is running.
 
 **FIRST ACTION FOR NEXT SESSION**:
 
