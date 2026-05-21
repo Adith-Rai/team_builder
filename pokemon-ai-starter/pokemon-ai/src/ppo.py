@@ -1473,12 +1473,18 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
     multi-episode batches with variable T. Larger effective batch per
     gradient step → enables higher lr safely (re-ablate after Tier 3).
 
+    S67 (2026-05-21): in_warmup=True is NOW supported. The caller is
+      responsible for setting param.requires_grad correctly BEFORE calling
+      (train_rl.py freezes everything except value_head). PyTorch's autograd
+      respects requires_grad: backward computes gradients only for
+      value_head params, optimizer step skips frozen params via grad=None.
+      This path does NOT have the legacy ppo_update's torch.no_grad()
+      backbone optimization, so warmup iters here build a full autograd
+      tape (same memory as normal training). At 30w/mb=64 the 6 GB margin
+      easily covers this. Tier 2 optimization (split backbone forward into
+      no_grad section) is deferred — not necessary at current scale.
+
     NOT supported in v1 (will add in subsequent commit if needed):
-      - in_warmup=True (per-step value-only training): currently raises
-        NotImplementedError. Warmup is 5 iters; production launches with
-        --warmup-iters 5 or 10 and then proceeds normally. For Tier 3
-        warmup support, callers can use the existing per-episode
-        ppo_update for warmup iters, then switch to ppo_update_batched.
       - Minibatching within an epoch: currently 1 batch per epoch (one
         gradient step per epoch). For very large batches (>2000
         transitions) consider splitting into 2-4 minibatches per epoch.
@@ -1490,7 +1496,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
       epochs, clip_eps, ent_coef, vf_coef, max_grad_norm, target_kl: same
       L_max: optional cap on episode length passed to collate_episodes
       normalize_advantages: passed through to ppo_loss_batched
-      in_warmup: rejected with NotImplementedError in v1 (see above)
+      in_warmup: noop in this path (caller sets requires_grad — see S67
+        docstring section above). Kept for API compatibility with ppo_update.
       compiled_step: optional callable from `make_compiled_train_step`. When
         provided, dispatches to the C5 single-graph compiled train_step
         (forward+loss+backward+clip+optimizer.step in one fused graph).
@@ -1507,12 +1514,9 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
       Stats are normalized over the number of EPOCHS that ran (not
       episodes), since batched path runs 1 step per epoch.
     """
-    if in_warmup:
-        raise NotImplementedError(
-            "ppo_update_batched does not support in_warmup=True yet. "
-            "Use the per-episode ppo_update for warmup iters, then switch "
-            "to ppo_update_batched for the main training loop."
-        )
+    # S67: in_warmup is a noop here — caller (train_rl.py) freezes
+    # backbone via param.requires_grad before calling; autograd handles
+    # the rest. See docstring "S67" section for rationale.
     if packed and compiled_step is not None:
         # S64 Phase B.6: packed path is eager-only in v1. --compile was
         # REFUTED at prod (S62, 8% slower) so the compile boundary is not

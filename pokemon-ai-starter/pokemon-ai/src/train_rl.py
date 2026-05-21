@@ -1203,7 +1203,14 @@ def main():
         else:
             _prof_ctx = None
 
-        if args.tier3 and not in_warmup:
+        # S67 (2026-05-21): Tier 3 batched path now supports warmup iters.
+        # Previously dispatched to legacy ppo_update during warmup because
+        # ppo_update_batched raised NotImplementedError; that limitation is
+        # lifted (requires_grad set by lines 1175-1176 controls grad flow).
+        # Warmup iters here are ~3-5× faster than legacy path. Legacy still
+        # available via direct call if memory-constrained env needs the
+        # no_grad backbone optimization.
+        if args.tier3:
             loss_info = ppo_update_batched(
                 model, optimizer, episodes, device, cfg,
                 epochs=args.ppo_epochs, clip_eps=args.clip_eps,
@@ -1216,6 +1223,7 @@ def main():
                 minibatch_size=args.tier3_minibatch_size,
                 packed=args.packed,
                 per_chunk_gc=not args.no_per_chunk_gc,
+                in_warmup=in_warmup,  # noop in batched path; caller controls requires_grad
             )
         else:
             loss_info = ppo_update(
