@@ -160,6 +160,31 @@ def run_sharded_eval(
     return Path(out_final)
 
 
+def _extract_elo(elo_raw) -> Optional[tuple[float, float, float]]:
+    """Normalize elo result across the three ladder formats observed in the wild.
+
+    V1 bug (2026-05-21): assumed list [med, lo, hi]. Actual `eval_elo_ladder.py`
+    output is a DICT {"median": ..., "lo95": ..., "hi95": ...}. Some older ladders
+    store just a float median. Handle all three gracefully.
+    """
+    if elo_raw is None:
+        return None
+    if isinstance(elo_raw, dict):
+        med = elo_raw.get("median")
+        lo = elo_raw.get("lo95", med)
+        hi = elo_raw.get("hi95", med)
+        if med is None:
+            return None
+        return (float(med), float(lo), float(hi))
+    if isinstance(elo_raw, (list, tuple)) and len(elo_raw) == 3:
+        return (float(elo_raw[0]), float(elo_raw[1]), float(elo_raw[2]))
+    if isinstance(elo_raw, (int, float)):
+        # Older ladders stored just the median
+        med = float(elo_raw)
+        return (med, med, med)
+    return None
+
+
 def evaluate_snapshot(
     run_name: str,
     iter_n: int,
@@ -186,14 +211,25 @@ def evaluate_snapshot(
     duration_min = (time.time() - t0) / 60
     logging.info(f"  Eval complete in {duration_min:.1f} min -> {final_ladder}")
 
-    # Extract Elo for this snapshot
-    final = json.loads(final_ladder.read_text())
-    elo = final.get("elos", {}).get(eval_name)
-    if elo:
-        med, lo, hi = elo
-        logging.info(f"  Iter {iter_n} Elo: {med:.1f} [{lo:.0f}, {hi:.0f}]")
-    else:
-        logging.warning(f"  Iter {iter_n} Elo not found in final ladder")
+    # Extract Elo for this snapshot — robust to dict/list/float formats
+    elo = None
+    try:
+        final = json.loads(final_ladder.read_text())
+        elo_raw = final.get("elos", {}).get(eval_name)
+        elo = _extract_elo(elo_raw)
+        if elo:
+            med, lo, hi = elo
+            logging.info(f"  Iter {iter_n} Elo: {med:.1f} [{lo:.0f}, {hi:.0f}]")
+        else:
+            keys = list(final.get("elos", {}).keys())[:5]
+            logging.warning(
+                f"  Iter {iter_n} Elo not extractable. Sample keys: {keys}. "
+                f"elo_raw type: {type(elo_raw).__name__}"
+            )
+    except Exception as e:
+        # Eval succeeded (ladder written) but extraction failed. Don't re-evaluate
+        # — log and move on. State will still mark iter as done.
+        logging.warning(f"  Iter {iter_n} Elo extraction failed: {e}")
 
     return final_ladder, elo
 
