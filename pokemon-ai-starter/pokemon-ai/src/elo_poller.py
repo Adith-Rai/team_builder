@@ -66,7 +66,11 @@ LOCAL_LADDER_DIR = Path("data/eval/registry")
 EVAL_SCRIPT = "eval_elo_ladder.py"
 
 N_GAMES_PER_OPP = "500"
-CONCURRENCY_PER_SHARD = "50"
+# Bumped 50 → 100 (S67 2026-05-21 evening): backfill empirically showed
+# conc=100/shard saves ~30% wall vs conc=50 with no GPU/BS instability on
+# RTX 3060 6GB. Total 300 concurrent games across 3 BS — well within
+# docstring example range (70-100/server).
+CONCURRENCY_PER_SHARD = "100"
 BS_PORTS = [9000, 9001, 9002]  # local battle server ports for sharding
 
 POLL_INTERVAL_DEFAULT_S = 300
