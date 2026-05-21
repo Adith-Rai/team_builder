@@ -29,10 +29,15 @@
 #   STAGE=stage1 (default — pure self-play warmup, init from BC v10)
 #   STAGE=stage2 INIT_CKPT=<best Stage 1 snapshot> (with externals)
 #
-# Requires: working directory = pokemon-ai-starter/pokemon-ai/src
-#           launch_rl.sh already bakes in PYTORCH_CUDA_ALLOC_CONF + LD_LIBRARY_PATH
+# Requires: launch_rl.sh already bakes in PYTORCH_CUDA_ALLOC_CONF + LD_LIBRARY_PATH
 
 set -uo pipefail
+
+# Resolve script's own directory and cd there — wrapper depends on relative
+# paths like ./launch_rl.sh, ./battle_server.js, external_adapters_*.yaml.
+# Works regardless of where the wrapper is invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || { echo "ERROR: cannot cd to script dir $SCRIPT_DIR" >&2; exit 1; }
 
 # =============================================================================
 # Configuration
