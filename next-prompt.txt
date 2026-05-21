@@ -1,19 +1,34 @@
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S67 FINAL COMPLETE — REVISION 2 (2026-05-21 evening) — READ FIRST
+⚠️  S67 FINAL COMPLETE — REVISION 3 (2026-05-21 evening, validation PASSED)
 ═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE: Phase 2 IS READY TO LAUNCH OUT OF THE BOX.**
+
+30w validation completed cleanly: 5/5 iters with steady-state full update (158s
+each — the exact scenario that killed Exp 1m iter 2 and 40w/pool=10 iter 1).
+Pod is clean, all infra committed, Quick Start §0 ready.
 
 **FIRST ACTION FOR NEXT SESSION**:
 
-1. Read `memory/project_phase2_launch_plan.md` BEFORE anything else. That's the
-   comprehensive Phase 2 design (Stage 1 + Stage 2 + Elo poller + curriculum +
-   OOM wrapper). Single source of truth.
-2. Also load `memory/project_s67_final_handover.md` for the worker scaling
-   experiment data + architectural ceiling derivation.
-3. Check 30w validation result on prod: `tail /tmp/exp30w_validate.log` +
-   `grep "Iter " /tmp/exp30w_validate.log`. If clean 5 iters → 30w fully
-   confirmed for Phase 2 ship. If OOM → architectural change happened, urgent
-   investigation needed (30w has 6 GB margin, OOM = real shift).
-4. ALL prior wraps below (S67-mid claiming 48w/pool=12, S66, S65) are SUPERSEDED.
+If launching Phase 2 → go to **docs/PHASE2_LAUNCH_PLAN.md §0 QUICK START** (also
+in memory/project_phase2_launch_plan.md §0). 4 commands to launch Stage 1.
+
+Otherwise:
+1. Read `memory/project_phase2_launch_plan.md` BEFORE anything else (auto-loaded).
+   Comprehensive Phase 2 design.
+2. Read `memory/project_s67_final_handover.md` for ceiling derivation.
+3. ALL prior wraps below (S67-mid claiming 48w/pool=12, S66, S65) are SUPERSEDED.
+
+**Quick recall of locked decisions** (don't re-litigate, read launch plan for why):
+- Workers: 30 (locked, architectural ceiling at mb=64)
+- Pool: unbounded (CIS slots fixed at 17)
+- Active opps/iter: 10 (composition design)
+- Stage 1 comp: 2 anchors (prev + prev-of-prev) + 2 random sp + 6 PFSP sp
+- Stage 2 comp: 4 PFSP ext + 1 random ext + 2 anchors + 2 PFSP sp + 1 random sp
+- Snapshot interval: 10. Warmup iters: 10.
+- OOM wrapper: option A (detect+notify, no auto-fallback)
+- Elo poller: V1 written, 3-shard sharded, --add-to elo_v10_500g_focused_plus_iter49.json
+- Stage 1 → Stage 2: restart from best Elo snap (not hot-add)
 
 ═══════════════════════════════════════════════════════════════════════════════
 S67 FINAL SUMMARY (REVISION 2) — REAL architectural ceiling at 30w
@@ -30,6 +45,22 @@ as ship after Exp 1m iter 0+1 succeeded. REFUTED later same day:
 **SESSION OUTCOME (REVISED)**: Phase 2 wall reduced from 32 min/iter (8w baseline)
 to **23.7 min/iter (30w/active=10)**. ~$37 saved per 200-iter Phase 2 (~$118/run
 vs $155 baseline). One flag change; no code change. Zero quality compromise.
+
+**30w VALIDATION RESULT (2026-05-21 10:01 UTC)**:
+| Iter | Collect | Update | Status |
+|---|---|---|---|
+| 0 | 523s | 158s | ✓ |
+| 1 | 533s | 153s | ✓ |
+| 2 | 543s | 158s | ✓ |
+| 3 | 545s | 155s | ✓ |
+| 4 | 552s | 158s | ✓ |
+
+All 5 iters at steady-state full update (158s = the iter-1+ value that killed
+40w/pool=10 iter 1 and Exp 1m iter 3). GPU end: 18.3 GB / 79.14 GB. No OOM.
+Post-update allocated 0.39-0.47 GB, reserved 0.68-0.79 GB. Memory ceiling 100%
+confirmed. (Collect was ~9 min not 21 min because test ran at pool=1 mirror
+self-play — much tighter inference batches. Production at active=10 will be
+~21 min collect as projected.)
 
 ═══════════════════════════════════════════════════════════════════════════════
 CANONICAL Phase 2 LAUNCH (UPDATED — post-Exp 1m)
