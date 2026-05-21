@@ -308,3 +308,254 @@ Status of pre-launch requirements:
 2. **Stage 1 → Stage 2 transition timing**: planned ~50-100 iters but exact cutoff depends on Stage 1 trajectory data. Decide when Stage 1 plateau is observed.
 3. **lr re-ablation**: should be done in a quick smoke (~$10) post-S67 to confirm `--lr 1e-5` still optimal with packed/sequence + 30w.
 4. **MediumIL smoke**: $1-2 smoke to confirm the day-1 YAML doesn't have toId() issues.
+
+---
+
+## §9. Operational HOW-TO (next-session ready-to-run)
+
+This section is for any session (fresh Claude or human) to execute Phase 2 without
+needing to re-derive operational details. Verified working 2026-05-21.
+
+### §9.1 Pod connection
+
+```bash
+# Prod pod (current as of 2026-05-21):
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@195.26.233.30
+# Code root:    /workspace/team_builder/
+# Source dir:   /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src/
+# torch:        2.5.1+cu121, triton 3.1.0 (verified 2026-05-21)
+# GPU:          A100 80GB SXM, 79.14 GB usable, $1.50/hr
+# BS ports:     9000-9007 (8 battle servers)
+```
+
+If SSH details change in future, verify via RunPod dashboard — IP/port can drift if pod restarts.
+
+### §9.2 Pre-Phase-2 prod setup (ONE TIME before first Phase 2 launch)
+
+```bash
+# 1. SSH to prod
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
+
+# 2. Verify clean state (no zombie training procs)
+pgrep -c python  # expect 0 (or only orphan multiprocessing wrappers)
+nvidia-smi --query-gpu=memory.used --format=csv,noheader  # expect ≤ 500 MiB
+
+# 3. Checkout master + pull latest (prod might be on a feature branch)
+cd /workspace/team_builder
+git status  # check current branch
+git checkout master
+git pull origin master
+git log -1 --oneline  # confirm has the S67 REV 2 commit 92751bc or newer
+
+# 4. Verify the wrapper + YAML are present (committed in 92751bc)
+ls -la pokemon-ai-starter/pokemon-ai/src/launch_phase2_with_oom_fallback.sh
+ls -la pokemon-ai-starter/pokemon-ai/src/external_adapters_phase2_day1.yaml
+
+# 5. Verify torch + triton (S51 lesson — version drift is a real failure mode)
+python -c "import torch, triton; print(torch.__version__, triton.__version__)"
+# Expected: 2.5.1+cu121 3.1.0
+
+# 6. Verify battle servers running
+ss -ltn | grep -cE ':900[0-7]'  # expect 8
+```
+
+If any of #2-#6 fails, fix before proceeding. Do NOT launch over a dirty state.
+
+### §9.3 Launch Stage 1 (pure self-play warmup)
+
+```bash
+# On prod, in src/ directory:
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+STAGE=stage1 nohup bash launch_phase2_with_oom_fallback.sh phase2_stage1_v1 \
+  > /tmp/phase2_stage1_v1_wrapper.log 2>&1 &
+
+# Wrapper writes training log to: /tmp/phase2_stage1_v1.log
+# Wrapper handles BS restart automatically.
+```
+
+**Expected behavior**:
+- BS restart in first ~10s
+- Training process starts (banner "BC anchor: loading reference..." appears)
+- Iter 0 collection begins ~30s after launch
+- First "Iter 0:" line lands in ~25 minutes (collect ~21 min + update ~2.5 min)
+- Subsequent iters land every ~24 minutes
+
+**Live monitoring** (from local or another SSH session):
+```bash
+# Iter completion lines (one per iter):
+ssh ... 'grep -E "^\[..:..:..\] Iter [0-9]+:" /tmp/phase2_stage1_v1.log'
+
+# Last 30 lines (to see in-progress collect):
+ssh ... 'tail -30 /tmp/phase2_stage1_v1.log'
+
+# OOM check:
+ssh ... 'grep -iE "out of memory|FATAL" /tmp/phase2_stage1_v1.log'
+
+# Process + GPU health:
+ssh ... 'pgrep -c python; nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader'
+```
+
+### §9.4 Launch Stage 2 (with externals — after Stage 1 best Elo identified)
+
+```bash
+# Identify best Stage 1 snapshot (run AFTER Stage 1 + Elo eval complete):
+# From local Elo ladder JSON, find snapshot with highest Elo from Stage 1 run.
+# Then pull that snapshot's path on prod:
+ssh ... 'ls -la /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v10/phase2_stage1_v1/selfplay_v9_*/iter_*.pt | sort -k9 -V'
+
+# Pick the best-Elo iter checkpoint, then launch Stage 2:
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+STAGE=stage2 \
+  INIT_CKPT=data/models/rl_v10/phase2_stage1_v1/selfplay_v9_XXXX/iter_NNNN.pt \
+  nohup bash launch_phase2_with_oom_fallback.sh phase2_stage2_v1 \
+  > /tmp/phase2_stage2_v1_wrapper.log 2>&1 &
+```
+
+### §9.5 Snapshot pull to local (for Elo eval poller)
+
+```bash
+# Pull a single snapshot from prod to local
+LOCAL_DIR=C:/Users/raiad/OneDrive/Desktop/team_builder/data/cloud_runs/phase2_stage1_v1
+mkdir -p "$LOCAL_DIR"
+
+scp -i ~/.ssh/id_ed25519 -P 47913 \
+  root@195.26.233.30:/workspace/team_builder/pokemon-ai-starter/pokemon-ai/src/data/models/rl_v10/phase2_stage1_v1/selfplay_v9_*/iter_NNNN.pt \
+  "$LOCAL_DIR/phase2_stage1_v1_iter_NNNN.pt"
+
+# Pull all snapshots not yet locally (Elo poller pattern):
+ssh ... 'ls /workspace/team_builder/.../selfplay_v9_*/iter_*.pt' \
+  > /tmp/prod_snapshots.txt
+# diff against local, scp the new ones with name rewrite to phase2_stage1_v1_iter_NNNN.pt
+```
+
+### §9.6 Run an Elo eval against the curated ladder (3-server sharded)
+
+```bash
+cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+
+# Make sure 3 battle servers are running locally (ports 9000/9001/9002).
+# Then run 3 parallel shards:
+NEW_CKPT=../data/cloud_runs/phase2_stage1_v1/phase2_stage1_v1_iter_0049.pt
+NEW_NAME=phase2_stage1_v1_iter49
+LADDER=data/eval/registry/elo_v10_500g_focused_plus_iter49.json
+OUT_BASE=data/eval/registry/elo_phase2_stage1_v1_iter49
+
+python -u eval_elo_ladder.py --add-to "$LADDER" \
+  --snapshots "$NEW_CKPT" --names "$NEW_NAME" \
+  --n-games 500 --concurrency 50 --device cuda \
+  --shard 0/3 --server ws://127.0.0.1:9000/showdown/websocket \
+  --out-json "${OUT_BASE}_shard0.json" &
+
+python -u eval_elo_ladder.py --add-to "$LADDER" \
+  --snapshots "$NEW_CKPT" --names "$NEW_NAME" \
+  --n-games 500 --concurrency 50 --device cuda \
+  --shard 1/3 --server ws://127.0.0.1:9001/showdown/websocket \
+  --out-json "${OUT_BASE}_shard1.json" &
+
+python -u eval_elo_ladder.py --add-to "$LADDER" \
+  --snapshots "$NEW_CKPT" --names "$NEW_NAME" \
+  --n-games 500 --concurrency 50 --device cuda \
+  --shard 2/3 --server ws://127.0.0.1:9002/showdown/websocket \
+  --out-json "${OUT_BASE}_shard2.json" &
+wait
+
+# Combine shards into final result:
+python -u eval_elo_ladder.py --combine "${OUT_BASE}_shard0.json" \
+  "${OUT_BASE}_shard1.json" "${OUT_BASE}_shard2.json" \
+  --out-json "${OUT_BASE}_FINAL.json"
+```
+
+**Before first use**: manually drop the 3 abandoned snapshots from the base ladder
+JSON (`phase1v3_abandoned_iter19/39/59`) so they don't pollute future BT fits.
+
+### §9.7 MediumIL smoke (before Stage 2 launch)
+
+The day-1 YAML includes `mm-mediumil`. Curated.yaml flagged it as "suspicious" for
+toId() / showdown_username issues. Validate before committing to Phase 2:
+
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+# Quick smoke: 50 games against ONLY mediumil
+cat > /tmp/mediumil_smoke.yaml <<EOF
+opponents:
+  - name: mm-mediumil
+    type: metamon
+    model: MediumIL
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0
+EOF
+
+nohup ./launch_rl.sh \
+  --init-from data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
+  --cis --bf16 --tier3 --tier3-minibatch-size 64 --packed --no-per-chunk-gc \
+  --cis-min-batch 32 --cis-timeout-ms 50 --mp-workers 8 \
+  --games-per-iter 50 --max-concurrent 50 \
+  --n-iters 1 --warmup-iters 0 --lr 1e-5 \
+  --reward-style terminal --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --external-adapters /tmp/mediumil_smoke.yaml \
+  --out-dir /tmp/mediumil_smoke_run \
+  > /tmp/mediumil_smoke.log 2>&1 &
+
+# Watch for either:
+# - "Iter 0:" line with responded=N matching (success)
+# - "hang at iter 0 — 0 of 8 expected MM challenges sent" pattern (failure → toId issue)
+```
+
+If smoke hangs at iter 0 with MM never challenging: open issue, drop MediumIL from
+day-1 YAML, replace with another easy/medium metamon (e.g., add a 2nd Minikazam or
+double SmallRL/SmallIL weight).
+
+### §9.8 Stage 1 → Stage 2 transition criteria
+
+**When is Stage 1 done?** Look at smart-bot eval trajectory (auto-logged at
+`data/eval/registry/evals.jsonl` every 10 iters via `--eval-interval 10`) AND
+Elo poller results:
+
+- **Eval trajectory plateau**: smart_avg WR stops improving for 20+ iters
+- **Elo trajectory peak**: best Elo iter has been ≥10 iters ago and not surpassed
+- **Operational floor**: at minimum, 50 iters of Stage 1 before considering done
+
+**Pick Stage 2 init**:
+- If terminal iter Elo is within ~15 points of best-Elo iter → use terminal (simpler)
+- Otherwise → use the best-Elo snapshot explicitly
+
+**Don't auto-decide**. This is a manual review point with the user. Surface the trajectory data, recommend, and confirm before proceeding.
+
+### §9.9 Python shutdown hang workaround (S64-era issue)
+
+After "Training complete" prints, the main python proc often hangs in cleanup
+because CIS workers don't exit gracefully. Kill explicitly:
+
+```bash
+ssh ... 'pgrep -af "python.*train_rl" | head -1'  # find PID
+ssh ... 'kill -9 <PID>; sleep 3; pkill -9 -f spawn_main; sleep 5; pgrep -c python'
+```
+
+If pgrep shows lingering procs, find spawn-main parent + kill it:
+```bash
+ssh ... 'ps auxf | grep -i "spawn_main" | grep -v grep | head -5'
+ssh ... 'kill -9 <PARENT_PID>; sleep 5; pgrep -c python'
+```
+
+### §9.10 SSH disconnect during operations
+
+`pkill -9 python` on prod can drop your SSH connection (exit code 255 because the
+SSH-child process gets killed too). This is normal. Reconnect and verify state
+with the §9.2 checks. The kill landed; the SSH just got caught in the blast radius.
+
+### §9.11 Cost monitoring during long runs
+
+Pod cost = $1.50/hr × hours running. To check pod uptime / billing:
+- RunPod dashboard (browser, user account)
+- `uptime` on the pod gives system uptime (not billing exactly, but proxies)
+
+For Phase 2:
+- Stage 1 (50-100 iters × 24 min) ≈ $30-60 in pod time
+- Stage 2 (150 iters × 24 min) ≈ $90
+- Total Phase 2 first run ≈ **$120-150**; restarts for tier additions could add $30-60
+
+Watch for OOM mid-run (wrapper exits with code 1 + preserved checkpoints) — that's
+when human review is required.
+
