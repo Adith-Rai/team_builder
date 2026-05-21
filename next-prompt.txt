@@ -1,12 +1,260 @@
 ═══════════════════════════════════════════════════════════════════════════════
-⚠️  S67 WORKER-SCALING COMPLETE (2026-05-20) — AUTHORITATIVE READ FIRST
+⚠️  S67 FINAL COMPLETE (2026-05-21) — AUTHORITATIVE READ FIRST
 ═══════════════════════════════════════════════════════════════════════════════
 
 **FIRST ACTION FOR NEXT SESSION**:
 
-1. Read `memory/project_s67_worker_scaling_findings.md` BEFORE anything else.
-2. The ship-ready Phase 2 change is in §8 of that memo: just add `--mp-workers 30` to the canonical launch.
-3. S66 wrap below is SUPERSEDED. S65 wrap below that is REFUTED. Don't act on either as authoritative.
+1. Read `memory/project_s67_final_handover.md` BEFORE anything else. This is the
+   single comprehensive handover for the entire S67 arc (worker scaling + Track B
+   rejection + architectural ceiling + user decisions + reinforced principles).
+2. Then check Exp 1m iter 1 result on prod: `tail /tmp/exp1m_48w_pool12.log`.
+   - If iter 1 update wall ≤ 200s and no OOM → ship `--mp-workers 48 --pool-anchors 11`.
+   - If OOM or update > 200s → fall back to `--mp-workers 30` at pool=15.
+3. ALL prior wraps below (S67-mid, S66, S65) are SUPERSEDED by this header + the
+   final handover memo. Don't act on them as authoritative.
+
+═══════════════════════════════════════════════════════════════════════════════
+S67 FINAL SUMMARY — what we measured, what shipped, what's REFUTED, principles
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION OUTCOME**: Phase 2 wall reduced from 32 min/iter (8w baseline) to
+**~18.5 min/iter (48w + pool=12)** at user's diversity target. ~$62 saved per
+200-iter Phase 2 (~$93/run vs $155 baseline). Two flag changes; no code change.
+Zero quality compromise.
+
+═══════════════════════════════════════════════════════════════════════════════
+CANONICAL Phase 2 LAUNCH (UPDATED — post-Exp 1m)
+═══════════════════════════════════════════════════════════════════════════════
+
+```bash
+# PRE-LAUNCH (mandatory):
+# 1. Verify Exp 1m iter 1 result: tail /tmp/exp1m_48w_pool12.log
+# 2. Cleanup if any python running:
+#    pkill -9 python; sleep 5; pkill -9 -f battle_server.js; sleep 5
+#    for p in 9000 9001 9002 9003 9004 9005 9006 9007; do
+#      nohup node battle_server.js --port $p > /tmp/bs_$p.log 2>&1 &
+#    done; sleep 10
+# 3. Verify torch 2.5.1+cu121 + LD_LIBRARY_PATH on prod
+
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+nohup ./launch_rl.sh \
+  --init-from data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-ckpt data/models/bc/v10_padded_for_cis_dev.pt \
+  --bc-anchor-coef 0.1 \
+  --cis --bf16 --tier3 --tier3-minibatch-size 64 \
+  --packed --no-per-chunk-gc \
+  --cis-min-batch 32 --cis-timeout-ms 50 \
+  --mp-workers 48 \                              # ← S67 NEW SHIP (was default 8)
+  --pool-anchors 11 \                            # ← 11 anchors + init = 12 active opps
+  --games-per-iter 1600 --max-concurrent 200 \
+  --n-iters 200 --warmup-iters 10 \              # ← USER DECISION: 10 warmup iters
+  --lr 1e-5 --lam 0.95 --ent-coef 0.02 --target-kl 0.03 \
+  --grad-accum 1 --turn-cap 300 \
+  --reward-style terminal \
+  --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
+  --adaptive-entropy --adaptive-entropy-low 0.65 --adaptive-entropy-high 0.95 \
+  --eval-interval 10 --eval-games 200 --eval-team-set metamon-competitive \
+  --snapshot-interval 10 \                        # ← USER DECISION: 5-10 OK; 10 default
+  --early-stop --early-stop-patience 3 \
+  --win-rate-mode ema --win-rate-ema-alpha 0.3 --win-rate-ema-window 50 \
+  --out-dir data/models/rl_v10/<RUN_NAME> \
+  > /tmp/<RUN_NAME>.log 2>&1 &
+```
+
+**Fallback if Exp 1m iter 1 fails**: drop `--pool-anchors 11`, change to
+`--mp-workers 30`. Pool defaults to 15 active. 23.7 min/iter → $115/run.
+
+═══════════════════════════════════════════════════════════════════════════════
+USER DECISIONS (2026-05-21) — DON'T RE-LITIGATE
+═══════════════════════════════════════════════════════════════════════════════
+
+| Setting | Decided value | User rationale |
+|---|---|---|
+| Total games/iter | 1600 | Matches ps-ppo/VGC-Bench rollout size. Don't reduce. |
+| Active opps/iter target | **10-12** | Stable PFSP weights + ample diversity. 133-160 g/opp. |
+| Snapshot interval | **5-10 iters** | Frequent refresh, low rotation overhead. |
+| Warmup iters | **10** | Stabilize value head before main training. |
+| Acceptable per-iter wall | "<10 min ideal, otherwise architectural floor" | Below 13-14 min needs multi-GPU. ~18.5 min is best practical without architecture change. |
+| Phase 2 budget per run | $93 (48w/pool=12) / $115 (30w fallback) | Acceptable. |
+
+═══════════════════════════════════════════════════════════════════════════════
+RATIO CURVE (CONCRETE measurements — pool=15 operating point + diagnostics)
+═══════════════════════════════════════════════════════════════════════════════
+
+At pool=15 (user diversity floor):
+| Workers | Active | Ratio | Wall avg |
+|---|---|---|---|
+| 8 | 8 | 1:1 | 32 min (baseline) |
+| 15 | 15 | 1:1 | 29 min |
+| 24 | 15 | 1.6:1 mixed | 25.5 min |
+| **30** | **15** | **2:1 clean** | **21.2 min** ← fallback ship |
+| 48 | 15 | 3.2:1 mixed | **OOM (mb=64 update)** |
+
+At pool=12 (Exp 1m, NEW SHIP):
+| Workers | Active | Ratio | Wall |
+|---|---|---|---|
+| **48** | **12** | **4:1 clean** | **18.0 min iter 0 / ~18.5 steady projected** ← SHIP |
+
+At pool=8 (diagnostic only — below user diversity floor):
+| Workers | Active | Ratio | Wall |
+|---|---|---|---|
+| 8 | 8 | 1:1 | 31 min |
+| 24 | 8 | 3:1 | 17.6 min |
+| 32 | 8 | 4:1 | 15.9 min |
+| 48 | 8 | 6:1 | 15.4 min |
+
+═══════════════════════════════════════════════════════════════════════════════
+ARCHITECTURAL CEILING — per-worker CUDA context
+═══════════════════════════════════════════════════════════════════════════════
+
+**Each Python worker process consumes ~490 MB GPU memory** (PyTorch CUDA primary
+context + lazy-loaded cuBLAS + cuDNN). Loaded the moment any worker touches CUDA,
+lives for process lifetime, can't be released.
+
+| Workers | Worker GPU | Update budget | mb=64 fit? |
+|---|---|---|---|
+| 8 | ~4 GB | ~73 GB | ✓ |
+| 30 | ~15 GB | ~62 GB | ✓ tight |
+| 48 + pool=15 | ~24 GB | ~53 GB | ❌ OOM (Exp 1k confirmed) |
+| **48 + pool=12** | **~24 GB** | **~54 GB** | **✓ (Exp 1m confirmed iter 0)** |
+
+To push past 48 workers needs **CPU-only-workers refactor** (~50-150 LOC). NOT urgent.
+
+═══════════════════════════════════════════════════════════════════════════════
+CONCLUSIVELY REFUTED in S67 — do NOT reopen without new evidence
+═══════════════════════════════════════════════════════════════════════════════
+
+1. **Per-worker concurrency confounder** (Exp 1g: 8w + conc=53 = 32 min baseline)
+2. **Battle server contention at 30w** (Exp 1f: 8 BS = 30 BS = 21.2 min)
+3. **Pool size capping as wall optimization** (Exp 5a: pool=8 = pool=15 active=8)
+4. **Active-opps-per-iter cap as wall fix** — user rejected (handicap to PFSP diversity)
+5. **S66 mp.send mechanism conjecture** — stage profile showed dispatch = 0.1-3%
+6. **Track A (waves)** — math hole, ratio at wave_size=K = ratio at pool=K, no escape
+7. **Track B (shared backbone freeze)** — REJECTED on principle, see
+   feedback_dont_propose_principle_violations.md. Caps model ceiling; quality non-negotiable.
+8. **Diminishing returns past 3:1** — earlier S67 framing, REFUTED by Exp 1j (6:1 ratio
+   continued scaling at -14% from 4:1)
+9. **Larger minibatch (80/96/128)** — OOM at 30+ workers (worker contexts eat GPU)
+
+═══════════════════════════════════════════════════════════════════════════════
+PRINCIPLES (reinforced, re-read every session)
+═══════════════════════════════════════════════════════════════════════════════
+
+These are not aspirations — they are how we work. **Past sessions failed when we
+drifted from these.** S67 itself drifted into Track B (freeze spatial) before user
+caught it on principle. Don't repeat.
+
+1. **No shortcuts. Ever.** No `.float()` shims. No "fix later" TODOs in critical path.
+   No skipping smoke validation. No half-finished branches. No bundling scope. The
+   "good enough for now" version is the version that needs to be touched again.
+
+2. **No assumptions. Label CONCRETE / STRONG INFERENCE / CONJECTURE.** Every perf
+   claim, every "X is the bottleneck", tag with evidence or mark conjecture. S66's
+   mp.send framing was conjecture-promoted-to-fact; cost weeks. S67 stage profile
+   refuted it in $5.
+
+3. **Quality > cost > calendar. Quality is NON-NEGOTIABLE.** Quality concessions are
+   NOT validatable tradeoffs. Don't propose them. Track B was the canonical example
+   in S67 — would have capped model ceiling for ALL future learning. User had to push
+   back twice before I retracted. **If a proposal violates a stated principle, push
+   back yourself instead of laying out options.**
+
+4. **Long-term overarching goal is the load-bearing context for EVERY decision**:
+       Phase 1 v3 (DONE) → ELITE GEN 9 (NEXT) → MULTI-GEN → all formats.
+   Every decision must serve this trajectory. **Anything shipped must be extendable**
+   to the next phase without rework. Don't ship gen-9-specific hacks multi-gen has
+   to undo. Don't ship single-pod assumptions multi-GPU has to refactor.
+
+5. **It's me and you against the problem.** Partnership, not deference. Push back
+   on user when premise is buggy. Also push back on yourself — if your proposed
+   framing has a principle-bug, the same rule applies.
+
+6. **Verify before recommending OR acting.** Memory snapshots are point-in-time, not
+   current state. Grep before promising. SSH exit codes can lie. Cheap to verify;
+   expensive to act on wrong state.
+
+7. **Diagnostic code on isolation branch; findings/scripts on master via cherry-pick.**
+   S67 pattern: `diag/cis-stage-profile` held the perf patches; `perf/freeze-spatial`
+   held the rejected scaffold; docs/memory went to master via separate commits.
+
+8. **Take inherited content with a grain of salt — confirm against current code.**
+   Older docs, older memos, older session wraps can contain framings correct at the
+   time but superseded later. Current code is truth. Newer findings override older
+   speculation.
+
+═══════════════════════════════════════════════════════════════════════════════
+NEW S67 MEMORY FILES (auto-loaded via MEMORY.md)
+═══════════════════════════════════════════════════════════════════════════════
+
+- **project_s67_final_handover.md** — THIS arc's authoritative one-file handover (read first)
+- project_s67_worker_scaling_findings.md — detailed experiment data
+- feedback_dont_propose_principle_violations.md — Track B rejection lesson (S67)
+- feedback_battle_server_restart_after_kill.md — BS cleanup recipe (cost ~$2 to learn)
+- feedback_freeze_spatial_use_cases.md — when freeze IS a legitimate scaffold lever
+
+═══════════════════════════════════════════════════════════════════════════════
+S67 BRANCHES (preserved, NOT merged to master)
+═══════════════════════════════════════════════════════════════════════════════
+
+- `diag/cis-stage-profile` @ 668df0f8 — per-fire stage profile + fwd internal split.
+  CIS_STAGE_PROFILE env var. Pure additive, default-off. Useful for any future CIS
+  perf investigation.
+- `perf/freeze-spatial` @ 671e19e4 — --freeze-spatial flag. REJECTED for Phase 2 use
+  on principle (caps model ceiling). KEEP available for TEMPORARY scaffold uses per
+  feedback_freeze_spatial_use_cases.md (Phase 2 launch anti-erosion, multi-gen
+  transfer, instability recovery, hyperparameter isolation).
+
+═══════════════════════════════════════════════════════════════════════════════
+PHASE 2 PREP TODO (separate sessions, no architectural changes left)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. **Validate Exp 1m iter 1 result** before launching production Phase 2.
+2. Source 100-150 real elite gen-9-OU teams (NEVER mix with 16 mm-competitive eval set).
+3. Wire H2H gauntlet (Kakuna/SmallRL/Minikazam adapters).
+4. External opps in PFSP pool (mcts-fast + others).
+5. lr re-ablation post-S67 arc to confirm `--lr 1e-5` still optimal.
+6. Phase 2 launch script with the updated canonical stack.
+
+═══════════════════════════════════════════════════════════════════════════════
+ANTI-PATTERNS THIS ARC REVEALED — DON'T REPEAT
+═══════════════════════════════════════════════════════════════════════════════
+
+1. **Killing experiments prematurely** — Exp 1 (15w pool=15) was killed at +22 min
+   on n_done=0; turned out to be slow-start regime and would have completed in ~29
+   min. User caught the error. Pool=15 collect is slow to start showing n_done —
+   don't conclude failure before normal completion time.
+
+2. **Forgetting documented lessons mid-session** — Battle server cleanup recipe was
+   documented in this same session but I skipped it before launching Exp 1, causing
+   chained failures. When launching ANY new experiment, run the cleanup recipe first.
+
+3. **Extrapolating without verifying** — projected pool=8 wall as ~20 min linearly
+   from pool=1-5 data; actual measurement (Exp 5a) was 31 min. Wall scales NON-linearly
+   with active opps. When projecting outside measurement range, MEASURE before
+   recommending.
+
+4. **Soft-pedaling principle violations as tradeoffs** — Track B was framed as
+   "tradeoff to validate" when it was actually a structural quality compromise.
+   User had to push back twice before I retracted. If a proposal violates a stated
+   principle, push back yourself.
+
+5. **Skipping cheap diagnostics in favor of expensive architectural proposals** —
+   Stage profile patch (~$3-5) refuted multi-session S66 framing. Should have
+   measured per-fire breakdown sessions ago.
+
+═══════════════════════════════════════════════════════════════════════════════
+POD STATE AT SESSION WRAP (2026-05-21)
+═══════════════════════════════════════════════════════════════════════════════
+
+- Prod (port 47913): Exp 1m running. 51 python procs. GPU 27 GB used / 54 GB free.
+  Iter 0 SHIPPED. Iter 1 in flight in collect at handover time.
+- Battle servers: 8 running on 9000-9007 from earlier launch
+- HEAD on prod: master (verify before launch — `git rev-parse HEAD`)
+- Local HEAD: master (S67 consolidation commit pending)
+
+**Cumulative S67 cost**: ~$76 pod time. Pays back in ~1.2 Phase 2 runs.
+
+═══════════════════════════════════════════════════════════════════════════════
 
 ═══════════════════════════════════════════════════════════════════════════════
 S67 SUMMARY — what we measured, what shipped, what's REFUTED
