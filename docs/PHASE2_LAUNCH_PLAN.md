@@ -6,6 +6,74 @@
 
 ---
 
+## §0. QUICK START — launch Stage 1 in 4 commands
+
+**Prerequisite**: 30w validation completed cleanly (iter 4 lands without OOM in
+`/tmp/exp30w_validate.log`). If not yet validated, see §5 first.
+
+**1. SSH to prod + sync to latest master:**
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 47913 -o StrictHostKeyChecking=no root@195.26.233.30
+cd /workspace/team_builder
+# Verify no zombie training procs from any previous run:
+pgrep -c python  # expect 0 (orphan multiprocessing wrappers OK)
+nvidia-smi --query-gpu=memory.used --format=csv,noheader  # expect ≤500 MiB
+# Sync master:
+git checkout master && git pull origin master
+git log -1 --oneline  # confirm cb7ea7ca or newer
+```
+
+**2. Make wrapper + poller executable** (one-time after first pull):
+```bash
+chmod +x pokemon-ai-starter/pokemon-ai/src/launch_phase2_with_oom_fallback.sh
+```
+
+**3. Launch Stage 1** (the actual one-line training launch):
+```bash
+cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
+STAGE=stage1 nohup bash launch_phase2_with_oom_fallback.sh phase2_stage1_v1 \
+  > /tmp/phase2_stage1_v1_wrapper.log 2>&1 &
+```
+
+**4. Verify training started cleanly** (~30s after launch):
+```bash
+sleep 30
+tail -20 /tmp/phase2_stage1_v1.log
+# Expect: "BC anchor: loading reference..." + CIS startup banner + iter 0 collect lines
+pgrep -c python  # expect ~33 (30 workers + main + CIS + orchestrator)
+nvidia-smi --query-gpu=memory.used --format=csv,noheader  # expect ~15-20 GB
+```
+
+**First iter line lands** at ~25 min after launch. Subsequent iters every ~24 min.
+
+### Concurrently on local (Elo poller — starts gathering data as snapshots land):
+
+**5. Start the Elo poller on local** (needs 3 BS running locally on 9000/9001/9002):
+```bash
+cd C:/Users/raiad/OneDrive/Desktop/team_builder/pokemon-ai-starter/pokemon-ai/src
+python elo_poller.py --run-name phase2_stage1_v1
+```
+
+The poller idles 5 min between checks when caught up. First snapshot lands on prod
+at iter 10 (snapshot-interval=10), so first Elo eval starts ~250 min into Stage 1.
+
+### Monitoring after launch
+```bash
+# Iter completion (one line per iter):
+ssh ... 'grep -E "^\[..:..:..\] Iter [0-9]+:" /tmp/phase2_stage1_v1.log'
+
+# OOM safety check:
+ssh ... 'grep -iE "out of memory|FATAL" /tmp/phase2_stage1_v1.log'
+
+# Smart-bot eval trajectory (auto-logged every 10 iters):
+ssh ... 'tail -20 data/eval/registry/evals.jsonl'
+```
+
+If you see anything weird: see §9 for deeper operational details, troubleshooting,
+and Stage 2 launch procedure.
+
+---
+
 ## TL;DR
 
 Two-stage Phase 2:
