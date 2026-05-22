@@ -98,6 +98,82 @@ def _make_server(ws_url: str) -> ServerConfiguration:
     return ServerConfiguration(ws, http)
 
 
+def select_opponents_phase2_stage1(
+    snapshot_pool: List[Union[str, PoolEntry]],
+    win_rates: Optional[Dict[str, list]] = None,
+    max_n: int = 10,
+) -> List[Union[str, PoolEntry]]:
+    """Phase 2 Stage 1 composition (S67 locked design, 2026-05-22).
+
+    Builds the per-iter active opponent list with explicit roles:
+      - 2 forced anchors: snapshot_pool[-2] (prev) + snapshot_pool[-3] (prev-of-prev)
+        These give deterministic regression detection vs ~10-20 iters back, which
+        PFSP weighting alone misses (PFSP deprioritizes opps current model beats
+        easily, hiding regressions that emerge against specific older snapshots).
+      - 2 random anchors: sampled uniformly from remaining pool
+        Anti-staleness — prevents PFSP from collapsing onto a small set.
+      - 6 PFSP anchors: sampled by (1-wr)^2 weighting from remaining pool
+        Adaptive curriculum — emphasizes opps current model finds hard.
+      = max_n (default 10) total active per iter.
+
+    Pool ordering invariant: snapshot_pool is appended chronologically by
+    train_rl.py:604, so pool[-1] = latest (just-saved), pool[-2] = prev,
+    pool[-3] = prev-of-prev.
+
+    Edge cases:
+      - pool <= max_n: return all (no composition needed; everyone plays)
+      - pool < 4: return all (not enough entries for 2 forced + 2 random + ...)
+      - 4 <= pool <= max_n: still return all (composition only kicks in above max_n)
+
+    Args:
+        snapshot_pool: chronologically ordered list of pool entries (paths or PoolEntry).
+        win_rates: {entry_key: [wins, games]} — required for PFSP path. None → random fallback.
+        max_n: target total active opponents (default 10 per Phase 2 design).
+
+    Returns:
+        List of selected pool entries (originals preserved, not coerced).
+    """
+    pool_size = len(snapshot_pool)
+    if pool_size <= max_n:
+        return list(snapshot_pool)
+
+    # Forced anchors (prev + prev-of-prev). pool_size > max_n >= 10 here, so
+    # both indices are safe; but guard for max_n < 10 edge cases.
+    forced = []
+    if pool_size >= 3:
+        forced.append(snapshot_pool[-2])  # PREV (10 iters back at snapshot-interval=10)
+    if pool_size >= 4:
+        forced.append(snapshot_pool[-3])  # PREV-OF-PREV (20 iters back)
+
+    # Remaining pool (exclude forced)
+    forced_keys = {_entry_key(f) for f in forced}
+    remaining = [s for s in snapshot_pool if _entry_key(s) not in forced_keys]
+
+    # Target: 2 random + (max_n - 2 forced - 2 random) PFSP
+    n_target_random = 2
+    n_target_pfsp = max_n - len(forced) - n_target_random
+
+    # Sample random anchors first (no replacement)
+    n_random = min(n_target_random, len(remaining))
+    random_picks = random.sample(remaining, n_random) if n_random > 0 else []
+
+    # PFSP from what's left
+    random_keys = {_entry_key(r) for r in random_picks}
+    pfsp_pool = [s for s in remaining if _entry_key(s) not in random_keys]
+    if n_target_pfsp > 0 and pfsp_pool:
+        if win_rates is not None:
+            # Pure PFSP (no uniform_frac mixing — random slots already handled above)
+            pfsp_picks = pfsp_sample(pfsp_pool, win_rates, n_target_pfsp,
+                                     uniform_frac=0.0, latest_snapshot=None)
+        else:
+            n = min(n_target_pfsp, len(pfsp_pool))
+            pfsp_picks = random.sample(pfsp_pool, n)
+    else:
+        pfsp_picks = []
+
+    return forced + random_picks + pfsp_picks
+
+
 def pfsp_sample(
     snapshot_pool: List[Union[str, PoolEntry]],
     win_rates: Dict[str, list],
@@ -200,22 +276,19 @@ async def collect_v9(
     if not snapshot_pool:
         raise ValueError("snapshot_pool must contain at least one checkpoint")
 
-    # Select opponents via PFSP (prioritized) or uniform fallback.
-    # S67 (2026-05-22): capped at 10 per locked Phase 2 composition decision
-    # (was 15). Rationale: 10 active opps = 160 g/opp at 1600g/iter, stable
-    # per-opp signal + bounds CIS slot count + caps collect-time inflation
-    # as pool grows past 10. See project_phase2_launch_plan.md §2.2.
+    # S67 Phase 2 Stage 1 composition (2026-05-22): 2 forced anchors (prev +
+    # prev-of-prev) + 2 random + 6 PFSP = 10. Forced anchors are deterministic
+    # regression-detection slots that PFSP weighting alone would miss. See
+    # select_opponents_phase2_stage1() docstring for full rationale. Pre-S67
+    # behavior was pure PFSP+latest with max_opponents=15; that path is in the
+    # function as a fallback when select_opponents_phase2_stage1 returns
+    # everything (small pool case).
     max_opponents = 10
-    if len(snapshot_pool) <= max_opponents:
-        selected = list(snapshot_pool)
-    elif win_rates is not None:
-        selected = pfsp_sample(snapshot_pool, win_rates, max_opponents,
-                               uniform_frac=0.15, latest_snapshot=latest_snapshot)
-    else:
-        selected = random.sample(snapshot_pool, max_opponents)
-        if latest_snapshot and not any(_entry_key(s) == latest_snapshot for s in selected):
-            selected[-1] = next((s for s in snapshot_pool if _entry_key(s) == latest_snapshot),
-                                selected[-1])
+    selected = select_opponents_phase2_stage1(snapshot_pool, win_rates, max_n=max_opponents)
+    # Log composition for orchestrator visibility (helps verify the design at runtime)
+    if len(snapshot_pool) > max_opponents:
+        print(f"  [composition] pool={len(snapshot_pool)} active={len(selected)} "
+              f"(2 forced anchors + 2 random + 6 PFSP per Phase 2 Stage 1 design)", flush=True)
 
     # Distribute games across opponents (roughly equal)
     games_per_opp = max(1, n_games // len(selected))
