@@ -101,7 +101,7 @@ def _make_server(ws_url: str) -> ServerConfiguration:
 def pfsp_sample(
     snapshot_pool: List[Union[str, PoolEntry]],
     win_rates: Dict[str, list],
-    n_opponents: int = 15,
+    n_opponents: int = 10,
     uniform_frac: float = 0.15,
     latest_snapshot: Optional[str] = None,
 ) -> List[Union[str, PoolEntry]]:
@@ -201,9 +201,11 @@ async def collect_v9(
         raise ValueError("snapshot_pool must contain at least one checkpoint")
 
     # Select opponents via PFSP (prioritized) or uniform fallback.
-    # 15 balances diversity (more opponents = broader training signal) against
-    # GPU memory (each opponent loads a separate model copy for inference).
-    max_opponents = 15
+    # S67 (2026-05-22): capped at 10 per locked Phase 2 composition decision
+    # (was 15). Rationale: 10 active opps = 160 g/opp at 1600g/iter, stable
+    # per-opp signal + bounds CIS slot count + caps collect-time inflation
+    # as pool grows past 10. See project_phase2_launch_plan.md §2.2.
+    max_opponents = 10
     if len(snapshot_pool) <= max_opponents:
         selected = list(snapshot_pool)
     elif win_rates is not None:

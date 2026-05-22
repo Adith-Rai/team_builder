@@ -475,7 +475,7 @@ def mp_collect_v2(
     n_workers = len(server_pool)
     rs_cfg = reward_shaper_cfg or {"ko_coef": 0.05, "hp_coef": 0.02, "clip_abs": 2.0}
 
-    max_opponents = 15
+    max_opponents = 10  # S67 2026-05-22: was 15, capped per Phase 2 design
     if len(snapshot_pool) <= max_opponents:
         selected = list(snapshot_pool)
     else:
