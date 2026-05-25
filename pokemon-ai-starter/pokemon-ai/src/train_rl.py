@@ -268,6 +268,21 @@ def parse_args():
                    help="Comma-separated paths to fixed anchor checkpoints kept in the "
                         "PFSP pool throughout training (e.g. peak-era references). "
                         "Always present; never pruned. Default empty = old behavior.")
+    p.add_argument("--max-opponents-per-iter", type=int, default=10,
+                   help="Max active opponents per iter. When pool > N, the "
+                        "select_opponents_phase2_stage1 composition function selects "
+                        "N from pool (2 forced anchors + 2 random + N-4 PFSP). "
+                        "Default 10 matches Phase 2 Stage 1 design. "
+                        "Set -1 to disable (use full pool — wall time grows with pool). "
+                        "S67 fix: previously only applied to legacy paths; now CIS too.")
+    p.add_argument("--force-anchors", default="",
+                   help="Comma-separated paths to opponents ALWAYS included in active "
+                        "set every iter (in addition to 2 self-forced anchors). "
+                        "S67 NEW. Use case: terminal-self regression check during "
+                        "Phase 2 Stage 2 external curriculum (force Stage 1 final "
+                        "checkpoint as anchor to detect regression below pure-self-play). "
+                        "Each path MUST also be in --pool-anchors (or already in pool). "
+                        "Limit: K force-anchors + 2 self-forced ≤ max_opponents_per_iter.")
     p.add_argument("--pool-max-current-run", type=int, default=-1,
                    help="Cap on number of self-play snapshots from the CURRENT run "
                         "kept in the pool. When N>=0 and the current run has produced "
@@ -413,13 +428,37 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         # Workers don't own a model; CIS is the single GPU model holder.
         # See docs/CENTRALIZED_INFERENCE_DESIGN.md.
         from mp_centralized_collect import mp_centralized_collect_sync
+
+        # S67 FIX: apply composition function for CIS (previously only applied
+        # to legacy paths). Without this, CIS plays ALL pool members per iter
+        # → wall time + GPU slot count grow unboundedly with pool size.
+        # Composition rule (2 forced + 2 random + N-4 PFSP) preserved via flag.
+        # S67-EXT: optional --force-anchors list always included (Phase 2 Stage 2
+        # use case: force terminal-self as regression check vs external curriculum).
+        max_opps = getattr(args, 'max_opponents_per_iter', 10)
+        force_anchors_str = getattr(args, 'force_anchors', '') or ''
+        force_anchors_list = [p.strip().replace("\\", "/") for p in force_anchors_str.split(",") if p.strip()] or None
+        effective_pool = snapshot_pool
+        if max_opps > 0 and len(snapshot_pool) > max_opps:
+            from rl_collection import select_opponents_phase2_stage1
+            effective_pool = select_opponents_phase2_stage1(
+                snapshot_pool, win_rates, max_n=max_opps,
+                force_anchors=force_anchors_list,
+            )
+            n_force = len(force_anchors_list) if force_anchors_list else 0
+            n_pfsp = max_opps - 2 - 2 - n_force  # 2 self-forced + 2 random
+            force_desc = f"{n_force} force-ext + 2 self-forced + 2 random + {n_pfsp} PFSP"
+            print(f"  [composition] pool={len(snapshot_pool)} active={len(effective_pool)} "
+                  f"({force_desc} per Phase 2 Stage 1 design)",
+                  flush=True)
+
         model.eval()
         _flow(f"starting CIS collection (n_workers={args.mp_workers})")
         cis_result = mp_centralized_collect_sync(
             model, device, server_pool,
             n_games=args.games_per_iter,
             max_concurrent=args.max_concurrent,
-            snapshot_pool=snapshot_pool,
+            snapshot_pool=effective_pool,
             fp16=args.fp16,
             reward_shaper_cfg=rs_cfg,
             temp_range=(args.temp_min, args.temp_max),
@@ -825,6 +864,15 @@ def main():
     # --pool-max-current-run.
     anchor_set = set()
     if args.pool_anchors:
+        # S67 FIX: insert anchors at position 1 (right after init_from), NOT append.
+        # Previously appended at end → anchors took the snapshot_pool[-2] / [-3] slots
+        # that select_opponents_phase2_stage1 uses for "prev" and "prev-of-prev" forced
+        # self-play snapshots. This made external anchors forced every iter, kicking
+        # out the recent self-play snapshots intended for regression-detection.
+        # Inserting at position 1 keeps init_from at [0], anchors at [1..N], and
+        # self-play snapshots accumulate chronologically at the END of pool — so
+        # pool[-1] / [-2] / [-3] are correctly the recent self snaps as designed.
+        insert_pos = 1  # after init_from
         for raw in args.pool_anchors.split(","):
             p = raw.strip().replace("\\", "/")
             if not p:
@@ -838,8 +886,9 @@ def main():
             if p in anchor_set:
                 continue
             anchor_set.add(p)
-            snapshot_pool.append(p)
-            print(f"  [pool] anchor added: {p}", flush=True)
+            snapshot_pool.insert(insert_pos, p)
+            insert_pos += 1  # next anchor goes after this one
+            print(f"  [pool] anchor added (at pos {insert_pos-1}): {p}", flush=True)
     rs_cfg = _build_reward_config(args)
 
     # Team builder. Training MUST use procedural Smogon-usage teams to avoid

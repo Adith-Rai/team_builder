@@ -102,33 +102,42 @@ def select_opponents_phase2_stage1(
     snapshot_pool: List[Union[str, PoolEntry]],
     win_rates: Optional[Dict[str, list]] = None,
     max_n: int = 10,
+    force_anchors: Optional[List[str]] = None,
 ) -> List[Union[str, PoolEntry]]:
     """Phase 2 Stage 1 composition (S67 locked design, 2026-05-22).
 
     Builds the per-iter active opponent list with explicit roles:
-      - 2 forced anchors: snapshot_pool[-2] (prev) + snapshot_pool[-3] (prev-of-prev)
-        These give deterministic regression detection vs ~10-20 iters back, which
-        PFSP weighting alone misses (PFSP deprioritizes opps current model beats
+      - K force-external anchors (S67-EXT): user-specified paths via --force-anchors,
+        always included every iter (e.g., terminal pure-self-play self for regression
+        detection during Phase 2 Stage 2 external-opp curriculum).
+      - 2 forced self anchors: snapshot_pool[-2] (prev) + snapshot_pool[-3] (prev-of-prev).
+        Deterministic regression detection vs ~10-20 iters back, which PFSP
+        weighting alone misses (PFSP deprioritizes opps current model beats
         easily, hiding regressions that emerge against specific older snapshots).
       - 2 random anchors: sampled uniformly from remaining pool
         Anti-staleness — prevents PFSP from collapsing onto a small set.
-      - 6 PFSP anchors: sampled by (1-wr)^2 weighting from remaining pool
-        Adaptive curriculum — emphasizes opps current model finds hard.
+      - (max_n - K - 4) PFSP anchors: sampled by (1-wr)^2 weighting from remaining
+        pool. Adaptive curriculum — emphasizes opps current model finds hard.
       = max_n (default 10) total active per iter.
 
-    Pool ordering invariant: snapshot_pool is appended chronologically by
-    train_rl.py:604, so pool[-1] = latest (just-saved), pool[-2] = prev,
-    pool[-3] = prev-of-prev.
+    Pool ordering invariant: snapshot_pool is appended chronologically. Anchors
+    inserted via --pool-anchors go at positions 1..N (right after init_from) per
+    S67 fix, so self-play snapshots accumulate at the END of pool: pool[-1] =
+    latest (just-saved), pool[-2] = prev, pool[-3] = prev-of-prev.
 
     Edge cases:
       - pool <= max_n: return all (no composition needed; everyone plays)
       - pool < 4: return all (not enough entries for 2 forced + 2 random + ...)
       - 4 <= pool <= max_n: still return all (composition only kicks in above max_n)
+      - K force-anchors > max_n-4: error (no slots left for self-forced + random + PFSP)
 
     Args:
         snapshot_pool: chronologically ordered list of pool entries (paths or PoolEntry).
         win_rates: {entry_key: [wins, games]} — required for PFSP path. None → random fallback.
         max_n: target total active opponents (default 10 per Phase 2 design).
+        force_anchors: optional list of checkpoint paths to always include (S67 NEW).
+            Paths must be present in snapshot_pool (typically added via --pool-anchors).
+            Use cases: terminal-self regression check during Phase 2 Stage 2.
 
     Returns:
         List of selected pool entries (originals preserved, not coerced).
@@ -137,21 +146,53 @@ def select_opponents_phase2_stage1(
     if pool_size <= max_n:
         return list(snapshot_pool)
 
-    # Forced anchors (prev + prev-of-prev). pool_size > max_n >= 10 here, so
-    # both indices are safe; but guard for max_n < 10 edge cases.
-    forced = []
-    if pool_size >= 3:
-        forced.append(snapshot_pool[-2])  # PREV (10 iters back at snapshot-interval=10)
-    if pool_size >= 4:
-        forced.append(snapshot_pool[-3])  # PREV-OF-PREV (20 iters back)
+    # S67-EXT: Force-external anchors. Resolve paths to pool entries.
+    force_anchor_entries = []
+    force_anchor_keys = set()
+    if force_anchors:
+        pool_keys_to_entry = {_entry_key(s): s for s in snapshot_pool}
+        for path in force_anchors:
+            path_norm = path.strip().replace("\\", "/") if isinstance(path, str) else path
+            if path_norm in force_anchor_keys:
+                continue  # de-dupe within force_anchors
+            if path_norm not in pool_keys_to_entry:
+                print(f"  [WARN] --force-anchors path not in pool: {path_norm} (skipping)",
+                      flush=True)
+                continue
+            force_anchor_entries.append(pool_keys_to_entry[path_norm])
+            force_anchor_keys.add(path_norm)
 
-    # Remaining pool (exclude forced)
+    # Validate capacity: need K force-ext + 2 self-forced + ≥0 random + ≥0 PFSP ≤ max_n
+    n_force_ext = len(force_anchor_entries)
+    if n_force_ext > max_n - 2:
+        raise ValueError(
+            f"--force-anchors has {n_force_ext} entries but max_n={max_n} only allows "
+            f"{max_n - 2} (need to leave ≥2 slots for self-forced anchors). "
+            f"Reduce force-anchors or raise --max-opponents-per-iter."
+        )
+
+    # Forced self anchors (prev + prev-of-prev). Skip duplicates with force-ext.
+    forced_self = []
+    if pool_size >= 3:
+        prev = snapshot_pool[-2]
+        if _entry_key(prev) not in force_anchor_keys:
+            forced_self.append(prev)
+    if pool_size >= 4:
+        prev_of_prev = snapshot_pool[-3]
+        if _entry_key(prev_of_prev) not in force_anchor_keys and \
+           _entry_key(prev_of_prev) not in {_entry_key(f) for f in forced_self}:
+            forced_self.append(prev_of_prev)
+
+    forced = force_anchor_entries + forced_self
     forced_keys = {_entry_key(f) for f in forced}
+
+    # Remaining pool (exclude all forced)
     remaining = [s for s in snapshot_pool if _entry_key(s) not in forced_keys]
 
-    # Target: 2 random + (max_n - 2 forced - 2 random) PFSP
-    n_target_random = 2
-    n_target_pfsp = max_n - len(forced) - n_target_random
+    # Target: 2 random + (max_n - forced - 2 random) PFSP
+    n_remaining_slots = max_n - len(forced)
+    n_target_random = min(2, n_remaining_slots)
+    n_target_pfsp = n_remaining_slots - n_target_random
 
     # Sample random anchors first (no replacement)
     n_random = min(n_target_random, len(remaining))
