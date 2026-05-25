@@ -956,6 +956,33 @@ def main():
         start_iter, snapshot_pool = _resume_from_checkpoint(
             args, model, optimizer, snapshot_pool, device)
 
+        # S67-EXT-FIX2: re-apply --pool-anchors after resume. Previously the ckpt
+        # pool overwrote whatever was set up at lines 859-892, so NEW anchors added
+        # via --pool-anchors on a resume launch were silently dropped (only anchors
+        # already in ckpt's saved pool persisted). Now we re-insert them at pos 1
+        # after the init checkpoint, deduping against the ckpt-loaded pool.
+        if args.pool_anchors:
+            insert_pos = 1  # after init_from
+            anchors_added = 0
+            existing_keys = set(snapshot_pool)
+            for raw in args.pool_anchors.split(","):
+                p = raw.strip().replace("\\", "/")
+                if not p or p in existing_keys:
+                    continue
+                if not Path(p).exists():
+                    print(f"  [WARN] --pool-anchors (post-resume) path not found: {p} "
+                          f"(skipping)", flush=True)
+                    continue
+                snapshot_pool.insert(insert_pos, p)
+                existing_keys.add(p)
+                insert_pos += 1
+                anchors_added += 1
+                print(f"  [pool] anchor re-applied post-resume (at pos {insert_pos-1}): {p}",
+                      flush=True)
+            if anchors_added:
+                print(f"  [pool] post-resume: added {anchors_added} new anchor(s), "
+                      f"pool now {len(snapshot_pool)} entries", flush=True)
+
     # torch.compile (Linux/cloud only - Windows local has no compile support;
     # the try/except below degrades gracefully there). Applied AFTER resume
     # because torch.compile wraps modules with `_orig_mod.` prefix in their

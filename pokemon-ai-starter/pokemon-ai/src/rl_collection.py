@@ -143,24 +143,45 @@ def select_opponents_phase2_stage1(
         List of selected pool entries (originals preserved, not coerced).
     """
     pool_size = len(snapshot_pool)
-    if pool_size <= max_n:
-        return list(snapshot_pool)
 
-    # S67-EXT: Force-external anchors. Resolve paths to pool entries.
+    # S67-EXT-FIX1 + S67-EXT-FIX3: Validate force-anchors BEFORE early-return.
+    # Previously the early-return at pool<=max_n bypassed validation entirely,
+    # so a force-anchor missing from pool got silently dropped without warning.
+    # Also: resolve symlinks via realpath so symlinked-vs-original path matches.
+    import os
     force_anchor_entries = []
     force_anchor_keys = set()
     if force_anchors:
-        pool_keys_to_entry = {_entry_key(s): s for s in snapshot_pool}
+        # Build pool key map with BOTH original key and realpath for matching
+        pool_keys_to_entry = {}
+        for s in snapshot_pool:
+            k = _entry_key(s)
+            pool_keys_to_entry[k] = s
+            # Also index by realpath (resolves symlinks)
+            try:
+                rp = os.path.realpath(k).replace("\\", "/") if isinstance(k, str) else k
+                if rp != k:
+                    pool_keys_to_entry[rp] = s
+            except (OSError, ValueError):
+                pass  # bad path; skip realpath indexing
         for path in force_anchors:
             path_norm = path.strip().replace("\\", "/") if isinstance(path, str) else path
             if path_norm in force_anchor_keys:
                 continue  # de-dupe within force_anchors
-            if path_norm not in pool_keys_to_entry:
+            # Try exact match first, then realpath match (S67-EXT-FIX3)
+            entry = pool_keys_to_entry.get(path_norm)
+            if entry is None:
+                try:
+                    rp_norm = os.path.realpath(path_norm).replace("\\", "/")
+                    entry = pool_keys_to_entry.get(rp_norm)
+                except (OSError, ValueError):
+                    pass
+            if entry is None:
                 print(f"  [WARN] --force-anchors path not in pool: {path_norm} (skipping)",
                       flush=True)
                 continue
-            force_anchor_entries.append(pool_keys_to_entry[path_norm])
-            force_anchor_keys.add(path_norm)
+            force_anchor_entries.append(entry)
+            force_anchor_keys.add(_entry_key(entry))  # store with actual pool key
 
     # Validate capacity: need K force-ext + 2 self-forced + ≥0 random + ≥0 PFSP ≤ max_n
     n_force_ext = len(force_anchor_entries)
@@ -170,6 +191,11 @@ def select_opponents_phase2_stage1(
             f"{max_n - 2} (need to leave ≥2 slots for self-forced anchors). "
             f"Reduce force-anchors or raise --max-opponents-per-iter."
         )
+
+    # Early-return: pool fits in max_n, no composition needed.
+    # Force-anchors are already in returned pool (validated above).
+    if pool_size <= max_n:
+        return list(snapshot_pool)
 
     # Forced self anchors (prev + prev-of-prev). Skip duplicates with force-ext.
     forced_self = []
