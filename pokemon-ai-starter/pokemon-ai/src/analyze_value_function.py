@@ -81,8 +81,12 @@ async def collect_self_play(model, device, n_games, max_concurrent,
 
 
 def compute_value_metrics(model, trajectories, device, cfg, packed=True,
-                           gamma=0.9999, lam=0.95):
+                           gamma=0.9999, lam=0.95, chunk_size=8):
     """Compute value-function quality metrics for one batch of trajectories.
+
+    Processes episodes in chunks of `chunk_size` to bound GPU memory (forward
+    pass on full N=200 episodes OOMs on 6GB cards). Per-chunk tensors are
+    moved to CPU + concatenated; final metrics computed on combined arrays.
 
     Returns dict of metrics.
     """
@@ -93,39 +97,75 @@ def compute_value_metrics(model, trajectories, device, cfg, packed=True,
     if not episodes:
         raise RuntimeError("No valid episodes after build_ppo_episodes")
 
-    # Collate
     temp_ctx = getattr(cfg, "temporal_context", None)
-    if packed:
-        collated = collate_episodes_packed(episodes, max_seqlen=temp_ctx,
-                                            device=device, tail=True)
-    else:
-        collated = collate_episodes(episodes, L_max=temp_ctx,
-                                     device=device, tail=True)
+    n_episodes = len(episodes)
+    n_chunks = (n_episodes + chunk_size - 1) // chunk_size
+    print(f"  Processing {n_episodes} episodes in {n_chunks} chunks of <= {chunk_size}...",
+          flush=True)
 
-    # Forward
+    # Accumulate on CPU to bound memory
+    all_v_pred = []
+    all_returns = []
+    all_advantages = []
+    all_entropy = []
+    all_max_prob = []
+    v_support_cpu = model.value_head.v_support.float().cpu()
+    v_bins = v_support_cpu.shape[0]
+
+    for chunk_idx in range(n_chunks):
+        chunk_eps = episodes[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+        if not chunk_eps:
+            continue
+
+        with torch.no_grad():
+            if packed:
+                collated = collate_episodes_packed(chunk_eps, max_seqlen=temp_ctx,
+                                                    device=device, tail=True)
+                out = model.forward_ppo_sequence_packed(collated, device)
+            else:
+                collated = collate_episodes(chunk_eps, L_max=temp_ctx,
+                                             device=device, tail=True)
+                out = model.forward_ppo_sequence(collated, device)
+
+            v_logits = out["v_logits"].float()
+            v_probs = F.softmax(v_logits, dim=-1)
+            v_pred = (v_probs * model.value_head.v_support.float()).sum(-1)
+
+            returns_t = collated["returns"].to(device).float()
+            advantages_t = collated["advantages"].to(device).float()
+
+            if not packed:
+                pad_mask_f = collated["pad_mask"].to(device).float()
+                mask = pad_mask_f.bool()
+                v_pred = v_pred[mask]
+                returns_t = returns_t[mask]
+                advantages_t = advantages_t[mask]
+                v_probs = v_probs[mask]
+
+            entropy_per_pos = -(v_probs * torch.log(v_probs.clamp(min=1e-12))).sum(-1)
+            max_prob_per_pos = v_probs.max(-1).values
+
+            all_v_pred.append(v_pred.cpu())
+            all_returns.append(returns_t.cpu())
+            all_advantages.append(advantages_t.cpu())
+            all_entropy.append(entropy_per_pos.cpu())
+            all_max_prob.append(max_prob_per_pos.cpu())
+
+        # Free GPU memory per chunk
+        del collated, out, v_logits, v_probs, v_pred, returns_t, advantages_t
+        del entropy_per_pos, max_prob_per_pos
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Concatenate everything on CPU
+    v_pred = torch.cat(all_v_pred)
+    returns_t = torch.cat(all_returns)
+    advantages_t = torch.cat(all_advantages)
+    entropy_per_pos = torch.cat(all_entropy)
+    max_prob_per_pos = torch.cat(all_max_prob)
+
+    # Compute final metrics on CPU
     with torch.no_grad():
-        if packed:
-            out = model.forward_ppo_sequence_packed(collated, device)
-        else:
-            out = model.forward_ppo_sequence(collated, device)
-
-        v_logits = out["v_logits"].float()  # (sum_T, v_bins) packed
-        v_support = model.value_head.v_support.float()  # (v_bins,)
-        v_probs = F.softmax(v_logits, dim=-1)
-        v_pred = (v_probs * v_support).sum(-1)  # (sum_T,) scalar value
-
-        returns_t = collated["returns"].to(device).float()
-        advantages_t = collated["advantages"].to(device).float()
-
-        # For non-packed, mask out padding
-        if not packed:
-            pad_mask_f = collated["pad_mask"].to(device).float()
-            n_valid = pad_mask_f.sum().clamp(min=1.0)
-            v_pred = v_pred[pad_mask_f.bool()]
-            returns_t = returns_t[pad_mask_f.bool()]
-            advantages_t = advantages_t[pad_mask_f.bool()]
-            v_probs = v_probs[pad_mask_f.bool()]
-
         n = v_pred.shape[0]
 
         # ---- Basic stats ----
@@ -146,7 +186,7 @@ def compute_value_metrics(model, trajectories, device, cfg, packed=True,
 
         # ---- Calibration: bin predictions, compute mean return per bin ----
         # Use 5 bins covering [-1, 1]
-        bin_edges = torch.linspace(-1.0, 1.0, 6, device=device)
+        bin_edges = torch.linspace(-1.0, 1.0, 6)
         calib = []
         for i in range(5):
             lo, hi = bin_edges[i].item(), bin_edges[i + 1].item()
@@ -163,13 +203,11 @@ def compute_value_metrics(model, trajectories, device, cfg, packed=True,
                               "actual_return_mean": ar_mean,
                               "actual_return_std": ar_std})
 
-        # ---- Distribution sharpness: entropy + max prob across bins ----
+        # ---- Distribution sharpness: pre-computed per-chunk, just aggregate ----
         # max entropy at 51 bins = log(51) ≈ 3.93 nats; sharp distribution → low entropy
-        entropy_per_pos = -(v_probs * torch.log(v_probs.clamp(min=1e-12))).sum(-1)
-        max_prob_per_pos = v_probs.max(-1).values
         mean_entropy = entropy_per_pos.mean().item()
         mean_max_prob = max_prob_per_pos.mean().item()
-        max_entropy = float(torch.log(torch.tensor(v_probs.shape[-1], dtype=torch.float32)).item())
+        max_entropy = float(torch.log(torch.tensor(v_bins, dtype=torch.float32)).item())
 
         # ---- Advantage stats ----
         adv_mean = advantages_t.mean().item()
@@ -212,6 +250,9 @@ async def main():
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--procedural-teams", default="/workspace/raw_data/pokemon_usage/2024-04",
                     help="Directory of procedural team stats (passed to ProceduralTeambuilder)")
+    ap.add_argument("--chunk-size", type=int, default=8,
+                    help="Episodes per forward-pass chunk. Smaller = lower GPU mem. "
+                         "8 fits in 6 GB; raise to 32+ on 80 GB cards.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -230,7 +271,8 @@ async def main():
     print(f"[VALUE-DIAG] collected {len(episodes)} episodes", flush=True)
 
     cfg = TransformerConfig()
-    m = compute_value_metrics(model, episodes, device, cfg, packed=args.packed)
+    m = compute_value_metrics(model, episodes, device, cfg, packed=args.packed,
+                               chunk_size=args.chunk_size)
 
     r2_interp = ("very good" if m["r2"] > 0.7 else
                  "good" if m["r2"] > 0.5 else
@@ -255,7 +297,7 @@ async def main():
           f"[{sharp_interp}]", flush=True)
     print(f"[VALUE-DIAG] advantages: mean={m['adv_mean']:+.4f}  std={m['adv_std']:.4f}  "
           f"|adv|_mean={m['adv_abs_mean']:.4f}  pos_frac={m['adv_pos_frac']:.3f}", flush=True)
-    print(f"[VALUE-DIAG] calibration (binned pred → actual return):")
+    print(f"[VALUE-DIAG] calibration (binned pred -> actual return):")
     for c in m["calibration"]:
         lo, hi = c["pred_bin"]
         if c["n"] == 0:
