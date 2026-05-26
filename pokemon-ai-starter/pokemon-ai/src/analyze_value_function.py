@@ -52,52 +52,46 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from model_transformer import TransformerBattlePolicy
-from features import TransformerConfig
-from ppo import collate_episodes_packed, collate_episodes
-from rl_collection import collect_v9
-from poke_env.player import LocalhostServerConfiguration
+from model_transformer import TransformerBattlePolicy, TransformerConfig
+from ppo import collate_episodes_packed, collate_episodes, build_ppo_episodes
+from rl_collection import collect_v9, _make_server
+from team_generator import procedural_teambuilder
 
 
 def load_model(ckpt_path: str, device: torch.device) -> TransformerBattlePolicy:
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        sd = state["model_state_dict"]
-        cfg = state.get("model_config") or state.get("cfg")
-    else:
-        sd = state if not isinstance(state, dict) else state.get("state_dict", state)
-        cfg = None
-    if cfg is None:
-        cfg = TransformerConfig()
-    model = TransformerBattlePolicy(cfg).to(device)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing or unexpected:
-        print(f"  [load] missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+    from ppo import load_checkpoint
+    model, _cfg, _ckpt = load_checkpoint(ckpt_path, device)
     model.eval()
     return model
 
 
 async def collect_self_play(model, device, n_games, max_concurrent,
-                             server_port, snapshot_path):
-    server_cfg = LocalhostServerConfiguration._replace(
-        websocket_url=f"ws://localhost:{server_port}/showdown/websocket"
-    )
-    episodes = await collect_v9(
+                             server_port, snapshot_path, teambuilder):
+    server_cfg = _make_server(f"ws://127.0.0.1:{server_port}/showdown/websocket")
+    result = await collect_v9(
         model=model, device=device, server_pool=[server_cfg],
         n_games=n_games, max_concurrent=max_concurrent,
         snapshot_pool=[snapshot_path], fp16=False,
-        teambuilder=None, battle_format="gen9ou",
+        teambuilder=teambuilder, battle_format="gen9ou",
         win_rates={snapshot_path: [25.0, 50]}, turn_cap=300,
     )
-    return episodes
+    # collect_v9 returns tuple: (trajs, wins, losses, ties, steps, summary, elapsed, opp_records)
+    all_trajs = result[0]
+    return all_trajs
 
 
-def compute_value_metrics(model, episodes, device, cfg, packed=True):
-    """Compute value-function quality metrics for one batch of episodes.
+def compute_value_metrics(model, trajectories, device, cfg, packed=True,
+                           gamma=0.9999, lam=0.95):
+    """Compute value-function quality metrics for one batch of trajectories.
 
     Returns dict of metrics.
     """
     model.eval()
+
+    # Convert raw Trajectory objects → episode dicts via GAE
+    episodes = build_ppo_episodes(trajectories, gamma=gamma, lam=lam)
+    if not episodes:
+        raise RuntimeError("No valid episodes after build_ppo_episodes")
 
     # Collate
     temp_ctx = getattr(cfg, "temporal_context", None)
@@ -216,6 +210,8 @@ async def main():
     ap.add_argument("--packed", action="store_true", default=True)
     ap.add_argument("--no-packed", dest="packed", action="store_false")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--procedural-teams", default="/workspace/raw_data/pokemon_usage/2024-04",
+                    help="Directory of procedural team stats (passed to ProceduralTeambuilder)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -224,11 +220,12 @@ async def main():
     print(f"[VALUE-DIAG] loading snapshot: {args.snapshot}", flush=True)
     model = load_model(args.snapshot, device)
 
+    teambuilder = procedural_teambuilder(args.procedural_teams, random_pct=0.05)
     print(f"[VALUE-DIAG] collecting {args.n_games} self-play games...", flush=True)
     episodes = await collect_self_play(
         model=model, device=device, n_games=args.n_games,
         max_concurrent=args.max_concurrent, server_port=args.server_port,
-        snapshot_path=args.snapshot,
+        snapshot_path=args.snapshot, teambuilder=teambuilder,
     )
     print(f"[VALUE-DIAG] collected {len(episodes)} episodes", flush=True)
 

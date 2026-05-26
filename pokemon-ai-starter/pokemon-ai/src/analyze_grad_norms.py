@@ -44,40 +44,20 @@ import torch
 import torch.nn.functional as F
 
 # Local imports — match train_rl.py setup
-from model_transformer import TransformerBattlePolicy
-from agent_v9 import V9RLPlayer
-from features import TransformerConfig
+from model_transformer import TransformerBattlePolicy, TransformerConfig
 from ppo import (
     collate_episodes, collate_episodes_packed,
     _ppo_loss_batched_internal, _ppo_loss_packed_internal,
-    forward_ppo_sequence,
+    build_ppo_episodes,
 )
-from rl_collection import collect_v9
-from poke_env.player import LocalhostServerConfiguration
+from rl_collection import collect_v9, _make_server
+from team_generator import procedural_teambuilder
 
 
 def load_model(ckpt_path: str, device: torch.device) -> TransformerBattlePolicy:
     """Load a TransformerBattlePolicy from a checkpoint."""
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        sd = state["model_state_dict"]
-        cfg = state.get("model_config") or state.get("cfg")
-    elif isinstance(state, dict) and "state_dict" in state:
-        sd = state["state_dict"]
-        cfg = state.get("config") or state.get("cfg")
-    else:
-        sd = state
-        cfg = None
-
-    if cfg is None:
-        # Fall back to default config; check shapes via load_state_dict
-        cfg = TransformerConfig()
-
-    model = TransformerBattlePolicy(cfg).to(device)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing or unexpected:
-        print(f"  [load] missing={len(missing)} unexpected={len(unexpected)} "
-              f"keys (likely OK if BC vs RL diff)", flush=True)
+    from ppo import load_checkpoint
+    model, _cfg, _ckpt = load_checkpoint(ckpt_path, device)
     model.eval()
     return model
 
@@ -89,34 +69,25 @@ async def collect_self_play(
     max_concurrent: int,
     server_port: int,
     snapshot_path: str,
+    teambuilder,
 ) -> list:
     """Collect N self-play games. Returns list of episode dicts."""
-    server_cfg = LocalhostServerConfiguration._replace(
-        websocket_url=f"ws://localhost:{server_port}/showdown/websocket"
+    server_cfg = _make_server(f"ws://127.0.0.1:{server_port}/showdown/websocket")
+    result = await collect_v9(
+        model=model, device=device, server_pool=[server_cfg],
+        n_games=n_games, max_concurrent=max_concurrent,
+        snapshot_pool=[snapshot_path], fp16=False,
+        teambuilder=teambuilder, battle_format="gen9ou",
+        win_rates={snapshot_path: [25.0, 50]}, turn_cap=300,
     )
-
-    # Self-play: snapshot_pool with just the snapshot itself
-    # Use random teambuilder (avoid needing procedural)
-    episodes = await collect_v9(
-        model=model,
-        device=device,
-        server_pool=[server_cfg],
-        n_games=n_games,
-        max_concurrent=max_concurrent,
-        snapshot_pool=[snapshot_path],
-        fp16=False,
-        teambuilder=None,  # use default
-        battle_format="gen9ou",
-        win_rates={snapshot_path: [25.0, 50]},  # 50/50 placeholder
-        turn_cap=300,
-    )
-    return episodes
+    # collect_v9 returns tuple: (trajs, wins, losses, ties, steps, summary, elapsed, opp_records)
+    return result[0]
 
 
 def analyze_grad_norms(
     model: TransformerBattlePolicy,
     bc_ref: TransformerBattlePolicy,
-    episodes: list,
+    trajectories: list,
     device: torch.device,
     cfg,
     bc_anchor_coef: float,
@@ -124,14 +95,21 @@ def analyze_grad_norms(
     vf_coef: float = 0.5,
     clip_eps: float = 0.2,
     packed: bool = True,
+    gamma: float = 0.9999,
+    lam: float = 0.95,
 ) -> dict:
-    """Compute PPO/BC grad-norm decomp on one batch of episodes.
+    """Compute PPO/BC grad-norm decomp on one batch of trajectories.
 
     Returns: dict with ppo_norm, bc_norm, cos, ppo/bc ratio.
     Mirrors the ppo_update_batched diag_grad_norms path.
     """
     model.train()
     bc_ref.eval()
+
+    # Convert raw Trajectory objects → episode dicts via GAE
+    episodes = build_ppo_episodes(trajectories, gamma=gamma, lam=lam)
+    if not episodes:
+        raise RuntimeError("No valid episodes after build_ppo_episodes")
 
     # Collate
     temp_ctx = getattr(cfg, "temporal_context", None)
@@ -233,6 +211,8 @@ async def main():
     ap.add_argument("--no-packed", dest="packed", action="store_false")
     ap.add_argument("--json-out", default=None,
                     help="Optional path to write results JSON")
+    ap.add_argument("--procedural-teams", default="/workspace/raw_data/pokemon_usage/2024-04",
+                    help="Directory of procedural team stats (passed to ProceduralTeambuilder)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -244,6 +224,7 @@ async def main():
     print(f"[GRAD-OFFLINE] loading BC ref: {args.bc_anchor}", flush=True)
     bc_ref = load_model(args.bc_anchor, device)
 
+    teambuilder = procedural_teambuilder(args.procedural_teams, random_pct=0.05)
     print(f"[GRAD-OFFLINE] collecting {args.n_games} self-play games "
           f"(max_concurrent={args.max_concurrent}, port={args.server_port})...",
           flush=True)
@@ -253,12 +234,13 @@ async def main():
         max_concurrent=args.max_concurrent,
         server_port=args.server_port,
         snapshot_path=args.snapshot,
+        teambuilder=teambuilder,
     )
     print(f"[GRAD-OFFLINE] collected {len(episodes)} episodes", flush=True)
 
     cfg = TransformerConfig()
     result = analyze_grad_norms(
-        model=model, bc_ref=bc_ref, episodes=episodes,
+        model=model, bc_ref=bc_ref, trajectories=episodes,
         device=device, cfg=cfg,
         bc_anchor_coef=args.bc_anchor_coef,
         ent_coef=args.ent_coef, vf_coef=args.vf_coef,
