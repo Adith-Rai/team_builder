@@ -195,6 +195,12 @@ def parse_args():
                         "(activation memory is well-bounded by Python ref counting "
                         "alone). If this flag is set: faster wall but risk OOM if "
                         "memory accumulates. Test at prod before shipping.")
+    p.add_argument("--diag-grad-norms", action="store_true",
+                   help="S67-EXT observability: per-epoch grad-norm decomposition "
+                        "(PPO part vs BC anchor part) + cosine similarity. Cost: "
+                        "1 extra backward per epoch (~3-5% update wall). Use to "
+                        "diagnose whether BC anchor is mechanically dominating "
+                        "updates vs PPO objective. See project_bc_anchor_dominance_diagnosis.md.")
     p.add_argument("--bc-anchor-coef", type=float, default=0.1,
                    help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
@@ -614,6 +620,65 @@ def _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
     writer.add_scalar("train/update_time", update_time, it)
     writer.add_scalar("train/steps", steps, it)
     writer.add_scalar("train/pool_size", len(snapshot_pool), it)
+
+    # S67-EXT observability: per-epoch trajectories + Tier 2 diagnostics +
+    # (flag-gated) grad-norm decomposition. See project_bc_anchor_dominance_diagnosis.md
+    # for what each metric tells us and how to interpret results.
+    def _fmt_list(xs, fmt="{:.4f}"):
+        return "[" + ", ".join(fmt.format(x) for x in xs) + "]"
+
+    kl_traj   = loss_info.get("epoch_kl_traj", [])
+    pi_traj   = loss_info.get("epoch_pi_traj", [])
+    bc_traj   = loss_info.get("epoch_bc_kl_traj", [])
+    ent_traj  = loss_info.get("epoch_ent_traj", [])
+    if kl_traj:
+        print(f"  [TRAJ] kl/ep={_fmt_list(kl_traj)}  "
+              f"pi/ep={_fmt_list(pi_traj)}  "
+              f"bc_kl/ep={_fmt_list(bc_traj)}  "
+              f"ent/ep={_fmt_list(ent_traj, '{:.3f}')}", flush=True)
+        # TensorBoard: log first + last epoch + delta for trend monitoring
+        writer.add_scalar("train/kl_epoch_0", kl_traj[0], it)
+        writer.add_scalar("train/kl_epoch_last", kl_traj[-1], it)
+        writer.add_scalar("train/kl_epoch_delta", kl_traj[-1] - kl_traj[0], it)
+        writer.add_scalar("train/pi_epoch_0", pi_traj[0], it)
+        writer.add_scalar("train/pi_epoch_last", pi_traj[-1], it)
+        if bc_traj and bc_traj[0] > 0:
+            writer.add_scalar("train/bc_kl_epoch_0", bc_traj[0], it)
+            writer.add_scalar("train/bc_kl_epoch_last", bc_traj[-1], it)
+
+    adv_pos = loss_info.get("adv_pos_frac", None)
+    n_valid_ep = loss_info.get("n_valid_per_epoch", None)
+    rcf       = loss_info.get("ratio_clip_frac", None)
+    if adv_pos is not None and rcf is not None:
+        print(f"  [DIAG] adv_pos_frac={adv_pos:.3f}  "
+              f"n_valid_per_epoch={int(n_valid_ep) if n_valid_ep else '-'}  "
+              f"ratio_clip_frac={rcf:.4f}", flush=True)
+        writer.add_scalar("train/adv_pos_frac", adv_pos, it)
+        writer.add_scalar("train/n_valid_per_epoch", n_valid_ep or 0, it)
+        writer.add_scalar("train/ratio_clip_frac", rcf, it)
+
+    ppo_norms = loss_info.get("epoch_grad_ppo_norm_traj", [])
+    bc_norms  = loss_info.get("epoch_grad_bc_norm_traj", [])
+    cos_sims  = loss_info.get("epoch_grad_cos_traj", [])
+    if ppo_norms and bc_norms:
+        # Mean across epochs (first chunk sample per epoch)
+        mean_ppo = sum(ppo_norms) / len(ppo_norms)
+        mean_bc  = sum(bc_norms)  / len(bc_norms)
+        mean_cos = sum(cos_sims)  / len(cos_sims) if cos_sims else 0.0
+        ratio = mean_bc / max(mean_ppo, 1e-12)
+        dom_str = ("BC-DOMINATED" if ratio > 1.5 else
+                   "PPO-dominated" if ratio < 0.67 else
+                   "balanced")
+        print(f"  [GRAD] ppo_norm/ep={_fmt_list(ppo_norms, '{:.4f}')}  "
+              f"bc_norm/ep={_fmt_list(bc_norms, '{:.4f}')}  "
+              f"cos/ep={_fmt_list(cos_sims, '{:+.3f}')}", flush=True)
+        print(f"  [GRAD] mean: ppo={mean_ppo:.4f}  bc={mean_bc:.4f}  "
+              f"bc/ppo={ratio:.2f}× ({dom_str})  cos={mean_cos:+.3f}",
+              flush=True)
+        writer.add_scalar("train/grad_ppo_norm", mean_ppo, it)
+        writer.add_scalar("train/grad_bc_norm", mean_bc, it)
+        writer.add_scalar("train/grad_bc_ppo_ratio", ratio, it)
+        writer.add_scalar("train/grad_cosine", mean_cos, it)
     return wr
 
 
@@ -1300,6 +1365,7 @@ def main():
                 packed=args.packed,
                 per_chunk_gc=not args.no_per_chunk_gc,
                 in_warmup=in_warmup,  # noop in batched path; caller controls requires_grad
+                diag_grad_norms=getattr(args, 'diag_grad_norms', False),
             )
         else:
             loss_info = ppo_update(

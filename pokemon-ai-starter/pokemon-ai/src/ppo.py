@@ -1454,7 +1454,8 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                        bc_ref=None, bc_anchor_coef: float = 0.0,
                        minibatch_size: Optional[int] = None,
                        packed: bool = False,
-                       per_chunk_gc: bool = True) -> dict:
+                       per_chunk_gc: bool = True,
+                       diag_grad_norms: bool = False) -> dict:
     """Sequence-batched PPO update — Tier 3's payoff. Composes C1/C2/C3:
         collate_episodes (C1) → forward_ppo_sequence (C2) → ppo_loss_batched (C3)
     → backward → optimizer.step().
@@ -1548,7 +1549,23 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
     stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
              "ratio_clip_frac": 0.0,
              "value_mean": 0.0, "return_mean": 0.0, "adv_abs_mean": 0.0,
-             "bc_kl": 0.0}
+             "bc_kl": 0.0,
+             # S67-EXT observability: per-epoch trajectories + Tier 2 cheap
+             # diagnostics. Always-on, ~0 cost. Tier 1 #4 + Tier 3 #8 grad
+             # decomp gated by diag_grad_norms flag.
+             "adv_pos_frac": 0.0,           # frac of positions with adv > 0
+             "n_valid_per_epoch": 0.0,      # mean n_valid per epoch
+             "epoch_kl_traj": [],           # list[float], per completed epoch
+             "epoch_pi_traj": [],
+             "epoch_bc_kl_traj": [],
+             "epoch_v_traj": [],
+             "epoch_ent_traj": [],
+             "epoch_ratio_clip_traj": [],
+             "epoch_adv_pos_traj": [],
+             "epoch_grad_ppo_norm_traj": [],   # populated only if diag_grad_norms
+             "epoch_grad_bc_norm_traj": [],
+             "epoch_grad_cos_traj": [],
+             }
     n = 0                # number of epochs that ran without skip
     n_failed = 0         # epochs that raised an exception
     n_skipped_kl = 0     # epochs gated by per-batch KL check (target_kl × 5)
@@ -1765,7 +1782,16 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             chunk_stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0,
                            "ratio_clip_frac": 0.0, "value_mean": 0.0,
                            "return_mean": 0.0, "adv_abs_mean": 0.0,
-                           "bc_kl": 0.0}
+                           "bc_kl": 0.0,
+                           "adv_pos_frac": 0.0,
+                           "n_valid_per_epoch": 0.0}
+            # Per-epoch grad-norm diag (Tier 1 #4 + Tier 3 #8). Sampled on
+            # first chunk only of each epoch — 1 extra backward per epoch.
+            # Cost: ~5/(5*n_chunks) of one epoch's backwards = ~1-4% of update.
+            ep_grad_ppo_norm = 0.0
+            ep_grad_bc_norm = 0.0
+            ep_grad_cos = 0.0
+            ep_grad_diag_done = False
             chunk_failed = False
 
             for chunk_idx, chunk_eps in enumerate(chunks):
@@ -1840,8 +1866,76 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                     chunk_failed = True
                     break
 
+                # ---- S67-EXT Tier 1 #4 + Tier 3 #8: grad-norm decomposition ----
+                # Split chunk_loss = ppo_part + bc_part via linearity. Measure
+                # each gradient's L2 norm + their cosine similarity. Used to
+                # answer: "is BC anchor mechanically dominating updates over
+                # PPO objective?" Sampled on first chunk of each epoch only to
+                # keep cost ~1 extra backward per epoch (4 epoch × 1 extra
+                # backward of ~80k tokens ≈ 5-10s update overhead per iter,
+                # ~3% wall). Skipped on warmup / when BC anchor disabled.
+                if (diag_grad_norms
+                        and not ep_grad_diag_done
+                        and bc_ref is not None
+                        and bc_anchor_coef != 0.0):
+                    # Reconstruct the loss decomposition (matches _ppo_loss_*_internal).
+                    # Backward must happen on the SCALED forms so the recorded
+                    # gradients are the same that would land in .grad from a
+                    # single chunk_loss.backward().
+                    pi_t   = loss_dict["pi_loss"]
+                    ent_t  = loss_dict["entropy"]
+                    v_t    = loss_dict["v_loss"]
+                    bc_t   = loss_dict["bc_kl"]
+                    ppo_part = (pi_t - ent_coef * ent_t + vf_coef * v_t) * inv_n
+                    bc_part  = (bc_anchor_coef * bc_t) * inv_n
+
+                    # 1st backward: PPO part only (need retain_graph for 2nd).
+                    optimizer.zero_grad(set_to_none=True)
+                    ppo_part.backward(retain_graph=True)
+                    ppo_grad_sqs = []
+                    ppo_grad_clones = []
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            g = p.grad.detach().float()
+                            ppo_grad_sqs.append((g * g).sum())
+                            ppo_grad_clones.append((p, g.clone()))
+                    ep_grad_ppo_norm = float(torch.sqrt(torch.stack(ppo_grad_sqs).sum()).item()) if ppo_grad_sqs else 0.0
+
+                    # 2nd backward: BC part. Don't zero — let it add to .grad
+                    # so .grad ends up = ppo + bc = chunk_loss.backward result.
+                    # This avoids needing a 3rd backward for the real step.
+                    bc_part.backward(retain_graph=False)
+
+                    # BC contribution = (current .grad) - (saved ppo clone)
+                    bc_grad_sqs = []
+                    dot_sum = torch.zeros((), device=device, dtype=torch.float32)
+                    ppo_norm_sq_sum = torch.zeros((), device=device, dtype=torch.float32)
+                    bc_norm_sq_sum = torch.zeros((), device=device, dtype=torch.float32)
+                    for (p, ppo_g) in ppo_grad_clones:
+                        if p.grad is None:
+                            continue
+                        bc_g = p.grad.detach().float() - ppo_g
+                        bc_grad_sqs.append((bc_g * bc_g).sum())
+                        dot_sum += (ppo_g * bc_g).sum()
+                        ppo_norm_sq_sum += (ppo_g * ppo_g).sum()
+                        bc_norm_sq_sum += (bc_g * bc_g).sum()
+                    ep_grad_bc_norm = float(torch.sqrt(torch.stack(bc_grad_sqs).sum()).item()) if bc_grad_sqs else 0.0
+                    denom = (torch.sqrt(ppo_norm_sq_sum) * torch.sqrt(bc_norm_sq_sum)).clamp(min=1e-12)
+                    ep_grad_cos = float((dot_sum / denom).item())
+
+                    # Free clone memory
+                    del ppo_grad_clones, ppo_grad_sqs, bc_grad_sqs
+                    ep_grad_diag_done = True
+                    # NOTE: .grad already contains the correct chunk gradient
+                    # (ppo + bc). Skip the normal chunk_loss.backward below
+                    # via the flag — set chunk_loss to None as a marker.
+                    chunk_loss_already_backwarded = True
+                else:
+                    chunk_loss_already_backwarded = False
+
                 # Backward — gradients accumulate into model.parameters().grad
-                chunk_loss.backward()
+                if not chunk_loss_already_backwarded:
+                    chunk_loss.backward()
 
                 # S63: accumulate as TENSORS (not floats) to defer .item()
                 # syncs to epoch boundary. Profile (S62) showed ~9k .item()
@@ -1871,6 +1965,9 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + v_pred.mean() * inv_n
                         chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + returns_t.mean() * inv_n
                         chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + advantages_t.abs().mean() * inv_n
+                        # S67-EXT Tier 2 #5 + #7
+                        chunk_stats["adv_pos_frac"] = chunk_stats["adv_pos_frac"] + (advantages_t > 0).float().mean() * inv_n
+                        chunk_stats["n_valid_per_epoch"] = chunk_stats["n_valid_per_epoch"] + float(advantages_t.shape[0])  # packed: all positions valid
                     else:
                         pad_mask_f = collated["pad_mask"].to(device).float()
                         n_valid_chunk = pad_mask_f.sum().clamp(min=1.0)
@@ -1881,6 +1978,9 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                         chunk_stats["value_mean"]   = chunk_stats["value_mean"]   + ((v_pred * pad_mask_f).sum() / n_valid_chunk) * inv_n
                         chunk_stats["return_mean"]  = chunk_stats["return_mean"]  + ((returns_t * pad_mask_f).sum() / n_valid_chunk) * inv_n
                         chunk_stats["adv_abs_mean"] = chunk_stats["adv_abs_mean"] + ((advantages_t.abs() * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        # S67-EXT Tier 2 #5 + #7
+                        chunk_stats["adv_pos_frac"] = chunk_stats["adv_pos_frac"] + (((advantages_t > 0).float() * pad_mask_f).sum() / n_valid_chunk) * inv_n
+                        chunk_stats["n_valid_per_epoch"] = chunk_stats["n_valid_per_epoch"] + float(n_valid_chunk.item())
 
                 # Per-chunk memory cleanup. `del` releases Python refs so
                 # PyTorch's caching allocator can reuse the buffers next
@@ -1931,6 +2031,22 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 stats[k] += v
             n += 1
 
+            # S67-EXT: append per-epoch trajectory entries (chunk_stats has
+            # already been .item()'d above). Trajectory arrays let _log_iter
+            # surface per-epoch evolution of KL/pi/bc_kl/etc — answers
+            # "does kl saturate by epoch 2 or grow linearly?"
+            stats["epoch_kl_traj"].append(chunk_stats["kl"])
+            stats["epoch_pi_traj"].append(chunk_stats["pi"])
+            stats["epoch_bc_kl_traj"].append(chunk_stats["bc_kl"])
+            stats["epoch_v_traj"].append(chunk_stats["v"])
+            stats["epoch_ent_traj"].append(chunk_stats["ent"])
+            stats["epoch_ratio_clip_traj"].append(chunk_stats["ratio_clip_frac"])
+            stats["epoch_adv_pos_traj"].append(chunk_stats["adv_pos_frac"])
+            if diag_grad_norms and ep_grad_diag_done:
+                stats["epoch_grad_ppo_norm_traj"].append(ep_grad_ppo_norm)
+                stats["epoch_grad_bc_norm_traj"].append(ep_grad_bc_norm)
+                stats["epoch_grad_cos_traj"].append(ep_grad_cos)
+
             # KL early-stop on averaged KL
             if avg_kl > target_kl * 1.5:
                 print(f"    KL early stop (batched-mb): epoch {ppo_ep}, "
@@ -1944,8 +2060,10 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
             optimizer.zero_grad(set_to_none=True)
             continue
 
-    # Normalize stats by number of completed epochs
+    # Normalize stats by number of completed epochs (skip list trajectories)
     for k in stats:
+        if isinstance(stats[k], list):
+            continue
         stats[k] /= max(1, n)
 
     stats["n_succeeded"] = n
