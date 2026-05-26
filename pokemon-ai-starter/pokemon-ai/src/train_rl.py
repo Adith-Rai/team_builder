@@ -733,7 +733,8 @@ def _maybe_save_snapshot(it, args, model, cfg, optimizer, steps, loss_info,
 
 
 def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
-                best_eval_wr, battle_format, eval_history=None):
+                best_eval_wr, battle_format, eval_history=None,
+                snapshot_pool=None):
     """Run bot evaluation if interval reached.
 
     Returns (updated_best_eval_wr, eval_dict or None, should_stop bool).
@@ -746,7 +747,17 @@ def _maybe_eval(it, args, model, cfg, optimizer, device, writer, run_dir,
     should_stop = False
     try:
         tmp = str(run_dir / f"iter_{it:04d}.pt")
-        save_checkpoint(tmp, model, cfg, optimizer, it)
+        # S67-EXT bugfix: include snapshot_pool in metrics so resume from
+        # iter_XXXX.pt doesn't lose the pool. Previously this save site
+        # passed no metrics, so any resume from iter_XXXX.pt got an empty
+        # pool — relying on disk scan of the run dir alone (which misses
+        # snaps in other selfplay subdirs and prior-run inherited snaps).
+        # Mirrors snapshot_XXXX.pt save at line 704.
+        _iter_metrics = {}
+        if snapshot_pool is not None:
+            _iter_metrics["snapshot_pool"] = [s for s in snapshot_pool if isinstance(s, str)]
+        save_checkpoint(tmp, model, cfg, optimizer, it,
+                        metrics=_iter_metrics if _iter_metrics else None)
 
         from train_bc import eval_vs_bots
         srv_url = f"ws://127.0.0.1:{args.servers.split(',')[0].strip()}/showdown/websocket"
@@ -1477,7 +1488,8 @@ def main():
         best_eval_wr, _, should_stop = _maybe_eval(
             it, args, model, cfg, optimizer, device, writer,
             run_dir, best_eval_wr, battle_format,
-            eval_history=eval_history if args.early_stop else None)
+            eval_history=eval_history if args.early_stop else None,
+            snapshot_pool=snapshot_pool)
         if should_stop:
             print(f"\n[EARLY STOP] Terminating at iter {it}. Best snapshots saved; "
                   f"check evals registry and snapshot_*.pt files in {run_dir}.", flush=True)
