@@ -2180,17 +2180,26 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         if liveness_state is not None:
             liveness_state["n_done"] = n_done
 
+        # S67-ext: `opponent` is only defined for local + external_inprocess
+        # paths (set inside their branches). external_subprocess opps don't
+        # have a local opponent Player — the subprocess plays its own side.
+        # Guard cleanup with locals() check so external_subprocess doesn't
+        # raise UnboundLocalError on the post-dispatch cleanup.
         try:
             player.reset_battles()
-            opponent.reset_battles()
+            if 'opponent' in locals() and opponent is not None:
+                opponent.reset_battles()
         except EnvironmentError:
             pass
         try:
             _cancel_listener(player)
-            _cancel_listener(opponent)
+            if 'opponent' in locals() and opponent is not None:
+                _cancel_listener(opponent)
         except Exception:
             pass
-        del player, opponent
+        del player
+        if 'opponent' in locals():
+            del opponent
 
         # POKE_LOOP threading rule (cookbook §3j): yield wall-clock time
         # so POKE_LOOP can drain cancellations + close websockets. Skip
