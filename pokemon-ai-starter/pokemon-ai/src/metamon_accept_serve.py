@@ -382,16 +382,17 @@ def main():
     )
     agent.env_mode = "sync"
     agent.verbose = False
-    # parallel_actors = N enables N concurrent battles per subprocess via
-    # gym's AsyncVectorEnv (async multiplexing through one model, batched
-    # inference). N=4 is the documented safe ceiling: bug B in metamon's
-    # vendored poke-env 0.8.3.3 (_challenge_queue AttributeError race in
-    # _handle_challenge_request) fires at 5+ concurrent challenges per
-    # subprocess. See docs/NEXT_SESSION.md historical-bugs table.
-    # S67-ext (2026-05-27): bumped 1→4 to fix Phase 2-ext production
-    # scale fan-in (30 workers / 10 active opps = 3 workers per MM →
-    # 1-actor MM hit 5-min watchdog stall; 4-actor MM absorbs the load).
-    agent.parallel_actors = 4
+    # parallel_actors stays 1 in this wrapper. Initially tried bumping to 4
+    # to absorb 3-workers-per-MM fan-in, but amago's evaluate_test asserts
+    # len(make_envs) == parallel_actors, and each env needs a unique
+    # Showdown username/port to avoid users.set() collision in
+    # battle_server. The historical "4-slot local" architecture was 4
+    # SUBPROCESS INSTANCES on ports 9000-9003, NOT one subprocess with
+    # parallel_actors=4. So scaling concurrent battles per MM model
+    # requires multi-instance spawning (option A — manager + composition
+    # changes needed). Deferred. See docs/NEXT_SESSION.md historical
+    # bugs table for context.
+    agent.parallel_actors = 1
 
     make_envs = [
         functools.partial(
