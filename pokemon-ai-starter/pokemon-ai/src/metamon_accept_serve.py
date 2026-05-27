@@ -305,29 +305,39 @@ def main():
 
     agent_maker = get_pretrained_model(args.model)
 
-    # S67-ext (2026-05-27): if flash-attn isn't installed in metamon_venv (e.g.
-    # cu130/cu124 toolkit mismatch makes flash-attn-from-source impossible
-    # without a major env rebuild), swap in VanillaAttention via the
-    # pretrained model's base_config. VanillaAttention is mathematically
-    # equivalent to FlashAttention — same weights, identical forward output,
-    # just slower (no fused CUDA kernels). Acceptable for opponent-side
-    # inference (each Metamon decision is a single forward pass per turn,
-    # not a training loop). To re-enable flash-attn later: install flash-attn
-    # in metamon_venv and remove this patch (or guard on import success).
-    try:
-        import flash_attn  # noqa: F401
-    except ImportError:
-        from amago.nets.transformer import VanillaAttention
-        agent_maker_cls = type(agent_maker)
-        original_base_config = agent_maker_cls.base_config.fget
-        def _patched_base_config(self):
-            cfg = original_base_config(self)
-            cfg["TformerTrajEncoder.attention_type"] = VanillaAttention
-            return cfg
-        agent_maker_cls.base_config = property(_patched_base_config)
-        print(f"[metamon] flash-attn missing — falling back to VanillaAttention "
-              f"(equivalent, slower forward). To re-enable flash-attn, install in "
-              f"metamon_venv.", flush=True)
+    # S67-ext (2026-05-27): force VanillaAttention via the pretrained model's
+    # base_config. VanillaAttention is mathematically equivalent to
+    # FlashAttention — same weights, identical forward output, just slower
+    # (no fused CUDA kernels). Acceptable for opponent-side inference (each
+    # Metamon decision is a single forward pass per turn, not a training loop).
+    # Why unconditional: this pod has flash-attn install blocked by cu130/cu124
+    # toolkit mismatch. amago's `from flash_attn import flash_attn_func`
+    # actually succeeds (partial flash_attn module exists) but the function
+    # symbol is None, so the assertion `flash_attn is not None` fails. Gating
+    # on `import flash_attn` doesn't catch this; force the swap.
+    print(f"[metamon-patch] forcing VanillaAttention via base_config override...", flush=True)
+    from amago.nets.transformer import VanillaAttention
+    # Walk MRO to find the class that actually DEFINES base_config (not just
+    # inherits it). Pretrained model classes have multi-level inheritance
+    # (e.g. Minikazam → PretrainedModel) and base_config is defined on the
+    # base. We patch on the base so initialize_agent (which accesses
+    # self.base_config) picks up the override.
+    base_cfg_cls = None
+    for cls in type(agent_maker).__mro__:
+        if "base_config" in cls.__dict__:
+            base_cfg_cls = cls
+            break
+    if base_cfg_cls is None:
+        raise RuntimeError("Could not find class defining base_config in MRO of "
+                           f"{type(agent_maker).__name__}")
+    print(f"[metamon-patch] base_config defined on: {base_cfg_cls.__name__}", flush=True)
+    original_base_config = base_cfg_cls.base_config.fget
+    def _patched_base_config(self):
+        cfg = original_base_config(self)
+        cfg["TformerTrajEncoder.attention_type"] = VanillaAttention
+        return cfg
+    base_cfg_cls.base_config = property(_patched_base_config)
+    print(f"[metamon-patch] VanillaAttention bound via base_config on {base_cfg_cls.__name__}", flush=True)
 
     if args.team_queue:
         # Pop one team from a coordinator-managed queue per battle. Lets the
