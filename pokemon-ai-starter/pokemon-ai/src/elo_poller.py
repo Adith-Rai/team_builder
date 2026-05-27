@@ -70,7 +70,10 @@ N_GAMES_PER_OPP = "500"
 # conc=100/shard saves ~30% wall vs conc=50 with no GPU/BS instability on
 # RTX 3060 6GB. Total 300 concurrent games across 3 BS — well within
 # docstring example range (70-100/server).
-CONCURRENCY_PER_SHARD = "100"
+# S67 2026-05-24: bumped 100 → 250 to test further wall savings on lr3e5 run.
+# Total 750 concurrent games across 3 BS — above docstring range, treat as
+# experimental. Watch for BS stalls or OOM. Revert to 100 if unstable.
+CONCURRENCY_PER_SHARD = "250"
 BS_PORTS = [9000, 9001, 9002]  # local battle server ports for sharding
 
 POLL_INTERVAL_DEFAULT_S = 300
