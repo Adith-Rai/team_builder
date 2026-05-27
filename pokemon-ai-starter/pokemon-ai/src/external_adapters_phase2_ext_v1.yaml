@@ -16,7 +16,11 @@
 # - Minikazam: smallest baseline reference (~1M params)
 # - LargeRL: largest standard RL model
 # - SmallRLGen9Beta: gen-9 tuned specialist
-# - TaurosEnsemble: ensemble approach (different architecture style)
+# - TaurosV0: Tauros line (reached #1 on Showdown leaderboard). Different
+#   training data lineage than the SyntheticRL family — Showdown-derived
+#   aggressive playstyle. (Was TaurosEnsemble originally, but ensemble class
+#   has a broken direct HF download path — swapped to single-model member
+#   2026-05-27. Same family, orthogonal policy distribution to other 4.)
 # - SyntheticRLV2: trained on synthetic data (different data distribution)
 
 opponents:
@@ -53,9 +57,9 @@ opponents:
     temperature: 1.0
     server_port: 9000
     weight: 1.0
-  - name: mm-taurosensemble
+  - name: mm-taurosv0
     type: metamon
-    model: TaurosEnsemble
+    model: TaurosV0
     temperature: 1.0
     server_port: 9000
     weight: 1.0
