@@ -1945,7 +1945,11 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         min_batch=min(8, max_concurrent), timeout_ms=15, slot=0,
     )
     opp_batchers: Dict[str, CISInferenceBatcher] = {}
+    # S67-EXT: only LOCAL opps need a CIS batcher (loaded model in slot).
+    # External opps (subprocess) make their own decisions; we just challenge them.
     for opp_entry in opp_pool:
+        if opp_entry.get("kind", "local") != "local":
+            continue  # external — no CIS slot needed
         opp_path = opp_entry["path"]
         slot_idx = pool_slot_map.get(opp_path, 0)
         opp_batchers[opp_path] = CISInferenceBatcher(
@@ -1961,16 +1965,16 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
     async def _play_vs_opp(opp_entry: dict, n_for_opp: int):
         nonlocal n_done, total_w_count, total_l, total_ties, total_fft_w, total_fft_l
-        opp_path = opp_entry["path"]
-        batch_id = (worker_id * 100000) + (iter_n * 1000) + (hash(opp_path) % 1000)
-        opp_tb = train_tb or random_pool_teambuilder()
+        # S67-EXT CIS+EXTERNAL Tier 1: dispatch on opp kind.
+        # - kind="local" (default): existing path — V9RLPlayer opponent via CIS slot
+        # - kind="external_subprocess": opp is a separate Showdown user (FP/MM
+        #   subprocess); use player.send_challenges(username) instead of
+        #   constructing an in-process opponent.
+        kind = opp_entry.get("kind", "local")
+        opp_key = opp_entry.get("key") or opp_entry.get("path") or "unknown"
+        batch_id = (worker_id * 100000) + (iter_n * 1000) + (hash(opp_key) % 1000)
 
-        # Phase 4.3a: player goes through slot 0; opp goes through its
-        # assigned slot. If pool_slot_map didn't list this opp (or fell
-        # back to {}), we use the player batcher for opp too — preserves
-        # Phase 4.1 self-play-vs-self behavior, never silently corrupts.
-        opp_batcher = opp_batchers.get(opp_path, player_batcher)
-
+        # Training player ALWAYS uses CIS player batcher (we still need NN inference)
         player = V9RLPlayer(
             batcher=player_batcher, device=device,
             reward_shaper_cfg=rs_cfg,
@@ -1984,28 +1988,55 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             server_configuration=srv,
         )
 
-        opponent = V9RLPlayer(
-            batcher=opp_batcher, device=device,
-            reward_shaper_cfg=rs_cfg,
-            temperature=1.0,
-            turn_cap=turn_cap,
-            battle_format=battle_format,
-            team=opp_tb,
-            max_concurrent_battles=min(max_concurrent, n_for_opp),
-            account_configuration=AccountConfiguration(
-                f"CISo{worker_id}r{batch_id}", None),
-            server_configuration=srv,
-        )
-
-        try:
-            await asyncio.wait_for(
-                player.battle_against(opponent, n_battles=n_for_opp),
-                timeout=max(300, n_for_opp * 30),
+        if kind == "local":
+            opp_path = opp_entry["path"]
+            opp_tb = train_tb or random_pool_teambuilder()
+            # Phase 4.3a: opp goes through its assigned slot. If pool_slot_map
+            # didn't list this opp, we fall back to the player batcher (preserves
+            # Phase 4.1 self-play-vs-self behavior).
+            opp_batcher = opp_batchers.get(opp_path, player_batcher)
+            opponent = V9RLPlayer(
+                batcher=opp_batcher, device=device,
+                reward_shaper_cfg=rs_cfg,
+                temperature=1.0,
+                turn_cap=turn_cap,
+                battle_format=battle_format,
+                team=opp_tb,
+                max_concurrent_battles=min(max_concurrent, n_for_opp),
+                account_configuration=AccountConfiguration(
+                    f"CISo{worker_id}r{batch_id}", None),
+                server_configuration=srv,
             )
-        except asyncio.TimeoutError:
-            print(f"[cis-w{worker_id}] timeout vs {opp_path}", flush=True)
-        except Exception as e:
-            print(f"[cis-w{worker_id}] error vs {opp_path}: {e}", flush=True)
+            try:
+                await asyncio.wait_for(
+                    player.battle_against(opponent, n_battles=n_for_opp),
+                    timeout=max(300, n_for_opp * 30),
+                )
+            except asyncio.TimeoutError:
+                print(f"[cis-w{worker_id}] timeout vs {opp_key}", flush=True)
+            except Exception as e:
+                print(f"[cis-w{worker_id}] error vs {opp_key}: {e}", flush=True)
+
+        elif kind == "external_subprocess":
+            # External Showdown user (FP/MM): no in-process opponent, just
+            # send challenges to their username. The subprocess (running in
+            # its own venv) accepts and plays.
+            username = opp_entry["username"]
+            try:
+                await asyncio.wait_for(
+                    player.send_challenges(username, n_challenges=n_for_opp),
+                    timeout=max(300, n_for_opp * 30),
+                )
+            except asyncio.TimeoutError:
+                print(f"[cis-w{worker_id}] timeout vs external {opp_key} ({username})",
+                      flush=True)
+            except Exception as e:
+                print(f"[cis-w{worker_id}] error vs external {opp_key} ({username}): {e}",
+                      flush=True)
+        else:
+            print(f"[cis-w{worker_id}] WARN unknown opp kind={kind} for {opp_key}; "
+                  f"skipping", flush=True)
+            return
 
         opp_w = sum(1 for b in player.battles.values() if b.won is True
                     and player._finish_looks_real(b))
@@ -2021,7 +2052,7 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         total_ties += opp_t
         total_fft_w += opp_fft_w
         total_fft_l += opp_fft_l
-        wr_per_opp[opp_path] = {
+        wr_per_opp[opp_key] = {
             "w": opp_w, "g": opp_w + opp_l,
             "fft_w": opp_fft_w, "fft_l": opp_fft_l,
         }
@@ -2372,9 +2403,16 @@ def mp_centralized_collect_sync(
         n_slots = g["n_slots"]
         cur_paths = g["current_slot_paths"]
         pool_slot_map: Dict[str, int] = {}
-        for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
-            slot_idx = i + 1  # slots 1..K
-            pool_slot_map[opp_path] = slot_idx
+        # S67-EXT: only LOCAL opps get CIS slots (externals don't need a
+        # loaded model). Iterate snapshot_pool, allocate slots only to
+        # str entries (legacy local paths). Dict entries (external) are
+        # routed via send_challenges later, no slot needed.
+        slot_idx = 1
+        for item in snapshot_pool[:max_pool_size]:
+            if isinstance(item, str):
+                pool_slot_map[item] = slot_idx
+                slot_idx += 1
+            # else: external dict — skip slot allocation
 
         # Reload slot 0 (player) every iter — model state changes after each
         # PPO update.
@@ -2423,7 +2461,11 @@ def mp_centralized_collect_sync(
         for a in assignments:
             if a["opp"] is None:
                 continue
-            opp_dist.setdefault(a["opp"]["path"], []).append(a["n_games"])
+            # S67-EXT: use 'key' (canonical id), fallback to 'path' for backward compat
+            opp_dist.setdefault(
+                a["opp"].get("key") or a["opp"].get("path", "unknown"),
+                []
+            ).append(a["n_games"])
         dist_summary = ", ".join(
             f"{os.path.basename(p)}={sum(g)}g/{len(g)}w"
             for p, g in sorted(opp_dist.items(), key=lambda kv: -sum(kv[1]))
@@ -2716,8 +2758,12 @@ class CISBgCollector:
         n_slots = g["n_slots"]
         cur_paths = g["current_slot_paths"]
         pool_slot_map: Dict[str, int] = {}
-        for i, opp_path in enumerate(snapshot_pool[:max_pool_size]):
-            pool_slot_map[opp_path] = i + 1
+        # S67-EXT: only LOCAL opps need CIS slots (same logic as orchestrator path above)
+        _slot_idx = 1
+        for item in snapshot_pool[:max_pool_size]:
+            if isinstance(item, str):
+                pool_slot_map[item] = _slot_idx
+                _slot_idx += 1
 
         try:
             g["server"].reload_weights(weights_path, slot=0, timeout_s=60.0)
@@ -2765,7 +2811,11 @@ class CISBgCollector:
         for a in assignments:
             if a["opp"] is None:
                 continue
-            opp_dist.setdefault(a["opp"]["path"], []).append(a["n_games"])
+            # S67-EXT: use 'key' (canonical id), fallback to 'path' for backward compat
+            opp_dist.setdefault(
+                a["opp"].get("key") or a["opp"].get("path", "unknown"),
+                []
+            ).append(a["n_games"])
         dist_summary = ", ".join(
             f"{os.path.basename(p)}={sum(g)}g/{len(g)}w"
             for p, g in sorted(opp_dist.items(), key=lambda kv: -sum(kv[1]))
@@ -2939,20 +2989,64 @@ class CISBgCollector:
             f"Last reason: {last_reset_reason}")
 
 
+def _entry_key(item) -> str:
+    """S67-EXT: canonical key for an opp entry (str or dict).
+
+    For local (str): the path IS the key.
+    For external dict: explicit "key" field.
+    Used as the dict key for stats (win_rates, pool_slot_map, etc).
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return item.get("key") or item.get("path") or "unknown"
+    return str(item)
+
+
+def _entry_is_local(item) -> bool:
+    """S67-EXT: is this opp entry a local checkpoint (vs external)?"""
+    if isinstance(item, str):
+        return True
+    if isinstance(item, dict):
+        return item.get("kind", "local") == "local"
+    return False
+
+
 def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
     """Build PFSP-weighted opp_pool list for the cmd dict. Same shape as
-    mp_disk_collect's helper of the same name."""
+    mp_disk_collect's helper of the same name.
+
+    S67-EXT: handles both legacy string entries (local paths) and dict
+    entries (external opps with kind/key/username fields). Output dict
+    always has 'key' field; 'path' only for local entries; 'kind' and
+    external fields propagated for non-local.
+    """
     out = []
-    for path in snapshot_pool:
-        wr_entry = (win_rates or {}).get(path, {})
+    for item in snapshot_pool:
+        key = _entry_key(item)
+        wr_entry = (win_rates or {}).get(key, {})
         if isinstance(wr_entry, dict):
             w = wr_entry.get("w", 0)
             g = max(wr_entry.get("g", 0), 1)
             wr = w / g
+        elif isinstance(wr_entry, list) and len(wr_entry) == 2:
+            # EMA format: [ema_wins, eff_games]
+            w, g = wr_entry
+            wr = w / max(g, 1)
         else:
             wr = 0.5
         weight = (1.0 - wr) ** 2
-        out.append({"path": path, "wr": wr, "weight": weight})
+        if isinstance(item, str):
+            out.append({"kind": "local", "key": item, "path": item,
+                        "wr": wr, "weight": weight})
+        elif isinstance(item, dict):
+            # Pass through external dict, augment with wr/weight
+            entry = dict(item)  # copy
+            entry["wr"] = wr
+            entry["weight"] = weight
+            out.append(entry)
+        else:
+            raise ValueError(f"Unknown opp entry type: {type(item).__name__}")
     return out
 
 

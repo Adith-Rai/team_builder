@@ -458,13 +458,47 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                   f"({force_desc} per Phase 2 Stage 1 design)",
                   flush=True)
 
+        # S67-EXT CIS+EXTERNAL Tier 1: convert PoolEntry objects (external
+        # opps from --external-adapters) to dict format for CIS pipeline.
+        # Local entries (strings) pass through unchanged. External subprocess
+        # entries become {"kind": "external_subprocess", "key": str, "username": str}.
+        # In-process external (factory-based MCTS, Tier 2) is REJECTED here —
+        # not yet supported in CIS mode (deferred per
+        # project_cis_external_integration_design).
+        cis_pool = []
+        for item in effective_pool:
+            if isinstance(item, str):
+                cis_pool.append(item)  # local checkpoint path — unchanged
+            else:
+                # PoolEntry-like object
+                kind = getattr(item, "kind", "local")
+                if kind == "local":
+                    cis_pool.append(item.path)
+                elif getattr(item, "showdown_username", None):
+                    cis_pool.append({
+                        "kind": "external_subprocess",
+                        "key": item.key,
+                        "username": item.showdown_username,
+                    })
+                elif getattr(item, "factory", None):
+                    raise NotImplementedError(
+                        f"In-process external opp '{item.key}' (factory-based, "
+                        f"e.g. MCTS) is not supported in --cis mode (Tier 2 "
+                        f"deferred per project_cis_external_integration_design). "
+                        f"Use legacy non-CIS path or drop this entry."
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown PoolEntry: kind={kind} key={item.key}"
+                    )
+
         model.eval()
         _flow(f"starting CIS collection (n_workers={args.mp_workers})")
         cis_result = mp_centralized_collect_sync(
             model, device, server_pool,
             n_games=args.games_per_iter,
             max_concurrent=args.max_concurrent,
-            snapshot_pool=effective_pool,
+            snapshot_pool=cis_pool,
             fp16=args.fp16,
             reward_shaper_cfg=rs_cfg,
             temp_range=(args.temp_min, args.temp_max),
