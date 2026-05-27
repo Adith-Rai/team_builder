@@ -382,7 +382,16 @@ def main():
     )
     agent.env_mode = "sync"
     agent.verbose = False
-    agent.parallel_actors = 1
+    # parallel_actors = N enables N concurrent battles per subprocess via
+    # gym's AsyncVectorEnv (async multiplexing through one model, batched
+    # inference). N=4 is the documented safe ceiling: bug B in metamon's
+    # vendored poke-env 0.8.3.3 (_challenge_queue AttributeError race in
+    # _handle_challenge_request) fires at 5+ concurrent challenges per
+    # subprocess. See docs/NEXT_SESSION.md historical-bugs table.
+    # S67-ext (2026-05-27): bumped 1→4 to fix Phase 2-ext production
+    # scale fan-in (30 workers / 10 active opps = 3 workers per MM →
+    # 1-actor MM hit 5-min watchdog stall; 4-actor MM absorbs the load).
+    agent.parallel_actors = 4
 
     make_envs = [
         functools.partial(
