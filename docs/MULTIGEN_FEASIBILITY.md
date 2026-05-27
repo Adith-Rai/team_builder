@@ -48,6 +48,46 @@ Audited Session 50 continuation:
 
 ---
 
+## 🚨 PHASE 2 PREREQUISITE — encoding completeness audit (S67-EXT, 2026-05-27)
+
+**MUST be done before BC v11 retrain.** Schema changes are free during the BC retrain window; ~10× cost if added later (would invalidate v11 + all multi-gen memmap).
+
+Game state elements currently NOT encoded (or poorly encoded) that should be added:
+
+### Tier 1 — Critical (no proxy, model can't learn from observation)
+- **Substitute HP** — sub absorbs damage with no HP delta on the mon behind it; stateful damage-calc accumulation NNs are weakest at
+- **Nature** — only resulting stats encoded; can't predict "Adamant boost +Atk/-SpA" structurally; needed for team-building too
+- **EVs spread** — only final stats; can't distinguish 252/252/4 from 244/0/252 spreads; critical for team-building
+- **IVs spread** — needed for gens 1-7 Hidden Power type derivation; also for 0-IV trick room mons
+- **Tera type as own token** — currently bundled in status MLP; should be its own dedicated token
+
+### Tier 2 — Duration counters (currently flag-only)
+- Encore (3), Taunt (3), Disable (4), Yawn (1), Tailwind (3-4), Heal Block (5), Wish (1-2), Sleep (1-3), Future Sight (3)
+- Model has indirect signal via temporal stack but explicit counters save attention capacity
+
+### Tier 2 — State attributes not exposed
+- Choice lock specific move (which move is locked, not just that one is)
+- Wish HP/turn counter
+- HP exact value (own side) in addition to hp_pct
+
+### Tier 3 — Pre-computed knowledge (consider)
+- Type effectiveness matrix per active mon
+- Speed tier comparison explicit
+- Damage calc baselines per move-vs-target
+
+**Full audit + investigation methodology + cost estimate**: see [`project_encoding_audit_phase2_todo.md`](../../.claude/projects/C--Users-raiad-OneDrive-Desktop-team-builder/memory/project_encoding_audit_phase2_todo.md) in memory.
+
+**Why this matters for team building**: future team-building work needs nature + EVs visibility to reason about spreads. Without it, structural blind spot.
+
+**Decision flow at Phase 2 prep window**:
+1. Enumerate ALL Tier 1 + 2 gaps from audit memo
+2. Decide encoding format for each (dedicated token / MLP / bank)
+3. Update features.py + dataset.py + model_transformer.py + bump LOOKUP_SCHEMA_VERSION (4 → 5)
+4. Re-encode multi-gen replay corpus with full v5 schema
+5. BC v11 trains on v5 directly — no later retrofitting needed
+
+---
+
 ## What needs to be built
 
 ### A. Architectural changes (small, ~1 week)
