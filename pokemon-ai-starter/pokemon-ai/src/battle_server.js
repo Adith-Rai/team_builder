@@ -34,8 +34,40 @@ function log(...a) {
 /** @type {Map<string, {ws: WebSocket, team: string|null, displayName: string}>} toId(name) -> connection */
 const users = new Map();
 
-/** @type {Map<string, {target: string, format: string}>} challenger name -> pending */
+/** @type {Map<string, Array<{target: string, format: string}>>} challenger name -> ordered list of pending challenges.
+ *
+ * S67-ext (2026-05-27): changed from Map<sender, ONE challenge> to FIFO list.
+ * Original single-value map silently overwrote when poke-env's
+ * `send_challenges(target, n=N)` burst-fired N /challenges from same sender
+ * within milliseconds. Result: only the LATEST challenge survived in map;
+ * earlier ones never reached the target's `_challenge_queue` for /accept,
+ * leaving N-1 of the trainer's `send_challenges` waiting forever for
+ * battles that never started. Manifested as worker hangs at
+ * n_done < N after ~10 of N battles completed (race-survivors).
+ *
+ * Fix: list-per-sender. Each /challenge appends; each /accept pops FIFO
+ * (first targeting matching user). Resend loops iterate ALL entries.
+ */
 const pendingChallenges = new Map();
+
+/** Helper: append a challenge to sender's pending list. */
+function addPendingChallenge(sender, target, format) {
+    if (!pendingChallenges.has(sender)) pendingChallenges.set(sender, []);
+    pendingChallenges.get(sender).push({ target, format });
+}
+
+/** Helper: pop first pending challenge from sender that targets `wantedTarget`.
+ * Returns the challenge {target, format} or null if no match. */
+function popPendingChallenge(sender, wantedTarget) {
+    const queue = pendingChallenges.get(sender);
+    if (!queue || queue.length === 0) return null;
+    const idx = queue.findIndex(c => c.target === wantedTarget);
+    if (idx < 0) return null;
+    const challenge = queue[idx];
+    queue.splice(idx, 1);
+    if (queue.length === 0) pendingChallenges.delete(sender);
+    return challenge;
+}
 
 let battleCounter = 0;
 
@@ -281,14 +313,16 @@ function cleanupBattle(tag) {
     // for any pending challenges targeted at users who just became idle so
     // their fresh accept loop picks them up.
     for (const idle of idleUsers) {
-        for (const [challenger, challenge] of pendingChallenges) {
-            if (challenge.target !== idle) continue;
-            // |pm| only — see comment in /challenge handler for why we don't
-            // also send |updatechallenges| (poke-env puts the challenger on
-            // its `_challenge_queue` from BOTH frames, causing a double-/accept
-            // and a stale "No pending challenge" log on the second attempt).
-            sendToUser(idle, `|pm| ${challenger}| ${idle}|/challenge|${challenge.format}|||`);
-            log(`Resent pending challenge ${challenger} -> ${idle} after battle cleanup`);
+        for (const [challenger, queue] of pendingChallenges) {
+            for (const challenge of queue) {
+                if (challenge.target !== idle) continue;
+                // |pm| only — see comment in /challenge handler for why we don't
+                // also send |updatechallenges| (poke-env puts the challenger on
+                // its `_challenge_queue` from BOTH frames, causing a double-/accept
+                // and a stale "No pending challenge" log on the second attempt).
+                sendToUser(idle, `|pm| ${challenger}| ${idle}|/challenge|${challenge.format}|||`);
+                log(`Resent pending challenge ${challenger} -> ${idle} after battle cleanup`);
+            }
         }
     }
 }
@@ -393,10 +427,12 @@ function handleMessage(ws, raw) {
         // (no ws yet) and the corresponding RL player's send_challenges hangs
         // forever waiting for a battle that never starts. Same class as
         // cleanupBattle's pending-challenge resend (bug #7), but at login time.
-        for (const [challenger, challenge] of pendingChallenges) {
-            if (challenge.target !== id) continue;
-            sendTo(ws, `|pm| ${challenger}| ${id}|/challenge|${challenge.format}|||`);
-            log(`Resent pending challenge ${challenger} -> ${id} on login`);
+        for (const [challenger, queue] of pendingChallenges) {
+            for (const challenge of queue) {
+                if (challenge.target !== id) continue;
+                sendTo(ws, `|pm| ${challenger}| ${id}|/challenge|${challenge.format}|||`);
+                log(`Resent pending challenge ${challenger} -> ${id} on login`);
+            }
         }
         return;
     }
@@ -422,7 +458,7 @@ function handleMessage(ws, raw) {
         const target = toId(rest.slice(0, commaIdx).trim());
         const format = toId(rest.slice(commaIdx + 1).trim());
 
-        pendingChallenges.set(name, { target, format });
+        addPendingChallenge(name, target, format);
 
         // Send |pm|/challenge in Showdown standard format. Foul Play splits
         // this on `|` and strictly requires len == 9 with split[5] == format,
@@ -445,12 +481,11 @@ function handleMessage(ws, raw) {
 
     if (cmdBody.startsWith('/accept ')) {
         const challenger = toId(cmdBody.slice(8).trim());
-        const challenge = pendingChallenges.get(challenger);
-        if (!challenge || challenge.target !== name) {
+        const challenge = popPendingChallenge(challenger, name);
+        if (!challenge) {
             log(`No pending challenge from ${challenger} for ${name} (raw msg=${msg.slice(0,80)})`);
             return;
         }
-        pendingChallenges.delete(challenger);
 
         const p1Team = users.get(challenger) ? users.get(challenger).team : null;
         const p2Team = users.get(name) ? users.get(name).team : null;
