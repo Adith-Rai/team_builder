@@ -74,7 +74,17 @@ def _factory_pokeengine(spec: dict, _ctx: dict) -> Tuple[PoolEntry, Optional[Ext
             server_configuration=server_configuration,
         )
 
-    entry = PoolEntry(kind="external", key=name, factory=_build, weight=weight)
+    # S67-EXT: store factory_kwargs explicitly on PoolEntry so CIS mode
+    # can reconstruct the player in worker subprocesses (the factory closure
+    # itself isn't pickleable across multiprocessing boundary, but the kwargs
+    # dict is). Workers import PokeEnginePlayer directly + construct from
+    # these kwargs. See mp_centralized_collect._play_vs_opp 'external_inprocess'
+    # branch + train_rl.py CIS-pool conversion.
+    entry = PoolEntry(
+        kind="external", key=name, factory=_build, weight=weight,
+        factory_kwargs={"factory_type": "pokeengine",
+                        "search_time_ms": search_time_ms},
+    )
     return entry, None  # no subprocess to manage
 
 

@@ -2017,6 +2017,52 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             except Exception as e:
                 print(f"[cis-w{worker_id}] error vs {opp_key}: {e}", flush=True)
 
+        elif kind == "external_inprocess":
+            # S67-EXT Tier 2: in-process external opp (e.g. PokeEnginePlayer
+            # MCTS). Worker imports + constructs the opponent player directly
+            # from factory_kwargs. Same battle_against flow as local — the
+            # opponent just isn't NN-based (it uses its own internal MCTS).
+            factory_type = opp_entry.get("factory_type", "pokeengine")
+            f_kwargs = opp_entry.get("factory_kwargs", {})
+            opp_tb_local = train_tb or random_pool_teambuilder()
+            try:
+                if factory_type == "pokeengine":
+                    from pokeengine_player import PokeEnginePlayer
+                    opponent = PokeEnginePlayer(
+                        search_time_ms=int(f_kwargs.get("search_time_ms", 200)),
+                        battle_format=battle_format,
+                        team=opp_tb_local,
+                        max_concurrent_battles=min(max_concurrent, n_for_opp),
+                        account_configuration=AccountConfiguration(
+                            f"CISei{worker_id}r{batch_id}", None),
+                        server_configuration=srv,
+                    )
+                else:
+                    print(f"[cis-w{worker_id}] unknown external_inprocess "
+                          f"factory_type={factory_type} for {opp_key}; skipping",
+                          flush=True)
+                    return
+            except ImportError as e:
+                print(f"[cis-w{worker_id}] cannot import factory for {opp_key}: {e}",
+                      flush=True)
+                return
+            except Exception as e:
+                print(f"[cis-w{worker_id}] error constructing {opp_key}: {e}",
+                      flush=True)
+                return
+
+            try:
+                await asyncio.wait_for(
+                    player.battle_against(opponent, n_battles=n_for_opp),
+                    timeout=max(300, n_for_opp * 60),  # MCTS slower than NN
+                )
+            except asyncio.TimeoutError:
+                print(f"[cis-w{worker_id}] timeout vs in-process {opp_key}",
+                      flush=True)
+            except Exception as e:
+                print(f"[cis-w{worker_id}] error vs in-process {opp_key}: {e}",
+                      flush=True)
+
         elif kind == "external_subprocess":
             # External Showdown user (FP/MM): no in-process opponent, just
             # send challenges to their username. The subprocess (running in

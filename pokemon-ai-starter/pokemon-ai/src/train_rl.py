@@ -485,12 +485,27 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                         "team_queue_dir": getattr(item, "team_queue_dir", None),
                     })
                 elif getattr(item, "factory", None):
-                    raise NotImplementedError(
-                        f"In-process external opp '{item.key}' (factory-based, "
-                        f"e.g. MCTS) is not supported in --cis mode (Tier 2 "
-                        f"deferred per project_cis_external_integration_design). "
-                        f"Use legacy non-CIS path or drop this entry."
-                    )
+                    # S67-EXT Tier 2: in-process external opp (e.g. MCTS via
+                    # PokeEnginePlayer). The factory callable itself isn't
+                    # pickleable across multiprocessing boundary to CIS workers,
+                    # but the CONFIG that built it IS (just search_time_ms etc).
+                    # We attach factory_type + factory_kwargs; worker dispatches
+                    # by type. Currently only "pokeengine" supported (matches
+                    # the only external in-process adapter we have).
+                    f_kwargs = getattr(item, "factory_kwargs", {}) or {}
+                    # Infer type from factory module/name. For PokeEnginePlayer,
+                    # the closure variables we need are search_time_ms (only one
+                    # config kwarg in _factory_pokeengine).
+                    factory_type = f_kwargs.get("factory_type", "pokeengine")
+                    cis_pool.append({
+                        "kind": "external_inprocess",
+                        "key": item.key,
+                        "factory_type": factory_type,
+                        "factory_kwargs": {
+                            k: v for k, v in f_kwargs.items()
+                            if k != "factory_type"
+                        } or {"search_time_ms": 200},  # default for pokeengine
+                    })
                 else:
                     raise ValueError(
                         f"Unknown PoolEntry: kind={kind} key={item.key}"
