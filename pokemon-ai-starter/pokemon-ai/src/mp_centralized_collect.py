@@ -2604,12 +2604,54 @@ def mp_centralized_collect_sync(
 
         cmds_sent: List[int] = []
         t_start = time.time()
+        # F4 helper: extract port from a server's websocket_url
+        # (ws://host:port/showdown/websocket → port int).
+        def _server_port(srv):
+            url = getattr(srv, 'websocket_url', None) or str(srv)
+            try:
+                return int(url.split(':')[2].split('/')[0])
+            except (IndexError, ValueError):
+                return None
+        # Pre-compute port→server map for fast lookup.
+        port_to_srv = {_server_port(s): s for s in server_pool if _server_port(s) is not None}
+
         for i, wid in enumerate(alive_wids):
             assignment = assignments[i]
             worker_n = assignment["n_games"]
-            single_opp_msg = [assignment["opp"]] if assignment["opp"] is not None else []
+            opp_msg = assignment["opp"]
+
+            # Default: worker bound to server_pool[i % N] (round-robin).
             srv_idx = i % len(server_pool)
             srv = server_pool[srv_idx]
+
+            # F4 multi-port routing: if opp is a multi-instance external
+            # subprocess, pick a concrete instance for this worker and OVERRIDE
+            # the worker's server to match that instance's port. Workers and
+            # MM instances must co-locate on the same battle_server.js process
+            # (different ports = different battle_server processes with no
+            # shared state). Routing: round-robin instance by worker index.
+            if opp_msg and opp_msg.get("kind") == "external_subprocess":
+                inst_usernames = opp_msg.get("instance_usernames")
+                inst_ports = opp_msg.get("instance_ports")
+                inst_queues = opp_msg.get("instance_team_queue_dirs")
+                if inst_usernames and inst_ports:
+                    inst_idx = i % len(inst_usernames)
+                    chosen_port = inst_ports[inst_idx]
+                    chosen_srv = port_to_srv.get(chosen_port)
+                    if chosen_srv is not None:
+                        srv = chosen_srv
+                    # Bake the instance's username + queue into the per-worker
+                    # opp dict. Strip instance lists (only needed at routing).
+                    opp_msg = dict(opp_msg)
+                    opp_msg["username"] = inst_usernames[inst_idx]
+                    opp_msg["team_queue_dir"] = (
+                        inst_queues[inst_idx] if inst_queues else None
+                    )
+                    opp_msg.pop("instance_usernames", None)
+                    opp_msg.pop("instance_team_queue_dirs", None)
+                    opp_msg.pop("instance_ports", None)
+
+            single_opp_msg = [opp_msg] if opp_msg is not None else []
             srv_url = getattr(srv, 'websocket_url', None) or str(srv)
             cmd = {
                 "cmd": "collect_iter",
@@ -3249,45 +3291,23 @@ def _allocate_opps_to_workers(
             target = new_target
 
     # Step 3: per-worker assignments. For each opp, split its games among
-    # its assigned workers. S67-ext-multi-instance: if the opp dict has
-    # `instance_usernames` (external_subprocess with N subprocess instances),
-    # route each worker to a distinct instance via round-robin. Each worker
-    # gets a per-iter dict copy with the chosen instance's username +
-    # team_queue_dir baked in. The logical opp key (used for PFSP WR
-    # tracking) is preserved so battles aggregate under one record.
+    # its assigned workers. Note: instance routing for multi-instance external
+    # subprocesses is NOT done here — it's deferred to the dispatch loop
+    # (cis_iter_dispatch in this file) which has access to server_pool and
+    # can co-locate workers + MM instances on the same battle_server port
+    # (F4). Here we just pass through the logical opp dict.
     assignments: List[dict] = []
     for opp_idx in range(n_opps):
         n_w = workers_per_opp[opp_idx]
         if n_w == 0:
             continue
         opp_msg = opp_pool_msg[opp_idx]
-        instance_usernames = opp_msg.get("instance_usernames")
-        instance_queue_dirs = opp_msg.get("instance_team_queue_dirs")
         games = target[opp_idx]
         base = games // n_w
         rem = games % n_w
         for w in range(n_w):
-            if instance_usernames:
-                # Multi-instance: round-robin worker → instance. Each worker
-                # gets a per-iter copy of opp dict with instance-specific
-                # username + queue dir. cis-orch may assign more workers
-                # than instances (e.g., 5 workers, 3 instances → modulo
-                # makes 2 workers share); that's the fan-in fallback when
-                # N_workers > N_instances.
-                inst_idx = w % len(instance_usernames)
-                opp_for_worker = dict(opp_msg)
-                opp_for_worker["username"] = instance_usernames[inst_idx]
-                opp_for_worker["team_queue_dir"] = (
-                    instance_queue_dirs[inst_idx] if instance_queue_dirs else None
-                )
-                # Strip the instance lists from the per-worker dict (they're
-                # only needed at routing time; carrying them confuses logging).
-                opp_for_worker.pop("instance_usernames", None)
-                opp_for_worker.pop("instance_team_queue_dirs", None)
-            else:
-                opp_for_worker = opp_msg
             assignments.append({
-                "opp": opp_for_worker,
+                "opp": opp_msg,
                 "n_games": base + (1 if w < rem else 0),
             })
 

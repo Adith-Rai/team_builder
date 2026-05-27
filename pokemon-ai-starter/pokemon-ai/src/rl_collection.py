@@ -82,6 +82,14 @@ class PoolEntry:
     # instances — battles aggregate under one key.
     instance_usernames: Optional[List[str]] = None
     instance_team_queue_dirs: Optional[List[Optional[str]]] = None
+    # S67-ext F4 multi-port routing (2026-05-27 eve): each instance's Showdown
+    # server port. Distributed across the battle_server pool (e.g., [9000..9007])
+    # so a single battle_server.js (single-threaded Node) doesn't bottleneck
+    # under 50+ active WebSocket connections. cis-orch's dispatch loop matches
+    # each worker's server_url to its assigned instance's port (workers and
+    # MMs co-locate on the same battle_server process per iter). None means
+    # all instances share base server_port (legacy single-port behavior).
+    instance_ports: Optional[List[int]] = None
 
 
 def _coerce_entry(item: Union[str, "PoolEntry"]) -> "PoolEntry":

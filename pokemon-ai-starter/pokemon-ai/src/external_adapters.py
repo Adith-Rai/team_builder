@@ -149,15 +149,41 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
     if os.name == "nt":
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
+    # S67-ext F4 (2026-05-27 eve): distribute instances across the
+    # battle_server port pool so battle_server.js (single-threaded Node)
+    # doesn't bottleneck. ctx["available_ports"] is the full list (default
+    # [9000..9007]); ctx["_port_cursor"] is a shared counter advanced across
+    # factory calls so consecutive MMs don't collide. First instance per MM
+    # uses spec's server_port if present in available; subsequent cycle the
+    # cursor. Loose target: 15 instances / 8 ports ≈ 2 per port → battle_server
+    # WS load drops from 50+ to ~6-8 per server.
+    available_ports = ctx.get("available_ports") or [9000 + i for i in range(8)]
+    if "_port_cursor" not in ctx:
+        ctx["_port_cursor"] = 0
+
     # Build N instances. For instances=1, suffix is empty (legacy username
     # preserved for backward compat). For instances>1, suffix is "-{i}".
     spawn_specs: List[ExternalOpponent] = []
     instance_usernames: List[str] = []
     instance_team_queue_dirs: List[Optional[str]] = []
+    instance_ports: List[int] = []
     for i in range(n_instances):
         suffix = "" if n_instances == 1 else f"-{i}"
         instance_username = f"{base_username}{suffix}"
         instance_name = f"{name}{suffix}"
+        # F4 port assignment:
+        # - Legacy single-instance (n_instances=1): honor spec's server_port.
+        #   Most existing YAMLs set server_port=9000; staying on that keeps
+        #   backward compatibility for old single-MM setups.
+        # - Multi-instance: pure round-robin across available_ports via the
+        #   shared cursor. Spec's server_port is ignored to ensure balanced
+        #   distribution (otherwise all MMs cluster on the first 3 ports
+        #   because they all default to server_port=9000).
+        if n_instances == 1:
+            instance_port = server_port
+        else:
+            instance_port = available_ports[ctx["_port_cursor"] % len(available_ports)]
+            ctx["_port_cursor"] = (ctx["_port_cursor"] + 1) % len(available_ports)
 
         if use_our_teams:
             instance_queue_dir = _PROJECT_ROOT / "data" / "external_team_queue" / instance_name
@@ -171,7 +197,7 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
             str(serve_script),
             "--model", str(model),
             "--username", str(instance_username),
-            "--server-port", str(server_port),
+            "--server-port", str(instance_port),
             "--format", str(battle_format),
             "--num-battles", str(num_battles),
             "--temperature", str(temperature),
@@ -196,6 +222,7 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
         ))
         instance_usernames.append(instance_username)
         instance_team_queue_dirs.append(instance_queue_str)
+        instance_ports.append(instance_port)
 
     # Logical PoolEntry: legacy fields point at instance 0 for backward
     # compat in any code paths that don't yet know about instances.
@@ -208,6 +235,7 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
         weight=weight,
         instance_usernames=instance_usernames if n_instances > 1 else None,
         instance_team_queue_dirs=instance_team_queue_dirs if n_instances > 1 else None,
+        instance_ports=instance_ports if n_instances > 1 else None,
     )
     return pool_entry, spawn_specs
 

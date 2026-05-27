@@ -510,6 +510,11 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                         # single-instance (legacy single-subprocess) behavior.
                         "instance_usernames": getattr(item, "instance_usernames", None),
                         "instance_team_queue_dirs": getattr(item, "instance_team_queue_dirs", None),
+                        # F4 multi-port routing: per-instance ports for the
+                        # cis-orch dispatch loop to override worker server_url
+                        # so workers + MM instances co-locate on the same
+                        # battle_server process per iter.
+                        "instance_ports": getattr(item, "instance_ports", None),
                     })
                 elif getattr(item, "factory", None):
                     # S67-EXT Tier 2: in-process external opp (e.g. MCTS via
