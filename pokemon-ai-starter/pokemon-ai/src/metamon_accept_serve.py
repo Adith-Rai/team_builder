@@ -328,29 +328,44 @@ def main():
     except Exception as e:
         print(f"[metamon-patch] WARN PokeAgentPlayer injection failed: {e}", flush=True)
 
-    print(f"[metamon-patch] forcing VanillaAttention via base_config override...", flush=True)
-    from amago.nets.transformer import VanillaAttention
-    # Walk MRO to find the class that actually DEFINES base_config (not just
-    # inherits it). Pretrained model classes have multi-level inheritance
-    # (e.g. Minikazam → PretrainedModel) and base_config is defined on the
-    # base. We patch on the base so initialize_agent (which accesses
-    # self.base_config) picks up the override.
-    base_cfg_cls = None
-    for cls in type(agent_maker).__mro__:
-        if "base_config" in cls.__dict__:
-            base_cfg_cls = cls
-            break
-    if base_cfg_cls is None:
-        raise RuntimeError("Could not find class defining base_config in MRO of "
-                           f"{type(agent_maker).__name__}")
-    print(f"[metamon-patch] base_config defined on: {base_cfg_cls.__name__}", flush=True)
-    original_base_config = base_cfg_cls.base_config.fget
-    def _patched_base_config(self):
-        cfg = original_base_config(self)
-        cfg["TformerTrajEncoder.attention_type"] = VanillaAttention
-        return cfg
-    base_cfg_cls.base_config = property(_patched_base_config)
-    print(f"[metamon-patch] VanillaAttention bound via base_config on {base_cfg_cls.__name__}", flush=True)
+    # S67-ext (2026-05-27): try real flash-attn first; only fall back to
+    # VanillaAttention if flash_attn module is unavailable. With flash-attn
+    # 2.7.4.post1 + torch 2.5.1+cu121 + cu12.4 toolkit (cloud pod recipe),
+    # flash-attn loads natively and we get the fast fused kernels. The
+    # VanillaAttention fallback was needed when metamon_venv had torch
+    # 2.12+cu130 (no matching flash-attn wheel + couldn't build from source
+    # against cu12.4 toolkit). Both paths are mathematically equivalent;
+    # flash-attn is just faster (~3-5x per forward).
+    try:
+        from flash_attn import flash_attn_func as _probe_fa  # noqa: F401
+        print(f"[metamon-patch] flash-attn AVAILABLE — using native FlashAttention "
+              f"(faster forward)", flush=True)
+    except ImportError as e:
+        print(f"[metamon-patch] flash-attn unavailable ({e}) — falling back to "
+              f"VanillaAttention via base_config override (equivalent, slower)",
+              flush=True)
+        from amago.nets.transformer import VanillaAttention
+        # Walk MRO to find the class that actually DEFINES base_config (not just
+        # inherits it). Pretrained model classes have multi-level inheritance
+        # (e.g. Minikazam → PretrainedModel) and base_config is defined on the
+        # base. We patch on the base so initialize_agent (which accesses
+        # self.base_config) picks up the override.
+        base_cfg_cls = None
+        for cls in type(agent_maker).__mro__:
+            if "base_config" in cls.__dict__:
+                base_cfg_cls = cls
+                break
+        if base_cfg_cls is None:
+            raise RuntimeError("Could not find class defining base_config in MRO of "
+                               f"{type(agent_maker).__name__}")
+        print(f"[metamon-patch] base_config defined on: {base_cfg_cls.__name__}", flush=True)
+        original_base_config = base_cfg_cls.base_config.fget
+        def _patched_base_config(self):
+            cfg = original_base_config(self)
+            cfg["TformerTrajEncoder.attention_type"] = VanillaAttention
+            return cfg
+        base_cfg_cls.base_config = property(_patched_base_config)
+        print(f"[metamon-patch] VanillaAttention bound via base_config on {base_cfg_cls.__name__}", flush=True)
 
     if args.team_queue:
         # Pop one team from a coordinator-managed queue per battle. Lets the
