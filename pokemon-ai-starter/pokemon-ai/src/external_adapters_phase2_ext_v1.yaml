@@ -1,0 +1,67 @@
+# Phase 2-ext v1 external adapter pool (S67-ext, 2026-05-27).
+#
+# Design (locked with user 2026-05-27):
+# - 3 MCTS variants (search-depth diversity, in-process via PokeEnginePlayer)
+# - 5 Metamon variants (size + style diversity, subprocess)
+# - NO Foul Play this run (per user: "fp is too hard off the bat — add later")
+# - All weights = 1.0 (pure (1-WR)^2 PFSP within stratified ext sub-pool)
+#
+# Composition (with --n-ext-per-iter 5 stratified mode):
+#   10 active slots per iter:
+#     - 1 force-anchor (iter_189, init regression check)
+#     - 5 self slots: 1 forced pool[-1] + 1 random_self + 3 PFSP_self
+#     - 5 ext slots: 1 random_ext + 4 PFSP_ext (from this YAML)
+#
+# Metamon selections (5 of 40+ available, picked for diversity):
+# - Minikazam: smallest baseline reference (~1M params)
+# - LargeRL: largest standard RL model
+# - SmallRLGen9Beta: gen-9 tuned specialist
+# - TaurosEnsemble: ensemble approach (different architecture style)
+# - SyntheticRLV2: trained on synthetic data (different data distribution)
+
+opponents:
+  # ─── MCTS variants (in-process, GPU-free, fast) ──
+  - name: mcts-fast
+    type: mcts
+    search_time_ms: 100
+    weight: 1.0
+  - name: mcts-medium
+    type: mcts
+    search_time_ms: 300
+    weight: 1.0
+  - name: mcts-hard
+    type: mcts
+    search_time_ms: 1000
+    weight: 1.0
+
+  # ─── Metamon variants (subprocess, port 9000) ──
+  - name: mm-minikazam
+    type: metamon
+    model: Minikazam
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0
+  - name: mm-largerl
+    type: metamon
+    model: LargeRL
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0
+  - name: mm-smallrlgen9beta
+    type: metamon
+    model: SmallRLGen9Beta
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0
+  - name: mm-taurosensemble
+    type: metamon
+    model: TaurosEnsemble
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0
+  - name: mm-syntheticrlv2
+    type: metamon
+    model: SyntheticRLV2
+    temperature: 1.0
+    server_port: 9000
+    weight: 1.0

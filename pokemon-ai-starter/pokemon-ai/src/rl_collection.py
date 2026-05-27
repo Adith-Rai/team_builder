@@ -86,6 +86,13 @@ def _entry_key(item) -> str:
     return _coerce_entry(item).key
 
 
+def _is_external_entry(item) -> bool:
+    """True if item is an external opp (Metamon subprocess, MCTS, etc.)."""
+    if isinstance(item, str):
+        return False
+    return getattr(item, "kind", "local") != "local"
+
+
 def _make_server(ws_url: str) -> ServerConfiguration:
     ws = ws_url.strip().rstrip("/")
     if ws.isdigit():
@@ -103,22 +110,43 @@ def select_opponents_phase2_stage1(
     win_rates: Optional[Dict[str, list]] = None,
     max_n: int = 10,
     force_anchors: Optional[List[str]] = None,
+    n_ext_target: int = 0,
 ) -> List[Union[str, PoolEntry]]:
     """Phase 2 Stage 1 composition (S67 locked design, 2026-05-22).
 
-    Builds the per-iter active opponent list with explicit roles:
-      - K force-external anchors (S67-EXT): user-specified paths via --force-anchors,
-        always included every iter (e.g., terminal pure-self-play self for regression
-        detection during Phase 2 Stage 2 external-opp curriculum).
-      - 2 forced self anchors: snapshot_pool[-2] (prev) + snapshot_pool[-3] (prev-of-prev).
-        Deterministic regression detection vs ~10-20 iters back, which PFSP
-        weighting alone misses (PFSP deprioritizes opps current model beats
-        easily, hiding regressions that emerge against specific older snapshots).
-      - 2 random anchors: sampled uniformly from remaining pool
-        Anti-staleness — prevents PFSP from collapsing onto a small set.
-      - (max_n - K - 4) PFSP anchors: sampled by (1-wr)^2 weighting from remaining
-        pool. Adaptive curriculum — emphasizes opps current model finds hard.
-      = max_n (default 10) total active per iter.
+    Two modes:
+
+    (A) **Non-stratified** (n_ext_target=0, default — back-compat):
+      - K force-external anchors (S67-EXT)
+      - 2 forced self anchors: pool[-1] (latest) + pool[-2] (prev)
+        S67-ext (2026-05-27): shifted from pool[-2]/pool[-3] for stronger
+        ratchet vs most-recent self (OpenAI Five-style).
+      - 2 random anchors
+      - (max_n - K - 4) PFSP anchors
+      Single PFSP over whole pool — externals (if any) compete with self for slots.
+
+    (B) **Stratified** (n_ext_target>0, S67-ext design 2026-05-27):
+      Separates self and external sub-pools with independent random + PFSP.
+      AlphaStar-style category allocation; prevents PFSP confound between
+      self-play stability and external-opp gradient diversity objectives.
+
+      Composition:
+        - K force-anchors (S67-EXT): user-specified via --force-anchors
+        - n_ext (=min(n_ext_target, len(ext_in_pool), max_n - K - 2)) external slots:
+            * 1 random_ext (uniform from external sub-pool)
+            * (n_ext - 1) PFSP_ext ((1-WR)^2 within external sub-pool only)
+        - n_self (=max_n - K - n_ext) self slots:
+            * 1 forced self (snapshot_pool[-1] — OpenAI Five-style ratchet vs latest)
+            * 1 random_self (uniform from self sub-pool)
+            * (n_self - 2) PFSP_self ((1-WR)^2 within self sub-pool only)
+
+      pool[-1] (not pool[-2]/[-3]) is the forced self anchor: maximizes
+      ratchet pressure vs most recent saved checkpoint. Caveat: 1 iter out
+      of every snapshot_interval (right after save), pool[-1] is effectively
+      current model → minimal gradient that iter. Accepted for ratchet semantics.
+
+      Falls back to mode (A) if no external entries exist in pool (degenerate
+      stratification).
 
     Pool ordering invariant: snapshot_pool is appended chronologically. Anchors
     inserted via --pool-anchors go at positions 1..N (right after init_from) per
@@ -197,17 +225,36 @@ def select_opponents_phase2_stage1(
     if pool_size <= max_n:
         return list(snapshot_pool)
 
-    # Forced self anchors (prev + prev-of-prev). Skip duplicates with force-ext.
+    # ── Mode (B): stratified self/ext composition (S67-ext, 2026-05-27) ──
+    # Active when n_ext_target > 0 AND pool actually contains externals.
+    # Allocates self and external slots independently with per-category PFSP.
+    if n_ext_target > 0:
+        ext_in_pool = [s for s in snapshot_pool if _is_external_entry(s)]
+        if ext_in_pool:
+            return _select_stratified(
+                snapshot_pool, win_rates, max_n,
+                force_anchor_entries, force_anchor_keys, n_ext_target,
+            )
+        # else: no externals in pool → fall through to non-stratified path
+
+    # Forced self anchors: walk back from end of pool, pick last 2 SELF entries.
+    # S67-ext (2026-05-27): shifted from pool[-2]/pool[-3] to "last 2 self"
+    # for OpenAI Five-style "beat current self" ratchet. Filters externals so
+    # externals at end of pool (PoolEntry kind='external_*') aren't mis-picked
+    # as self anchors. Skip dups with force-ext.
     forced_self = []
-    if pool_size >= 3:
-        prev = snapshot_pool[-2]
-        if _entry_key(prev) not in force_anchor_keys:
-            forced_self.append(prev)
-    if pool_size >= 4:
-        prev_of_prev = snapshot_pool[-3]
-        if _entry_key(prev_of_prev) not in force_anchor_keys and \
-           _entry_key(prev_of_prev) not in {_entry_key(f) for f in forced_self}:
-            forced_self.append(prev_of_prev)
+    forced_self_keys: set = set()
+    for i in range(pool_size - 1, -1, -1):
+        cand = snapshot_pool[i]
+        if _is_external_entry(cand):
+            continue
+        ckey = _entry_key(cand)
+        if ckey in force_anchor_keys or ckey in forced_self_keys:
+            continue
+        forced_self.append(cand)
+        forced_self_keys.add(ckey)
+        if len(forced_self) >= 2:
+            break
 
     forced = force_anchor_entries + forced_self
     forced_keys = {_entry_key(f) for f in forced}
@@ -239,6 +286,89 @@ def select_opponents_phase2_stage1(
         pfsp_picks = []
 
     return forced + random_picks + pfsp_picks
+
+
+def _select_stratified(
+    snapshot_pool: List[Union[str, PoolEntry]],
+    win_rates: Optional[Dict[str, list]],
+    max_n: int,
+    force_anchor_entries: List[Union[str, PoolEntry]],
+    force_anchor_keys: set,
+    n_ext_target: int,
+) -> List[Union[str, PoolEntry]]:
+    """Stratified self/ext composition (S67-ext, AlphaStar-style category allocation).
+
+    Composition per Phase 2-ext design:
+      - K force-anchors (passed in, already validated)
+      - n_ext_eff = min(n_ext_target - K_ext, available_ext, max_n - K - 2) external slots:
+          * 1 random_ext (uniform within ext sub-pool)
+          * rest PFSP_ext ((1-WR)^2 within ext sub-pool only)
+      - n_self_eff = max_n - K - n_ext_eff self slots:
+          * 1 forced self (snapshot_pool[-1], walking back if dup with force)
+          * 1 random_self (uniform within self sub-pool)
+          * rest PFSP_self ((1-WR)^2 within self sub-pool only)
+    """
+    # Count externals already in force-anchors (subtract from target)
+    n_force_ext = sum(1 for f in force_anchor_entries if _is_external_entry(f))
+    n_force = len(force_anchor_entries)
+
+    # Split non-forced pool into self vs external
+    non_forced = [s for s in snapshot_pool if _entry_key(s) not in force_anchor_keys]
+    self_pool = [s for s in non_forced if not _is_external_entry(s)]
+    ext_pool = [s for s in non_forced if _is_external_entry(s)]
+
+    # Resolve target slot counts
+    n_ext_remaining = max(0, n_ext_target - n_force_ext)
+    n_ext = min(n_ext_remaining, len(ext_pool), max(0, max_n - n_force - 2))
+    n_self = max_n - n_force - n_ext
+
+    # === Self sub-composition: 1 forced (pool[-1]) + 1 random + (n_self - 2) PFSP ===
+    forced_self_picks = []
+    if n_self > 0:
+        # Walk back from end of snapshot_pool to find first SELF entry not in force-anchors
+        for i in range(len(snapshot_pool) - 1, -1, -1):
+            cand = snapshot_pool[i]
+            if not _is_external_entry(cand) and _entry_key(cand) not in force_anchor_keys:
+                forced_self_picks.append(cand)
+                break
+
+    forced_self_keys = {_entry_key(f) for f in forced_self_picks}
+    self_remaining = [s for s in self_pool if _entry_key(s) not in forced_self_keys]
+
+    n_self_random = min(1, max(0, n_self - len(forced_self_picks)), len(self_remaining))
+    self_random = random.sample(self_remaining, n_self_random) if n_self_random > 0 else []
+
+    self_random_keys = {_entry_key(r) for r in self_random}
+    self_for_pfsp = [s for s in self_remaining if _entry_key(s) not in self_random_keys]
+    n_self_pfsp = n_self - len(forced_self_picks) - len(self_random)
+    if n_self_pfsp > 0 and self_for_pfsp:
+        if win_rates is not None:
+            self_pfsp = pfsp_sample(self_for_pfsp, win_rates, n_self_pfsp,
+                                    uniform_frac=0.0, latest_snapshot=None)
+        else:
+            self_pfsp = random.sample(self_for_pfsp, min(n_self_pfsp, len(self_for_pfsp)))
+    else:
+        self_pfsp = []
+
+    # === Ext sub-composition: 1 random + (n_ext - 1) PFSP ===
+    n_ext_random = min(1, n_ext, len(ext_pool))
+    ext_random = random.sample(ext_pool, n_ext_random) if n_ext_random > 0 else []
+
+    ext_random_keys = {_entry_key(r) for r in ext_random}
+    ext_for_pfsp = [e for e in ext_pool if _entry_key(e) not in ext_random_keys]
+    n_ext_pfsp = n_ext - n_ext_random
+    if n_ext_pfsp > 0 and ext_for_pfsp:
+        if win_rates is not None:
+            ext_pfsp = pfsp_sample(ext_for_pfsp, win_rates, n_ext_pfsp,
+                                   uniform_frac=0.0, latest_snapshot=None)
+        else:
+            ext_pfsp = random.sample(ext_for_pfsp, min(n_ext_pfsp, len(ext_for_pfsp)))
+    else:
+        ext_pfsp = []
+
+    return (force_anchor_entries
+            + forced_self_picks + self_random + self_pfsp
+            + ext_random + ext_pfsp)
 
 
 def pfsp_sample(
@@ -343,8 +473,9 @@ async def collect_v9(
     if not snapshot_pool:
         raise ValueError("snapshot_pool must contain at least one checkpoint")
 
-    # S67 Phase 2 Stage 1 composition (2026-05-22): 2 forced anchors (prev +
-    # prev-of-prev) + 2 random + 6 PFSP = 10. Forced anchors are deterministic
+    # S67 Phase 2 Stage 1 composition (2026-05-22, updated 2026-05-27):
+    # 2 forced anchors (pool[-1] latest + pool[-2] prev) + 2 random + 6 PFSP = 10.
+    # Forced anchors are deterministic
     # regression-detection slots that PFSP weighting alone would miss. See
     # select_opponents_phase2_stage1() docstring for full rationale. Pre-S67
     # behavior was pure PFSP+latest with max_opponents=15; that path is in the

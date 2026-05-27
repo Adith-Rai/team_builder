@@ -289,6 +289,15 @@ def parse_args():
                         "checkpoint as anchor to detect regression below pure-self-play). "
                         "Each path MUST also be in --pool-anchors (or already in pool). "
                         "Limit: K force-anchors + 2 self-forced ≤ max_opponents_per_iter.")
+    p.add_argument("--n-ext-per-iter", type=int, default=0,
+                   help="S67-ext (2026-05-27): if >0, switches to STRATIFIED composition "
+                        "with this many external opponent slots per iter (AlphaStar-style "
+                        "category allocation). Composition: K force-anchors + n_ext "
+                        "(1 random_ext + rest PFSP_ext within ext sub-pool) + n_self "
+                        "(1 forced pool[-1] + 1 random_self + rest PFSP_self within self "
+                        "sub-pool). Requires pool to contain external opps (via "
+                        "--external-adapters). Default 0 = non-stratified single-PFSP. "
+                        "Phase 2-ext design: --n-ext-per-iter 5 → 5 self + 5 ext per iter.")
     p.add_argument("--pool-max-current-run", type=int, default=-1,
                    help="Cap on number of self-play snapshots from the CURRENT run "
                         "kept in the pool. When N>=0 and the current run has produced "
@@ -444,18 +453,28 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         max_opps = getattr(args, 'max_opponents_per_iter', 10)
         force_anchors_str = getattr(args, 'force_anchors', '') or ''
         force_anchors_list = [p.strip().replace("\\", "/") for p in force_anchors_str.split(",") if p.strip()] or None
+        n_ext_per_iter = getattr(args, 'n_ext_per_iter', 0)
         effective_pool = snapshot_pool
         if max_opps > 0 and len(snapshot_pool) > max_opps:
-            from rl_collection import select_opponents_phase2_stage1
+            from rl_collection import select_opponents_phase2_stage1, _is_external_entry
             effective_pool = select_opponents_phase2_stage1(
                 snapshot_pool, win_rates, max_n=max_opps,
                 force_anchors=force_anchors_list,
+                n_ext_target=n_ext_per_iter,
             )
             n_force = len(force_anchors_list) if force_anchors_list else 0
-            n_pfsp = max_opps - 2 - 2 - n_force  # 2 self-forced + 2 random
-            force_desc = f"{n_force} force-ext + 2 self-forced + 2 random + {n_pfsp} PFSP"
+            # Log composition (different shape for stratified vs non-stratified)
+            n_ext_actual = sum(1 for s in effective_pool if _is_external_entry(s))
+            n_self_actual = len(effective_pool) - n_ext_actual
+            if n_ext_per_iter > 0:
+                force_desc = (f"{n_force} force + stratified: "
+                              f"{n_self_actual} self (1 pool[-1] + 1 rand + rest PFSP) + "
+                              f"{n_ext_actual} ext (1 rand + rest PFSP)")
+            else:
+                n_pfsp = max_opps - 2 - 2 - n_force  # 2 self-forced + 2 random
+                force_desc = f"{n_force} force-ext + 2 self-forced + 2 random + {n_pfsp} PFSP"
             print(f"  [composition] pool={len(snapshot_pool)} active={len(effective_pool)} "
-                  f"({force_desc} per Phase 2 Stage 1 design)",
+                  f"({force_desc})",
                   flush=True)
 
         # S67-EXT CIS+EXTERNAL Tier 1: convert PoolEntry objects (external
