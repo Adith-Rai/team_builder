@@ -304,6 +304,31 @@ def main():
           flush=True)
 
     agent_maker = get_pretrained_model(args.model)
+
+    # S67-ext (2026-05-27): if flash-attn isn't installed in metamon_venv (e.g.
+    # cu130/cu124 toolkit mismatch makes flash-attn-from-source impossible
+    # without a major env rebuild), swap in VanillaAttention via the
+    # pretrained model's base_config. VanillaAttention is mathematically
+    # equivalent to FlashAttention — same weights, identical forward output,
+    # just slower (no fused CUDA kernels). Acceptable for opponent-side
+    # inference (each Metamon decision is a single forward pass per turn,
+    # not a training loop). To re-enable flash-attn later: install flash-attn
+    # in metamon_venv and remove this patch (or guard on import success).
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        from amago.nets.transformer import VanillaAttention
+        agent_maker_cls = type(agent_maker)
+        original_base_config = agent_maker_cls.base_config.fget
+        def _patched_base_config(self):
+            cfg = original_base_config(self)
+            cfg["TformerTrajEncoder.attention_type"] = VanillaAttention
+            return cfg
+        agent_maker_cls.base_config = property(_patched_base_config)
+        print(f"[metamon] flash-attn missing — falling back to VanillaAttention "
+              f"(equivalent, slower forward). To re-enable flash-attn, install in "
+              f"metamon_venv.", flush=True)
+
     if args.team_queue:
         # Pop one team from a coordinator-managed queue per battle. Lets the
         # main process hand us its own procedural Smogon teams so both sides
