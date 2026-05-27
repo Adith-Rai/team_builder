@@ -112,7 +112,7 @@ class AcceptChallengesOnLocal(QueueOnLocalLadder):
         server_port: int,
         opponent_username: str | None = None,
         save_trajectories_to: str | None = None,
-        save_team_results_to: str | None = None,
+        save_results_to: str | None = None,
         battle_backend: str = "metamon",
         team_preview_model=None,
     ):
@@ -133,7 +133,7 @@ class AcceptChallengesOnLocal(QueueOnLocalLadder):
             player_team_set=player_team_set,
             player_username=player_username,
             save_trajectories_to=save_trajectories_to,
-            save_team_results_to=save_team_results_to,
+            save_results_to=save_results_to,
             battle_backend=battle_backend,
             team_preview_model=team_preview_model,
             print_battle_bar=False,
