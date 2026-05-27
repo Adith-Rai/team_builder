@@ -2021,18 +2021,92 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             # External Showdown user (FP/MM): no in-process opponent, just
             # send challenges to their username. The subprocess (running in
             # its own venv) accepts and plays.
+            #
+            # S67-EXT: matches legacy rl_collection._play_one_opponent's
+            # protections (Session 42-44 bug fixes):
+            #   1. team_queue_dir enqueue (matched-source teams)
+            #   2. dispatch watchdog (5-min stall detection, 30-min hard cap)
+            #   Layer 4 (force-restart stuck subprocess) is NOT here: workers
+            #   in CIS subprocesses don't have direct access to external_manager.
+            #   Manager's monitor_thread auto-restarts DEAD subprocesses; for
+            #   STUCK subprocesses, we cancel the dispatch + skip the games
+            #   this iter. Next iter may retry; if still stuck, manager
+            #   eventually catches via its own checks.
             username = opp_entry["username"]
+            team_queue_dir = opp_entry.get("team_queue_dir")
+
+            # Layer 1: team_queue enqueue (if subprocess uses QueueTeambuilder).
+            # Pre-enqueue n_for_opp teams so subprocess plays matched-source.
+            # Uses worker's teambuilder (train_tb if set, else random_pool fallback).
+            if team_queue_dir:
+                _enq_tb = train_tb or random_pool_teambuilder()
+                try:
+                    from team_generator import enqueue_team
+                    for _ in range(n_for_opp):
+                        try:
+                            enqueue_team(team_queue_dir, _enq_tb.yield_team())
+                        except Exception as e:
+                            print(f"[cis-w{worker_id}] enqueue_team for {opp_key} failed: {e}",
+                                  flush=True)
+                            break
+                except ImportError:
+                    print(f"[cis-w{worker_id}] team_queue_dir set but team_generator not importable",
+                          flush=True)
+
+            # Layer 3: dispatch watchdog. Wrap send_challenges as task so we
+            # can monitor progress. Cancel if stalled > stall_threshold_s,
+            # absolute cap at hard_cap_s (per legacy spirit).
+            stall_threshold_s = 5 * 60      # 5 min without a single battle finishing
+            hard_cap_s = 30 * 60            # absolute max per opponent per iter
+            poll_interval_s = 15
+
+            challenge_task = asyncio.create_task(
+                player.send_challenges(username, n_challenges=n_for_opp)
+            )
+            t_start = time.time()
+            last_progress_t = t_start
+            last_completed = 0
             try:
-                await asyncio.wait_for(
-                    player.send_challenges(username, n_challenges=n_for_opp),
-                    timeout=max(300, n_for_opp * 30),
-                )
-            except asyncio.TimeoutError:
-                print(f"[cis-w{worker_id}] timeout vs external {opp_key} ({username})",
-                      flush=True)
+                while not challenge_task.done():
+                    await asyncio.sleep(poll_interval_s)
+                    if challenge_task.done():
+                        break
+                    now = time.time()
+                    completed = (player.n_won_battles + player.n_lost_battles
+                                 + player.n_tied_battles)
+                    if completed > last_completed:
+                        last_completed = completed
+                        last_progress_t = now
+                    stalled_s = now - last_progress_t
+                    elapsed_s = now - t_start
+                    if completed >= n_for_opp:
+                        break  # task wrapping up; let it finish
+                    if stalled_s >= stall_threshold_s:
+                        print(f"[cis-w{worker_id}] external {opp_key} stalled at "
+                              f"{completed}/{n_for_opp} for {int(stalled_s)}s — "
+                              f"cancelling dispatch; skipping remaining "
+                              f"{n_for_opp - completed} games this iter",
+                              flush=True)
+                        challenge_task.cancel()
+                        break
+                    if elapsed_s >= hard_cap_s:
+                        print(f"[cis-w{worker_id}] external {opp_key} exceeded "
+                              f"hard cap {hard_cap_s}s at {completed}/{n_for_opp} — "
+                              f"cancelling dispatch", flush=True)
+                        challenge_task.cancel()
+                        break
+                # Best-effort: let cancellation propagate cleanly
+                try:
+                    await asyncio.wait_for(challenge_task, timeout=10.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             except Exception as e:
                 print(f"[cis-w{worker_id}] error vs external {opp_key} ({username}): {e}",
                       flush=True)
+                try:
+                    challenge_task.cancel()
+                except Exception:
+                    pass
         else:
             print(f"[cis-w{worker_id}] WARN unknown opp kind={kind} for {opp_key}; "
                   f"skipping", flush=True)

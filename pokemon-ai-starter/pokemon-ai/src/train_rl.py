@@ -479,6 +479,10 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                         "kind": "external_subprocess",
                         "key": item.key,
                         "username": item.showdown_username,
+                        # S67-EXT: team_queue_dir tells worker to enqueue a
+                        # procedural team per challenge so subprocess plays a
+                        # matched-source team (vs its own internal team).
+                        "team_queue_dir": getattr(item, "team_queue_dir", None),
                     })
                 elif getattr(item, "factory", None):
                     raise NotImplementedError(
