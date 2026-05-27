@@ -1497,8 +1497,11 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
       epochs, clip_eps, ent_coef, vf_coef, max_grad_norm, target_kl: same
       L_max: optional cap on episode length passed to collate_episodes
       normalize_advantages: passed through to ppo_loss_batched
-      in_warmup: noop in this path (caller sets requires_grad — see S67
-        docstring section above). Kept for API compatibility with ppo_update.
+      in_warmup: used to skip the diag-grad-norms decomposition (which
+        requires a live grad path through the policy head — fails when
+        backbone is frozen). Otherwise a noop here (caller sets
+        requires_grad — see S67 docstring section above). Kept for API
+        compatibility with ppo_update.
       compiled_step: optional callable from `make_compiled_train_step`. When
         provided, dispatches to the C5 single-graph compiled train_step
         (forward+loss+backward+clip+optimizer.step in one fused graph).
@@ -1874,32 +1877,21 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 # keep cost ~1 extra backward per epoch (4 epoch × 1 extra
                 # backward of ~80k tokens ≈ 5-10s update overhead per iter,
                 # ~3% wall). Skipped on warmup / when BC anchor disabled.
-                # S67-ext bugfix (2026-05-27): also gate on backbone being
-                # unfrozen. During warmup, train_rl.py sets requires_grad=False
-                # on backbone (only value_head trains). bc_kl comes from a
-                # softmax of model action_logits whose entire grad path goes
-                # through the frozen backbone → bc_part has no grad_fn →
-                # backward would raise RuntimeError "element 0 of tensors does
-                # not require grad". Same for ppo_part (pi_loss has no grad).
-                # Skip diag when grad path is dead — decomposition is
-                # meaningless when only value_head trains anyway.
-                # Caught Era 4 FATAL on iter 0 (lr8e5_v1, warmup-iters=20).
-                _do_grad_diag = False
+                # S67-ext bugfix (2026-05-27): skip diag-grad-norms during
+                # warmup. During warmup train_rl.py freezes the backbone
+                # (param.requires_grad=False on everything except value_head).
+                # bc_kl flows through the frozen policy head → no grad_fn →
+                # bc_part.backward() raises "element 0 of tensors does not
+                # require grad". Same for pi_loss. The decomposition is
+                # mechanically meaningless during warmup anyway — only
+                # value_head trains, so there's no ppo-vs-bc gradient battle
+                # to measure. Caught Era 4 FATAL on iter 0 (lr8e5_v1,
+                # warmup-iters=20).
                 if (diag_grad_norms
                         and not ep_grad_diag_done
+                        and not in_warmup
                         and bc_ref is not None
                         and bc_anchor_coef != 0.0):
-                    # Quick probe: does loss_dict["bc_kl"] have a grad_fn?
-                    # If not, we're in warmup (or some other frozen-backbone
-                    # state) — skip this iter's diag rather than crash.
-                    if loss_dict["bc_kl"].grad_fn is not None and \
-                       loss_dict["pi_loss"].grad_fn is not None:
-                        _do_grad_diag = True
-                    else:
-                        # Mark done so we don't retry every chunk this epoch.
-                        ep_grad_diag_done = True
-
-                if _do_grad_diag:
                     # Reconstruct the loss decomposition (matches _ppo_loss_*_internal).
                     # Backward must happen on the SCALED forms so the recorded
                     # gradients are the same that would land in .grad from a
