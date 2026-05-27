@@ -88,23 +88,35 @@ def _factory_pokeengine(spec: dict, _ctx: dict) -> Tuple[PoolEntry, Optional[Ext
     return entry, None  # no subprocess to manage
 
 
-def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent]:
+def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpponent]]:
     """Subprocess adapter — spawns metamon_accept_serve.py in metamon_venv.
 
-    Returns (PoolEntry pointing at the subprocess's Showdown username,
-    ExternalOpponent describing how to spawn/supervise it). The caller wires
-    the ExternalOpponent into a manager that handles spawn + auto-restart.
+    Returns (PoolEntry with logical opp metadata + per-instance usernames,
+    List[ExternalOpponent] — one spawn spec per instance). The caller wires
+    each ExternalOpponent into a manager that handles spawn + auto-restart.
+
+    S67-ext-multi-instance (2026-05-27): YAML `instances: N` (default 1)
+    spawns N independent subprocesses, each its own username and team queue
+    dir (e.g., MM-Minikazam-0, MM-Minikazam-1, ...). This solves the
+    Phase 2-ext production scale fan-in: with 3 workers per logical MM,
+    1 subprocess (parallel_actors=1) becomes a serial bottleneck. N=3
+    instances absorbs all 3 workers with no queue depth. cis-orch picks
+    one instance per worker at iter-start, round-robin within the same
+    logical opp. PFSP win-rate stays under the logical key (battles
+    aggregate). For instances=1 (default), behavior is identical to
+    the pre-multi-instance path.
     """
     name = spec["__name__"]
     weight = spec["__weight__"]
     model = spec.get("model", "Minikazam")
-    showdown_username = spec.get("showdown_username") or f"MM-{model}"
+    base_username = spec.get("showdown_username") or f"MM-{model}"
     team_set = spec.get("team_set", "competitive")
     temperature = float(spec.get("temperature", 1.0))
     checkpoint = spec.get("checkpoint")  # int or None
     battle_format = spec.get("format", "gen9ou")
     server_port = int(spec.get("server_port", ctx.get("default_server_port", 9000)))
     num_battles = int(spec.get("num_battles", 100000))
+    n_instances = max(1, int(spec.get("instances", 1)))
 
     venv_python = (
         _PROJECT_ROOT / "metamon_venv" / "Scripts" / "python.exe"
@@ -122,70 +134,82 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent
         raise FileNotFoundError(f"metamon_accept_serve.py missing at {serve_script}")
 
     log_dir = _PROJECT_ROOT / "logs" / "external"
-    log_path = log_dir / f"{name}.log"
 
     # Coordinator-managed team queue. We hand Metamon our procedural Smogon
     # teams per battle so both sides match per-game without sharing process
     # state. Set to a unique-per-name dir so multiple Metamon variants don't
     # collide. `use_our_teams: false` in the YAML reverts to metamon's static
-    # team set (legacy behavior, useful for verifying the ladder rating side
-    # without our team distribution).
+    # team set.
     use_our_teams = bool(spec.get("use_our_teams", True))
-    if use_our_teams:
-        team_queue_dir = _PROJECT_ROOT / "data" / "external_team_queue" / name
-        team_queue_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        team_queue_dir = None
-
-    cmd = [
-        str(venv_python),
-        str(serve_script),
-        "--model", str(model),
-        "--username", str(showdown_username),
-        "--server-port", str(server_port),
-        "--format", str(battle_format),
-        "--num-battles", str(num_battles),
-        "--temperature", str(temperature),
-    ]
-    if team_queue_dir is not None:
-        cmd += ["--team-queue", str(team_queue_dir)]
-    else:
-        cmd += ["--team-set", str(team_set)]
-    if checkpoint is not None:
-        cmd += ["--checkpoint", str(int(checkpoint))]
 
     # Pass env vars the subprocess needs (cache dir + version-check bypass)
     metamon_cache = os.environ.get("METAMON_CACHE_DIR") or str(_PROJECT_ROOT / "metamon_cache")
-    os.environ["METAMON_CACHE_DIR"] = metamon_cache  # for completeness; subprocess inherits
+    os.environ["METAMON_CACHE_DIR"] = metamon_cache
     Path(metamon_cache).mkdir(parents=True, exist_ok=True)
-
-    # Disable torch.compile / dynamo. Metamon's amago integration tries to
-    # torch.compile the policy on first inference, which requires Triton.
-    # Triton has no Windows wheels, so the compile fails and the agent crashes
-    # before its first move. Eager mode is fine — Minikazam is 4.7M params,
-    # CPU/GPU eager is plenty fast for our throughput.
     if os.name == "nt":
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
-    spawn_spec = ExternalOpponent(
-        name=name,
-        showdown_username=showdown_username,
-        command=cmd,
-        cwd=None,  # absolute paths in cmd, no cwd needed
-        venv=None,
-        auto_restart=True,
-        log_file=str(log_path),
-        description=f"Metamon {model} (in metamon_venv subprocess)",
-    )
+    # Build N instances. For instances=1, suffix is empty (legacy username
+    # preserved for backward compat). For instances>1, suffix is "-{i}".
+    spawn_specs: List[ExternalOpponent] = []
+    instance_usernames: List[str] = []
+    instance_team_queue_dirs: List[Optional[str]] = []
+    for i in range(n_instances):
+        suffix = "" if n_instances == 1 else f"-{i}"
+        instance_username = f"{base_username}{suffix}"
+        instance_name = f"{name}{suffix}"
 
+        if use_our_teams:
+            instance_queue_dir = _PROJECT_ROOT / "data" / "external_team_queue" / instance_name
+            instance_queue_dir.mkdir(parents=True, exist_ok=True)
+            instance_queue_str: Optional[str] = str(instance_queue_dir)
+        else:
+            instance_queue_str = None
+
+        cmd = [
+            str(venv_python),
+            str(serve_script),
+            "--model", str(model),
+            "--username", str(instance_username),
+            "--server-port", str(server_port),
+            "--format", str(battle_format),
+            "--num-battles", str(num_battles),
+            "--temperature", str(temperature),
+        ]
+        if instance_queue_str is not None:
+            cmd += ["--team-queue", instance_queue_str]
+        else:
+            cmd += ["--team-set", str(team_set)]
+        if checkpoint is not None:
+            cmd += ["--checkpoint", str(int(checkpoint))]
+
+        log_path = log_dir / f"{instance_name}.log"
+        spawn_specs.append(ExternalOpponent(
+            name=instance_name,
+            showdown_username=instance_username,
+            command=cmd,
+            cwd=None,
+            venv=None,
+            auto_restart=True,
+            log_file=str(log_path),
+            description=f"Metamon {model} instance {i+1}/{n_instances} (subprocess)",
+        ))
+        instance_usernames.append(instance_username)
+        instance_team_queue_dirs.append(instance_queue_str)
+
+    # Logical PoolEntry: legacy fields point at instance 0 for backward
+    # compat in any code paths that don't yet know about instances.
+    # Multi-instance routing uses instance_usernames + instance_team_queue_dirs.
     pool_entry = PoolEntry(
         kind="external",
         key=name,
-        showdown_username=showdown_username,
-        team_queue_dir=str(team_queue_dir) if team_queue_dir else None,
+        showdown_username=instance_usernames[0],
+        team_queue_dir=instance_team_queue_dirs[0],
         weight=weight,
+        instance_usernames=instance_usernames if n_instances > 1 else None,
+        instance_team_queue_dirs=instance_team_queue_dirs if n_instances > 1 else None,
     )
-    return pool_entry, spawn_spec
+    return pool_entry, spawn_specs
 
 
 def _factory_foulplay(spec: dict, ctx: dict) -> Tuple[PoolEntry, ExternalOpponent]:
@@ -312,11 +336,20 @@ def load_pool_entries(
             continue
 
         entries.append(entry)
-        if spawn_spec is not None:
+        # S67-ext-multi-instance: factory may return a single ExternalOpponent
+        # (legacy single-subprocess), a list of N (multi-instance), or None
+        # (in-process adapter, no subprocess needed). Normalize to a flat list.
+        if spawn_spec is None:
+            n_subprocs = 0
+        elif isinstance(spawn_spec, list):
+            spawn_specs.extend(spawn_spec)
+            n_subprocs = len(spawn_spec)
+        else:
             spawn_specs.append(spawn_spec)
+            n_subprocs = 1
         logger.info("Loaded external adapter: %s (%s, weight=%.2f, %s)",
                     name, kind, weight,
-                    "subprocess" if spawn_spec else "in-process")
+                    f"{n_subprocs} subprocess(es)" if n_subprocs else "in-process")
 
     manager: Optional[ExternalOpponentManager] = None
     if spawn_specs:

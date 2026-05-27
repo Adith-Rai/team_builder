@@ -3249,18 +3249,45 @@ def _allocate_opps_to_workers(
             target = new_target
 
     # Step 3: per-worker assignments. For each opp, split its games among
-    # its assigned workers.
+    # its assigned workers. S67-ext-multi-instance: if the opp dict has
+    # `instance_usernames` (external_subprocess with N subprocess instances),
+    # route each worker to a distinct instance via round-robin. Each worker
+    # gets a per-iter dict copy with the chosen instance's username +
+    # team_queue_dir baked in. The logical opp key (used for PFSP WR
+    # tracking) is preserved so battles aggregate under one record.
     assignments: List[dict] = []
     for opp_idx in range(n_opps):
         n_w = workers_per_opp[opp_idx]
         if n_w == 0:
             continue
+        opp_msg = opp_pool_msg[opp_idx]
+        instance_usernames = opp_msg.get("instance_usernames")
+        instance_queue_dirs = opp_msg.get("instance_team_queue_dirs")
         games = target[opp_idx]
         base = games // n_w
         rem = games % n_w
         for w in range(n_w):
+            if instance_usernames:
+                # Multi-instance: round-robin worker → instance. Each worker
+                # gets a per-iter copy of opp dict with instance-specific
+                # username + queue dir. cis-orch may assign more workers
+                # than instances (e.g., 5 workers, 3 instances → modulo
+                # makes 2 workers share); that's the fan-in fallback when
+                # N_workers > N_instances.
+                inst_idx = w % len(instance_usernames)
+                opp_for_worker = dict(opp_msg)
+                opp_for_worker["username"] = instance_usernames[inst_idx]
+                opp_for_worker["team_queue_dir"] = (
+                    instance_queue_dirs[inst_idx] if instance_queue_dirs else None
+                )
+                # Strip the instance lists from the per-worker dict (they're
+                # only needed at routing time; carrying them confuses logging).
+                opp_for_worker.pop("instance_usernames", None)
+                opp_for_worker.pop("instance_team_queue_dirs", None)
+            else:
+                opp_for_worker = opp_msg
             assignments.append({
-                "opp": opp_pool_msg[opp_idx],
+                "opp": opp_for_worker,
                 "n_games": base + (1 if w < rem else 0),
             })
 

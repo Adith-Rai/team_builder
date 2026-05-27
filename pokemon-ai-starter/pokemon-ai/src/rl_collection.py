@@ -72,6 +72,16 @@ class PoolEntry:
     # "this subprocess uses its own internal team source" (legacy behavior).
     team_queue_dir: Optional[str] = None
     weight: float = 1.0
+    # S67-ext-multi-instance (2026-05-27): for external_subprocess opps that
+    # spawn N subprocess INSTANCES (each its own username + team_queue_dir),
+    # this lists the per-instance metadata. Cis-orch picks one instance per
+    # worker at iter-start (round-robin), so N workers playing this logical
+    # opp route to N different instances → no fan-in to a single subprocess.
+    # None for legacy single-instance setups or non-subprocess entries.
+    # The logical opp's key (used for PFSP WR tracking) is preserved across
+    # instances — battles aggregate under one key.
+    instance_usernames: Optional[List[str]] = None
+    instance_team_queue_dirs: Optional[List[Optional[str]]] = None
 
 
 def _coerce_entry(item: Union[str, "PoolEntry"]) -> "PoolEntry":

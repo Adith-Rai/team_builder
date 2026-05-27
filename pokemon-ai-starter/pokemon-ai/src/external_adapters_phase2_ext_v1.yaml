@@ -12,6 +12,14 @@
 #     - 5 self slots: 1 forced pool[-1] + 1 random_self + 3 PFSP_self
 #     - 5 ext slots: 1 random_ext + 4 PFSP_ext (from this YAML)
 #
+# S67-ext-multi-instance (2026-05-27): each MM has instances=3. At 30 workers
+# / 10 active opps = 3 workers per opp. With 3 instances per MM, cis-orch
+# routes each of those 3 workers to a distinct subprocess → no fan-in to
+# a single subprocess (each instance handles 1 battle at a time, perfect
+# 1:1 match). PFSP win-rate aggregates across instances under the logical
+# opp key (e.g., "mm-minikazam"). 5 MMs × 3 instances = 15 MM subprocesses
+# alive total — fits comfortably on A100 80GB (each MM is ~5-50M params).
+#
 # Metamon selections (5 of 40+ available, picked for diversity):
 # - Minikazam: smallest baseline reference (~1M params)
 # - LargeRL: largest standard RL model
@@ -46,27 +54,32 @@ opponents:
     temperature: 1.0
     server_port: 9000
     weight: 1.0
+    instances: 3
   - name: mm-largerl
     type: metamon
     model: LargeRL
     temperature: 1.0
     server_port: 9000
     weight: 1.0
+    instances: 3
   - name: mm-smallrlgen9beta
     type: metamon
     model: SmallRLGen9Beta
     temperature: 1.0
     server_port: 9000
     weight: 1.0
+    instances: 3
   - name: mm-mediumrl-aug
     type: metamon
     model: MediumRL_Aug
     temperature: 1.0
     server_port: 9000
     weight: 1.0
+    instances: 3
   - name: mm-syntheticrlv2
     type: metamon
     model: SyntheticRLV2
     temperature: 1.0
     server_port: 9000
     weight: 1.0
+    instances: 3

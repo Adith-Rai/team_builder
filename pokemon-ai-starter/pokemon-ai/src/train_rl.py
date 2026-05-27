@@ -502,6 +502,14 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                         # procedural team per challenge so subprocess plays a
                         # matched-source team (vs its own internal team).
                         "team_queue_dir": getattr(item, "team_queue_dir", None),
+                        # S67-ext-multi-instance: per-instance metadata for
+                        # opps that spawn N subprocess instances. cis-orch's
+                        # _allocate_opps_to_workers picks one instance per
+                        # worker (round-robin), baking a concrete instance
+                        # username into each worker's assignment. None means
+                        # single-instance (legacy single-subprocess) behavior.
+                        "instance_usernames": getattr(item, "instance_usernames", None),
+                        "instance_team_queue_dirs": getattr(item, "instance_team_queue_dirs", None),
                     })
                 elif getattr(item, "factory", None):
                     # S67-EXT Tier 2: in-process external opp (e.g. MCTS via
