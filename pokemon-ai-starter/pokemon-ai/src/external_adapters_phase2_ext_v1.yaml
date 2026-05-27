@@ -16,11 +16,12 @@
 # - Minikazam: smallest baseline reference (~1M params)
 # - LargeRL: largest standard RL model
 # - SmallRLGen9Beta: gen-9 tuned specialist
-# - TaurosV0: Tauros line (reached #1 on Showdown leaderboard). Different
-#   training data lineage than the SyntheticRL family — Showdown-derived
-#   aggressive playstyle. (Was TaurosEnsemble originally, but ensemble class
-#   has a broken direct HF download path — swapped to single-model member
-#   2026-05-27. Same family, orthogonal policy distribution to other 4.)
+# - MediumRL_Aug: medium-sized RL with augmentation. Fills the missing
+#   "medium" tier between Minikazam (small) and LargeRL (large). RL training
+#   with data augmentation (different from baseline RL). Orthogonal to other 4.
+#   (Was TaurosV0 originally but its gin config hardcodes @FlashAttention +
+#   windowed attention which our VanillaAttention swap can't substitute —
+#   would require actual flash-attn install. Swapped 2026-05-27.)
 # - SyntheticRLV2: trained on synthetic data (different data distribution)
 
 opponents:
@@ -57,9 +58,9 @@ opponents:
     temperature: 1.0
     server_port: 9000
     weight: 1.0
-  - name: mm-taurosv0
+  - name: mm-mediumrl-aug
     type: metamon
-    model: TaurosV0
+    model: MediumRL_Aug
     temperature: 1.0
     server_port: 9000
     weight: 1.0

@@ -315,6 +315,19 @@ def main():
     # actually succeeds (partial flash_attn module exists) but the function
     # symbol is None, so the assertion `flash_attn is not None` fails. Gating
     # on `import flash_attn` doesn't catch this; force the swap.
+    # Library bug patch: metamon.env.wrappers references PokeAgentPlayer
+    # (line 312) but never imports it. Inject the missing binding so
+    # battle_backend='pokeagent' models (Minikazam, SmallRLGen9Beta, etc.)
+    # don't crash with NameError. Idempotent — no-op if already bound.
+    try:
+        import metamon.env.wrappers as _wrappers_mod
+        if not hasattr(_wrappers_mod, "PokeAgentPlayer"):
+            from metamon.env.metamon_player import PokeAgentPlayer as _PAP
+            _wrappers_mod.PokeAgentPlayer = _PAP
+            print(f"[metamon-patch] injected PokeAgentPlayer binding into metamon.env.wrappers", flush=True)
+    except Exception as e:
+        print(f"[metamon-patch] WARN PokeAgentPlayer injection failed: {e}", flush=True)
+
     print(f"[metamon-patch] forcing VanillaAttention via base_config override...", flush=True)
     from amago.nets.transformer import VanillaAttention
     # Walk MRO to find the class that actually DEFINES base_config (not just
