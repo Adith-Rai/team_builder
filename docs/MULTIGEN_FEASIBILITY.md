@@ -48,6 +48,29 @@ Audited Session 50 continuation:
 
 ---
 
+## 📊 S67-EXT findings on the self-play ceiling (2026-05-27)
+
+Important context for any future Phase 2 planning. Diversity + vf=0.5 training arc (iters 89-219) revealed:
+
+- **Real but modest H2H improvement** vs old peak `rl_v10_1600g_iter39`: 8 of 11 of our snapshots win at 51-54% WR
+- **Absolute ladder ceiling essentially unchanged**: 1179 → 1180 max Elo across the arc
+- **Diversity expanded the pool HORIZONTALLY** (more 1170+ peers) **not VERTICALLY** (ceiling didn't rise)
+- **Classic Nash-equilibrium convergent self-play signature**
+
+**What's been REFUTED at the ceiling** (don't retry without new evidence):
+- lr ablation (3e-5 worse, 1e-5 stable at ceiling)
+- vf_coef ablation (0.5 marginally worse than 1.0)
+- bc_anchor coef reduction (0.05 anneal failed)
+- More PPO epochs (per-epoch trajectory flat)
+
+**What's UNTESTED**: external opponents (Metamon, MCTS). These don't co-evolve with us, can apply genuine pressure, and are the deferred Phase 2 work per [`EXTERNAL_OPPONENTS_PHASE2.md`](EXTERNAL_OPPONENTS_PHASE2.md).
+
+**Implication for multi-gen planning**: any new self-play recipe is likely to hit a similar convergent ceiling. The path to genuine strength push is external opps + (eventually) human ladder validation. Multi-gen on top of pure self-play won't break this pattern by itself.
+
+Full audit: see `project_self_play_convergence_pattern_s67ext` in memory.
+
+---
+
 ## 🚨 PHASE 2 PREREQUISITE — encoding completeness audit (S67-EXT, 2026-05-27)
 
 **MUST be done before BC v11 retrain.** Schema changes are free during the BC retrain window; ~10× cost if added later (would invalidate v11 + all multi-gen memmap).
