@@ -914,8 +914,10 @@ def _add_to_existing(args):
             game_counts[(a.name, b.name)] = r["total"]
             game_counts[(b.name, a.name)] = r["total"]
             completed += 1
-            _log(f"  -> {r['p1_wins']}-{r['p2_wins']} (ties:{r['ties']}) "
-                 f"| {r['p1_wr']:.0%} | {r['elapsed']:.0f}s")
+            # S67-EXT readability: label matchup explicitly so interleaved
+            # shard logs are unambiguous. Format: "[A vs B] A_wins-B_wins (ties) | A WR=X% | elapsed"
+            _log(f"  -> [{a.name} vs {b.name}] {r['p1_wins']}-{r['p2_wins']} (ties:{r['ties']}) "
+                 f"| {a.name} WR={r['p1_wr']:.0%} | {r['elapsed']:.0f}s")
             append_match_to_jsonl(jsonl_path, r)
     finally:
         _log(f"=== Done: {completed} new matchups in {(time.time()-t_start)/60:.1f}m ===")
@@ -1286,8 +1288,10 @@ def main():
             games[(a.name, b.name)] = r["total"]
             games[(b.name, a.name)] = r["total"]
             completed_this_session += 1
-            _log(f"  -> {r['p1_wins']}-{r['p2_wins']} (ties:{r['ties']}) "
-                 f"| {r['p1_wr']:.0%} | {r['elapsed']:.0f}s")
+            # S67-EXT readability: label matchup explicitly so interleaved
+            # shard logs are unambiguous. Format: "[A vs B] A_wins-B_wins (ties) | A WR=X% | elapsed"
+            _log(f"  -> [{a.name} vs {b.name}] {r['p1_wins']}-{r['p2_wins']} (ties:{r['ties']}) "
+                 f"| {a.name} WR={r['p1_wr']:.0%} | {r['elapsed']:.0f}s")
 
             # Incremental save — append to JSONL immediately
             append_match_to_jsonl(jsonl_path, r)
