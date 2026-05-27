@@ -1874,10 +1874,32 @@ def ppo_update_batched(model, optimizer, episodes, device, cfg,
                 # keep cost ~1 extra backward per epoch (4 epoch × 1 extra
                 # backward of ~80k tokens ≈ 5-10s update overhead per iter,
                 # ~3% wall). Skipped on warmup / when BC anchor disabled.
+                # S67-ext bugfix (2026-05-27): also gate on backbone being
+                # unfrozen. During warmup, train_rl.py sets requires_grad=False
+                # on backbone (only value_head trains). bc_kl comes from a
+                # softmax of model action_logits whose entire grad path goes
+                # through the frozen backbone → bc_part has no grad_fn →
+                # backward would raise RuntimeError "element 0 of tensors does
+                # not require grad". Same for ppo_part (pi_loss has no grad).
+                # Skip diag when grad path is dead — decomposition is
+                # meaningless when only value_head trains anyway.
+                # Caught Era 4 FATAL on iter 0 (lr8e5_v1, warmup-iters=20).
+                _do_grad_diag = False
                 if (diag_grad_norms
                         and not ep_grad_diag_done
                         and bc_ref is not None
                         and bc_anchor_coef != 0.0):
+                    # Quick probe: does loss_dict["bc_kl"] have a grad_fn?
+                    # If not, we're in warmup (or some other frozen-backbone
+                    # state) — skip this iter's diag rather than crash.
+                    if loss_dict["bc_kl"].grad_fn is not None and \
+                       loss_dict["pi_loss"].grad_fn is not None:
+                        _do_grad_diag = True
+                    else:
+                        # Mark done so we don't retry every chunk this epoch.
+                        ep_grad_diag_done = True
+
+                if _do_grad_diag:
                     # Reconstruct the loss decomposition (matches _ppo_loss_*_internal).
                     # Backward must happen on the SCALED forms so the recorded
                     # gradients are the same that would land in .grad from a
