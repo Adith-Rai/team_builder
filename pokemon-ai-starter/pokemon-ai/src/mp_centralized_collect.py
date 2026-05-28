@@ -3229,6 +3229,14 @@ def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
 # Per-game estimates are calibrated from smoke v9 (mcts-hard worker wall =
 # 23 min for 53 games ≈ 26s/game) and only need ordinal accuracy.
 _SLOW_OPP_THRESHOLD_S = 20.0
+# Within speed-aware mode, cap self-play opps at this many workers each. SP
+# wall is dominated by battle length (~10 min), not per-game cost — adding
+# workers to SP doesn't reduce wall because each worker already runs 50+
+# concurrent battles via asyncio.gather, sharing CIS inference. Capping SP
+# frees workers for slow opps (mcts-hard) that DO scale linearly with worker
+# count. Only applied when speed-aware mode is active; in normal iters SP
+# gets the usual 3 workers per opp like everyone else.
+_SP_CAP_IN_SPEED_AWARE = 2
 
 
 def _estimate_per_game_seconds(opp_msg: dict) -> float:
@@ -3309,12 +3317,58 @@ def _allocate_opps_to_workers(
         [target[i] * per_game_s[i] for i in range(n_opps)] if has_slow_opp
         else list(target)
     )
+    # Per-opp worker cap in speed-aware mode:
+    #   - SP (kind='local'): cap at _SP_CAP_IN_SPEED_AWARE (asyncio.gather
+    #     concurrency means more workers don't reduce wall).
+    #   - MM/FP (kind='external_subprocess'): cap at instance count from
+    #     'instance_ports' field. Adding workers beyond instance count
+    #     forces multiple workers to share a single subprocess, undoing
+    #     the multi-instance fan-out (S67 instances=N design).
+    #   - MCTS (kind='external_inprocess'): no cap (in-process, scales
+    #     with CPU which we don't model directly).
+    #   - In NON-speed-aware mode, no caps apply — legacy 3w/opp behavior.
+    def _worker_cap(i: int) -> Optional[int]:
+        if not has_slow_opp:
+            return None
+        kind = opp_pool_msg[i].get("kind", "local")
+        if kind == "local":
+            return _SP_CAP_IN_SPEED_AWARE
+        if kind == "external_subprocess":
+            inst_ports = opp_pool_msg[i].get("instance_ports") or []
+            return len(inst_ports) if inst_ports else None
+        return None  # in-process / unknown: no cap
+    caps = [_worker_cap(i) for i in range(n_opps)]
+
     if n_workers >= n_opps:
-        workers_per_opp = [1] * n_opps
-        extras = n_workers - n_opps
+        # Pre-fill capped opps to their cap (in speed-aware mode). This
+        # ensures MMs always get full instance utilization (one worker per
+        # subprocess instance) rather than the greedy under-allocating MM
+        # because MCTS's higher wall_cost wins the ratio comparison.
+        # Then greedy distributes remaining workers across uncapped opps.
+        if has_slow_opp:
+            workers_per_opp = [caps[i] if caps[i] is not None else 1
+                               for i in range(n_opps)]
+            # Defensive: if pre-fill exceeds budget, trim back to 1 each
+            # (caps were too aggressive for this n_workers).
+            if sum(workers_per_opp) > n_workers:
+                workers_per_opp = [1] * n_opps
+        else:
+            workers_per_opp = [1] * n_opps
+        extras = n_workers - sum(workers_per_opp)
         for _ in range(extras):
-            ratios = [cost[i] / workers_per_opp[i] for i in range(n_opps)]
-            workers_per_opp[ratios.index(max(ratios))] += 1
+            # Build candidate list, excluding opps that hit their cap.
+            candidates = [
+                (cost[i] / workers_per_opp[i], i)
+                for i in range(n_opps)
+                if caps[i] is None or workers_per_opp[i] < caps[i]
+            ]
+            if candidates:
+                workers_per_opp[max(candidates, key=lambda x: x[0])[1]] += 1
+            else:
+                # Defensive: all opps capped (shouldn't trigger with
+                # reasonable mixes since MCTS has no cap).
+                ratios = [cost[i] / workers_per_opp[i] for i in range(n_opps)]
+                workers_per_opp[ratios.index(max(ratios))] += 1
         if has_slow_opp:
             # Surface the wall-time projection per opp so iter wall variance
             # is debuggable from the train log alone.
