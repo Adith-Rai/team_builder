@@ -28,9 +28,18 @@ from pathlib import Path
 from typing import Optional
 
 from poke_env.player import Player
+from poke_env import AccountConfiguration
 from poke_env.battle import Status, SideCondition, Weather, Field
 
 import poke_engine as pe
+
+try:
+    from policy_smartbots import TacticalPlayer as _FallbackBotCls
+except ImportError:
+    try:
+        from .policy_smartbots import TacticalPlayer as _FallbackBotCls
+    except ImportError:
+        _FallbackBotCls = None
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +439,33 @@ class PokeEnginePlayer(Player):
         )
         # {battle_tag: (last_turn, count_of_calls_at_this_turn)}
         self._turn_call_count: dict[str, tuple[int, int]] = {}
+        # Never-connected smart bot used as panic fallback. Falls back to
+        # random move if smart-bot init fails or its choose_move raises.
+        self._fallback_bot = None
+        if _FallbackBotCls is not None:
+            try:
+                self._fallback_bot = _FallbackBotCls(
+                    account_configuration=AccountConfiguration(
+                        f"pefb-{id(self):x}"[:18], None
+                    ),
+                    start_listening=False,
+                )
+            except BaseException as e:
+                logger.warning("PokeEngine fallback-bot init failed (%s): falling back to random",
+                               type(e).__name__)
+                self._fallback_bot = None
+
+    def _smart_fallback(self, battle):
+        if self._fallback_bot is None:
+            return self.choose_random_move(battle)
+        try:
+            return self._fallback_bot.choose_move(battle)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            logger.warning("PokeEngine smart-fallback raised for %s: %s (%s); using random",
+                           battle.battle_tag, e, type(e).__name__)
+            return self.choose_random_move(battle)
 
     def _bump_turn_counter(self, battle) -> int:
         last_turn, n = self._turn_call_count.get(battle.battle_tag, (-1, 0))
@@ -464,7 +500,7 @@ class PokeEnginePlayer(Player):
         except BaseException as e:
             logger.warning("PokeEngine state build failed for %s: %s (%s)",
                            battle.battle_tag, e, type(e).__name__, exc_info=True)
-            return self.choose_random_move(battle)
+            return self._smart_fallback(battle)
 
         loop = asyncio.get_event_loop()
         try:
@@ -479,7 +515,7 @@ class PokeEnginePlayer(Player):
         except BaseException as e:
             logger.warning("PokeEngine MCTS failed for %s: %s (%s)",
                            battle.battle_tag, e, type(e).__name__, exc_info=True)
-            return self.choose_random_move(battle)
+            return self._smart_fallback(battle)
 
         try:
             choice = _select_choice_from_mcts(mcts_result)
@@ -489,7 +525,7 @@ class PokeEnginePlayer(Player):
         except BaseException as e:
             logger.warning("PokeEngine choice translation failed for %s: %s (%s)",
                            battle.battle_tag, e, type(e).__name__, exc_info=True)
-            return self.choose_random_move(battle)
+            return self._smart_fallback(battle)
 
     def _battle_finished_callback(self, battle):
         self._turn_call_count.pop(battle.battle_tag, None)
