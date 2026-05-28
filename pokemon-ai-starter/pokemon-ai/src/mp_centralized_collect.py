@@ -3221,6 +3221,38 @@ def _build_opp_pool_msg(snapshot_pool, win_rates) -> List[dict]:
     return out
 
 
+# S67-ext speed-aware allocation (2026-05-28): per-game wall-time estimates
+# used to size worker count per opp. ONLY activated when at least one opp
+# crosses _SLOW_OPP_THRESHOLD_S (e.g., mcts-hard at ~30s/game). Otherwise the
+# allocator falls through to the legacy games-balanced greedy that produces
+# the clean even distribution (3 workers per opp for typical 30w/10opp iter).
+# Per-game estimates are calibrated from smoke v9 (mcts-hard worker wall =
+# 23 min for 53 games ≈ 26s/game) and only need ordinal accuracy.
+_SLOW_OPP_THRESHOLD_S = 20.0
+
+
+def _estimate_per_game_seconds(opp_msg: dict) -> float:
+    """Rough s/game estimate by opp kind. Used to decide whether speed-aware
+    allocation should activate, and (when activated) to weight worker count
+    per opp by wall-time cost rather than game count."""
+    kind = opp_msg.get("kind", "local")
+    if kind == "external_inprocess":
+        # MCTS via poke-engine: ~25 turns × search_time_ms + ~5s overhead
+        # (state-build, network, choose_move serialization).
+        f_kwargs = opp_msg.get("factory_kwargs", {})
+        st_ms = int(f_kwargs.get("search_time_ms", 200))
+        return st_ms * 0.025 + 5.0
+    if kind == "external_subprocess":
+        key = (opp_msg.get("key") or "").lower()
+        if key.startswith("mm-") or "metamon" in key:
+            return 5.0  # Metamon: NN inference in subprocess, fast
+        if key.startswith("fp-") or "foul" in key or "foulplay" in key:
+            return 20.0  # Foul Play subprocess: MCTS too, but full strategy stack
+        return 10.0  # generic external subprocess
+    # kind == "local" (self-play snapshots, GPU inference via shared CIS)
+    return 10.0
+
+
 def _allocate_opps_to_workers(
     opp_pool_msg: List[dict],
     n_workers: int,
@@ -3265,12 +3297,37 @@ def _allocate_opps_to_workers(
         target[weights.index(max(weights))] += drift
 
     # Step 2: distribute workers across opps.
+    # S67-ext speed-aware: when a slow opp (mcts-hard, ~30s/game) is in the
+    # active pool, swap the greedy cost metric from `games` to `games *
+    # per_game_seconds` so extra workers flow toward the slow opp instead of
+    # piling on opps that are already fast. When no slow opp is present, this
+    # is identical to the legacy games-balanced greedy (each opp converges to
+    # workers ~ proportional to game share, i.e., 3 per opp for 30w/10opp).
+    per_game_s = [_estimate_per_game_seconds(o) for o in opp_pool_msg]
+    has_slow_opp = any(s >= _SLOW_OPP_THRESHOLD_S for s in per_game_s)
+    cost = (
+        [target[i] * per_game_s[i] for i in range(n_opps)] if has_slow_opp
+        else list(target)
+    )
     if n_workers >= n_opps:
         workers_per_opp = [1] * n_opps
         extras = n_workers - n_opps
         for _ in range(extras):
-            ratios = [target[i] / workers_per_opp[i] for i in range(n_opps)]
+            ratios = [cost[i] / workers_per_opp[i] for i in range(n_opps)]
             workers_per_opp[ratios.index(max(ratios))] += 1
+        if has_slow_opp:
+            # Surface the wall-time projection per opp so iter wall variance
+            # is debuggable from the train log alone.
+            wall_proj = ", ".join(
+                f"{(opp_pool_msg[i].get('key') or 'opp')[:24]}="
+                f"{cost[i] / workers_per_opp[i]:.0f}s/{workers_per_opp[i]}w"
+                for i in range(n_opps)
+            )
+            print(
+                f"[cis-orch] speed-aware alloc (slow opp >= "
+                f"{_SLOW_OPP_THRESHOLD_S:.0f}s/g): {wall_proj}",
+                flush=True,
+            )
     else:
         sorted_idx = sorted(range(n_opps), key=lambda i: -weights[i])
         top_idx = set(sorted_idx[:n_workers])
