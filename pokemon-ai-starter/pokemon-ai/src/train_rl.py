@@ -72,7 +72,8 @@ def parse_args():
     p.add_argument("--resume", default=None, help="Resume from checkpoint")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--opponent-device", default="cuda")
-    p.add_argument("--servers", default="9000", help="Comma-separated ports")
+    p.add_argument("--servers", default=",".join(str(9000 + i) for i in range(16)),
+                   help="Comma-separated battle_server ports (default: 9000..9015, 16 ports)")
     p.add_argument("--format", default="gen9ou", help="Battle format (gen9ou, gen8ou, etc.)")
     p.add_argument("--games-per-iter", type=int, default=200)
     p.add_argument("--max-concurrent", type=int, default=20)
@@ -1316,9 +1317,12 @@ def main():
     external_manager = None
     if getattr(args, "external_adapters", None):
         from external_adapters import load_pool_entries
-        default_port = int(args.servers.split(",")[0].strip())
+        server_ports = [int(p.strip()) for p in args.servers.split(",") if p.strip()]
+        default_port = server_ports[0]
         ext_entries, external_manager = load_pool_entries(
-            args.external_adapters, default_server_port=default_port
+            args.external_adapters,
+            default_server_port=default_port,
+            available_ports=server_ports,
         )
         if ext_entries:
             snapshot_pool.extend(ext_entries)

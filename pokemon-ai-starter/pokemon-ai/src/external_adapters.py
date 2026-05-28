@@ -157,7 +157,7 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
     # uses spec's server_port if present in available; subsequent cycle the
     # cursor. Loose target: 15 instances / 8 ports ≈ 2 per port → battle_server
     # WS load drops from 50+ to ~6-8 per server.
-    available_ports = ctx.get("available_ports") or [9000 + i for i in range(8)]
+    available_ports = ctx.get("available_ports") or [9000 + i for i in range(16)]
     if "_port_cursor" not in ctx:
         ctx["_port_cursor"] = 0
 
@@ -329,19 +329,29 @@ _FACTORY_REGISTRY = {
 def load_pool_entries(
     config_path: str,
     default_server_port: int = 9000,
+    available_ports: Optional[List[int]] = None,
 ) -> Tuple[List[PoolEntry], Optional[ExternalOpponentManager]]:
     """Read a YAML config and return (PoolEntry list, manager-or-None).
 
     The manager is set when at least one adapter type needs subprocess
     supervision (currently: metamon). Caller is responsible for calling
     manager.start_all() before training begins and manager.stop_all() after.
+
+    `available_ports` is the full battle_server port pool used for MM
+    instance round-robin distribution. If None, defaults to 16 ports
+    (9000-9015). Caller (train_rl.py) should pass the parsed --servers
+    list so MM instances align with the actual battle_server pool — too
+    few ports causes cursor wrap-around and instance clustering, which
+    was the S67 phase2_ext smoke v9 bottleneck.
     """
     with open(config_path) as f:
         cfg = yaml.safe_load(f) or {}
 
     entries: List[PoolEntry] = []
     spawn_specs: List[ExternalOpponent] = []
-    ctx = {"default_server_port": default_server_port}
+    ctx: dict = {"default_server_port": default_server_port}
+    if available_ports:
+        ctx["available_ports"] = list(available_ports)
 
     for raw in cfg.get("opponents", []) or []:
         spec = dict(raw)
