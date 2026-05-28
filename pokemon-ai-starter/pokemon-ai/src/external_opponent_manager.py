@@ -56,6 +56,12 @@ class ExternalOpponent:
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
     n_restarts: int = 0
     started_at: float = 0.0
+    # S67-ext (2026-05-28): byte offset in log_file at spawn time. Used by
+    # _wait_one_ready to scan ONLY this spawn's output, not stale markers
+    # from prior spawns (log file is append-mode for crash-debug preservation;
+    # without this offset the marker scan finds OLD "iter 1/" entries from
+    # an earlier spawn and returns ready immediately, causing the MM race).
+    spawn_log_pos: int = 0
 
 
 class ExternalOpponentManager:
@@ -149,11 +155,19 @@ class ExternalOpponentManager:
         cwd = self._resolve_path(opp.cwd)
 
         # Open log file (append mode so restarts share a log).
+        # Record byte offset BEFORE opening so _wait_one_ready can scan
+        # only this spawn's output (prior spawns wrote ready markers to
+        # the same file and would falsely satisfy the check).
         log_path = self._resolve_path(opp.log_file) if opp.log_file else None
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                opp.spawn_log_pos = log_path.stat().st_size if log_path.exists() else 0
+            except OSError:
+                opp.spawn_log_pos = 0
             log_fh = open(log_path, 'a', buffering=1)
         else:
+            opp.spawn_log_pos = 0
             log_fh = subprocess.DEVNULL
 
         # logger.warning (not info) so it survives Python's default lastResort
@@ -218,8 +232,11 @@ class ExternalOpponentManager:
                     break
                 try:
                     if log_path and log_path.exists():
-                        with open(log_path, 'r', errors='ignore') as f:
-                            text = f.read()
+                        # Seek past pre-spawn content so stale markers from
+                        # prior restarts don't satisfy this check.
+                        with open(log_path, 'rb') as f:
+                            f.seek(opp.spawn_log_pos)
+                            text = f.read().decode('utf-8', errors='ignore')
                         if any(m in text for m in self._READY_MARKERS):
                             ready = True
                             break
@@ -270,7 +287,11 @@ class ExternalOpponentManager:
         self._monitor_thread.start()
 
     def _wait_one_ready(self, opp: ExternalOpponent, timeout_s: float) -> bool:
-        """Wait for a single opponent's log to contain a ready marker.
+        """Wait for a single opponent's log to contain a ready marker emitted
+        by THIS spawn (not a previous spawn's marker — the log file is
+        append-mode across restarts, so we seek past the pre-spawn offset
+        recorded in `_spawn`).
+
         Extracted from wait_until_ready loop so spawn_active can poll
         individual opps (e.g., to report readiness incrementally)."""
         if not opp.log_file:
@@ -286,8 +307,10 @@ class ExternalOpponentManager:
                 return False
             try:
                 if log_path and log_path.exists():
-                    with open(log_path, 'r', errors='ignore') as f:
-                        text = f.read()
+                    with open(log_path, 'rb') as f:
+                        f.seek(opp.spawn_log_pos)
+                        new_bytes = f.read()
+                    text = new_bytes.decode('utf-8', errors='ignore')
                     if any(m in text for m in self._READY_MARKERS):
                         return True
             except OSError:
