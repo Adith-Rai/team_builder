@@ -219,6 +219,10 @@ def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpp
             auto_restart=True,
             log_file=str(log_path),
             description=f"Metamon {model} instance {i+1}/{n_instances} (subprocess)",
+            # S67-ext per-iter spawn: logical_name is the YAML opp name
+            # (e.g., "mm-minikazam") — all instances share it. Manager uses
+            # it to find all instances of a logical opp for spawn_active().
+            logical_name=name,
         ))
         instance_usernames.append(instance_username)
         instance_team_queue_dirs.append(instance_queue_str)

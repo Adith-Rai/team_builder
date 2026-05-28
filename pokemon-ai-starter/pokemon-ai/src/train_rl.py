@@ -543,6 +543,29 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
                         f"Unknown PoolEntry: kind={kind} key={item.key}"
                     )
 
+        # S67-ext per-iter MM spawn (2026-05-28): identify active MM logical
+        # names from effective_pool and spawn ONLY those for this iter.
+        # SP/MCTS workers fire immediately below — MM /challenges queue in
+        # battle_server pendingChallenges until MM logs in (bug 10 fix).
+        if external_manager is not None:
+            active_mm_logical = set()
+            for item in effective_pool:
+                if not isinstance(item, str) and getattr(item, "kind", None) == "external":
+                    # External entries can be in-process (MCTS, factory set,
+                    # no subprocess) OR external_subprocess (MM/FP, showdown
+                    # username set). Only spawn the latter.
+                    if getattr(item, "showdown_username", None):
+                        active_mm_logical.add(item.key)
+            if active_mm_logical:
+                _flow(f"spawning {len(active_mm_logical)} active MM logical opps: {sorted(active_mm_logical)}")
+                external_manager.spawn_active(
+                    active_mm_logical,
+                    wait_ready=True,
+                    per_opp_timeout_s=180.0,
+                )
+            else:
+                _flow("no MM opps in this iter's composition; skipping spawn_active")
+
         model.eval()
         _flow(f"starting CIS collection (n_workers={args.mp_workers})")
         cis_result = mp_centralized_collect_sync(
@@ -566,6 +589,15 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
+
+        # S67-ext per-iter MM release (2026-05-28): kill all active MMs to
+        # free GPU before the PPO update memory peak. Without this, MMs
+        # accumulate GPU through update, pushing past the A100 80GB ceiling.
+        # Kills are parallel (SIGKILL all, then wait); typical wall ~1-2s.
+        if external_manager is not None:
+            killed = external_manager.release_all(timeout_s=15.0)
+            _flow(f"released {killed} MM subprocesses before update (GPU freed)")
+
         return cis_result
 
     if getattr(args, 'mp', False):
@@ -1293,21 +1325,18 @@ def main():
             ext_keys = ", ".join(e.key for e in ext_entries)
             print(f"  [PFSP] +{len(ext_entries)} external adapters: {ext_keys}", flush=True)
         if external_manager is not None:
-            print(f"  [PFSP] starting {len(external_manager.opponents)} subprocess adapter(s)",
+            # S67-ext per-iter spawn (2026-05-28): start ONLY the monitor
+            # thread; don't spawn any subprocesses yet. Subprocesses are
+            # spawned per-iter via external_manager.spawn_active() inside
+            # the training loop, scoped to that iter's active composition.
+            # This avoids the GPU architectural ceiling overrun from
+            # spawn-at-startup pattern (5 MMs × 3 instances = 15 alive
+            # constantly = ~10 GB MM GPU vs 6 GB peak with per-iter active
+            # set of 3 MMs × 3 instances).
+            print(f"  [PFSP] {len(external_manager.opponents)} subprocess adapter(s) "
+                  f"available; per-iter spawn (will start on iter 0 composition)",
                   flush=True)
-            external_manager.start_all()
-            # Block until every subprocess has logged into Showdown and entered
-            # its accept loop. Metamon's model-load takes ~30s, Foul Play ~10s.
-            # Without this gate, V9RLPlayer's challenges hit not-yet-ready
-            # subprocesses → wait_for timeout per opponent → wave-time blow up.
-            print(f"  [PFSP] waiting up to 180s for subprocess adapter(s) to be ready...",
-                  flush=True)
-            ready = external_manager.wait_until_ready(per_opp_timeout_s=180.0)
-            if ready:
-                print(f"  [PFSP] all subprocess adapter(s) ready", flush=True)
-            else:
-                print(f"  [PFSP] WARN — one or more subprocess adapter(s) not ready; "
-                      f"proceeding anyway, expect timeouts", flush=True)
+            external_manager.start_monitor_only()
             # NOTE: the 30s GUARD sleep we tried in attempt 6 was REPLACED by
             # the dispatch watchdog in rl_collection.py `_play_one_opponent`.
             # Watchdog catches the same login-race symptoms AND any other

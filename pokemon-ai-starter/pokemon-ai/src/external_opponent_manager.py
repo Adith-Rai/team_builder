@@ -45,6 +45,12 @@ class ExternalOpponent:
     auto_restart: bool = True
     log_file: Optional[str] = None
     description: str = ""
+    # S67-ext per-iter spawn (2026-05-28): the LOGICAL opp name this instance
+    # belongs to. For single-instance opps it's the same as `name`. For
+    # multi-instance, name = "{logical}-{i}" but logical_name stays at the
+    # base (e.g., "mm-minikazam"). Used by spawn_active(logical_names) to
+    # find all instances of a given logical opp without prefix-string parsing.
+    logical_name: Optional[str] = None
 
     # runtime state
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
@@ -64,6 +70,12 @@ class ExternalOpponentManager:
         self.default_team_folder: Optional[str] = None
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
+        # S67-ext per-iter spawn (2026-05-28): set of logical opp names
+        # currently "active" (spawned for this iter). Empty when between
+        # iters (release_all clears it). Monitor loop only auto-restarts
+        # opps whose logical_name is in this set — prevents respawn of
+        # opps that were deliberately killed by release_all.
+        self._active_logical: set = set()
         self._load_config()
 
     # ── Config loading ────────────────────────────────────────────
@@ -75,9 +87,12 @@ class ExternalOpponentManager:
         for entry in cfg.get('opponents', []):
             # Filter to known fields to avoid TypeError on extras.
             allowed = {'name', 'showdown_username', 'command', 'cwd', 'venv',
-                       'auto_restart', 'log_file', 'description'}
+                       'auto_restart', 'log_file', 'description', 'logical_name'}
             kwargs = {k: v for k, v in entry.items() if k in allowed}
-            self.opponents.append(ExternalOpponent(**kwargs))
+            opp = ExternalOpponent(**kwargs)
+            if opp.logical_name is None:
+                opp.logical_name = opp.name  # single-instance default
+            self.opponents.append(opp)
         logger.info(f"Loaded {len(self.opponents)} external opponents from {self.config_path}")
 
     # ── Process spawning ──────────────────────────────────────────
@@ -218,6 +233,158 @@ class ExternalOpponentManager:
                 all_ready = False
         return all_ready
 
+    # ── S67-ext per-iter spawn architecture (2026-05-28) ──────────
+    # Unlike start_all (spawn all at boot, keep alive forever), per-iter
+    # spawn matches MM subprocess lifecycle to the iter that uses them:
+    #
+    #   - iter start: spawn_active(active_logical_names) — spawns ONLY the
+    #     MMs the composition picked for THIS iter, in parallel. SP/MCTS
+    #     workers can fire immediately (battle_server pendingChallenges
+    #     queues their /challenges; MMs serve them after login).
+    #   - end of collect: release_all() — kills active MMs, waits clean
+    #     shutdown. Frees GPU (model weights + CUDA contexts) before main
+    #     process's PPO update peak.
+    #   - update runs with full GPU.
+    #   - next iter: spawn_active() with NEW composition's active set.
+    #
+    # Why this fits the architectural ceiling: only ACTIVE MMs consume GPU
+    # during collect (e.g., 3 of 5 picked → 3 × N instances alive, not all
+    # 5 × N). Pool size becomes virtually unbounded — can add Kakuna,
+    # Superkazam, etc., without GPU pressure, since only picked-active
+    # ones load. Cost: ~60-90s parallel MM startup per iter (overlapped
+    # with SP/MCTS collect — net iter wall +1-2 min).
+
+    def start_monitor_only(self):
+        """Start the monitor thread WITHOUT spawning anything. Use with
+        per-iter spawn architecture where spawn_active() controls lifecycle.
+
+        Alternative entry to start_all(): start_all spawns all opponents
+        immediately + starts monitor (legacy spawn-at-boot pattern);
+        start_monitor_only just runs the monitor (waits for spawn_active
+        to fire spawns)."""
+        if self._monitor_thread is not None:
+            return
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name='ExtOppMonitor'
+        )
+        self._monitor_thread.start()
+
+    def _wait_one_ready(self, opp: ExternalOpponent, timeout_s: float) -> bool:
+        """Wait for a single opponent's log to contain a ready marker.
+        Extracted from wait_until_ready loop so spawn_active can poll
+        individual opps (e.g., to report readiness incrementally)."""
+        if not opp.log_file:
+            time.sleep(2)
+            return True
+        log_path = self._resolve_path(opp.log_file)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if opp.proc and opp.proc.poll() is not None:
+                logger.warning(
+                    f"{opp.name} exited rc={opp.proc.returncode} before ready"
+                )
+                return False
+            try:
+                if log_path and log_path.exists():
+                    with open(log_path, 'r', errors='ignore') as f:
+                        text = f.read()
+                    if any(m in text for m in self._READY_MARKERS):
+                        return True
+            except OSError:
+                pass
+            time.sleep(1)
+        logger.warning(f"{opp.name} did NOT signal ready in {timeout_s:.0f}s")
+        return False
+
+    def spawn_active(self, active_logical: set,
+                     wait_ready: bool = True,
+                     per_opp_timeout_s: float = 180.0) -> dict:
+        """Spawn all instances of the listed logical opp names in parallel.
+
+        Idempotent: instances already alive are skipped (no double-spawn).
+        Returns a map of {instance_name: is_ready_bool}.
+
+        Set the active_logical set as authoritative: monitor loop will
+        only auto-restart opps whose logical_name is in this set, so any
+        opps NOT in active_logical that are alive will NOT be respawned
+        on death this iter.
+
+        For per-iter spawn architecture:
+          - SP/MCTS workers can fire collect immediately (don't wait).
+          - MM workers' /challenges queue in battle_server pendingChallenges
+            until their assigned MM finishes login (bug 10 fix handles the
+            resend on /trn login).
+        """
+        self._active_logical = set(active_logical)
+        spawned: List[ExternalOpponent] = []
+        results: dict = {}
+        for opp in self.opponents:
+            if opp.logical_name not in active_logical:
+                results[opp.name] = False
+                continue
+            # Already alive — skip (idempotent)
+            if opp.proc is not None and opp.proc.poll() is None:
+                results[opp.name] = True
+                continue
+            # Spawn fresh
+            opp.n_restarts = 0  # reset restart counter (fresh iter)
+            self._spawn(opp)
+            spawned.append(opp)
+
+        # Wait for spawned opps to signal ready (in parallel — each opp's
+        # readiness is independent of others; we poll sequentially but the
+        # spawning happens in parallel because each spawn returns immediately
+        # after Popen, before the subprocess finishes initialization).
+        if wait_ready and spawned:
+            for opp in spawned:
+                results[opp.name] = self._wait_one_ready(opp, per_opp_timeout_s)
+        logger.info(
+            f"spawn_active: {len(active_logical)} logical opps requested, "
+            f"{len(spawned)} new instances spawned, "
+            f"{sum(1 for k, v in results.items() if v)}/{len(results)} ready"
+        )
+        return results
+
+    def release_all(self, timeout_s: float = 15.0) -> int:
+        """Kill all currently-alive opponents, wait for clean shutdown.
+
+        Clears active_logical set so monitor thread won't auto-restart
+        the killed opps. Returns count of opponents killed.
+
+        Used between collect and update in per-iter spawn architecture:
+        frees GPU before main process's PPO update memory peak. Kills
+        in parallel (SIGKILL all, then wait for each).
+        """
+        # Clear active set FIRST so monitor doesn't race to respawn during kill
+        self._active_logical = set()
+        # Phase 1: SIGKILL all alive opps in parallel (don't wait yet)
+        killed = 0
+        for opp in self.opponents:
+            if opp.proc is None or opp.proc.poll() is not None:
+                continue
+            try:
+                opp.proc.kill()
+                killed += 1
+            except Exception as e:
+                logger.warning(f"release_all: kill of {opp.name} failed: {e}")
+        # Phase 2: wait for all to actually die. Since SIGKILL was sent in
+        # parallel above, the deaths happen concurrently — this sequential
+        # wait just collects the results. Total wall ≈ slowest single kill.
+        t0 = time.time()
+        deadline = t0 + timeout_s
+        for opp in self.opponents:
+            if opp.proc is None:
+                continue
+            remaining = max(0.5, deadline - time.time())
+            try:
+                opp.proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"release_all: {opp.name} did not exit in {timeout_s:.0f}s")
+            opp.proc = None  # clear so next spawn_active knows to (re)spawn
+        elapsed = time.time() - t0
+        logger.info(f"release_all: killed {killed} opponents in {elapsed:.1f}s")
+        return killed
+
     def stop_all(self, timeout: float = 10.0):
         self._stop_event.set()
         for opp in self.opponents:
@@ -342,6 +509,20 @@ class ExternalOpponentManager:
                     f"  --- end tail ---"
                 )
                 if not opp.auto_restart:
+                    opp.proc = None
+                    continue
+                # S67-ext per-iter spawn (2026-05-28): only respawn if this
+                # opp's logical_name is in the active set. Otherwise it was
+                # deliberately killed by release_all (between collect and
+                # update) — don't fight that by respawning.
+                # When active_logical is empty (no iter in progress), nothing
+                # respawns regardless of auto_restart.
+                if (self._active_logical
+                        and opp.logical_name not in self._active_logical):
+                    opp.proc = None
+                    continue
+                if not self._active_logical:
+                    # Between iters — no respawning. Clear and wait.
                     opp.proc = None
                     continue
                 opp.n_restarts += 1
