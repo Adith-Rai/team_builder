@@ -1562,13 +1562,17 @@ def main():
                     rec[0] += w
                     rec[1] += g
                     win_rates[nk] = rec
-            # Save periodically (every 5 iters to avoid IO bottleneck)
-            if (it + 1) % 5 == 0:
-                try:
-                    with open(win_rates_path, "w") as f:
-                        json.dump(win_rates, f)
-                except Exception:
-                    pass
+            # Per-iter per-opp wins/games line for log-based trajectory analysis
+            parts = []
+            for ckpt, (w, g) in sorted(opp_records.items()):
+                short = ckpt.replace("\\", "/").split("/")[-1]
+                parts.append(f"{short}={w}w/{g}g")
+            print(f"  [PFSP-ITER] iter={it} per-opp: " + " ".join(parts), flush=True)
+            try:
+                with open(win_rates_path, "w") as f:
+                    json.dump(win_rates, f)
+            except Exception:
+                pass
 
         # ---- Adaptive entropy ----
         # Raises ent_coef when entropy drops (prevents collapse).
