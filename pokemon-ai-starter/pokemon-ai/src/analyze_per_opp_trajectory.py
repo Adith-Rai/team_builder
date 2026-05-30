@@ -160,25 +160,71 @@ def main():
         print(row)
     print("\n(* = EMA-smoothed snapshot value; blank = per-iter exact WR)")
 
-    # Per-opp summary
+    # Per-opp summary with movement direction classification
     print("\n=== Per-opp summary ===")
-    print(f"{'opp':30s} {'first':>10s} {'last':>10s} {'delta':>8s} {'n_pts':>6s}")
-    print("-" * 72)
+    print(f"{'opp':28s} {'first':>9s} {'last':>9s} {'range':>7s} {'slope':>8s} "
+          f"{'rev':>4s} {'n':>3s}  pattern")
+    print("-" * 88)
     for opp in opps:
         per_iter = {}
         for it, wr, g, kind in sorted(records[opp]):
             existing = per_iter.get(it)
             if existing is None or (existing[2] == "ema" and kind == "per-iter"):
                 per_iter[it] = (wr, g, kind)
-        if not per_iter:
+        if not per_iter or len(per_iter) < 2:
             continue
         items = sorted(per_iter.items())
-        first_it, (first_wr, _, _) = items[0]
-        last_it, (last_wr, _, _) = items[-1]
-        delta = (last_wr - first_wr) * 100
-        sign = "+" if delta >= 0 else ""
-        print(f"{opp[:30]:30s} {first_wr*100:5.1f}@i{first_it:<3d} "
-              f"{last_wr*100:5.1f}@i{last_it:<3d} {sign}{delta:+5.1f}pp {len(items):6d}")
+        iters = [it for it, _ in items]
+        wrs = [wr for _, (wr, _, _) in items]  # 0..1
+        wrs_pp = [w * 100 for w in wrs]
+
+        first_wr = wrs_pp[0]
+        last_wr = wrs_pp[-1]
+        vmin, vmax = min(wrs_pp), max(wrs_pp)
+        rng = vmax - vmin
+
+        # Linear regression slope (pp per 10 iters)
+        n = len(iters)
+        mx = sum(iters) / n
+        my = sum(wrs_pp) / n
+        num = sum((iters[i] - mx) * (wrs_pp[i] - my) for i in range(n))
+        den = sum((iters[i] - mx) ** 2 for i in range(n))
+        slope_per_iter = num / den if den > 0 else 0.0
+        slope_per_10 = slope_per_iter * 10
+        span = iters[-1] - iters[0]
+        net = slope_per_iter * span  # implied net change over span (pp)
+
+        # Direction reversals
+        diffs = [wrs_pp[i+1] - wrs_pp[i] for i in range(n - 1)]
+        reversals = sum(
+            1 for i in range(1, len(diffs))
+            if (diffs[i] > 0 and diffs[i-1] < 0) or (diffs[i] < 0 and diffs[i-1] > 0)
+        )
+
+        # Classification
+        # FLAT: range < 1pp
+        # TRENDING_*: |net| > 1.5x range/2 (slope explains > 75% of swing)
+        # OSCILLATING: reversals >= (n-1)/2  AND  |net| < range/4
+        # MIXED: reversals high but with slope
+        if rng < 1.0:
+            pattern = "FLAT"
+        elif abs(net) > 0.75 * rng:
+            pattern = "TREND_UP" if net > 0 else "TREND_DOWN"
+        elif reversals >= max(1, (n - 1) // 2) and abs(net) < rng / 3:
+            pattern = "OSCILLATING"
+        elif abs(net) > rng / 3:
+            pattern = "DRIFT_UP" if net > 0 else "DRIFT_DOWN"
+        else:
+            pattern = "BOUNCING"
+
+        sign = "+" if slope_per_10 >= 0 else ""
+        print(f"{opp[:28]:28s} {first_wr:6.1f}%@i{iters[0]:<3d} "
+              f"{last_wr:6.1f}%@i{iters[-1]:<3d} "
+              f"{rng:5.1f}pp {sign}{slope_per_10:+5.2f}/10it "
+              f"{reversals:4d} {n:3d}  {pattern}")
+    print("\nLegend: range=max-min, slope=pp per 10 iters via linreg, rev=direction reversals.")
+    print("Patterns: FLAT=<1pp range; TREND_*=slope dominates; DRIFT_*=slope present but noisy;")
+    print("          OSCILLATING=many reversals + small net; BOUNCING=noisy without direction.")
 
 
 if __name__ == "__main__":

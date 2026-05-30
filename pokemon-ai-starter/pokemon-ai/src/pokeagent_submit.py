@@ -31,7 +31,20 @@ from poke_env.ps_client.server_configuration import ServerConfiguration
 from poke_env.teambuilder.constant_teambuilder import ConstantTeambuilder
 
 from battle_agent import BattleAgent
+from battle_agent_transformer import BattleAgentTransformer
 from teams_ou import get_team, list_teams, TEAMS, random_pool_teambuilder
+
+
+def _detect_arch(ckpt_path: str, cached: dict) -> str:
+    """Return 'transformer' for new TransformerBattlePolicy ckpts, else 'legacy'.
+    Auto-detect by inspecting state_dict keys."""
+    sd = cached.get("model_state_dict") if isinstance(cached, dict) else None
+    if sd is None:
+        return "legacy"
+    # TransformerBattlePolicy has tokenizer / spatial / temporal stacks.
+    if any(k.startswith(("tokenizer.", "spatial_", "temporal_")) for k in sd.keys()):
+        return "transformer"
+    return "legacy"
 
 
 # PokeAgent Challenge server (from official docs)
@@ -53,10 +66,19 @@ def main():
                         help="Number of ladder games to play (default: 50)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--format", default="gen9ou", help="Battle format (default: gen9ou)")
+    parser.add_argument("--arch", default="auto", choices=["auto", "legacy", "transformer"],
+                        help="Model architecture. 'auto' inspects checkpoint state_dict to pick "
+                             "BattleAgent (legacy MLP) or BattleAgentTransformer (new arch).")
     args = parser.parse_args()
 
     # Team setup
-    if args.team == "random":
+    if args.team == "metamon-competitive":
+        # 16 Metamon-bundled Smogon competitive teams — same set used by our
+        # eval and the per-opp WR analysis. Rotates per battle.
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        teambuilder = MetamonCompetitiveTeambuilder()
+        print("Using metamon-competitive (16 teams, rotated per battle)")
+    elif args.team == "random":
         # Use top 10 teams from selection results
         top_teams = ["TEAM_AU", "TEAM_T", "TEAM_G", "TEAM_B", "TEAM_C",
                       "TEAM_O", "TEAM_AZ", "TEAM_BK", "TEAM_BJ", "TEAM_BE"]
@@ -69,7 +91,7 @@ def main():
         teambuilder = ConstantTeambuilder(team_str)
         print(f"Using {args.team}")
     else:
-        print(f"Unknown team: {args.team}. Use a TEAM_XX name or 'random'.")
+        print(f"Unknown team: {args.team}. Use 'metamon-competitive', a TEAM_XX name, or 'random'.")
         sys.exit(1)
 
     print(f"Checkpoint: {args.checkpoint}")
@@ -83,8 +105,16 @@ def main():
     cached_ckpt = torch.load(args.checkpoint, map_location=torch.device(args.device),
                               weights_only=False)
 
+    # Pick architecture (auto-detect by default).
+    arch = args.arch
+    if arch == "auto":
+        arch = _detect_arch(args.checkpoint, cached_ckpt)
+    print(f"Architecture: {arch}")
+
+    AgentClass = BattleAgentTransformer if arch == "transformer" else BattleAgent
+
     async def run():
-        player = BattleAgent(
+        player = AgentClass(
             args.checkpoint,
             device=args.device,
             _cached_ckpt=cached_ckpt,
