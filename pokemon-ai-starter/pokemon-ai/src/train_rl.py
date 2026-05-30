@@ -1440,6 +1440,18 @@ def main():
         episodes = build_ppo_episodes(trajs, gamma=args.gamma, lam=args.lam)
         _flow(f"PPO episodes built: {len(episodes)} episodes")
 
+        # Drop refs to collect-side state before update to let GC + CUDA cache
+        # reclaim memory. Without this, allocator fragmentation accumulates
+        # across iters (iter 0 succeeds at mb=128 but iter 1+ OOMs).
+        trajs = None
+        try:
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            _flow("GPU cache cleared before PPO update")
+        except Exception as _e:
+            _flow(f"GPU cache clear failed (non-fatal): {_e}")
+
         model.train()
         if in_warmup:
             for name, param in model.named_parameters():
