@@ -202,6 +202,15 @@ def parse_args():
                         "1 extra backward per epoch (~3-5% update wall). Use to "
                         "diagnose whether BC anchor is mechanically dominating "
                         "updates vs PPO objective. See project_bc_anchor_dominance_diagnosis.md.")
+    p.add_argument("--mem-diag", action="store_true",
+                   help="S68 Phase A observability: print [MEM-DIAG] lines at key "
+                        "boundaries (iter_start, after_collect, after_build_episodes, "
+                        "after_trajs_None_gc, after_empty_cache, before_ppo_update, "
+                        "after_ppo_update). Used to verify 47 GB main proc accounting "
+                        "from S67 OOM data. Also probes whether trajs release frees "
+                        "memory (does build_ppo_episodes share refs?). Cost: ~6 prints "
+                        "per iter + one gc.collect/empty_cache per iter when active. "
+                        "See docs/S68_CLEANUP_DESIGN.md.")
     p.add_argument("--bc-anchor-coef", type=float, default=0.1,
                    help="Coefficient for the BC anchor KL term. Typical 0.05-0.2. "
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
@@ -1410,7 +1419,18 @@ def main():
         def _flow(msg):
             elapsed = time.time() - _flow_t0
             print(f"  [FLOW {datetime.now().strftime('%H:%M:%S')} +{elapsed:6.1f}s] {msg}", flush=True)
+        # S68 Phase A instrumentation: track main proc GPU memory at key boundaries
+        # to verify 47 GB hypothesis (trajs ~15 + episodes ~15 + activations ~15).
+        # Gated by --mem-diag (default off, no production impact).
+        def _mem_diag(label):
+            if not getattr(args, "mem_diag", False) or not torch.cuda.is_available():
+                return
+            alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+            reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+            print(f"  [MEM-DIAG iter={it}] {label}: alloc={alloc_gb:.2f} GB, "
+                  f"reserved={reserved_gb:.2f} GB", flush=True)
         _flow("iter start")
+        _mem_diag("iter_start")
 
         # Value warmup (freeze backbone+policy, train only value head)
         in_warmup = (it - start_iter) < args.warmup_iters
@@ -1434,11 +1454,27 @@ def main():
         opp_records = collect_result[7] if len(collect_result) > 7 else {}
         pending_collection = None
         wr = wins / max(1, wins + losses + ties)
+        _mem_diag("after_collect_with_trajs")
 
         # ---- PPO Update ----
         _flow("building PPO episodes")
         episodes = build_ppo_episodes(trajs, gamma=args.gamma, lam=args.lam)
         _flow(f"PPO episodes built: {len(episodes)} episodes")
+        _mem_diag("after_build_episodes_trajs_alive")
+
+        # Test if trajs is freeable (does build_ppo_episodes share refs or copy?)
+        if getattr(args, "mem_diag", False):
+            _trajs_ref = trajs  # keep ref to compare
+            trajs = None
+            import gc as _gc
+            _gc.collect()
+            _mem_diag("after_trajs_None_gc_only")
+            try:
+                torch.cuda.empty_cache()
+                _mem_diag("after_empty_cache")
+            except Exception:
+                pass
+            trajs = _trajs_ref  # restore to not change behavior
 
         model.train()
         if in_warmup:
@@ -1446,6 +1482,7 @@ def main():
                 param.requires_grad = "value_head" in name
 
         _flow("starting PPO update")
+        _mem_diag("before_ppo_update")
         t_update = time.time()
         # Tier 3 (--tier3) routes to ppo_update_batched which is a drop-in
         # replacement: same args, same returned stats. Warmup iters fall
@@ -1518,6 +1555,7 @@ def main():
 
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")
+        _mem_diag("after_ppo_update")
 
         # ---- Catastrophic-failure guard (Session 33) ----
         if loss_info.get("n_succeeded", 1) == 0:
