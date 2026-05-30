@@ -15,6 +15,37 @@ metadata:
 
 **This memo is a DESIGN, not a decision.** Implementation needs code verification (open questions section).
 
+## 🔴 IMPORTANT: S68 Phase A FINDINGS (2026-05-30 evening) — read before implementing
+
+**The 47 GB main proc hypothesis was WRONG.** Phase A instrumentation (commit `aaef191` on `instrumentation/s68-phase-a-memory-diag` branch) measured main proc at all 7 boundaries with `--mem-diag` flag. Concrete data from iter 140 at 60w + mb=128:
+
+| Boundary | alloc | reserved |
+|---|---|---|
+| iter_start | 0.37 GB | 0.61 GB |
+| after_collect_with_trajs | 0.37 GB | 0.61 GB |
+| after_build_episodes (trajs+episodes both alive) | 0.37 GB | 0.61 GB |
+| after_trajs_None_gc_only | 0.37 GB | 0.61 GB |
+| after_empty_cache | 0.37 GB | **0.40 GB** |
+| before_ppo_update | 0.37 GB | 0.40 GB |
+| after_ppo_update | 0.38 GB | 0.53 GB |
+
+**Main proc steady-state = 0.37 GB.** Trajs+episodes combined < 0.5 GB. The "15 GB trajs" estimate in this memo was wrong by 30×.
+
+**The 47 GB OOM is the PPO update TRANSIENT PEAK at mb=128** — gradients + activations during forward/backward at packed sequence size 1600 trajs × mb=128. After update completes (or fails on OOM), memory drops back to 0.38 GB.
+
+**Revised cleanup picture**:
+- Total OOM math: ~47 GB (update transient peak) + ~29 GB (60 worker residual) = 76 GB / 79 GB cap
+- Margin: ~3 GB before fragmentation pushes over
+
+**Implications for this memo**:
+- ❌ **Target #1 (drop trajs) — SKIP**. trajs are <0.5 GB, releasing buys nothing.
+- ✅ **Target #2 (worker kill+respawn) — STILL HIGH LEVERAGE**. Frees 29 GB → leaves 50 GB for update → mb=128 fits cleanly (peak 47 + cushion 3 = 50).
+- ⚖️ **NEW: Target #1' — Reduce PPO update peak** via grad checkpointing OR smaller mb (mb=96 likely fits without worker cleanup). Big engineering for the former, easy config for the latter.
+
+**Recommended next step**: skip Target #1, go directly to Target #2 (worker cleanup). If implementation cost is high, do the cheaper alternative first: test mb=96 + worker stays at 60 = should fit with current code (no cleanup needed). If mb=96 update is fast enough (~15-20s vs mb=64's 117s), that's a no-code-change win.
+
+---
+
 ---
 
 ## Memory accounting — where each GB lives
