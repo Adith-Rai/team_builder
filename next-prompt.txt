@@ -1,4 +1,61 @@
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S67 LATE (2026-05-30 evening, SPEED OPT ARC + DESIGN MEMO READY)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE**: speed-optimization sweep done, cleanup design memo ready, two prod-bound runs in flight.
+
+## Reads FIRST
+
+1. **`docs/S67_SPEED_OPT_FINDINGS.md`** — sweep results. Worker scaling REFUTED (30→60w flat at mb=64), pure-SP slower than SP+MCTS (allocator concentration), empty_cache fix REFUTED (47 GB live state not fragmentation). Iter 0 at 60w+mb=128 = ~7 min IS sustainable target after cleanup.
+2. **`docs/S68_CLEANUP_DESIGN.md`** — NEXT-SESSION IMPL TARGET. 5 phases (instrument → trajs release → worker kill+respawn → validate). Recommended Option A for worker cleanup. Open questions to verify during impl. ~1-1.5 session effort.
+3. **`memory/project_s67_speed_optimization_findings.md`** — same as #1 but with sweep table + lesson capture.
+4. **`memory/project_s68_cleanup_design.md`** — same as #2 but with memory accounting + risk + open questions.
+
+## In-flight runs (DO NOT DISTURB unless explicit)
+
+### Prod pod (port 47913 / 195.26.233.30) — v2_dense
+- At iter 134 of 140 planned (~2h to natural completion at session end time 2026-05-30 18:00 UTC)
+- Config: 30w + mb=64 + SP + 3 MCTS + 3 MMs + dense reward + bc-anchor 0.10 + lr=1e-5
+- WR plateau at 27-30% (external) and ~70% smart_avg (4 baseline bots, 5 evals)
+- Per-opp WR snapshots auto-collected via `wr_poller.sh` to `data/models/rl_v10/phase2_ext_v2_dense/.../win_rates_history/`
+- **First action**: check iter 140 done, pull snapshot_0139 for chain eval. See `project_phase2_ext_v2_dense_findings` (not yet written) for full takeaways.
+
+### Dev pod (port 34576 / 213.173.105.9) — IDLE post-sweep
+- Era 4 (lr8e5_v1_flash) DONE — final.pt at iter 139, **1178 Elo (#1 in chain)** per `data/eval/registry/elo_lr8e5_era4_chain_FINAL.json`
+- Possible orphan GPU mem from S67 sweep OOMs (~2 GB) — restart pod if doing intensive next work
+
+## Speed optimization arc (CURRENT)
+
+**Mile 1 target**: sustainable 7 min/iter at 60w + mb=128 via cleanup (per S68 memo).
+**Mile 2 (found)**: no-cleanup ceiling = 10 min/iter at 30w + mb=64 (where v2_dense lives).
+**Mile 3 (planned)**: torch.compile, async update overlap.
+**Mile 4 (later)**: per-shard CIS batching, sub-5min architectural.
+
+**Branches**:
+- `experimental/empty-cache-before-update` — REFUTED, kept for archive. Do NOT merge.
+- `master` — S67/S68 memos + analyzer trend classifier + pokeagent arch auto-detect (commit `198c577a`)
+
+## Decision points for next session
+
+1. **Cleanup implementation** (per S68 memo): start Phase A instrumentation. ~1-1.5 session.
+2. **LR=1e-4 experiment** (deferred since S67 mid): can run on whichever pod is free after v2_dense ends. Launch script drafted at `C:/tmp/launch_lr1e4_v1.sh`.
+3. **v2_dense post-run analysis**: per-opp trajectory + Elo ladder against new snapshot_0139.
+
+## Tasks open
+
+- #102: Phase 2-ext v2_dense (will complete naturally ~iter 140)
+- #105: Multi-session speed optimization arc (cleanup design DONE; impl is next-session work)
+- #69: Era 3 vf_coef ablation (older, low priority)
+
+## Settled this session (don't redo)
+
+- S67 sweep findings on speed optimization — see memos
+- Era 4 ladder eval — 1178 Elo, registry saved locally + in prod
+- v2_dense dense-reward experiment outcome: smart_avg flat at 70%, no breakout, MM external WR flat
+- empty_cache fix attempt — refuted (memo)
+- Multiple SCP'd snapshots saved to `data/cloud_runs/lr8e5_compare/`
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S67 FINAL — REVISION 4 (2026-05-21 evening, Phase 2 LAUNCHED)
 ═══════════════════════════════════════════════════════════════════════════════
 
