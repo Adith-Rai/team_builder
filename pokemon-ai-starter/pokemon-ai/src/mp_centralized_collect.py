@@ -2494,6 +2494,7 @@ def mp_centralized_collect_sync(
     cis_min_batch: int = 8,
     cis_timeout_ms: int = 15,
     max_pool_size: int = 16,
+    pfsp_max_share: float = 0.20,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
 
@@ -2583,7 +2584,8 @@ def mp_centralized_collect_sync(
         n_alive = len(alive_wids)
         if n_alive == 0:
             raise RuntimeError(f"[cis-orch] iter {iter_n}: no alive workers")
-        assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games)
+        assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games,
+                                                 max_share=pfsp_max_share)
 
         # Log per-iter distribution for visibility (one line, sorted by games).
         opp_dist: Dict[str, List[int]] = {}
@@ -2977,7 +2979,8 @@ class CISBgCollector:
 
         # S58 (F): one opp per worker. See _allocate_opps_to_workers docstring
         # for rationale. Mirrors the regular orchestrator dispatch path.
-        assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games)
+        assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games,
+                                                 max_share=ctx.get("pfsp_max_share", 0.20))
         opp_dist: Dict[str, List[int]] = {}
         for a in assignments:
             if a["opp"] is None:
@@ -3077,6 +3080,8 @@ class CISBgCollector:
             "procedural_teams_path": args_dict.get("teambuilder_path"),
             "device_str": str(device),
             "device_type": device.type,
+            # S68 Path B-hybrid: per-opp max share cap (default 0.20).
+            "pfsp_max_share": args_dict.get("pfsp_max_share", 0.20),
             "amp_dtype": amp_dtype,
             "max_pool_size": max_pool_size,
             "cis_min_batch": cis_min_batch,
@@ -3265,6 +3270,7 @@ def _allocate_opps_to_workers(
     opp_pool_msg: List[dict],
     n_workers: int,
     total_games: int,
+    max_share: float = 0.20,
 ) -> List[dict]:
     """S58 (F): orchestrator-side opp -> worker assignment. One opp per worker.
 
@@ -3303,6 +3309,61 @@ def _allocate_opps_to_workers(
     drift = total_games - sum(target)
     if drift != 0:
         target[weights.index(max(weights))] += drift
+
+    # Step 1b: S68 Path B-hybrid (2026-05-31) — cap any single opp at
+    # `max_share` fraction of total_games (default 0.20). PFSP-weighted
+    # allocation can pathologically concentrate games on one opp at our
+    # actor scale (~30 workers): e.g. mirror match (default WR=0.5,
+    # weight=0.25) was observed taking 36% of games while 9 other opps
+    # split the rest. The cap preserves PFSP's "harder=more" signal within
+    # the cap, but prevents any single opp from dominating the iter and
+    # starving the gradient signal from less-played opps. Excess from
+    # capped opps redistributes by weight to uncapped opps.
+    #
+    # Disable by passing max_share >= 1.0 (legacy unbounded behavior).
+    # See [[s68-path-b-design]] memo + AlphaStar/OpenAI Five comparison.
+    if 0.0 < max_share < 1.0 and n_opps >= 2:
+        cap = max(1, int(total_games * max_share))
+        capped = [i for i in range(n_opps) if target[i] > cap]
+        if capped:
+            excess = sum(target[i] - cap for i in capped)
+            for i in capped:
+                target[i] = cap
+            # Redistribute excess to under-capped opps by their weight.
+            # Iterate until excess is drained or all opps hit cap (rare).
+            uncapped = [i for i in range(n_opps) if target[i] < cap]
+            while excess > 0 and uncapped:
+                uncap_w = sum(weights[i] for i in uncapped)
+                if uncap_w <= 0:
+                    break
+                added_this_round = 0
+                still_uncapped = []
+                for i in uncapped:
+                    add = max(1, int(round(excess * weights[i] / uncap_w)))
+                    headroom = cap - target[i]
+                    add = min(add, headroom, excess - added_this_round)
+                    if add <= 0:
+                        continue
+                    target[i] += add
+                    added_this_round += add
+                    if target[i] < cap:
+                        still_uncapped.append(i)
+                if added_this_round == 0:
+                    break  # safety: avoid infinite loop
+                excess -= added_this_round
+                uncapped = still_uncapped
+            # Last-resort drift fix: if integer rounding left excess > 0,
+            # dump remainder on the highest-weight opp with headroom.
+            # Preserves PFSP ordering and total_games invariant.
+            if excess > 0:
+                remaining = [i for i in range(n_opps) if target[i] < cap]
+                if remaining:
+                    best_idx = max(remaining, key=lambda i: weights[i])
+                    target[best_idx] += excess
+                else:
+                    # Pathological: every opp at cap. Put on highest-weight
+                    # capped opp (better than dropping games).
+                    target[weights.index(max(weights))] += excess
 
     # Step 2: distribute workers across opps.
     # S67-ext speed-aware: when a slow opp (mcts-hard, ~30s/game) is in the
