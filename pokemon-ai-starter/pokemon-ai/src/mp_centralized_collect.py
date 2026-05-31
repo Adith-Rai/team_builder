@@ -2494,8 +2494,15 @@ def mp_centralized_collect_sync(
     cis_min_batch: int = 8,
     cis_timeout_ms: int = 15,
     max_pool_size: int = 16,
+    worker_device: Optional[str] = None,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
+
+    S68: `worker_device` (default None = str(device)) overrides the device
+    string sent to workers in their collect_iter cmd. Set to "cpu" to keep
+    workers off the GPU entirely (avoids ~490 MB CUDA context per worker;
+    60w = 30 GB saved on main GPU). CIS subprocess still uses `device`
+    (cuda) for actual model inference.
 
     Drop-in replacement for mp_disk_collect_sync when --cis flag is set.
     Returns the same tuple shape: (trajs, w, l, t, steps, opp_name,
@@ -2668,7 +2675,7 @@ def mp_centralized_collect_sync(
                 "turn_cap": turn_cap,
                 "battle_format": battle_format,
                 "procedural_teams_path": procedural_teams_path,
-                "device": str(device),
+                "device": worker_device if worker_device else str(device),
                 "opponent_device": opponent_device,
                 "rng_seed": rng_seed,
                 "amp_dtype": amp_dtype,
@@ -3017,7 +3024,7 @@ class CISBgCollector:
                 "turn_cap": ctx["turn_cap"],
                 "battle_format": ctx["battle_format"],
                 "procedural_teams_path": ctx["procedural_teams_path"],
-                "device": ctx["device_str"],
+                "device": ctx.get("worker_device_str") or ctx["device_str"],
                 "opponent_device": ctx["opponent_device"],
                 "rng_seed": ctx["rng_seed"],
                 "amp_dtype": ctx["amp_dtype"],
@@ -3077,6 +3084,10 @@ class CISBgCollector:
             "procedural_teams_path": args_dict.get("teambuilder_path"),
             "device_str": str(device),
             "device_type": device.type,
+            # S68 worker-cpu mode: if args_dict["worker_device_str"] is set,
+            # workers get that device (typically "cpu") instead of "cuda".
+            # CIS subprocess + main proc still use `device` for inference.
+            "worker_device_str": (args_dict.get("worker_device_str") or str(device)),
             "amp_dtype": amp_dtype,
             "max_pool_size": max_pool_size,
             "cis_min_batch": cis_min_batch,
