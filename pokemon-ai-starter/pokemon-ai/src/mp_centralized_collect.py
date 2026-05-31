@@ -1699,6 +1699,18 @@ def _cis_worker_main(worker_id: int, ctrl_pipe, result_pipe,
     except Exception:
         pass
 
+    # S68 Path A1: workers are IO-bound on CIS responses; they only do
+    # tiny CPU tensor ops (9-elem logits, scalar value, D-dim summary).
+    # Without this, torch defaults each worker's OMP/MKL thread pool to
+    # num_cpus → 60 workers × 16+ threads each can exhaust the per-user
+    # nproc ulimit and trigger `libgomp: Thread creation failed`. One
+    # thread per worker is correct AND eliminates the failure mode.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already set earlier in process lifetime; non-fatal
+
     import logging
     logging.basicConfig(level=logging.WARNING)
 
