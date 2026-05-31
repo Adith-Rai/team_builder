@@ -249,12 +249,14 @@ def parse_args():
     p.add_argument("--mp-workers", type=int, default=8,
                    help="Number of mp-disk OR cis workers when --mp/--cis is set "
                         "(default 8 for RunPod A100 80GB; tune down for smaller VRAM).")
-    p.add_argument("--worker-cpu", action="store_true",
-                   help="CIS workers receive device='cpu' (not 'cuda'). Workers "
-                        "don't own a model — only convert tiny logits tensors "
-                        "from CIS's numpy responses. Forcing CPU avoids the "
-                        "~490 MB CUDA context per worker (60w = 30 GB saved on "
-                        "main GPU). Pairs with --cis; no-op without it.")
+    p.add_argument("--worker-cpu", action=argparse.BooleanOptionalAction, default=True,
+                   help="CIS workers receive device='cpu' (default) instead of "
+                        "'cuda'. Workers don't own a model — only convert tiny "
+                        "logits tensors from CIS's numpy responses. CPU avoids "
+                        "the ~490 MB CUDA context per worker (60w = 30 GB saved "
+                        "on main GPU) AND is empirically slightly faster (PCIe "
+                        "transfer eliminated for tiny tensors). Pairs with "
+                        "--cis; no-op without it. Disable with --no-worker-cpu.")
     p.add_argument("--mp-cache-size", type=int, default=3,
                    help="Per-worker LRU cache size for opponent ckpts (default 3).")
     p.add_argument("--batch-timeout-ms", type=float, default=15,
@@ -593,7 +595,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             amp_dtype=getattr(args, 'amp_dtype_name', None),
             cis_min_batch=args.cis_min_batch,
             cis_timeout_ms=args.cis_timeout_ms,
-            worker_device=("cpu" if getattr(args, 'worker_cpu', False) else str(device)),
+            worker_device=("cpu" if getattr(args, 'worker_cpu', True) else str(device)),
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1398,8 +1400,8 @@ def main():
         "cis_min_batch": args.cis_min_batch,
         "cis_timeout_ms": args.cis_timeout_ms,
         # S68 worker-cpu mode: read by CISBgCollector.start, propagates to
-        # workers' device cmd-arg. None = use main device (back-compat).
-        "worker_device_str": ("cpu" if getattr(args, 'worker_cpu', False) else None),
+        # workers' device cmd-arg. Default True (cpu) — disable via --no-worker-cpu.
+        "worker_device_str": ("cpu" if getattr(args, 'worker_cpu', True) else None),
     }
     pending_collection = None
     # Background collector for --mp/--cis + --pipeline. Mirrors the
