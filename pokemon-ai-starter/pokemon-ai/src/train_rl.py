@@ -257,6 +257,14 @@ def parse_args():
                         "on main GPU) AND is empirically slightly faster (PCIe "
                         "transfer eliminated for tiny tensors). Pairs with "
                         "--cis; no-op without it. Disable with --no-worker-cpu.")
+    p.add_argument("--pfsp-max-share", type=float, default=0.20,
+                   help="Cap per-iter games for any single opp at this fraction "
+                        "of total. Default 0.20 (max 20%% per opp). Prevents "
+                        "PFSP weight pathologies (e.g., mirror getting ~36%% of "
+                        "games) without dropping the prioritization signal — "
+                        "excess is redistributed to under-capped opps by their "
+                        "PFSP weight. Set to 1.0 to disable cap (legacy "
+                        "unbounded PFSP allocation).")
     p.add_argument("--mp-cache-size", type=int, default=3,
                    help="Per-worker LRU cache size for opponent ckpts (default 3).")
     p.add_argument("--batch-timeout-ms", type=float, default=15,
@@ -596,6 +604,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             cis_min_batch=args.cis_min_batch,
             cis_timeout_ms=args.cis_timeout_ms,
             worker_device=("cpu" if getattr(args, 'worker_cpu', True) else str(device)),
+            pfsp_max_share=getattr(args, 'pfsp_max_share', 0.20),
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1402,6 +1411,9 @@ def main():
         # S68 worker-cpu mode: read by CISBgCollector.start, propagates to
         # workers' device cmd-arg. Default True (cpu) — disable via --no-worker-cpu.
         "worker_device_str": ("cpu" if getattr(args, 'worker_cpu', True) else None),
+        # S68 Path B-hybrid: per-opp max share cap (default 0.20 = max 20%
+        # of per-iter games per opp). Read by CISBgCollector.start.
+        "pfsp_max_share": getattr(args, 'pfsp_max_share', 0.20),
     }
     pending_collection = None
     # Background collector for --mp/--cis + --pipeline. Mirrors the
