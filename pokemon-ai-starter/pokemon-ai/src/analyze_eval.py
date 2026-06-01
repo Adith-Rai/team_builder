@@ -80,9 +80,31 @@ _TYPE_CHART_RAW = {
 # Species -> types lookup via poke-env (covers all 1547 species)
 try:
     from poke_env.data.gen_data import GenData as _GenData
-    _POKEDEX = _GenData.from_gen(9).pokedex
+    _GD = _GenData.from_gen(9)
+    _POKEDEX = _GD.pokedex
+    _MOVES = _GD.moves
 except Exception:
     _POKEDEX = {}
+    _MOVES = {}
+
+def _move_accuracy(move_name):
+    """Return move base accuracy (0-100) or None if never-miss or unknown.
+
+    poke-env stores moves under lowercase no-space ids (e.g. 'closecombat').
+    Accuracy field is int 0-100 OR boolean True for never-miss moves.
+    """
+    if not _MOVES or not move_name:
+        return None
+    key = re.sub(r'[^a-z0-9]', '', move_name.lower())
+    md = _MOVES.get(key)
+    if md is None:
+        return None
+    acc = md.get('accuracy')
+    if acc is True:
+        return None  # never-miss; don't count in miss-rate denominator
+    if isinstance(acc, (int, float)):
+        return int(acc)
+    return None
 
 def _get_species_types(species):
     """Look up types for a species name via poke-env pokedex."""
@@ -185,7 +207,10 @@ def _parse_battle_log(log, battle_id, fname=''):
             if current_turn['number'] > 0:
                 battle['turns'].append(current_turn)
             turn_num = int(line.split('|')[2])
-            current_turn = {'number': turn_num, 'p1_actions': [], 'p2_actions': [], 'events': []}
+            # Snapshot HP at turn start (used for bad-sack detection — HP BEFORE damaging moves this turn)
+            start_hp_snapshot = dict(battle['hp_tracker'])
+            current_turn = {'number': turn_num, 'p1_actions': [], 'p2_actions': [], 'events': [],
+                            'start_hp': start_hp_snapshot}
             last_move_player = None  # reset per-turn to prevent cross-turn misattribution
             battle['total_turns'] = turn_num
         elif line.startswith('|move|'):
@@ -250,14 +275,20 @@ def _parse_battle_log(log, battle_id, fname=''):
                 battle['hp_tracker'][f'{player}: {mon_name}'] = hp_pct
         elif line.startswith('|faint|'):
             parts = line.split('|')
-            current_turn['events'].append(('faint', parts[2]))
-            if parts[2].startswith('p1'):
+            target_ref = parts[2]
+            player = 'p1' if target_ref.startswith('p1') else 'p2'
+            mon_name = target_ref.split(': ')[1] if ': ' in target_ref else target_ref
+            # HP at START of this turn (BEFORE damage this turn) — for bad-sack analysis.
+            # If mon was already low at turn start AND faints this turn, that's NOT a bad sack.
+            # If mon was healthy at turn start AND faints this turn, it's a possible bad sack.
+            start_hp = current_turn.get('start_hp', {}).get(f'{player}: {mon_name}')
+            # 3-tuple: (kind, mon_ref, start_hp_at_faint_turn). Existing code reading event[1] still works.
+            current_turn['events'].append(('faint', target_ref, start_hp))
+            if target_ref.startswith('p1'):
                 battle['p1_faints'] += 1
-            elif parts[2].startswith('p2'):
+            elif target_ref.startswith('p2'):
                 battle['p2_faints'] += 1
             # Set HP to 0
-            player = 'p1' if parts[2].startswith('p1') else 'p2'
-            mon_name = parts[2].split(': ')[1] if ': ' in parts[2] else parts[2]
             battle['hp_tracker'][f'{player}: {mon_name}'] = 0.0
         elif line.startswith('|-supereffective|'):
             current_turn['events'].append(('supereffective', last_move_player))
@@ -282,6 +313,24 @@ def _parse_battle_log(log, battle_id, fname=''):
         elif line.startswith('|-crit|'):
             parts = line.split('|')
             current_turn['events'].append(('crit', parts[2]))
+        elif line.startswith('|-miss|'):
+            # |-miss|<source_pokemon>|<target_pokemon>  (target optional)
+            parts = line.split('|')
+            source_ref = parts[2] if len(parts) > 2 else ''
+            source_player = 'p1' if source_ref.startswith('p1') else ('p2' if source_ref.startswith('p2') else None)
+            current_turn['events'].append(('miss', source_player))
+        elif line.startswith('|-end|') and 'Substitute' in line:
+            # |-end|p1a: Mon|Substitute  (sub broken)
+            parts = line.split('|')
+            target_ref = parts[2] if len(parts) > 2 else ''
+            target_player = 'p1' if target_ref.startswith('p1') else ('p2' if target_ref.startswith('p2') else None)
+            current_turn['events'].append(('sub_end', target_player))
+        elif line.startswith('|-activate|') and ('trapped' in line.lower() or 'magnet pull' in line.lower() or 'mean look' in line.lower() or 'arena trap' in line.lower() or 'shadow tag' in line.lower()):
+            # |-activate|<player>|trapped  or  |-activate|<player>|move: Mean Look  etc.
+            parts = line.split('|')
+            target_ref = parts[2] if len(parts) > 2 else ''
+            target_player = 'p1' if target_ref.startswith('p1') else ('p2' if target_ref.startswith('p2') else None)
+            current_turn['events'].append(('trapped', target_player))
         elif line.startswith('|win|'):
             battle['winner'] = line.split('|')[2]
 
@@ -336,6 +385,32 @@ def analyze_battles(battles, our_player_prefix='BCPolicyPlayer'):
         'early_switches': 0,  # switches in turns 1-3
         'early_turns': 0,
         'unique_mons_per_battle': [],
+        # ── S68 Tier 1+2 additions (Jun 1) ──
+        # Accuracy / miss (only counts moves where acc != True/None)
+        'acc_moves_attempted_us': 0,
+        'acc_moves_missed_us': 0,
+        'low_acc_used_us': 0,           # moves with base acc < 90
+        # Status APPLIED breakdown (who applied it to whom)
+        'status_applied_us': Counter(),  # {brn,par,slp,frz,psn,tox} — we statused them
+        'status_applied_them': Counter(),# they statused us
+        # Substitute outcomes
+        'sub_used_us': 0,
+        'sub_broken_us': 0,
+        # Trapping
+        'trapped_us': 0,
+        'trapped_them': 0,
+        # Per-mon KO attribution (heuristic: last damaging move of our side per turn)
+        'kos_per_mon_us': Counter(),
+        'mon_active_count_us': Counter(),   # times species was sent in
+        'mon_faint_count_us': Counter(),    # times species fainted
+        # Bad sacks: faints at >40% HP (existing faint_hps tracked in stats below)
+        'all_faint_hps_us': [],
+        'bad_sacks_us': 0,
+        # Lead / mid / endgame phase splits (turn ranges: 1-3 / 4-15 / 16+)
+        'phase_moves_us': {'lead': 0, 'mid': 0, 'end': 0},
+        'phase_misses_us': {'lead': 0, 'mid': 0, 'end': 0},
+        'phase_se_us': {'lead': 0, 'mid': 0, 'end': 0},
+        'phase_resisted_us': {'lead': 0, 'mid': 0, 'end': 0},
     }
 
     for b in battles:
@@ -473,6 +548,81 @@ def analyze_battles(battles, our_player_prefix='BCPolicyPlayer'):
                     if attacker == our_key:
                         stats['our_immune_moves'] += 1
 
+            # ── S68 Tier 1+2 per-turn aggregation (Jun 1) ──
+            # Phase classification: lead=1-3 / mid=4-15 / end=16+
+            tnum = turn['number']
+            phase = 'lead' if tnum <= 3 else ('mid' if tnum <= 15 else 'end')
+            # Categories that do NOT damage (so we exclude them when finding our last damaging mon for KO attribution)
+            _NON_DAMAGING = SETUP_MOVES | HAZARD_MOVES | HAZARD_REMOVAL | STATUS_MOVES | RECOVERY_MOVES | PROTECT_MOVES
+            our_last_damaging_mon = None
+            for action in our_actions:
+                if action['type'] != 'move':
+                    continue
+                move = action['move']
+                stats['phase_moves_us'][phase] += 1
+                acc = _move_accuracy(move)
+                if acc is not None:
+                    stats['acc_moves_attempted_us'] += 1
+                    if acc < 90:
+                        stats['low_acc_used_us'] += 1
+                if move == 'Substitute':
+                    stats['sub_used_us'] += 1
+                if move not in _NON_DAMAGING:
+                    our_last_damaging_mon = action['mon']
+            for event in turn['events']:
+                kind = event[0]
+                if kind == 'miss':
+                    side = event[1] if len(event) > 1 else None
+                    if side == our_key:
+                        stats['acc_moves_missed_us'] += 1
+                        stats['phase_misses_us'][phase] += 1
+                elif kind == 'supereffective':
+                    if (event[1] if len(event) > 1 else None) == our_key:
+                        stats['phase_se_us'][phase] += 1
+                elif kind == 'resisted':
+                    if (event[1] if len(event) > 1 else None) == our_key:
+                        stats['phase_resisted_us'][phase] += 1
+                elif kind == 'sub_end':
+                    if (event[1] if len(event) > 1 else None) == our_key:
+                        stats['sub_broken_us'] += 1
+                elif kind == 'trapped':
+                    side = event[1] if len(event) > 1 else None
+                    if side == our_key:
+                        stats['trapped_us'] += 1
+                    elif side == opp_key:
+                        stats['trapped_them'] += 1
+                elif kind == 'status':
+                    # ('status', target_ref, status_type) — target is who got statused
+                    target_ref = event[1] if len(event) > 1 else ''
+                    status_type = event[2] if len(event) > 2 else ''
+                    if status_type and target_ref:
+                        tside = 'p1' if target_ref.startswith('p1') else ('p2' if target_ref.startswith('p2') else None)
+                        if tside == opp_key:
+                            stats['status_applied_us'][status_type] += 1
+                        elif tside == our_key:
+                            stats['status_applied_them'][status_type] += 1
+                elif kind == 'faint':
+                    # ('faint', target_ref, start_hp_this_turn)
+                    target_ref = event[1]
+                    start_hp = event[2] if len(event) > 2 else None
+                    tside = 'p1' if target_ref.startswith('p1') else 'p2'
+                    target_species = target_ref.split(': ')[1] if ': ' in target_ref else target_ref
+                    canon_species = target_species  # keep hyphenated names intact (Ting-Lu, Chien-Pao etc.)
+                    if tside == opp_key:
+                        # We KO'd them — attribute to our last damaging mon if known
+                        if our_last_damaging_mon:
+                            stats['kos_per_mon_us'][our_last_damaging_mon] += 1
+                    elif tside == our_key:
+                        stats['mon_faint_count_us'][canon_species] += 1
+                        if start_hp is not None:
+                            stats['all_faint_hps_us'].append(start_hp)
+                            if start_hp > 40.0:
+                                stats['bad_sacks_us'] += 1
+
+        # Battle-level: count unique species we used (active count)
+        for species in battle_mons:
+            stats['mon_active_count_us'][species] += 1
+
         if streak >= 3:
             stats['same_move_streaks'].append((prev_move, streak))
 
@@ -543,6 +693,44 @@ def compute_playstyle_profile(stats):
     # Win rate
     decided = stats['wins'] + stats['losses']
     profile['win_rate'] = stats['wins'] / max(1, decided)
+
+    # ── S68 Tier 1+2 derived metrics ──
+    # Accuracy / miss rate (denominator = acc-rolling moves only)
+    acc_att = stats.get('acc_moves_attempted_us', 0)
+    profile['miss_rate'] = stats.get('acc_moves_missed_us', 0) / max(1, acc_att)
+    profile['low_acc_used_rate'] = stats.get('low_acc_used_us', 0) / max(1, total_moves)
+    profile['acc_moves_attempted'] = acc_att
+    profile['acc_moves_missed'] = stats.get('acc_moves_missed_us', 0)
+    # Substitute outcomes
+    sub_used = stats.get('sub_used_us', 0)
+    sub_broken = stats.get('sub_broken_us', 0)
+    profile['sub_used'] = sub_used
+    profile['sub_broken_pct'] = sub_broken / max(1, sub_used)
+    # Trapping
+    profile['trapped_us'] = stats.get('trapped_us', 0)
+    profile['trapped_them'] = stats.get('trapped_them', 0)
+    # Bad sacks
+    n_faints = len(stats.get('all_faint_hps_us', []))
+    profile['bad_sacks_us'] = stats.get('bad_sacks_us', 0)
+    profile['bad_sack_pct'] = stats['bad_sacks_us'] / max(1, n_faints) if n_faints else 0.0
+    # Useless members: 0 KOs AND fainted >=70% of active rate AND active >= 3 (filter noise)
+    useless = []
+    for species, n_active in stats.get('mon_active_count_us', {}).items():
+        if n_active < 3:
+            continue
+        n_kos = stats.get('kos_per_mon_us', {}).get(species, 0)
+        n_faints_mon = stats.get('mon_faint_count_us', {}).get(species, 0)
+        if n_kos == 0 and n_faints_mon >= 0.7 * n_active:
+            useless.append((species, n_kos, n_faints_mon, n_active))
+    profile['useless_members'] = useless
+    # Phase split metrics (rate per phase)
+    for ph in ('lead', 'mid', 'end'):
+        m = stats['phase_moves_us'].get(ph, 0)
+        profile[f'phase_{ph}_moves'] = m
+        profile[f'phase_{ph}_miss_rate'] = stats['phase_misses_us'].get(ph, 0) / max(1, m)
+        # SE/resisted rate vs moves issued in that phase (not flagged-only — keeps comparison consistent)
+        profile[f'phase_{ph}_se_rate'] = stats['phase_se_us'].get(ph, 0) / max(1, m)
+        profile[f'phase_{ph}_resisted_rate'] = stats['phase_resisted_us'].get(ph, 0) / max(1, m)
 
     return profile
 
@@ -1152,6 +1340,67 @@ def print_playstyle_report(stats, profile, label):
             spam_counter[move] += 1
         for move, count in spam_counter.most_common(5):
             print(f"    {move:28s} {count:3d} streaks")
+
+    # ── S68 Tier 1+2 sections (accuracy / status / sub / trap / per-mon / bad sacks / phase) ──
+    acc_att = profile.get('acc_moves_attempted', 0)
+    if acc_att > 0:
+        print(f"\n  ACCURACY")
+        print(f"    Acc-rolling moves: {acc_att}")
+        print(f"    Missed:            {profile['acc_moves_missed']} ({profile['miss_rate']:.1%})")
+        print(f"    Low-acc (<90) used: {stats.get('low_acc_used_us', 0)} ({profile['low_acc_used_rate']:.1%} of all moves)")
+
+    sa_us = stats.get('status_applied_us')
+    sa_them = stats.get('status_applied_them')
+    if sa_us or sa_them:
+        print(f"\n  STATUS APPLIED")
+        if sa_us:
+            parts = ' '.join(f"{s}={c}" for s, c in sa_us.most_common())
+            print(f"    We → them: {parts}  (total {sum(sa_us.values())})")
+        if sa_them:
+            parts = ' '.join(f"{s}={c}" for s, c in sa_them.most_common())
+            print(f"    Them → us: {parts}  (total {sum(sa_them.values())})")
+
+    sub_used = profile.get('sub_used', 0)
+    if sub_used:
+        broken = stats.get('sub_broken_us', 0)
+        print(f"\n  SUBSTITUTE")
+        print(f"    Used:    {sub_used}")
+        print(f"    Broken:  {broken} ({profile['sub_broken_pct']:.0%})")
+        print(f"    Preserved (or end-of-battle): {sub_used - broken}")
+
+    if profile.get('trapped_us', 0) or profile.get('trapped_them', 0):
+        print(f"\n  TRAPPING")
+        print(f"    Our mons trapped:  {profile['trapped_us']}")
+        print(f"    Opp mons trapped:  {profile['trapped_them']}")
+
+    kos = stats.get('kos_per_mon_us')
+    if kos:
+        print(f"\n  PER-MON CONTRIBUTION (top KO scorers, our side)")
+        for species, n_kos in kos.most_common(8):
+            n_active = stats['mon_active_count_us'].get(species, 0)
+            n_faints = stats['mon_faint_count_us'].get(species, 0)
+            print(f"    {species:20s} {n_kos:3d} KOs / {n_active:3d} active / {n_faints:3d} faints")
+    useless = profile.get('useless_members', [])
+    if useless:
+        print(f"\n  USELESS MEMBERS (0 KOs scored, fainted ≥70% of active count, ≥3 active)")
+        for species, _, n_faints, n_active in useless:
+            print(f"    {species:20s} 0 KOs / {n_active} active / {n_faints} faints")
+
+    n_faints_total = len(stats.get('all_faint_hps_us', []))
+    if n_faints_total:
+        print(f"\n  BAD SACKS (faint at >40% turn-start HP)")
+        print(f"    Bad sacks: {profile['bad_sacks_us']} / {n_faints_total} ({profile['bad_sack_pct']:.0%})")
+
+    lead_m = profile.get('phase_lead_moves', 0)
+    mid_m = profile.get('phase_mid_moves', 0)
+    end_m = profile.get('phase_end_moves', 0)
+    if lead_m + mid_m + end_m:
+        print(f"\n  PHASE SPLITS (lead=t1-3 / mid=t4-15 / end=t16+)")
+        for ph, m in [('lead', lead_m), ('mid', mid_m), ('end', end_m)]:
+            if m == 0:
+                continue
+            print(f"    {ph:5s}  moves={m:4d}  miss={profile[f'phase_{ph}_miss_rate']:.1%}  "
+                  f"SE={profile[f'phase_{ph}_se_rate']:.1%}  resisted={profile[f'phase_{ph}_resisted_rate']:.1%}")
 
 
 def print_comparison(profiles, labels):
