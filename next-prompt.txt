@@ -1,4 +1,195 @@
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S68 (2026-06-01, FISHBOWL LR=1e-4 IN FLIGHT — dual-shard parallel runs)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE**: dual-shard fishbowl LR=1e-4 running. Dev shard 1 v2 (from BC v10, full 62-entry dev pool) at iter 3-warmup ~12:42 UTC. Prod shard 2 v2 (from lr8e5 record snap_0139 = 1178.4 Elo, cleaned 151-entry pool, MMs + mcts-fast/medium NO mcts-hard) at iter 140-warmup ~12:44 UTC. Together they characterize whether LR=1e-4 is the next step past 8e-5 (which set the 1178.4 record).
+
+## Critical context — DO NOT RESTART, DO NOT RE-INVESTIGATE
+
+**Runs are running.** Don't relaunch. Don't re-derive what LR=1e-4 should test. Don't re-restart the dev shard.
+
+**Branch (both pods)**: `opt/combined-cleanup-allocator` @ commit `0d4e7d8` (S68 thread-cap fix). CONFIRMED Jun 1 12:30 UTC.
+
+## In-flight runs
+
+### Dev pod (port 34576 / 213.173.105.9) — Fishbowl shard 1 v2
+- Run dir: `data/models/rl_v10/fishbowl_lr1e-4_v2/selfplay_v9_20260601_122046/`
+- Launched: 12:20:47 UTC
+- Init: `data/models/bc/v10_padded_for_cis_dev.pt` (BC v10 padded)
+- Pool: **62 dev-native entries** (lr8e5 + phase2 + BC + h2h + phase1_v3 — see `/tmp/pool_anchors_dev.txt` on dev)
+- Force anchor: BC v10 padded (symmetric with prod's force = resume snap)
+- Stack: pure SP, 90w, mb=64, warmup=5, 150 iters
+- Composition: 1 force + 2 self-forced + 2 random + 5 PFSP = 10 active opps/iter
+- Iter wall observed: collect 217-227s, update 71-75s (warmup) = ~290-300s/iter
+- First eval at iter 9 (~13:50 UTC)
+- Monitor: task `bpiw4a2xg` (persistent)
+- Launch script: `/tmp/launch_fishbowl_lr1e-4_v2.sh`
+
+**v1 (KILLED)**: ran 12 iters with empty pool (pool=1), discovered pool conditions confounded vs lr8e5_v1_flash original. Restarted as v2 with full pool. v1 iter 9 eval = smart_avg 68%.
+
+### Prod pod (port 47913 / 195.26.233.30) — Fishbowl shard 2 v2
+- Run dir: `data/models/rl_v10/fishbowl_prod_lr1e-4_v1/`
+- Launched (clean): 12:34:44 UTC after restart
+- Resume: `data/models/rl_v10/lr8e5_v1_flash/selfplay_v9_20260528_124244/snapshot_0139.pt` (1178.4 Elo record)
+- Force anchor: snap_0139 (resume snap)
+- Pool: **151 cleaned entries** (was 156 — removed 5 pre-tokenizer-expansion bad entries: 4 ppo_phase1 May-5-arch + 1 v10_cloud_gen9 un-padded). Train_rl auto-scans adds run-dir snaps → effective pool=174.
+- Externals: 3 MMs (LargeRL + MediumRL_Aug + SyntheticRLV2 × instances=3) + mcts-fast + mcts-medium. **mcts-hard DROPPED** (drives collect wall ~+50%, fishbowl wants quick signal).
+- Stack: 90w, mb=64, warmup=5, 150 iters, --max-opponents-per-iter 10, --n-ext-per-iter 5
+- Iter 140 (first after restart, WARMUP): W/L=626/974/0 (39.1%) — losing as expected vs strong pool, pi=0.006, collect=409s, update=65s, bc_kl=0.16
+- First eval at iter 149 (~15:30 UTC)
+- Monitor: task `bbkj6rm5k` (persistent)
+- Launch script: `/tmp/launch_fishbowl_prod_lr1e-4.sh`
+- External adapters yaml: `external_adapters_fishbowl_lr1e-4_v1.yaml`
+
+**Local Elo poller**: NOT running this session — no continuous poller set up. Use `eval_elo_ladder.py` post-run for ladder eval.
+
+## LR landscape (CONCRETE — from era4_chain_FINAL.json + S57-S67 records)
+
+| LR | Reward style | Best Elo | Notes |
+|---|---|---|---|
+| 1e-5 | dense (v2_dense) | 1170.1 (phase2_vf05_v1_iter189) | Plateau ~1168-1170, multiple lineages confirm |
+| 3e-5 | dense | LOWER basin (per `project_lr_results_summary.md`) | **REFUTED — don't retry** |
+| 8e-5 | **terminal** | **1178.4** (lr8e5_v1_flash POST_INIT_iter139, RECORD) | +8.3 Elo over best 1e-5 peer. Potentially still rising at iter 139. |
+| **1e-4** | **dense** (S68 fishbowl) | TESTING NOW | **NOT apples-to-apples vs 8e-5 record** — reward style differs |
+
+**CRITICAL CONFOUND**: S68 fishbowl uses `--reward-style dense` (matches canonical stack). 8e-5 record was set under `--reward-style terminal`. Two variables changed.
+- Dev shard 1 vs v2_dense baseline = apples-to-apples (both dense)
+- Prod shard 2 resumed-from-record = NOT apples-to-apples (reward style differs from how the resumed snap was trained)
+- **Historical pattern (CRITICAL)**: dense was used in earlier runs but **at some point begins optimizing for rewards not wins** (reward hacking — policy stacks KO/HP shaping without winning). That's why we historically switched to terminal. The 8e-5 record was a dense → terminal switch run. **Watch for**: WR stable/down + smart_avg down + bc_kl climbing unusually high + v_loss climbing → reward hacking signal. If detected → drop dense for Phase 2 final, revert to terminal.
+- Real fishbowl question revised: "Is 1e-4 better than 1e-5 in the CANONICAL DENSE stack?" Dev shard answers directly. "Is dense+1e-4 better than terminal+8e-5?" needs a follow-up shard at 1e-4 + terminal.
+
+**Fishbowl-shaped landscape** (S68 framing): non-monotonic, 8e-5 is best found but unknown if floor or still on slope. **Plan: if 1e-4 isn't at the wall → try 2e-4. If 1e-4 IS the wall → step back between 8e-5 and 1e-4.** "Wall" signal = oscillation in metric (not plateau — plateau is the equilibrium, oscillation is "stepped past the optimum").
+
+## Verified Era 4 ladder (CONCRETE)
+
+POST_INIT lineage (8e-5):
+- iter 29: 1164.7 (post-speed-opt restart point)
+- iter 39: 1161.1 (accidental warmup dip)
+- iter 69: 1169.2
+- iter 89: 1173.0
+- iter 119: 1171.9
+- **iter 139: 1178.4 (RECORD)**
+
+1e-5 peers (best of each lineage):
+- phase2_vf05_v1_iter189: 1170.1
+- phase2_diversity_v1_iter139: 1169.9
+- phase2_diversity_v1_iter159: 1169.4
+
+Baselines:
+- bc_v10_cloud_e3: 1135.3
+- rl_v10_1600g_iter9: 1134.5
+- Bots: Tactical=1019.9, SmartDmg=1017.1, SH=1000.0 (anchor), Strategic=997.4
+
+## Worker count findings (CONCRETE, verified Jun 1)
+
+**Real ceiling on RunPod community pod: 90w.** Cgroup `pids.max=9728` caps thread count. 100w hits thread_exhaustion. 120w produces 11,551 "can't start new thread" errors.
+
+Timing data (CONCRETE, pure SP, mb=64, era4 final.pt resume, pool=47 unless noted):
+
+| Workers | Branch | Collect | Update | Total | Status |
+|---|---|---|---|---|---|
+| 30 | master (pre-worker-cpu) | 572-578s | 131-135s | **703-713s** | CLEAN |
+| 60 | master (pre-worker-cpu) | 532s | 54s (4 OOMs) | broken | OOM in update |
+| 30 | opt/worker-cpu-only | 523-538s | 127-135s | **650-673s** | -7% |
+| 60 + ext (no MM) | opt/combined | 185-221s | 115-116s | **300-337s** | pool=50 |
+| 80 (pool=5) | opt/combined | 211s | 131s | 342s | snap_0139 resume |
+| 90 (pool=5) | opt/combined | 202s | 128s | **330s** | snap_0139 resume |
+| 100 | opt/combined | thread_exhaustion | - | - | cgroup-bound |
+
+**Caveat**: 60w/80w/90w combined-branch comparisons are at smaller pools than 30w pure SP. Apples-to-apples requires re-running 30w on combined branch — not done yet.
+
+**On dedicated (non-community) pod**: re-test 100w/110w/120w. Cgroup limit may be higher. **Out of scope until pod upgrade.**
+
+## PER-OPP WR IS THE REAL ITER-BY-ITER SIGNAL (Jun 1 grep)
+
+**Total iter-WR (the W/L/T summary line) is noise** — weighted sum of opp-categories with wildly different WRs (mirror ~50, BC anchor ~60, old self ~55, mcts ~30, MM ~15). Use per-opp WR trends across iters. Built `parse_peropp.py` on both pods (in /tmp/) to extract `[PFSP-ITER]` lines.
+
+Findings (CONCRETE, with salt):
+- **Dev fishbowl is genuinely learning per-opp** (60 iters): BC anchor +11pp, own snap_0009 +8pp, multiple opps trending up. Total WR oscillation completely hid this.
+- **Prod fishbowl MM WRs flat** (38 iters): mm-largerl 19→20, mm-syntheticrlv2 15→16. 1e-4 didn't improve MM perf vs v2_dense's 1e-5.
+- **v2_dense MM WRs same flat 15-19 band** (50 iters): structural ceiling-like behavior across LR/reward configs tested. Conjecture: 8e-5+terminal's record gain was SP-relative, not MM-relative (can't verify directly — lr8e5 had no MMs).
+- **Implication (STRONG INFERENCE)**: Phase 2 should weight SP heavily, use externals for diversity not primary learning signal.
+- **Salt**: 38 iters short for MM eval. Dev's 60-iter climb is good but could plateau. Per-opp pattern may not generalize.
+
+See [[lr-results-summary]] §"PER-OPP WR IS THE REAL SIGNAL" for full table.
+
+## IMPORTANT — smart_avg interpretation (CRITICAL CORRECTION, Jun 1 mid-session)
+
+**Smart_avg vs the 4 default bots (SH/SmartDmg/Tactical/Strategic) plateaus at 70-74% across ALL training configs we've tested.** v2_dense (1e-5+dense), lr8e5_v1_flash (8e-5+terminal RECORD HOLDER), and fishbowl runs (1e-4+dense) all land in same band. The +8 Elo advantage of 8e-5 over 1e-5 lives in **Elo ladder**, NOT smart_avg.
+
+- DO NOT use smart_avg as a "is this run better" metric past iter 9-19
+- DO use smart_avg to confirm "policy alive" (dip below ~65 = real problem)
+- DO use Elo ladder eval (era4_chain_FINAL.json approach) for quality comparison
+- DO use gradient/training signals (pi, kl, bc_kl, pool-WR) for iter-by-iter health
+
+My earlier "dense ceiling at 72%" framing was wrong-in-scope — it's a bot-eval ceiling, not dense-specific.
+
+## REWARD STYLE ROLE — WEAKENED (user-surfaced + verified Jun 1)
+
+**Curriculum hypothesis (dense early → terminal late) is WEAKENED, not refuted.** Findings:
+- **lr8e5_v1_flash was ALWAYS terminal** (user confirmed) — not a curriculum switch run
+- **Prod ran terminal first, switched to dense mid-stream as a "hail mary"** when WR declined. Grep verified: smart_avg + pool-WR essentially same pre/post switch. Switch did NOT visibly help.
+- **STRONG INFERENCE (not concrete)**: in new-arch + BC anchor, LR is the lever, reward style is small effect or noise. Evidence: 1e-5+terminal stuck, 1e-5+dense stuck, 8e-5+terminal RECORD. Only LR change moved needle.
+
+**Caveats (where we could be wrong):**
+- 8e-5's advantage might be terminal-specific at higher LR (interaction). 8e-5+dense UNTESTED.
+- Curriculum DENSE→TERMINAL direction UNTESTED in new arch (only the opposite was tried)
+- Confounds in v1→v2_dense comparison (different pool sizes, policy shock at switch)
+
+**For S68 fishbowl: don't switch mid-run, don't worry about reward style change for prod shard.** Reward style probably matters less than I made it out to. Let both shards complete at 1e-4 + dense. End-of-run Elo ladder vs era4 chain is the decider. See [[lr-results-summary]] §"PROD TERMINAL → DENSE SWITCH DATA" + §"REWARD CURRICULUM HYPOTHESIS" for details with uncertainty labels.
+
+**For Phase 2 design**: lean on LR as primary tuning lever. Curriculum is backup if LR alone insufficient.
+
+## Settled this session — DON'T REOPEN
+
+1. **--worker-cpu is now DEFAULT True** (`--no-worker-cpu` to disable). Workers don't init CUDA. Frees ~30 GB GPU at 60w.
+2. **--pfsp-max-share 0.20 is now DEFAULT.** Path B-hybrid PFSP cap. Prevents mirror over-concentration.
+3. **Thread-cap fix shipped** (commit `0d4e7d8`): per-worker asyncio executor capped to `max(8, min(max_concurrent, n_games))`. `ulimit -u 16384` in launch_rl.sh (no-op on RunPod cgroup but belt-and-suspenders).
+4. **Canonical 90w stack**: `--cis --bf16 --tier3 --tier3-minibatch-size 64 --packed --no-per-chunk-gc --cis-min-batch 32 --cis-timeout-ms 50 --mp-workers 90 --games-per-iter 1600 --max-concurrent 200`. (NOT mb=16 like older `project_phase2_launch_plan.md` claims — that memo predates S64 sequence packing.)
+5. **5 bad pool entries identified + cleaned on prod**: 4 ppo_phase1 May-5-arch (types=28/slots=24/no gen_embed) + 1 v10_cloud_gen9 un-padded BC. Future pool builds should exclude these patterns.
+6. **mcts-hard dropped from fishbowl ext config**: drives collect wall significantly. mcts-fast + mcts-medium retained for MCTS-style diversity.
+
+## Open investigations — DO at next opportunity
+
+### MM stall pattern (UNRESOLVED — not blocking but real signal loss)
+- Pattern: workers stall at small n_done (4/28, 12-14/18) → 300s timeout → speed-aware allocator cancels remaining for that opp on that worker
+- Recent: prod fishbowl v1 workers 83/86/89 on mm-syntheticrlv2 at 12-14/18
+- REFUTED: user hypothesis "parallel_actors=4 in MM" (not in MM code path)
+- **TODO at next stall**: grep MM subprocess log for that worker timeframe + check BS handshake / poke-env state at the stuck game
+- See NEW `project_s68_mm_stall_open_investigation.md`
+
+### CIS-style Elo ladder eval (Phase 2 prereq, TODO)
+- Current `eval_elo_ladder.py` is sequential subprocess battles → takes hours for many checkpoints
+- Phase 2 scale will need many regular Elo evals
+- Need CIS-routed batch inference architecture
+- See NEW `project_cis_elo_ladder_todo.md`
+
+## What I corrected this session — anchor for next session
+
+1. **"60w no improvement vs 30w"** — was wrong-in-context. S67's flat 604-637s was specifically mb=64 + SP+MCTS pre-worker-cpu. Post worker-cpu + combined opts, 60w/80w/90w smash 30w handily (300-337s vs 650-673s under matched-as-possible conditions). User correction recorded.
+2. **First fishbowl prod launch had 5 bad pool entries** (state_dict errors). Cleaned + restarted.
+3. **Dev shard 1 v1 had empty pool** (started from BC with no --pool-anchors). Restarted as v2 with full pool to match lr8e5_v1_flash conditions (apples-to-apples).
+4. **SSH self-kill** via pkill -f matching SSH bash cmdline (recurrent S68 pattern). Always write killem to /tmp first; separate SSH calls for kill vs verify.
+
+## Reads first for next session (mandatory)
+
+1. **`MEMORY.md`** auto-load
+2. **`project_session_boot_protocol.md`** — standing orders + trajectory + standards
+3. **`project_optimization_tracker.md`** — multi-session arc state (some now-old sections, but principles in §0 are immutable)
+4. **THIS FILE (S68 wrap above)** — current state, in-flight runs, what NOT to redo
+5. **`project_fishbowl_lr1e-4_design.md`** (NEW this session) — dual-shard rationale, success criteria, decision matrix
+6. **`project_lr_results_summary.md`** — LR results context (1e-5/3e-5/8e-5 outcomes)
+7. **`project_s68_canonical_90w_config.md`** — exact launch commands + verified timing
+8. **`project_s68_era4_ladder_and_120w_rca.md`** — Elo data + cgroup RCA
+9. **`project_s68_mm_stall_open_investigation.md`** (NEW) — current MM debug state
+
+## Cost / time projections
+
+Each fishbowl shard: ~9 hours wall at ~330-360s/iter pure SP (dev) and ~10-14 min/iter with MMs (prod). At $1.50/hr each pod: ~$13.50 per shard. Total dual-shard ~$27.
+
+Next checkpoint: iter 9 eval on dev (~13:50 UTC), iter 149 eval on prod (~15:30 UTC). Both will land smart_avg numbers + first WR trajectory to compare against era4 lineage.
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S67 LATE (2026-05-30 evening, SPEED OPT ARC + DESIGN MEMO READY)
 ═══════════════════════════════════════════════════════════════════════════════
 
