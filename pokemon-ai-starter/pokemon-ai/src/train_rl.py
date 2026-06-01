@@ -322,6 +322,16 @@ def parse_args():
                         "pool (still saved on disk). Anchor checkpoints and the init "
                         "checkpoint are not affected. Default -1 = unbounded (old "
                         "behavior — caused S43/S44 dilution).")
+    # S68 pool validation (Jun 1) — exclude stale-schema entries that ckpt's
+    # saved snapshot_pool can drag in (e.g. pre-tokenizer-expansion files).
+    p.add_argument("--strict-pool", action="store_true", default=False,
+                   help="Fail HARD on ANY excluded pool entry during validation. "
+                        "Use for production launches where every anchor must be valid. "
+                        "Default off — warns but continues if <5%% of pool excluded.")
+    p.add_argument("--skip-pool-validation", action="store_true", default=False,
+                   help="Skip pool schema validation at startup. Saves ~1-3 min of "
+                        "torch.load calls but stale-schema entries will cause silent "
+                        "CIS reload failures + training pollution mid-run. Debug only.")
     # Memory: per-battle turn cap. New arch's per-attribute tokenization makes
     # PPO's per-episode forward over T turns scale ~quadratically (T=45 ≈ 1.7 GB,
     # T=200 ≈ 8 GB on a 6 GB GPU). Lowering turn_cap on local; cloud can keep 300.
@@ -352,6 +362,119 @@ def _build_reward_config(args) -> dict:
         raise ValueError(f"Unknown reward_style: {style}")
     print(f"Reward style: {style} ({cfg})", flush=True)
     return cfg
+
+
+def _validate_pool_for_arch(snapshot_pool, ref_model, strict=False, skip=False):
+    """Validate every pool entry against current model arch.
+
+    Why: ckpt.metrics.snapshot_pool can carry stale-schema entries from
+    pre-tokenizer-expansion runs (e.g. cloud_gen9/epoch_003.pt has
+    type_id_embed=[28,256] vs current [29,256]). They survive into the
+    pool, cause CIS slot reload failures every iter, pollute training
+    via stale-model dispatch (~3-5% game pollution per stale entry that
+    PFSP picks).
+
+    This function:
+      - Loads each entry's tokenizer.{type_id_embed,pokemon_slot_embed,
+        gen_embed}.weight shapes
+      - Excludes any with shape mismatch / missing gen_embed
+      - Logs every exclusion with reason
+      - FAILS HARD if >5% of pool excluded (configurable threshold via
+        --strict-pool=True for any exclusion). High exclusion rate is
+        likely a real upstream bug, not stray bad files.
+
+    Args:
+      snapshot_pool: list[str] of checkpoint paths
+      ref_model: model with current arch — used to derive expected shapes
+      strict: if True, ANY exclusion is fatal (use for production)
+      skip: if True, return pool unmodified (debug bypass)
+
+    Returns: (cleaned_pool, excluded_list[(path, reason)])
+
+    Cost: ~1-2 sec per entry on CPU. 150-entry pool = ~3 min startup.
+    Acceptable one-time cost vs 9+ hr run with mid-run errors.
+    """
+    if skip:
+        print(f"  [pool-validate] SKIPPED (--skip-pool-validation). pool={len(snapshot_pool)}", flush=True)
+        return list(snapshot_pool), []
+    if not snapshot_pool:
+        return [], []
+    # Get expected shapes from current model
+    ref_sd = ref_model.state_dict()
+    ref_keys = ['tokenizer.type_id_embed.weight',
+                'tokenizer.pokemon_slot_embed.weight',
+                'tokenizer.gen_embed.weight']
+    ref_shapes = {}
+    for k in ref_keys:
+        if k in ref_sd:
+            ref_shapes[k] = tuple(ref_sd[k].shape)
+    if not ref_shapes:
+        print(f"  [pool-validate] WARN: ref_model missing tokenizer keys, skipping validation", flush=True)
+        return list(snapshot_pool), []
+
+    import time as _time
+    t0 = _time.time()
+    cleaned = []
+    excluded = []
+    for p in snapshot_pool:
+        from pathlib import Path as _Path
+        path_norm = p.replace("\\", "/") if isinstance(p, str) else str(p)
+        if not _Path(path_norm).exists():
+            excluded.append((path_norm, "file does not exist"))
+            continue
+        try:
+            sd = torch.load(path_norm, map_location='cpu', weights_only=False)
+            if isinstance(sd, dict) and 'model_state_dict' in sd:
+                sd = sd['model_state_dict']
+            elif isinstance(sd, dict) and 'state_dict' in sd:
+                sd = sd['state_dict']
+            # Check expected keys + shapes
+            bad_reason = None
+            for k, expected_shape in ref_shapes.items():
+                if k not in sd:
+                    bad_reason = f"missing key {k}"
+                    break
+                actual_shape = tuple(sd[k].shape)
+                if actual_shape != expected_shape:
+                    bad_reason = f"{k}: {actual_shape} vs expected {expected_shape}"
+                    break
+            if bad_reason:
+                excluded.append((path_norm, bad_reason))
+            else:
+                cleaned.append(path_norm)
+        except Exception as e:
+            excluded.append((path_norm, f"load error: {type(e).__name__}: {str(e)[:80]}"))
+    elapsed = _time.time() - t0
+
+    # Log results
+    n_total = len(snapshot_pool)
+    n_excl = len(excluded)
+    excl_pct = n_excl / max(1, n_total) * 100
+    print(f"  [pool-validate] {n_total - n_excl}/{n_total} entries valid "
+          f"({excl_pct:.1f}% excluded, {elapsed:.1f}s)", flush=True)
+    if excluded:
+        print(f"  [pool-validate] Excluded entries:", flush=True)
+        for path, reason in excluded[:20]:  # cap output at 20 entries
+            print(f"    {path} — {reason}", flush=True)
+        if len(excluded) > 20:
+            print(f"    ... and {len(excluded) - 20} more (see /tmp/pool_validate_excluded.txt if debug needed)", flush=True)
+
+    # Threshold-based fail (catches real bugs, not stray bad files)
+    if strict and n_excl > 0:
+        raise SystemExit(
+            f"[pool-validate] STRICT mode: {n_excl} pool entries excluded. "
+            f"Fix the entries or remove --strict-pool flag."
+        )
+    if n_excl > 0 and excl_pct > 5.0:
+        raise SystemExit(
+            f"[pool-validate] FATAL: {excl_pct:.1f}% of pool excluded ({n_excl}/{n_total}) — "
+            f"exceeds 5% threshold. This usually indicates a real upstream bug "
+            f"(wrong paths in --pool-anchors, schema migration without padding, "
+            f"corrupted checkpoints) — not stray bad files. Fix the source or "
+            f"raise the threshold/use --skip-pool-validation if you're sure."
+        )
+
+    return cleaned, excluded
 
 
 def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
@@ -1194,6 +1317,18 @@ def main():
             if anchors_added:
                 print(f"  [pool] post-resume: added {anchors_added} new anchor(s), "
                       f"pool now {len(snapshot_pool)} entries", flush=True)
+
+    # ── S68 pool validation (Jun 1) ──
+    # Strip stale-schema entries inherited from ckpt.metrics.snapshot_pool
+    # (e.g. cloud_gen9/epoch_003.pt is pre-tokenizer-expansion: type_id=[28,256]
+    # vs current [29,256]). Without this, CIS slot reloads fail every iter on
+    # those entries, slots silently fall back to stale models, and 3-5% of
+    # training games per stale entry are vs the wrong opp (pollution).
+    snapshot_pool, _excluded = _validate_pool_for_arch(
+        snapshot_pool, model,
+        strict=args.strict_pool,
+        skip=args.skip_pool_validation,
+    )
 
     # torch.compile (Linux/cloud only - Windows local has no compile support;
     # the try/except below degrades gracefully there). Applied AFTER resume
