@@ -2265,6 +2265,24 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # S68 thread-cap fix: bound the asyncio executor (used by
+    # CISInferenceBatcher.submit for blocking pipe.send to CIS) to the
+    # per-worker concurrent-battles upper bound, NOT the python default
+    # min(32, cpus+4) which is 32 on 128-core pods. At 120 workers × 32
+    # default threads = 3840 system threads just for asyncio executors,
+    # which exhausts the per-user nproc ulimit (~4096) and causes
+    # "can't start new thread" cascade. Cap = min(max_concurrent, n_games)
+    # gives each worker EXACTLY enough threads for its real workload.
+    # Floor of 8 ensures no over-tightening on small allocations.
+    import concurrent.futures as _cf
+    _max_battles = min(max_concurrent, n_games) if n_games > 0 else max_concurrent
+    _exec_max = max(8, _max_battles)
+    loop.set_default_executor(_cf.ThreadPoolExecutor(
+        max_workers=_exec_max,
+        thread_name_prefix=f"cis-w{worker_id}-exec",
+    ))
+
     try:
         loop.run_until_complete(_main())
     finally:
