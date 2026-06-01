@@ -30,5 +30,12 @@ export LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:
 # Allow override via env if caller already set it.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# S68 thread-cap belt-and-suspenders: raise per-user nproc/thread limit so
+# high worker counts (>60w) don't hit RunPod's default ulimit -u of ~4096.
+# Each worker also caps its asyncio executor in code (mp_centralized_collect.py
+# _run_collect_in_worker_cis) — this is the safety net. 16384 covers up to
+# ~500 workers with bounded executors. No-op if already higher.
+ulimit -u 16384 2>/dev/null || true
+
 # Exec preserves the PID + signal semantics nohup expects.
 exec python -u train_rl.py "$@"

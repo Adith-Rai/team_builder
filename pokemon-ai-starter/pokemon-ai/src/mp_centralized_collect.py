@@ -1699,6 +1699,18 @@ def _cis_worker_main(worker_id: int, ctrl_pipe, result_pipe,
     except Exception:
         pass
 
+    # S68 Path A1: workers are IO-bound on CIS responses; they only do
+    # tiny CPU tensor ops (9-elem logits, scalar value, D-dim summary).
+    # Without this, torch defaults each worker's OMP/MKL thread pool to
+    # num_cpus → 60 workers × 16+ threads each can exhaust the per-user
+    # nproc ulimit and trigger `libgomp: Thread creation failed`. One
+    # thread per worker is correct AND eliminates the failure mode.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already set earlier in process lifetime; non-fatal
+
     import logging
     logging.basicConfig(level=logging.WARNING)
 
@@ -2253,6 +2265,24 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # S68 thread-cap fix: bound the asyncio executor (used by
+    # CISInferenceBatcher.submit for blocking pipe.send to CIS) to the
+    # per-worker concurrent-battles upper bound, NOT the python default
+    # min(32, cpus+4) which is 32 on 128-core pods. At 120 workers × 32
+    # default threads = 3840 system threads just for asyncio executors,
+    # which exhausts the per-user nproc ulimit (~4096) and causes
+    # "can't start new thread" cascade. Cap = min(max_concurrent, n_games)
+    # gives each worker EXACTLY enough threads for its real workload.
+    # Floor of 8 ensures no over-tightening on small allocations.
+    import concurrent.futures as _cf
+    _max_battles = min(max_concurrent, n_games) if n_games > 0 else max_concurrent
+    _exec_max = max(8, _max_battles)
+    loop.set_default_executor(_cf.ThreadPoolExecutor(
+        max_workers=_exec_max,
+        thread_name_prefix=f"cis-w{worker_id}-exec",
+    ))
+
     try:
         loop.run_until_complete(_main())
     finally:
@@ -2494,8 +2524,16 @@ def mp_centralized_collect_sync(
     cis_min_batch: int = 8,
     cis_timeout_ms: int = 15,
     max_pool_size: int = 16,
+    worker_device: Optional[str] = None,
+    pfsp_max_share: float = 0.20,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
+
+    S68: `worker_device` (default None = str(device)) overrides the device
+    string sent to workers in their collect_iter cmd. Set to "cpu" to keep
+    workers off the GPU entirely (avoids ~490 MB CUDA context per worker;
+    60w = 30 GB saved on main GPU). CIS subprocess still uses `device`
+    (cuda) for actual model inference.
 
     Drop-in replacement for mp_disk_collect_sync when --cis flag is set.
     Returns the same tuple shape: (trajs, w, l, t, steps, opp_name,
@@ -2583,7 +2621,8 @@ def mp_centralized_collect_sync(
         n_alive = len(alive_wids)
         if n_alive == 0:
             raise RuntimeError(f"[cis-orch] iter {iter_n}: no alive workers")
-        assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games)
+        assignments = _allocate_opps_to_workers(opp_pool_full, n_alive, n_games,
+                                                 max_share=pfsp_max_share)
 
         # Log per-iter distribution for visibility (one line, sorted by games).
         opp_dist: Dict[str, List[int]] = {}
@@ -2668,7 +2707,7 @@ def mp_centralized_collect_sync(
                 "turn_cap": turn_cap,
                 "battle_format": battle_format,
                 "procedural_teams_path": procedural_teams_path,
-                "device": str(device),
+                "device": worker_device if worker_device else str(device),
                 "opponent_device": opponent_device,
                 "rng_seed": rng_seed,
                 "amp_dtype": amp_dtype,
@@ -2977,7 +3016,8 @@ class CISBgCollector:
 
         # S58 (F): one opp per worker. See _allocate_opps_to_workers docstring
         # for rationale. Mirrors the regular orchestrator dispatch path.
-        assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games)
+        assignments = _allocate_opps_to_workers(opp_pool_msg, n_alive, n_games,
+                                                 max_share=ctx.get("pfsp_max_share", 0.20))
         opp_dist: Dict[str, List[int]] = {}
         for a in assignments:
             if a["opp"] is None:
@@ -3017,7 +3057,7 @@ class CISBgCollector:
                 "turn_cap": ctx["turn_cap"],
                 "battle_format": ctx["battle_format"],
                 "procedural_teams_path": ctx["procedural_teams_path"],
-                "device": ctx["device_str"],
+                "device": ctx.get("worker_device_str") or ctx["device_str"],
                 "opponent_device": ctx["opponent_device"],
                 "rng_seed": ctx["rng_seed"],
                 "amp_dtype": ctx["amp_dtype"],
@@ -3077,6 +3117,12 @@ class CISBgCollector:
             "procedural_teams_path": args_dict.get("teambuilder_path"),
             "device_str": str(device),
             "device_type": device.type,
+            # S68 worker-cpu mode: if args_dict["worker_device_str"] is set,
+            # workers get that device (typically "cpu") instead of "cuda".
+            # CIS subprocess + main proc still use `device` for inference.
+            "worker_device_str": (args_dict.get("worker_device_str") or str(device)),
+            # S68 Path B-hybrid: per-opp max share cap (default 0.20).
+            "pfsp_max_share": args_dict.get("pfsp_max_share", 0.20),
             "amp_dtype": amp_dtype,
             "max_pool_size": max_pool_size,
             "cis_min_batch": cis_min_batch,
@@ -3265,6 +3311,7 @@ def _allocate_opps_to_workers(
     opp_pool_msg: List[dict],
     n_workers: int,
     total_games: int,
+    max_share: float = 0.20,
 ) -> List[dict]:
     """S58 (F): orchestrator-side opp -> worker assignment. One opp per worker.
 
@@ -3303,6 +3350,61 @@ def _allocate_opps_to_workers(
     drift = total_games - sum(target)
     if drift != 0:
         target[weights.index(max(weights))] += drift
+
+    # Step 1b: S68 Path B-hybrid (2026-05-31) — cap any single opp at
+    # `max_share` fraction of total_games (default 0.20). PFSP-weighted
+    # allocation can pathologically concentrate games on one opp at our
+    # actor scale (~30 workers): e.g. mirror match (default WR=0.5,
+    # weight=0.25) was observed taking 36% of games while 9 other opps
+    # split the rest. The cap preserves PFSP's "harder=more" signal within
+    # the cap, but prevents any single opp from dominating the iter and
+    # starving the gradient signal from less-played opps. Excess from
+    # capped opps redistributes by weight to uncapped opps.
+    #
+    # Disable by passing max_share >= 1.0 (legacy unbounded behavior).
+    # See [[s68-path-b-design]] memo + AlphaStar/OpenAI Five comparison.
+    if 0.0 < max_share < 1.0 and n_opps >= 2:
+        cap = max(1, int(total_games * max_share))
+        capped = [i for i in range(n_opps) if target[i] > cap]
+        if capped:
+            excess = sum(target[i] - cap for i in capped)
+            for i in capped:
+                target[i] = cap
+            # Redistribute excess to under-capped opps by their weight.
+            # Iterate until excess is drained or all opps hit cap (rare).
+            uncapped = [i for i in range(n_opps) if target[i] < cap]
+            while excess > 0 and uncapped:
+                uncap_w = sum(weights[i] for i in uncapped)
+                if uncap_w <= 0:
+                    break
+                added_this_round = 0
+                still_uncapped = []
+                for i in uncapped:
+                    add = max(1, int(round(excess * weights[i] / uncap_w)))
+                    headroom = cap - target[i]
+                    add = min(add, headroom, excess - added_this_round)
+                    if add <= 0:
+                        continue
+                    target[i] += add
+                    added_this_round += add
+                    if target[i] < cap:
+                        still_uncapped.append(i)
+                if added_this_round == 0:
+                    break  # safety: avoid infinite loop
+                excess -= added_this_round
+                uncapped = still_uncapped
+            # Last-resort drift fix: if integer rounding left excess > 0,
+            # dump remainder on the highest-weight opp with headroom.
+            # Preserves PFSP ordering and total_games invariant.
+            if excess > 0:
+                remaining = [i for i in range(n_opps) if target[i] < cap]
+                if remaining:
+                    best_idx = max(remaining, key=lambda i: weights[i])
+                    target[best_idx] += excess
+                else:
+                    # Pathological: every opp at cap. Put on highest-weight
+                    # capped opp (better than dropping games).
+                    target[weights.index(max(weights))] += excess
 
     # Step 2: distribute workers across opps.
     # S67-ext speed-aware: when a slow opp (mcts-hard, ~30s/game) is in the
