@@ -600,7 +600,8 @@ def main():
         # Build matchup queue: only NEW × ALL pairs
         new_names_set = {s.name for s in truly_new}
         matchups = _compute_new_pairs(specs, new_names_set)
-        print(f"    {len(matchups)} NEW matchups (vs {len(combinations(range(len(specs)), 2))} all-vs-all)")
+        import math as _math
+        print(f"    {len(matchups)} NEW matchups (vs {_math.comb(len(specs), 2)} all-vs-all)")
     else:
         specs = new_specs
         n = len(specs)
