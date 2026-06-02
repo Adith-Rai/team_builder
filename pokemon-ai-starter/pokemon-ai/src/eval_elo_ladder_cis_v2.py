@@ -297,6 +297,10 @@ def main():
                         "matchup, parallelism comes from W workers.")
     p.add_argument("--cis-min-batch", type=int, default=8)
     p.add_argument("--cis-timeout-ms", type=int, default=15)
+    p.add_argument("--result-timeout-sec", type=int, default=7200,
+                   help="Max wait between matchup-completion results in main. "
+                        "Default 7200 (2h). First-batch wall at high N is long; "
+                        "later batches arrive faster. Set generous.")
     p.add_argument("--anchor", default="SH")
     p.add_argument("--anchor-elo", type=float, default=1000.0)
     p.add_argument("--out-json", default=None)
@@ -453,9 +457,10 @@ def main():
     t_start = time.time()
     while len(results) < len(matchups):
         try:
-            result = result_q.get(timeout=1800)
+            result = result_q.get(timeout=args.result_timeout_sec)
         except Exception:
-            print(f"  [!] result_q timeout after {len(results)}/{len(matchups)}")
+            print(f"  [!] result_q timeout ({args.result_timeout_sec}s) after "
+                  f"{len(results)}/{len(matchups)} matchups; aborting wait")
             break
         results.append(result)
         if "error" in result:
@@ -485,12 +490,18 @@ def main():
         if wp.is_alive():
             wp.terminate()
 
+    new_results_ok = [r for r in results if "error" not in r]
+    if args.add_to and len(new_results_ok) == 0:
+        print("  [!] No NEW matchup results completed — refusing to compute BT "
+              "(would produce degenerate Elos for new players). JSON NOT saved.")
+        cis_proc and cis_proc.terminate()
+        return
+
     # Compute final Elos (combining --add-to base if present)
     if args.add_to:
-        # Merge base matches + new results; refit on full ladder
-        all_matches = list(existing_matches) + [r for r in results if "error" not in r]
+        all_matches = list(existing_matches) + new_results_ok
     else:
-        all_matches = [r for r in results if "error" not in r]
+        all_matches = new_results_ok
 
     if all_matches:
         elos = compute_elos(specs, all_matches, args.anchor, args.anchor_elo)
