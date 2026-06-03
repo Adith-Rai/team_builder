@@ -73,6 +73,18 @@ def spawn_mm(model: str, username: str, port: int) -> Tuple[subprocess.Popen, st
     return proc, log_path
 
 
+def _get_teambuilder():
+    """Returns MetamonCompetitiveTeambuilder for bot side.
+
+    Bot uses the same 16 metamon-competitive teams that our smart_avg
+    eval uses, so MM-vs-bot WRs are directly comparable to our
+    model-vs-smart-bot smart_avg numbers. MM side already uses
+    --team-set competitive (the same 16 teams) per spawn_mm config.
+    """
+    from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+    return MetamonCompetitiveTeambuilder()
+
+
 def make_bot(bot_name: str, port: int, account: str, concurrency: int):
     cls = ALL_BOTS[bot_name]
     server_cfg = resolve_server(f"ws://127.0.0.1:{port}/showdown/websocket")
@@ -80,7 +92,7 @@ def make_bot(bot_name: str, port: int, account: str, concurrency: int):
         battle_format="gen9ou",
         max_concurrent_battles=concurrency,
         server_configuration=server_cfg,
-        team=random_pool_teambuilder(),
+        team=_get_teambuilder(),
         account_configuration=AccountConfiguration(account, None),
     )
 
