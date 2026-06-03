@@ -206,12 +206,23 @@ async def run_pair(entity_name: str, entity_kind: str, ckpt_path: str, cached_ck
                               team_set, procedural_teams_path)
 
     t0 = time.time()
-    # send_challenges returns when all are queued/sent. Then poll for completion.
-    await asyncio.wait_for(
-        bot.send_challenges(mm_username, n_games), timeout=600
-    )
-    # Wait for all battles to finish (poll bot.n_finished_battles)
-    deadline = time.time() + max(600, n_games * 30)
+    # send_challenges in poke-env DOESN'T return when all are queued — it
+    # waits as battles play out (gated by max_concurrent_battles). So this
+    # timeout must cover the WHOLE matchup wall, not just the queueing.
+    # 4 hours is generous; procedural teams can produce 80+ min matchups.
+    matchup_timeout = max(14400, n_games * 30)
+    try:
+        await asyncio.wait_for(
+            bot.send_challenges(mm_username, n_games), timeout=matchup_timeout
+        )
+    except asyncio.TimeoutError:
+        # Some battles may still have completed even if send_challenges
+        # timed out. Continue to record whatever we have.
+        print(f"    [!] send_challenges timeout after {matchup_timeout}s; "
+              f"recording partial results", flush=True)
+    # Belt-and-suspenders: poll for completion in case send_challenges
+    # returned early (shouldn't happen but guards against version drift).
+    deadline = time.time() + 300
     while bot.n_finished_battles < n_games and time.time() < deadline:
         await asyncio.sleep(2.0)
     elapsed = time.time() - t0
