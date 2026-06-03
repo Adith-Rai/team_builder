@@ -95,7 +95,10 @@ def spawn_mm(model: str, username: str, port: int,
     if team_mode == "queue":
         if not team_queue_dir:
             raise ValueError("team_mode='queue' requires team_queue_dir")
-        cmd += ["--team-queue", team_queue_dir]
+        cmd += ["--team-queue", team_queue_dir,
+                # CRITICAL: keep our pre-filled teams. Default 'true' wipes
+                # them at MM startup → empty queue → MM blocks accepting.
+                "--clean-on-init", "false"]
     else:
         cmd += ["--team-set", "competitive"]
     env = {**os.environ, "METAMON_CACHE_DIR": METAMON_CACHE}
@@ -306,7 +309,7 @@ async def main_async(n_games: int, bot_concurrency: int, mms: List[Tuple[str, st
                                    "timestamp": datetime.utcnow().isoformat()},
                                   f, indent=2)
                 except Exception as e:
-                    print(f"    ERROR: {e}", flush=True)
+                    print(f"    ERROR: {type(e).__name__}: {e!r}", flush=True)
                     import traceback
                     traceback.print_exc()
         finally:
