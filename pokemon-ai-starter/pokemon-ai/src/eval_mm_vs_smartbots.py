@@ -183,7 +183,8 @@ async def run_pair(entity_name: str, entity_kind: str, ckpt_path: str, cached_ck
 
 async def main_async(n_games: int, bot_concurrency: int, mms: List[Tuple[str, str, int]],
                      entities: List[Tuple[str, str, str]], cached_ckpts: dict,
-                     out_json: str, device: str = "cuda") -> None:
+                     out_json: str, device: str = "cuda",
+                     mm_startup_wait: int = 60) -> None:
     """entities is a list of (name, kind, path) tuples. kind ∈ {"bot", "snapshot"}.
     For bot: path is "" (unused; name is the ALL_BOTS key).
     For snapshot: path is the .pt file; cached_ckpts[name] is the pre-loaded dict.
@@ -197,8 +198,9 @@ async def main_async(n_games: int, bot_concurrency: int, mms: List[Tuple[str, st
               flush=True)
         proc, log_path = spawn_mm(mm_model, mm_username, mm_port)
         print(f"  PID={proc.pid}, log={log_path}", flush=True)
-        # Wait for MM to log in and start accepting (15s typically enough)
-        await asyncio.sleep(15)
+        # Wait for MM to log in and start accepting (longer = safer for big models)
+        # SyntheticRLV2 is 200M params and needs ~30-60s; 15s timed out the first run.
+        await asyncio.sleep(mm_startup_wait)
         if proc.poll() is not None:
             print(f"  [!] {mm_model} subprocess died early (exitcode={proc.returncode}); skip",
                   flush=True)
@@ -293,6 +295,10 @@ def main():
     ap.add_argument("--device", default="cuda",
                     help="Device for loading our checkpoint models. MMs run in their own "
                          "subprocess and ignore this.")
+    ap.add_argument("--mm-startup-wait", type=int, default=60,
+                    help="Seconds to wait after spawning each MM subprocess before "
+                         "sending challenges. SyntheticRLV2 (200M params) needs ~30-60s; "
+                         "smaller MMs need ~10-15s. Default 60 (safe for all).")
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
 
@@ -337,7 +343,8 @@ def main():
     print(f"  Output: {out_json}")
 
     asyncio.run(main_async(args.n_games, args.bot_concurrency, mms, entities,
-                            cached_ckpts, out_json, args.device))
+                            cached_ckpts, out_json, args.device,
+                            args.mm_startup_wait))
 
 
 if __name__ == "__main__":
