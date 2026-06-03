@@ -55,6 +55,29 @@ from eval_elo_ladder import (
     _battle_pair,
     fit_bradley_terry,
 )
+
+
+def _get_teambuilder(team_set: str):
+    """Resolve teambuilder by name. Mirrors classic eval_elo_ladder.py's
+    --team-set semantics so CIS-Elo ladders are smart_avg-comparable.
+
+    metamon-competitive: 16 curated teams, random.choice per battle per side.
+                         Matches our smart_avg / eval_metamon_competitive setup.
+                         This is the DEFAULT, intentionally — using procedural
+                         teams here would put CIS-Elo results in a different
+                         team distribution than smart_avg / classic Elo ladder,
+                         confounding cross-comparison.
+    pool:                Random Smogon usage-data teams (procedural). Wider
+                         distribution but NOT matched to smart_avg eval.
+    """
+    if team_set == "metamon-competitive":
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        return MetamonCompetitiveTeambuilder()
+    elif team_set == "pool":
+        return random_pool_teambuilder()
+    else:
+        raise ValueError(f"Unknown --team-set {team_set!r}; "
+                         f"use 'metamon-competitive' or 'pool'")
 from mp_centralized_collect import _cis_main_multi, _get_mp_ctx
 
 # Reuse v1 helpers (arch classification, pad, ladder I/O)
@@ -132,16 +155,19 @@ def _spawn_cis_server_multiworker(nn_ckpt_paths: List[str], device: str,
 def _make_player_for_spec_v2(spec: PlayerSpec, slot_id: int, arch: str,
                               cis_req_w, cis_resp_r, cis_lock, cfg, server_cfg,
                               account_name: str, battle_format: str,
-                              concurrency: int):
+                              concurrency: int, team_set: str):
     """Worker-side player constructor. Workers always run on CPU
     (BattleAgentTransformerCIS sends numpy to CIS via pipe; MLP runs on CPU
     to avoid competing with CIS for GPU). Mirrors v1 dispatch but device='cpu'.
+
+    team_set selects the teambuilder; see _get_teambuilder. Default is
+    metamon-competitive (matches smart_avg eval).
     """
     common = dict(
         battle_format=battle_format,
         max_concurrent_battles=concurrency,
         server_configuration=server_cfg,
-        team=random_pool_teambuilder(),
+        team=_get_teambuilder(team_set),
         account_configuration=AccountConfiguration(account_name, None),
     )
     if spec.kind == "bot":
@@ -175,7 +201,8 @@ def _run_matchup_in_worker(worker_id: int, matchup_idx: int,
                            cis_req_w, cis_resp_r, cis_lock,
                            arch_map: Dict[str, str], slot_map: Dict[str, int],
                            cfg, server_url: str, battle_format: str,
-                           n_games: int, concurrency: int) -> dict:
+                           n_games: int, concurrency: int,
+                           team_set: str) -> dict:
     """One matchup run inside a worker. Builds 2 Players, plays n_games via
     battle_against, returns result dict (same shape as v1)."""
     name_a = f"W{worker_id}m{matchup_idx}a"
@@ -190,10 +217,10 @@ def _run_matchup_in_worker(worker_id: int, matchup_idx: int,
 
     p1 = _make_player_for_spec_v2(spec_a, slot_a, arch_a, cis_req_w, cis_resp_r,
                                    cis_lock, cfg, server_cfg, name_a,
-                                   battle_format, concurrency)
+                                   battle_format, concurrency, team_set)
     p2 = _make_player_for_spec_v2(spec_b, slot_b, arch_b, cis_req_w, cis_resp_r,
                                    cis_lock, cfg, server_cfg, name_b,
-                                   battle_format, concurrency)
+                                   battle_format, concurrency, team_set)
 
     t0 = time.time()
     loop = asyncio.new_event_loop()
@@ -234,7 +261,8 @@ def _worker_main(worker_id: int, matchup_q, result_q,
                  cis_req_w, cis_resp_r,
                  arch_map: Dict[str, str], slot_map: Dict[str, int],
                  cfg, server_url: str, battle_format: str,
-                 n_games: int, concurrency: int) -> None:
+                 n_games: int, concurrency: int,
+                 team_set: str) -> None:
     """Long-lived worker. Pulls (matchup_idx, spec_a, spec_b) tuples from
     matchup_q, runs each, pushes result dict via result_q. Exits on None
     sentinel."""
@@ -262,6 +290,7 @@ def _worker_main(worker_id: int, matchup_q, result_q,
                 cis_req_w, cis_resp_r, cis_lock,
                 arch_map, slot_map, cfg,
                 server_url, battle_format, n_games, concurrency,
+                team_set,
             )
             result_q.put(result)
         except Exception as e:
@@ -292,6 +321,14 @@ def main():
     p.add_argument("--device", default="cuda",
                    help="CIS server device. Workers always run CPU.")
     p.add_argument("--format", default="gen9ou", dest="battle_format")
+    p.add_argument("--team-set", choices=["metamon-competitive", "pool"],
+                   default="metamon-competitive",
+                   help="Team source for BOTH sides. Default 'metamon-competitive' "
+                        "(16 curated teams, matches smart_avg / classic eval_elo_ladder "
+                        "default). Use 'pool' only when you specifically want random "
+                        "Smogon usage-data teams. Mixing distributions across runs is "
+                        "WRONG — confounds BT refit (one player's matches under different "
+                        "team distributions get treated as same-skill data).")
     p.add_argument("--concurrency", type=int, default=1,
                    help="Battles per Player (within one matchup). 1 = serial within "
                         "matchup, parallelism comes from W workers.")
@@ -409,6 +446,12 @@ def main():
     print(f"  Plan: {len(matchups)} matchups × {args.n_games} games "
           f"= {len(matchups) * args.n_games} games via {args.workers} workers "
           f"across {len(args.servers)} server(s)")
+    print(f"  Team set: {args.team_set!r} (both sides)")
+    if args.add_to and args.team_set != "metamon-competitive":
+        print(f"  [!] WARNING: --add-to with --team-set={args.team_set!r} mixes team "
+              f"distributions across runs — BT refit will be confounded if the base "
+              f"ladder used a different team set. Strongly recommend metamon-competitive "
+              f"to match classic eval_elo_ladder default.", flush=True)
 
     # Spawn CIS multi-worker
     ctx = _get_mp_ctx()
@@ -446,7 +489,8 @@ def main():
                                req_w, resp_r,
                                arch_map, slot_map, cfg,
                                server_url, args.battle_format,
-                               args.n_games, args.concurrency))
+                               args.n_games, args.concurrency,
+                               args.team_set))
         wp.start()
         workers.append(wp)
 

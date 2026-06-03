@@ -125,10 +125,23 @@ def _spawn_cis_server(nn_ckpt_paths: List[str], device: str,
     return cis_proc, req_w, resp_r, (ctrl_req_w, ctrl_resp_r)
 
 
+def _get_teambuilder_v1(team_set: str):
+    """Same dispatch as eval_elo_ladder_cis_v2._get_teambuilder. Kept duplicated
+    for v1's self-contained sequential model. See v2 for full docstring."""
+    if team_set == "metamon-competitive":
+        from eval_metamon_competitive import MetamonCompetitiveTeambuilder
+        return MetamonCompetitiveTeambuilder()
+    elif team_set == "pool":
+        return random_pool_teambuilder()
+    else:
+        raise ValueError(f"Unknown --team-set {team_set!r}")
+
+
 def _make_player_for_spec(spec: PlayerSpec, slot_id: int, arch: str,
                           cis_req_w, cis_resp_r, cis_lock, cfg, server_cfg,
                           account_name: str, device: str,
-                          battle_format: str, concurrency: int):
+                          battle_format: str, concurrency: int,
+                          team_set: str = "metamon-competitive"):
     """Create a Player instance for one matchup side. Arch-aware dispatch:
         - bot                                       → spec.bot_cls (rule-based)
         - snapshot, arch in (transformer_current, transformer_pre_pad)
@@ -141,7 +154,7 @@ def _make_player_for_spec(spec: PlayerSpec, slot_id: int, arch: str,
         battle_format=battle_format,
         max_concurrent_battles=concurrency,
         server_configuration=server_cfg,
-        team=random_pool_teambuilder(),
+        team=_get_teambuilder_v1(team_set),
         account_configuration=AccountConfiguration(account_name, None),
     )
     if spec.kind == "bot":
@@ -177,7 +190,8 @@ def run_match_cis(spec_a: PlayerSpec, spec_b: PlayerSpec,
                   arch_map: Dict[str, str],
                   cis_req_w, cis_resp_r, cis_lock, cfg,
                   server_cfg, device: str, battle_format: str,
-                  concurrency: int, match_idx: int) -> dict:
+                  concurrency: int, match_idx: int,
+                  team_set: str = "metamon-competitive") -> dict:
     """Run n_games between spec_a and spec_b. Arch-aware dispatch via
     arch_map: transformer arch classes go through CIS slot_map; MLP arch
     runs as a local BattleAgent (no CIS slot); bots ignore both maps.
@@ -195,10 +209,10 @@ def run_match_cis(spec_a: PlayerSpec, spec_b: PlayerSpec,
 
     p1 = _make_player_for_spec(spec_a, slot_a, arch_a, cis_req_w, cis_resp_r,
                                 cis_lock, cfg, server_cfg, name_a,
-                                device, battle_format, concurrency)
+                                device, battle_format, concurrency, team_set)
     p2 = _make_player_for_spec(spec_b, slot_b, arch_b, cis_req_w, cis_resp_r,
                                 cis_lock, cfg, server_cfg, name_b,
-                                device, battle_format, concurrency)
+                                device, battle_format, concurrency, team_set)
 
     t0 = time.time()
     loop = asyncio.new_event_loop()
@@ -522,6 +536,11 @@ def main():
     p.add_argument("--server", default="ws://127.0.0.1:9020/showdown/websocket")
     p.add_argument("--device", default="cuda")
     p.add_argument("--format", default="gen9ou", dest="battle_format")
+    p.add_argument("--team-set", choices=["metamon-competitive", "pool"],
+                   default="metamon-competitive",
+                   help="Team source for BOTH sides. Default 'metamon-competitive' "
+                        "matches smart_avg + classic eval_elo_ladder default. Mixing "
+                        "team distributions across runs is WRONG (BT refit confound).")
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--cis-min-batch", type=int, default=2)
     p.add_argument("--cis-timeout-ms", type=int, default=15)
@@ -711,6 +730,7 @@ def main():
                 req_w, resp_r, cis_lock, cfg,
                 server_cfg, args.device, args.battle_format,
                 args.concurrency, match_idx=mi,
+                team_set=args.team_set,
             )
             matches.append(result)
             print(f"    {result['p1_wins']}W/{result['p2_wins']}L/{result['ties']}T "
