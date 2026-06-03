@@ -38,11 +38,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]   # team_builder/
 SRC_DIR = Path(__file__).resolve().parent
 METAMON_CACHE = str(PROJECT_ROOT / "metamon_cache")
 
-# Default MM set matches fishbowl_lr1e-4_v1.yaml (the 3 trained models)
+# Default MM set matches fishbowl_lr1e-4_v1.yaml (the 3 trained models) +
+# Minikazam (default in external_adapters.py — small RNN baseline meant to be
+# in the pool but not currently in the fishbowl yaml; eval-tier unknown).
 DEFAULT_MMS = [
     ("LargeRL", "MMevalLargeRL", 9000),
     ("MediumRL_Aug", "MMevalMediumRLAug", 9001),
     ("SyntheticRLV2", "MMevalSyntheticRLV2", 9002),
+    ("Minikazam", "MMevalMinikazam", 9003),
 ]
 
 SMART_BOTS = ["SH", "SmartDmg", "Tactical", "Strategic"]
