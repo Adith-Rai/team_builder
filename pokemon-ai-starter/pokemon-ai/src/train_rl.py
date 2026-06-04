@@ -1523,12 +1523,10 @@ def main():
                 "Per S62 refutation, --compile is not in the canonical "
                 "Phase 2 stack anyway (8% slower at prod scale)."
             )
-        if args.packed:
-            raise SystemExit(
-                "AWR replay rehearsal is incompatible with --packed in v1 "
-                "(packed-mode loss path will get AWR after eager validation). "
-                "Drop --packed or unset --awr-replay-memmap."
-            )
+        # NOTE: --packed IS now supported. AWR uses bc_to_ppo_packed_format +
+        # forward_ppo_sequence_packed when args.packed=True, matching PPO's
+        # forward path. Equivalence with the padded path is verified in
+        # tests/test_forward_paths_equivalence.py (extended for packed).
         if not args.tier3:
             raise SystemExit(
                 "AWR replay rehearsal requires --tier3 (eager batched path). "
@@ -1827,6 +1825,7 @@ def main():
                     awr_clip_high=args.awr_clip_high,
                     max_grad_norm=args.max_grad_norm,
                     detach_value=True,  # v1: AWR updates policy only
+                    packed=args.packed,  # match PPO's forward path
                 )
                 loss_info.update(awr_info)
                 awr_time = time.time() - t_awr

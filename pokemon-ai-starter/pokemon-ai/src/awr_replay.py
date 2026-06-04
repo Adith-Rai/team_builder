@@ -291,6 +291,98 @@ def bc_to_ppo_format(bc_collated: dict) -> dict:
     }
 
 
+def bc_to_ppo_packed_format(bc_collated: dict) -> dict:
+    """Convert BC-format batch to PPO packed format for forward_ppo_sequence_packed.
+
+    Sister to bc_to_ppo_format() — same data, different layout. Packs valid
+    (b, t) positions of every tensor into a flat (sum_T, ...) layout, using
+    cu_seqlens for episode boundaries. Eliminates padding waste; matches the
+    Tier 3 packed path PPO uses with --packed.
+
+    Per-tensor packing:
+      (B, L_max, ...) padded -> cat over b of tensor[b, :seq_lens[b], ...]
+      = (sum_T, ...) flat
+
+    Why this exists: when PPO is run with --packed, its forward goes through
+    forward_ppo_sequence_packed. If AWR uses the padded forward
+    (forward_ppo_sequence) instead, the two heads disagree by ~1e-3 to 4e-3
+    (see test_forward_paths_equivalence.py for forward_sequence vs
+    forward_ppo_sequence; the packed/padded delta would be similar). To
+    avoid that silent pollution, AWR uses the SAME forward path as PPO —
+    packed when --packed is set, padded otherwise.
+    """
+    B = bc_collated["our_pokemon_ids"].shape[0]
+    device = bc_collated["our_pokemon_ids"].device
+    seq_lens = bc_collated["seq_lens"]  # (B,) long
+    seq_lens_list = seq_lens.tolist()
+    sum_T = sum(seq_lens_list)
+    max_seqlen = max(seq_lens_list) if seq_lens_list else 0
+
+    # cu_seqlens: int32, FA convention
+    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    if B > 0:
+        cu_seqlens[1:] = torch.tensor(seq_lens_list, dtype=torch.int32,
+                                      device=device).cumsum(0)
+
+    def _pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Pack (B, L_max, ...) -> (sum_T, ...) by concatenating valid slices."""
+        if tensor.dim() < 2:
+            raise ValueError(f"Cannot pack tensor of shape {tensor.shape}; "
+                             "expected (B, L_max, ...)")
+        parts = [tensor[b, :seq_lens_list[b]] for b in range(B)]
+        return torch.cat(parts, dim=0)
+
+    flat_feat = {
+        "our_pokemon_ids":       _pack(bc_collated["our_pokemon_ids"]),
+        "our_pokemon_banks":     _pack(bc_collated["our_pokemon_banks"]),
+        "our_pokemon_cont":      _pack(bc_collated["our_pokemon_cont"]),
+        "our_pokemon_move_ids":  _pack(bc_collated["our_pokemon_move_ids"]),
+        "our_pokemon_move_cont": _pack(bc_collated["our_pokemon_move_cont"]),
+        "opp_pokemon_ids":       _pack(bc_collated["opp_pokemon_ids"]),
+        "opp_pokemon_banks":     _pack(bc_collated["opp_pokemon_banks"]),
+        "opp_pokemon_cont":      _pack(bc_collated["opp_pokemon_cont"]),
+        "opp_pokemon_move_ids":  _pack(bc_collated["opp_pokemon_move_ids"]),
+        "opp_pokemon_move_cont": _pack(bc_collated["opp_pokemon_move_cont"]),
+        "field_cont":            _pack(bc_collated["field_cont_raw"]),
+        "transition_cont":       _pack(bc_collated["trans_cont_raw"]),
+        "active_move_ids":       _pack(bc_collated["active_move_ids_raw"]),
+        "active_move_cont":      _pack(bc_collated["active_move_cont_raw"]),
+        "switch_ids":            _pack(bc_collated["switch_ids_raw"]),
+        "switch_cont":           _pack(bc_collated["switch_cont_raw"]),
+        "legal_mask":            _pack(bc_collated["legal_mask_raw"]),
+    }
+    # field_banks: split (B, L_max, 4) -> dict of 4 (sum_T,)
+    fb = bc_collated["field_banks_raw"]
+    flat_feat["field_banks"] = {
+        "turn":        _pack(fb[:, :, 0:1]).squeeze(-1),
+        "weather_dur": _pack(fb[:, :, 1:2]).squeeze(-1),
+        "terrain_dur": _pack(fb[:, :, 2:3]).squeeze(-1),
+        "tr_dur":      _pack(fb[:, :, 3:4]).squeeze(-1),
+    }
+    ti = bc_collated["trans_ids_raw"]
+    flat_feat["transition_ids"] = {
+        "our_action": _pack(ti[:, :, 0:1]).squeeze(-1),
+        "opp_action": _pack(ti[:, :, 1:2]).squeeze(-1),
+    }
+    amb = bc_collated["active_move_banks_raw"]  # (B, L, 4, 4)
+    flat_feat["active_move_banks"] = {
+        "bp":   _pack(amb[:, :, :, 0]),  # (sum_T, 4)
+        "acc":  _pack(amb[:, :, :, 1]),
+        "pp":   _pack(amb[:, :, :, 2]),
+        "prio": _pack(amb[:, :, :, 3]),
+    }
+    # gen_id: per-position, default 9 for gen9ou
+    flat_feat["gen_id"] = torch.full((sum_T,), 9, dtype=torch.long, device=device)
+
+    return {
+        "flat_feat_batches": flat_feat,
+        "cu_seqlens": cu_seqlens,
+        "seq_lens": seq_lens,
+        "max_seqlen": max_seqlen,
+        "B": B,
+    }
+
+
 # =============================
 # AWR loss + optimizer step (Phase 2C, Task #125)
 # =============================
@@ -318,6 +410,7 @@ def compute_awr_loss(
     awr_beta: float = 1.0,
     awr_clip_high: float = 20.0,
     detach_value: bool = True,
+    packed: bool = False,
 ) -> dict:
     """Compute AWR loss for a replay batch (pure math, no optimizer).
 
@@ -368,15 +461,85 @@ def compute_awr_loss(
             n_valid:            number of (B, T) positions with valid R + non-pad
             n_total_valid_pad:  number of non-pad positions (for ratio)
     """
-    # Use forward_ppo_sequence — the SAME forward path Tier 3 PPO uses
-    # for updates. Critical: forward_sequence (BC path) and
-    # forward_ppo_sequence (PPO/Tier 3 path) DIVERGE by ~1.9e-3 in
-    # action_logits and ~3.6e-3 in v_logits at valid positions, verified
-    # via test_forward_paths_equivalence.py. Using forward_sequence here
-    # would pull the policy toward an inconsistent distribution vs PPO's
-    # updates -> active pollution.
-    # Adapter bc_to_ppo_format converts dataset.collate_seq output to
-    # the dict format forward_ppo_sequence expects.
+    # Use the SAME forward path PPO uses. Critical for path equivalence:
+    # different model forwards diverge at fp32 noise scale (1e-3 ish) per
+    # test_forward_paths_equivalence.py. Using a different forward than PPO
+    # would pull policy toward a distribution PPO doesn't operate on ->
+    # active pollution.
+    #   - packed=False (default): bc_to_ppo_format + forward_ppo_sequence
+    #     (matches PPO without --packed). Outputs (B, L_max, ...).
+    #   - packed=True: bc_to_ppo_packed_format + forward_ppo_sequence_packed
+    #     (matches PPO with --packed). Outputs (sum_T, ...).
+    if packed:
+        ppo_batch = bc_to_ppo_packed_format(replay_batch)
+        out = model.forward_ppo_sequence_packed(ppo_batch, device)
+        # Packed outputs are FLAT (sum_T, ...). No pad_mask needed since
+        # every position is valid by construction.
+        action_logits = out["action_logits"]  # (sum_T, n_actions)
+        value = out["value"]                  # (sum_T,) scalar V_theta
+
+        if detach_value:
+            value = value.detach()
+
+        # Pack actions: BC-format actions (B, L_max) -> packed (sum_T,)
+        seq_lens = replay_batch["seq_lens"]  # (B,)
+        B = seq_lens.shape[0]
+        seq_lens_list = seq_lens.tolist()
+        actions_padded = replay_batch["action"]  # (B, L_max) long
+        # Concatenate valid action slices
+        actions_packed_parts = [
+            actions_padded[b, :seq_lens_list[b]] for b in range(B)
+        ]
+        actions = torch.cat(actions_packed_parts, dim=0)  # (sum_T,)
+
+        # terminal_result: per-episode -> per-position via repeat_interleave
+        terminal_result = replay_batch["terminal_result"]  # (B,)
+        R = torch.repeat_interleave(terminal_result, seq_lens.to(terminal_result.device))  # (sum_T,)
+
+        # NaN handling: episodes with no terminal info get NaN R; mask them out
+        valid_R = ~torch.isnan(R)
+        n_valid = valid_R.float().sum().clamp(min=1.0)
+        R_clean = torch.nan_to_num(R, nan=0.0)
+
+        advantage = R_clean - value.float()  # (sum_T,)
+
+        if awr_binary:
+            weight = (advantage > 0).float()
+        else:
+            weight = torch.exp(advantage / awr_beta).clamp(max=awr_clip_high)
+
+        # Apply valid_R mask (zero out positions from NaN-R episodes)
+        weight = weight * valid_R.float()
+
+        # Action gather. Packed actions are always valid (no pad sentinels).
+        actions_clean = actions.clamp(min=0)
+        log_probs = F.log_softmax(action_logits.float(), dim=-1)  # (sum_T, n_actions)
+        chosen_log_probs = log_probs.gather(
+            -1, actions_clean.unsqueeze(-1)
+        ).squeeze(-1)  # (sum_T,)
+
+        # Loss: weighted mean (no pad_mask needed in packed format).
+        awr_loss_per_pos = -weight * chosen_log_probs
+        awr_loss = awr_loss_per_pos.sum() / n_valid
+
+        # Diagnostics.
+        pos_advantage_frac = ((advantage > 0).float() * valid_R.float()).sum() / n_valid
+        weight_max_val = weight.max()
+        weight_mean_val = weight.sum() / n_valid
+        advantage_mean = (advantage * valid_R.float()).sum() / n_valid
+        n_total = torch.tensor(float(advantage.shape[0]), device=device)
+
+        return {
+            "loss": awr_loss,
+            "advantage_mean": advantage_mean,
+            "advantage_pos_frac": pos_advantage_frac,
+            "weight_max": weight_max_val,
+            "weight_mean": weight_mean_val,
+            "n_valid": n_valid,
+            "n_total_valid_pad": n_total,
+        }
+
+    # Padded path (default; matches PPO without --packed).
     ppo_batch = bc_to_ppo_format(replay_batch)
     out = model.forward_ppo_sequence(ppo_batch, device)
     action_logits = out["action_logits"]  # (B, L_max, n_actions)
@@ -455,6 +618,7 @@ def awr_step(
     awr_binary: bool = True,
     awr_beta: float = 1.0,
     awr_clip_high: float = 20.0,
+    packed: bool = False,
     max_grad_norm: float = 0.5,
     detach_value: bool = True,
 ) -> dict:
@@ -512,6 +676,7 @@ def awr_step(
             awr_beta=awr_beta,
             awr_clip_high=awr_clip_high,
             detach_value=detach_value,
+            packed=packed,
         )
         loss_scaled = awr_mix_weight * awr_out["loss"]
 
