@@ -181,14 +181,16 @@ def main():
             raise SystemExit(f"missing source file: {src_path}")
 
         t0 = time.time()
-        # np.memmap reads file lazily; slicing is a view (no copy)
+        # CRITICAL: R2 source .npy files are RAW BYTES (no .npy header) —
+        # MemmapDataset uses np.memmap(...) which assumes the same.
+        # If we used np.save() here, headers would be added and MemmapDataset
+        # would read header bytes as data -> garbage IDs -> CUDA OOB asserts.
+        # Confirmed empirically during S68 Phase 2D.
         src_arr = np.memmap(str(src_path), dtype=dtype, mode="r",
                             shape=full_shape)
         sub_view = src_arr[:n_records_keep]
-        # ascontiguousarray forces materialization -> np.save writes correct
-        # contiguous .npy. Memory spike = dst_b bytes.
         sub_copy = np.ascontiguousarray(sub_view)
-        np.save(str(dst_path), sub_copy)
+        sub_copy.tofile(str(dst_path))  # raw bytes, no .npy header
         # Release source memmap immediately to avoid holding it across files
         del src_arr, sub_view, sub_copy
         dt = time.time() - t0
@@ -198,8 +200,9 @@ def main():
               f"({rate_mb:.0f} MB/s)")
 
     # 5. New episode_index.npy — keep just the first N_ep_target rows.
-    new_ep_index = ep_index[:N_ep_target].copy()
-    np.save(str(dst / "episode_index.npy"), new_ep_index)
+    # ALSO raw bytes (no .npy header) to match R2 format + MemmapDataset.
+    new_ep_index = np.ascontiguousarray(ep_index[:N_ep_target])
+    new_ep_index.tofile(str(dst / "episode_index.npy"))
     print(f"  wrote episode_index.npy ({new_ep_index.shape})")
 
     # 6. New metadata.json (preserve dims, update counts).
