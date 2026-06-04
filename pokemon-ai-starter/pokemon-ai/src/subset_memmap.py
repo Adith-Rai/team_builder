@@ -200,10 +200,13 @@ def main():
               f"({rate_mb:.0f} MB/s)")
 
     # 5. New episode_index.npy — keep just the first N_ep_target rows.
-    # ALSO raw bytes (no .npy header) to match R2 format + MemmapDataset.
+    # ASYMMETRY: dataset.py:40 uses np.load() (not np.memmap!) for
+    # episode_index.npy, so this file MUST have a .npy header even
+    # though all other .npy files in the same dir are raw bytes.
+    # (Inconsistency in MemmapDataset that we're matching for compat.)
     new_ep_index = np.ascontiguousarray(ep_index[:N_ep_target])
-    new_ep_index.tofile(str(dst / "episode_index.npy"))
-    print(f"  wrote episode_index.npy ({new_ep_index.shape})")
+    np.save(str(dst / "episode_index.npy"), new_ep_index)
+    print(f"  wrote episode_index.npy ({new_ep_index.shape}) — WITH .npy header")
 
     # 6. New metadata.json (preserve dims, update counts).
     new_meta = dict(meta)
