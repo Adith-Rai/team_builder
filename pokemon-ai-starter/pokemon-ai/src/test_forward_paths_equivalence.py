@@ -23,76 +23,8 @@ import sys
 
 import torch
 
-from awr_replay import AWRReplayBuffer
+from awr_replay import AWRReplayBuffer, bc_to_ppo_format
 from train_rl import load_checkpoint
-
-
-def bc_to_ppo_format(bc_collated: dict) -> dict:
-    """Convert dataset.collate_seq output to the dict format that
-    forward_ppo_sequence expects (output of ppo.collate_episodes).
-
-    Specifically:
-      - flat field_banks_raw (B,L,4) -> nested dict of 4 (B,L) tensors
-      - flat trans_ids_raw (B,L,2)  -> dict of 2 (B,L) tensors
-      - flat active_move_banks_raw (B,L,4,4) -> dict of 4 (B,L,4) tensors
-      - rename *_raw keys to non-raw
-      - add pad_mask, B, L_max, seq_lens at top level
-      - add gen_id default 9 (gen9ou)
-    """
-    B, L = bc_collated["our_pokemon_ids"].shape[:2]
-    device = bc_collated["our_pokemon_ids"].device
-    feat_batches = {
-        "our_pokemon_ids":      bc_collated["our_pokemon_ids"],
-        "our_pokemon_banks":    bc_collated["our_pokemon_banks"],
-        "our_pokemon_cont":     bc_collated["our_pokemon_cont"],
-        "our_pokemon_move_ids": bc_collated["our_pokemon_move_ids"],
-        "our_pokemon_move_cont": bc_collated["our_pokemon_move_cont"],
-        "opp_pokemon_ids":      bc_collated["opp_pokemon_ids"],
-        "opp_pokemon_banks":    bc_collated["opp_pokemon_banks"],
-        "opp_pokemon_cont":     bc_collated["opp_pokemon_cont"],
-        "opp_pokemon_move_ids": bc_collated["opp_pokemon_move_ids"],
-        "opp_pokemon_move_cont": bc_collated["opp_pokemon_move_cont"],
-        "field_cont":           bc_collated["field_cont_raw"],
-        "transition_cont":      bc_collated["trans_cont_raw"],
-        "active_move_ids":      bc_collated["active_move_ids_raw"],
-        "active_move_cont":     bc_collated["active_move_cont_raw"],
-        "switch_ids":           bc_collated["switch_ids_raw"],
-        "switch_cont":          bc_collated["switch_cont_raw"],
-        "legal_mask":           bc_collated["legal_mask_raw"],
-    }
-    fb = bc_collated["field_banks_raw"]
-    feat_batches["field_banks"] = {
-        "turn":        fb[:, :, 0],
-        "weather_dur": fb[:, :, 1],
-        "terrain_dur": fb[:, :, 2],
-        "tr_dur":      fb[:, :, 3],
-    }
-    ti = bc_collated["trans_ids_raw"]
-    feat_batches["transition_ids"] = {
-        "our_action": ti[:, :, 0],
-        "opp_action": ti[:, :, 1],
-    }
-    amb = bc_collated["active_move_banks_raw"]
-    feat_batches["active_move_banks"] = {
-        "bp":   amb[:, :, :, 0],
-        "acc":  amb[:, :, :, 1],
-        "pp":   amb[:, :, :, 2],
-        "prio": amb[:, :, :, 3],
-    }
-    feat_batches["gen_id"] = torch.full(
-        (B, L), 9, dtype=torch.long, device=device
-    )
-
-    mask = bc_collated["mask"]
-    pad_mask = (mask > 0.5)
-
-    return {
-        "feat_batches": feat_batches,
-        "pad_mask": pad_mask,
-        "seq_lens": bc_collated["seq_lens"],
-        "B": B,
-        "L_max": L,
-    }
 
 
 def main():

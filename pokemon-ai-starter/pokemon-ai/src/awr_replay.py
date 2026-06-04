@@ -214,6 +214,84 @@ class AWRReplayBuffer:
 
 
 # =============================
+# BC-format -> PPO-format adapter (Phase 2C v2, Task #125)
+# =============================
+#
+# AWRReplayBuffer outputs BC-format batches (dataset.collate_seq), but
+# AWR's forward goes through forward_ppo_sequence (the same path Tier 3
+# PPO uses) for consistency. forward_ppo_sequence expects PPO-format
+# (ppo.collate_episodes output) which differs structurally:
+#   - field_banks_raw (B,L,4)       -> field_banks dict of 4 (B,L) tensors
+#   - trans_ids_raw (B,L,2)         -> transition_ids dict of 2 (B,L) tensors
+#   - active_move_banks_raw (B,L,4,4) -> active_move_banks dict of 4 (B,L,4)
+#   - *_raw keys                     -> non-raw keys
+#   - flat top level                 -> {"feat_batches": ..., "pad_mask": ...}
+# This adapter does that conversion in O(1) tensor views (no copies).
+
+def bc_to_ppo_format(bc_collated: dict) -> dict:
+    """Convert AWRReplayBuffer.sample() output to forward_ppo_sequence input.
+
+    No copies (tensor views + slices). The terminal_result field is NOT
+    forwarded to PPO format — AWR keeps it at top level for advantage
+    computation outside the model.
+    """
+    B, L = bc_collated["our_pokemon_ids"].shape[:2]
+    device = bc_collated["our_pokemon_ids"].device
+    feat_batches = {
+        "our_pokemon_ids":      bc_collated["our_pokemon_ids"],
+        "our_pokemon_banks":    bc_collated["our_pokemon_banks"],
+        "our_pokemon_cont":     bc_collated["our_pokemon_cont"],
+        "our_pokemon_move_ids": bc_collated["our_pokemon_move_ids"],
+        "our_pokemon_move_cont": bc_collated["our_pokemon_move_cont"],
+        "opp_pokemon_ids":      bc_collated["opp_pokemon_ids"],
+        "opp_pokemon_banks":    bc_collated["opp_pokemon_banks"],
+        "opp_pokemon_cont":     bc_collated["opp_pokemon_cont"],
+        "opp_pokemon_move_ids": bc_collated["opp_pokemon_move_ids"],
+        "opp_pokemon_move_cont": bc_collated["opp_pokemon_move_cont"],
+        "field_cont":           bc_collated["field_cont_raw"],
+        "transition_cont":      bc_collated["trans_cont_raw"],
+        "active_move_ids":      bc_collated["active_move_ids_raw"],
+        "active_move_cont":     bc_collated["active_move_cont_raw"],
+        "switch_ids":           bc_collated["switch_ids_raw"],
+        "switch_cont":          bc_collated["switch_cont_raw"],
+        "legal_mask":           bc_collated["legal_mask_raw"],
+    }
+    fb = bc_collated["field_banks_raw"]
+    feat_batches["field_banks"] = {
+        "turn":        fb[:, :, 0],
+        "weather_dur": fb[:, :, 1],
+        "terrain_dur": fb[:, :, 2],
+        "tr_dur":      fb[:, :, 3],
+    }
+    ti = bc_collated["trans_ids_raw"]
+    feat_batches["transition_ids"] = {
+        "our_action": ti[:, :, 0],
+        "opp_action": ti[:, :, 1],
+    }
+    amb = bc_collated["active_move_banks_raw"]
+    feat_batches["active_move_banks"] = {
+        "bp":   amb[:, :, :, 0],
+        "acc":  amb[:, :, :, 1],
+        "pp":   amb[:, :, :, 2],
+        "prio": amb[:, :, :, 3],
+    }
+    feat_batches["gen_id"] = torch.full(
+        (B, L), 9, dtype=torch.long, device=device
+    )
+
+    mask = bc_collated["mask"]
+    pad_mask = (mask > 0.5)
+
+    return {
+        "feat_batches": feat_batches,
+        "pad_mask": pad_mask,
+        "seq_lens": bc_collated["seq_lens"],
+        "B": B,
+        "L_max": L,
+    }
+
+
+# =============================
 # AWR loss + optimizer step (Phase 2C, Task #125)
 # =============================
 #
@@ -290,7 +368,17 @@ def compute_awr_loss(
             n_valid:            number of (B, T) positions with valid R + non-pad
             n_total_valid_pad:  number of non-pad positions (for ratio)
     """
-    out = model.forward_sequence(replay_batch, device)
+    # Use forward_ppo_sequence — the SAME forward path Tier 3 PPO uses
+    # for updates. Critical: forward_sequence (BC path) and
+    # forward_ppo_sequence (PPO/Tier 3 path) DIVERGE by ~1.9e-3 in
+    # action_logits and ~3.6e-3 in v_logits at valid positions, verified
+    # via test_forward_paths_equivalence.py. Using forward_sequence here
+    # would pull the policy toward an inconsistent distribution vs PPO's
+    # updates -> active pollution.
+    # Adapter bc_to_ppo_format converts dataset.collate_seq output to
+    # the dict format forward_ppo_sequence expects.
+    ppo_batch = bc_to_ppo_format(replay_batch)
+    out = model.forward_ppo_sequence(ppo_batch, device)
     action_logits = out["action_logits"]  # (B, L_max, n_actions)
     value = out["value"]                  # (B, L_max) scalar V_theta
 
