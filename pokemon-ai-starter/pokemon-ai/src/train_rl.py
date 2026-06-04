@@ -207,6 +207,67 @@ def parse_args():
                         "0.0 disables anchor even if --bc-anchor-ckpt given. "
                         "Default 0.1 — caps drift without capping PPO improvement "
                         "direction (S57 isolation experiment starting point).")
+    # =============================
+    # S68 AWR replay rehearsal (Task #125) — flag skeleton (Phase 2A).
+    # Loss path / loader implementation lands in Phase 2B-C.
+    # When --awr-replay-memmap is None, this is a no-op (default).
+    # Full design: docs/AWR_REPLAY_REHEARSAL_DESIGN.md.
+    # =============================
+    p.add_argument("--awr-replay-memmap", default=None,
+                   help="S68 AWR replay rehearsal: path to a BC-style memmap "
+                        "dir (e.g. data/datasets/human_v8_memmap) of 1500+ Elo "
+                        "human replays. When set, an auxiliary AWR loss "
+                        "(advantage-weighted BC on replay samples) is added "
+                        "to the PPO update. Tests the plateau hypothesis: "
+                        "BC-learned elite patterns fade in PPO because PPO "
+                        "never rewards them; replay rehearsal reinforces "
+                        "high-reward replay actions via V_theta-derived "
+                        "advantage. v1 = binary AWR (1[A>0] * log pi), "
+                        "terminal-reward only (memmap result field). Eager "
+                        "Tier 3 path only — NOT supported with --compile or "
+                        "--packed in v1. See docs/AWR_REPLAY_REHEARSAL_DESIGN.md.")
+    p.add_argument("--awr-mix-weight", type=float, default=0.05,
+                   help="Weight applied to AWR loss in total_loss = ppo_loss "
+                        "+ awr_mix_weight * awr_loss. 0.0 disables AWR even "
+                        "if --awr-replay-memmap given. Default 0.05 = "
+                        "conservative starting point for smoke; validation-"
+                        "run weight is set ADAPTIVELY from 5-iter smoke "
+                        "calibration data (see Q2 table in design memo §4). "
+                        "Bounds: <0.02 = noise floor, >0.10 = risk of "
+                        "becoming dominant signal.")
+    p.add_argument("--awr-batch-size", type=int, default=512,
+                   help="Number of (state, action, R) transitions sampled "
+                        "from the replay memmap per PPO iter for the AWR "
+                        "loss. Default 512 = balance between stable "
+                        "gradient and cheap forward. Tune at Phase 2D.")
+    p.add_argument("--awr-min-rating", type=int, default=1500,
+                   help="Minimum Elo rating of replay episodes to include "
+                        "in AWR sampling. BC v10 was trained on 1500+; "
+                        "matching the filter keeps demonstrations elite-"
+                        "quality. Requires episode_index.npy has a rating "
+                        "column (verify at Phase 2B; if missing, this is "
+                        "ignored and ALL episodes are sampled — WARN logged).")
+    p.add_argument("--awr-binary", action="store_true", default=True,
+                   help="v1 default ON: use binary-filter AWR "
+                        "(weight = 1[A>0]). Mirrors metamon binary_rl.gin "
+                        "(SyntheticRLV2). Simpler than exp(A/beta) — no "
+                        "beta tuning, lower variance. Use --no-awr-binary "
+                        "to switch to the exponential variant (uses "
+                        "--awr-beta).")
+    p.add_argument("--no-awr-binary", dest="awr_binary", action="store_false",
+                   help="Disable binary AWR (use exp(A/beta) weighting). "
+                        "Requires tuning --awr-beta.")
+    p.add_argument("--awr-beta", type=float, default=1.0,
+                   help="Temperature for exp(A/beta) AWR weighting. "
+                        "Only used when --no-awr-binary is set. Smaller "
+                        "= sharper filtering (more like binary). Metamon "
+                        "exp_rl.gin uses beta=1.0.")
+    p.add_argument("--awr-clip-high", type=float, default=20.0,
+                   help="Maximum AWR sample weight to prevent extreme "
+                        "single-sample gradient domination. Only matters "
+                        "for the exp(A/beta) variant (binary weights are "
+                        "{0,1}). Metamon uses 100; we start more "
+                        "conservative.")
     p.add_argument("--pipeline", action="store_true",
                    help="Pipeline collection and PPO update (overlap on GPU)")
     p.add_argument("--profile-iters", type=str, default="",
@@ -1423,6 +1484,42 @@ def main():
         n_bc_params = sum(p.numel() for p in bc_ref.parameters())
         print(f"BC anchor: ref loaded ({n_bc_params:,} params, frozen, "
               f"coef={args.bc_anchor_coef})", flush=True)
+
+    # S68 AWR replay rehearsal (Task #125) — Phase 2A flag validation.
+    # Loader + loss term land in Phase 2B-C. Until then, --awr-replay-memmap
+    # is a no-op with a WARN. Incompatible flag combos fail fast (no point
+    # waiting for Phase 2C to discover them).
+    # See docs/AWR_REPLAY_REHEARSAL_DESIGN.md §2.4 / §2.8 for rationale.
+    if args.awr_replay_memmap is not None:
+        if args.compile:
+            raise SystemExit(
+                "AWR replay rehearsal is incompatible with --compile in v1 "
+                "(see project_bc_anchor_design.md for compile-boundary "
+                "complexity). Drop --compile or unset --awr-replay-memmap. "
+                "Per S62 refutation, --compile is not in the canonical "
+                "Phase 2 stack anyway (8% slower at prod scale)."
+            )
+        if args.packed:
+            raise SystemExit(
+                "AWR replay rehearsal is incompatible with --packed in v1 "
+                "(packed-mode loss path will get AWR after eager validation). "
+                "Drop --packed or unset --awr-replay-memmap."
+            )
+        if not args.tier3:
+            raise SystemExit(
+                "AWR replay rehearsal requires --tier3 (eager batched path). "
+                "AWR is layered on ppo_update_batched, not the legacy "
+                "per-episode ppo_update."
+            )
+        if args.awr_mix_weight == 0.0:
+            print("[WARN] --awr-mix-weight is 0.0; AWR will be a no-op. "
+                  "Set --awr-mix-weight 0.05 (or per design memo §4 Q2 "
+                  "calibration table) to enable.", flush=True)
+        # Phase 2A placeholder — loader + loss term land in Phase 2B-C.
+        print(f"[WARN] AWR Phase 2A: --awr-replay-memmap accepted "
+              f"({args.awr_replay_memmap}) but loader+loss not yet "
+              f"implemented (Phase 2B/2C). Continuing as if AWR were OFF. "
+              f"See docs/AWR_REPLAY_REHEARSAL_DESIGN.md.", flush=True)
 
     # Tier 3 C5 (S55+): single-graph compiled train_step for the batched PPO
     # update. Built AFTER per-submodule compile so the per-submodule compile
