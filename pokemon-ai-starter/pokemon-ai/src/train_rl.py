@@ -76,7 +76,10 @@ def parse_args():
                    help="Comma-separated battle_server ports (default: 9000..9015, 16 ports)")
     p.add_argument("--format", default="gen9ou", help="Battle format (gen9ou, gen8ou, etc.)")
     p.add_argument("--games-per-iter", type=int, default=200)
-    p.add_argument("--max-concurrent", type=int, default=20)
+    p.add_argument("--max-concurrent", type=int, default=200,
+                   help="Cap on concurrent battles in-flight per iter. "
+                        "Default 200 (S68 canonical for 90w prod). Lower "
+                        "for memory-constrained dev (try 20-40).")
     p.add_argument("--n-iters", type=int, default=500)
     p.add_argument("--lr", type=float, default=3e-5,
                    help="Adam learning rate. Default 3e-5 — the value S39 used "
@@ -179,7 +182,7 @@ def parse_args():
                         "production scale, 8 for tighter memory. None "
                         "= one chunk = old mega-batch behavior (smoke "
                         "scale only).")
-    p.add_argument("--packed", action="store_true",
+    p.add_argument("--packed", action=argparse.BooleanOptionalAction, default=True,
                    help="S64: route the Tier 3 eager update through the "
                         "packed-sequence path (collate_episodes_packed + "
                         "forward_ppo_sequence_packed + _ppo_loss_packed_internal). "
@@ -187,15 +190,16 @@ def parse_args():
                         "stack (~38%% of update CPU at prod scale per S64 step-back "
                         "profile). Requires --tier3. NOT supported with --compile "
                         "(eager-only in v1). Bit-equivalent to legacy at fp32 eval "
-                        "and within bf16 noise at training (B.2-B.5 gates).")
-    p.add_argument("--no-per-chunk-gc", action="store_true",
-                   help="S64 2b experiment: disable per-chunk gc.collect() + "
-                        "torch.cuda.empty_cache() in the Tier 3 eager update path. "
-                        "Default is per-chunk gc ON (matches legacy). At mb=64+ "
-                        "with packed memory savings, per-chunk gc may be redundant "
-                        "(activation memory is well-bounded by Python ref counting "
-                        "alone). If this flag is set: faster wall but risk OOM if "
-                        "memory accumulates. Test at prod before shipping.")
+                        "and within bf16 noise at training. **DEFAULT TRUE as of "
+                        "S68**: canonical perf path. Use --no-packed to opt out.")
+    p.add_argument("--per-chunk-gc", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable per-chunk gc.collect() + torch.cuda.empty_cache() "
+                        "in the Tier 3 eager update path. **DEFAULT FALSE as of "
+                        "S68**: at mb=64+ with packed memory savings, per-chunk gc "
+                        "is redundant (activation memory bounded by Python ref counting "
+                        "alone) and costs 2-3 min/iter wall. Legacy `--no-per-chunk-gc` "
+                        "now no-op (same default). Set --per-chunk-gc to re-enable "
+                        "for OOM debugging or memory-constrained dev.")
     p.add_argument("--diag-grad-norms", action="store_true",
                    help="S67-EXT observability: per-epoch grad-norm decomposition "
                         "(PPO part vs BC anchor part) + cosine similarity. Cost: "
@@ -1775,7 +1779,7 @@ def main():
                 bc_anchor_coef=args.bc_anchor_coef,
                 minibatch_size=args.tier3_minibatch_size,
                 packed=args.packed,
-                per_chunk_gc=not args.no_per_chunk_gc,
+                per_chunk_gc=args.per_chunk_gc,
                 in_warmup=in_warmup,  # noop in batched path; caller controls requires_grad
                 diag_grad_norms=getattr(args, 'diag_grad_norms', False),
             )
