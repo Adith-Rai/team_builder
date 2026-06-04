@@ -281,15 +281,19 @@ def parse_args():
                         "~20-30%% wall overhead during profiled iters. Use sparingly. "
                         "Example: --profile-iters 0,2")
     p.add_argument("--snapshot-interval", type=int, default=5, help="Save snapshot every N iters")
-    p.add_argument("--eval-interval", type=int, default=20)
-    p.add_argument("--eval-games", type=int, default=200)
-    p.add_argument("--eval-team-set", choices=["pool", "metamon-competitive"], default="pool",
-                   help="Team source for in-training bot evals. 'pool' = 70-team "
-                        "teams_ou pool (legacy default; ~30pt strength spread → "
-                        "noisy smart_avg). 'metamon-competitive' = 16 curated "
-                        "Smogon teams from metamon_cache (lower team-quality "
-                        "variance, ladder-validated, ~3.6pt same-policy noise "
-                        "floor at 200×4 games).")
+    p.add_argument("--eval-interval", type=int, default=10,
+                   help="Eval frequency in iters. Default 10 (S68 canonical, "
+                        "matches fishbowl_prod). Use 99 to disable in-loop eval.")
+    p.add_argument("--eval-games", type=int, default=200,
+                   help="Games per bot per eval (×4 bots = 800 total). Default 200.")
+    p.add_argument("--eval-team-set", choices=["pool", "metamon-competitive"],
+                   default="metamon-competitive",
+                   help="Team source for in-training bot evals. **DEFAULT "
+                        "'metamon-competitive' as of S68**: 16 curated Smogon "
+                        "teams, lower team-quality variance, ladder-validated, "
+                        "~3.6pt same-policy noise floor at 200×4 games. "
+                        "'pool' = legacy 70-team teams_ou pool (~30pt strength "
+                        "spread → noisy smart_avg).")
     p.add_argument("--out-dir", default="data/models/rl_v9")
     p.add_argument("--immune-penalty", type=float, default=0.0,
                    help="Per-step penalty when our move hits immunity")
