@@ -31,6 +31,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from dataset import MemmapDataset, collate_seq
 
@@ -210,6 +211,241 @@ class AWRReplayBuffer:
             else:
                 out[k] = v
         return out
+
+
+# =============================
+# AWR loss + optimizer step (Phase 2C, Task #125)
+# =============================
+#
+# compute_awr_loss is pure math (forward → loss + diagnostics dict).
+# awr_step wraps it with optimizer.zero_grad + backward + grad_clip + step.
+# Called from train_rl.py AFTER ppo_update_batched returns, when
+# --awr-replay-memmap is set AND not in warmup. Single optimizer step
+# per PPO iter (one forward, one backward, one step) for AWR's part.
+#
+# Why detach V_θ for advantage (default in v1):
+#   AWR with terminal reward can pull V_θ toward "win probability" while
+#   PPO with shaped reward pulls V_θ toward "discounted shaped return."
+#   With terminal-only PPO + binary AWR (the planned setup), the two
+#   reward distributions match → detach matters less. But we keep
+#   detach=True in v1 for surface area reduction: AWR updates POLICY
+#   only, value head is trained exclusively by PPO. Disable via
+#   `detach_value=False` once we want to ablate.
+
+def compute_awr_loss(
+    model,
+    replay_batch: dict,
+    device: torch.device,
+    awr_binary: bool = True,
+    awr_beta: float = 1.0,
+    awr_clip_high: float = 20.0,
+    detach_value: bool = True,
+) -> dict:
+    """Compute AWR loss for a replay batch (pure math, no optimizer).
+
+    Loss formula:
+        L = - E_(s,a)~replay [ w(s,a) * log pi_theta(a | s) ]
+
+        w(s,a) = 1[A(s,a) > 0]                       if awr_binary
+               = clip(exp(A(s,a)/beta), max=clip_high) otherwise
+
+        A(s,a) = R - V_theta(s)
+
+    Where:
+        R = terminal_result of the episode (broadcast to all states).
+            In {-1, +1, NaN}. NaN means no terminal info — those
+            positions are masked out.
+        V_theta(s) = scalar value head output (detached by default).
+
+    Aggregation: masked-mean over (B, T) positions where both the
+    pad mask AND the terminal-result-validity mask are True. Same
+    aggregation style as the BC anchor KL term.
+
+    Args:
+        model: TransformerBattlePolicy (will run forward_sequence on it)
+        replay_batch: output of AWRReplayBuffer.sample() — BC-format
+            with terminal_result (B,) tensor in {-1, +1, NaN}
+        device: torch device
+        awr_binary: if True (default), use 1[A>0] weight. Mirrors
+            metamon binary_rl.gin (SyntheticRLV2 / Minikazam paradigm).
+        awr_beta: temperature for exp(A/beta). Only used if not binary.
+        awr_clip_high: max weight to prevent extreme single-sample
+            domination. Only matters for the exp variant (binary
+            weights are {0, 1}).
+        detach_value: if True (default), V_theta is detached for the
+            advantage. AWR only updates policy. See docstring rationale.
+            NOTE: for the BINARY variant, value head gradient is blocked
+            REGARDLESS of detach_value, because `(A > 0)` is a
+            non-differentiable comparison. detach_value only matters
+            for the exp(A/beta) variant. Verified end-to-end with all
+            4 (binary x detach) combos at Phase 2C.
+
+    Returns:
+        dict (all scalar tensors except 'loss' which has grad):
+            loss:               scalar AWR loss (with grad)
+            advantage_mean:     mean A over valid positions
+            advantage_pos_frac: fraction of valid positions with A > 0
+            weight_max:         max weight applied
+            weight_mean:        mean weight over valid positions
+            n_valid:            number of (B, T) positions with valid R + non-pad
+            n_total_valid_pad:  number of non-pad positions (for ratio)
+    """
+    out = model.forward_sequence(replay_batch, device)
+    action_logits = out["action_logits"]  # (B, L_max, n_actions)
+    value = out["value"]                  # (B, L_max) scalar V_theta
+
+    if detach_value:
+        value = value.detach()
+
+    mask = replay_batch["mask"]                       # (B, L_max) {0, 1}
+    actions = replay_batch["action"]                  # (B, L_max) long, -1 at pad
+    terminal_result = replay_batch["terminal_result"] # (B,) in {-1, +1, NaN}
+
+    B, T = mask.shape
+
+    # Broadcast terminal_result to per-state R.
+    R = terminal_result.unsqueeze(1).expand(B, T)  # (B, T)
+
+    # Valid mask: non-pad AND R is finite (NaN means no terminal info,
+    # those episodes can't contribute to AWR).
+    valid_R = ~torch.isnan(R)
+    valid_mask = (mask > 0.5) & valid_R
+    valid_mask_f = valid_mask.float()
+    n_valid = valid_mask_f.sum().clamp(min=1.0)
+
+    # Replace NaN in R with 0 to avoid NaN propagation; masking handles them.
+    R_clean = torch.nan_to_num(R, nan=0.0)
+
+    # Advantage. Float for numerical safety (value head outputs may be
+    # in autocast dtype like bf16).
+    advantage = R_clean - value.float()  # (B, T)
+
+    # Weight per position.
+    if awr_binary:
+        weight = (advantage > 0).float()
+    else:
+        weight = torch.exp(advantage / awr_beta).clamp(max=awr_clip_high)
+
+    # Log probability of the chosen action. Pad-positions have action=-1;
+    # clamp to a valid index (we mask the loss anyway, so the actual
+    # value doesn't propagate).
+    actions_clean = actions.clamp(min=0)
+    log_probs = F.log_softmax(action_logits.float(), dim=-1)  # (B, T, n_actions)
+    chosen_log_probs = log_probs.gather(
+        -1, actions_clean.unsqueeze(-1)
+    ).squeeze(-1)  # (B, T)
+
+    # Per-position AWR loss, masked-mean over valid positions.
+    awr_loss_per_pos = -weight * chosen_log_probs
+    awr_loss = (awr_loss_per_pos * valid_mask_f).sum() / n_valid
+
+    # Diagnostics.
+    weighted_mask = weight * valid_mask_f
+    pos_advantage_frac = ((advantage > 0).float() * valid_mask_f).sum() / n_valid
+    weight_max_val = (weight * valid_mask_f).max()
+    weight_mean_val = weighted_mask.sum() / n_valid
+    advantage_mean = (advantage * valid_mask_f).sum() / n_valid
+
+    return {
+        "loss": awr_loss,
+        "advantage_mean": advantage_mean,
+        "advantage_pos_frac": pos_advantage_frac,
+        "weight_max": weight_max_val,
+        "weight_mean": weight_mean_val,
+        "n_valid": n_valid,
+        "n_total_valid_pad": (mask > 0.5).float().sum(),
+    }
+
+
+def awr_step(
+    model,
+    optimizer,
+    replay_buffer: "AWRReplayBuffer",
+    device: torch.device,
+    awr_batch_episodes: int,
+    awr_mix_weight: float,
+    awr_binary: bool = True,
+    awr_beta: float = 1.0,
+    awr_clip_high: float = 20.0,
+    max_grad_norm: float = 0.5,
+    detach_value: bool = True,
+) -> dict:
+    """Single AWR optimizer step. Called after ppo_update_batched.
+
+    Pattern mirrors a PPO step: zero_grad → forward → loss × mix_weight
+    → backward → clip → step. One step per PPO iter.
+
+    The AWR forward shares the optimizer with PPO (same AdamW). PPO's
+    accumulated state at zero_grad ensures the AWR backward starts
+    clean; PPO's optimizer.step at the end of its own loop already
+    flushed PPO gradients.
+
+    Args:
+        model: TransformerBattlePolicy. Will be set to model.train().
+        optimizer: the same AdamW used by PPO.
+        replay_buffer: AWRReplayBuffer (from awr_replay module).
+        device: torch device.
+        awr_batch_episodes: number of episodes to sample per AWR step.
+        awr_mix_weight: scalar multiplier on AWR loss before backward.
+            Per design memo Q2 calibration table, picked from 5-iter
+            smoke data (Phase 2D).
+        awr_binary / awr_beta / awr_clip_high: see compute_awr_loss.
+        max_grad_norm: passed to clip_grad_norm_.
+        detach_value: see compute_awr_loss.
+
+    Returns:
+        dict of Python floats (ready for TensorBoard logging):
+            awr_loss              raw AWR loss value
+            awr_loss_scaled       AWR loss × mix_weight (what backward sees)
+            awr_advantage_mean    mean advantage over valid positions
+            awr_advantage_pos_frac  frac of valid positions with A > 0
+            awr_weight_max        max applied weight
+            awr_weight_mean       mean applied weight
+            awr_n_valid           positions used (post-NaN-mask)
+            awr_n_total_valid     positions before NaN-mask
+            awr_grad_norm         gradient norm post-AWR-backward (pre-clip)
+            awr_mix_weight        the mix weight used (for logging)
+    """
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    batch = replay_buffer.sample(awr_batch_episodes, device)
+
+    # bf16 autocast iff enabled (matches PPO update path; see ppo.py).
+    from precision_config import get_amp_dtype, autocast_ctx
+    import contextlib
+    _amp_ctx = (autocast_ctx() if get_amp_dtype() is torch.bfloat16
+                else contextlib.nullcontext())
+
+    with _amp_ctx:
+        awr_out = compute_awr_loss(
+            model, batch, device,
+            awr_binary=awr_binary,
+            awr_beta=awr_beta,
+            awr_clip_high=awr_clip_high,
+            detach_value=detach_value,
+        )
+        loss_scaled = awr_mix_weight * awr_out["loss"]
+
+    loss_scaled.backward()
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), max_grad_norm
+    )
+    optimizer.step()
+
+    return {
+        "awr_loss": float(awr_out["loss"].item()),
+        "awr_loss_scaled": float(loss_scaled.item()),
+        "awr_advantage_mean": float(awr_out["advantage_mean"].item()),
+        "awr_advantage_pos_frac": float(awr_out["advantage_pos_frac"].item()),
+        "awr_weight_max": float(awr_out["weight_max"].item()),
+        "awr_weight_mean": float(awr_out["weight_mean"].item()),
+        "awr_n_valid": float(awr_out["n_valid"].item()),
+        "awr_n_total_valid": float(awr_out["n_total_valid_pad"].item()),
+        "awr_grad_norm": float(grad_norm.item()),
+        "awr_mix_weight": float(awr_mix_weight),
+    }
 
 
 # =============================

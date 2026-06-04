@@ -999,6 +999,30 @@ def _log_iter(writer, it, wins, losses, ties, steps, collect_time, update_time,
         writer.add_scalar("train/grad_bc_norm", mean_bc, it)
         writer.add_scalar("train/grad_bc_ppo_ratio", ratio, it)
         writer.add_scalar("train/grad_cosine", mean_cos, it)
+
+    # S68 AWR replay rehearsal (Task #125): log AWR stats if present.
+    # Stats only present when --awr-replay-memmap is set and not in warmup.
+    # awr_loss is RAW (pre-mix-weight); awr_loss_scaled is the value
+    # backward() actually saw. The ratio awr_loss_scaled / total_ppo_loss
+    # is what design memo §4 Q2 calibration table uses to pick the
+    # validation-run mix weight (after Phase 2D smoke).
+    if "awr_loss" in loss_info:
+        awr_l    = loss_info["awr_loss"]
+        awr_ls   = loss_info["awr_loss_scaled"]
+        awr_apf  = loss_info.get("awr_advantage_pos_frac", 0.0)
+        awr_wmax = loss_info.get("awr_weight_max", 0.0)
+        awr_wmean = loss_info.get("awr_weight_mean", 0.0)
+        awr_gn   = loss_info.get("awr_grad_norm", 0.0)
+        awr_mw   = loss_info.get("awr_mix_weight", 0.0)
+        print(f"  [AWR ] loss={awr_l:.4f} (scaled={awr_ls:.4f}, mix={awr_mw}), "
+              f"adv_pos_frac={awr_apf:.3f}, w_max={awr_wmax:.2f}, "
+              f"w_mean={awr_wmean:.3f}, grad_norm={awr_gn:.3f}", flush=True)
+        writer.add_scalar("train/awr_loss", awr_l, it)
+        writer.add_scalar("train/awr_loss_scaled", awr_ls, it)
+        writer.add_scalar("train/awr_advantage_pos_frac", awr_apf, it)
+        writer.add_scalar("train/awr_weight_max", awr_wmax, it)
+        writer.add_scalar("train/awr_weight_mean", awr_wmean, it)
+        writer.add_scalar("train/awr_grad_norm", awr_gn, it)
     return wr
 
 
@@ -1485,11 +1509,11 @@ def main():
         print(f"BC anchor: ref loaded ({n_bc_params:,} params, frozen, "
               f"coef={args.bc_anchor_coef})", flush=True)
 
-    # S68 AWR replay rehearsal (Task #125) — Phase 2A flag validation.
-    # Loader + loss term land in Phase 2B-C. Until then, --awr-replay-memmap
-    # is a no-op with a WARN. Incompatible flag combos fail fast (no point
-    # waiting for Phase 2C to discover them).
-    # See docs/AWR_REPLAY_REHEARSAL_DESIGN.md §2.4 / §2.8 for rationale.
+    # S68 AWR replay rehearsal (Task #125) — Phase 2C: buffer instantiation.
+    # Loss/step lives in awr_replay.py; called after ppo_update_batched returns.
+    # Incompatible flag combos fail fast (no point getting into the training loop
+    # to discover them). See docs/AWR_REPLAY_REHEARSAL_DESIGN.md §2.4 / §2.8.
+    awr_buffer = None
     if args.awr_replay_memmap is not None:
         if args.compile:
             raise SystemExit(
@@ -1515,11 +1539,16 @@ def main():
             print("[WARN] --awr-mix-weight is 0.0; AWR will be a no-op. "
                   "Set --awr-mix-weight 0.05 (or per design memo §4 Q2 "
                   "calibration table) to enable.", flush=True)
-        # Phase 2A placeholder — loader + loss term land in Phase 2B-C.
-        print(f"[WARN] AWR Phase 2A: --awr-replay-memmap accepted "
-              f"({args.awr_replay_memmap}) but loader+loss not yet "
-              f"implemented (Phase 2B/2C). Continuing as if AWR were OFF. "
-              f"See docs/AWR_REPLAY_REHEARSAL_DESIGN.md.", flush=True)
+        # Build buffer (logs episode count + filter status internally).
+        from awr_replay import AWRReplayBuffer
+        awr_buffer = AWRReplayBuffer(
+            memmap_path=args.awr_replay_memmap,
+            min_rating=args.awr_min_rating,
+        )
+        _awr_variant = "binary" if args.awr_binary else f"exp(A/{args.awr_beta})"
+        print(f"AWR: {_awr_variant} variant, mix_weight={args.awr_mix_weight}, "
+              f"batch={args.awr_batch_size} episodes/iter, skip-during-warmup=True",
+              flush=True)
 
     # Tier 3 C5 (S55+): single-graph compiled train_step for the batched PPO
     # update. Built AFTER per-submodule compile so the per-submodule compile
@@ -1774,6 +1803,46 @@ def main():
 
         update_time = time.time() - t_update
         _flow(f"PPO update DONE: {update_time:.0f}s")
+
+        # ---- AWR replay rehearsal (S68, Task #125) ----
+        # Separate optimizer step on a replay batch sampled from BC-style
+        # memmap. Runs AFTER PPO update so the two steps don't interfere
+        # within a single optimizer.zero_grad scope. Skipped during warmup
+        # because warmup freezes the policy backbone (only value_head trains)
+        # and AWR's loss is on policy — gradient would be discarded.
+        # See docs/AWR_REPLAY_REHEARSAL_DESIGN.md and awr_replay.awr_step.
+        if awr_buffer is not None and not in_warmup and args.awr_mix_weight != 0.0:
+            from awr_replay import awr_step
+            t_awr = time.time()
+            try:
+                awr_info = awr_step(
+                    model=model,
+                    optimizer=optimizer,
+                    replay_buffer=awr_buffer,
+                    device=device,
+                    awr_batch_episodes=args.awr_batch_size,
+                    awr_mix_weight=args.awr_mix_weight,
+                    awr_binary=args.awr_binary,
+                    awr_beta=args.awr_beta,
+                    awr_clip_high=args.awr_clip_high,
+                    max_grad_norm=args.max_grad_norm,
+                    detach_value=True,  # v1: AWR updates policy only
+                )
+                loss_info.update(awr_info)
+                awr_time = time.time() - t_awr
+                _flow(f"AWR step DONE: {awr_time:.1f}s, "
+                      f"loss={awr_info['awr_loss']:.4f}, "
+                      f"adv_pos_frac={awr_info['awr_advantage_pos_frac']:.3f}, "
+                      f"grad_norm={awr_info['awr_grad_norm']:.3f}")
+            except Exception as e:
+                # AWR is a layer on top of PPO; a failure here should not
+                # kill the run (PPO already updated). Log + zero stats and
+                # continue. Phase 2D smoke is the right place to catch + fix.
+                print(f"  [WARN] AWR step failed: {e}; continuing with PPO only.",
+                      flush=True)
+                loss_info.setdefault("awr_loss", 0.0)
+                loss_info.setdefault("awr_loss_scaled", 0.0)
+                loss_info.setdefault("awr_grad_norm", 0.0)
 
         # ---- Catastrophic-failure guard (Session 33) ----
         if loss_info.get("n_succeeded", 1) == 0:
