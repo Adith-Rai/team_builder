@@ -1809,6 +1809,9 @@ def _do_collect_iter_cis(state, worker_id, cmd, result_pipe, heartbeat_fn):
     turn_cap = cmd.get("turn_cap", 300)
     battle_format = cmd.get("battle_format", "gen9ou")
     procedural_teams_path = cmd.get("procedural_teams_path")
+    # S68 hierarchical teambuilders: syn_config dict (or None) for
+    # paired-pool team distribution (TopMixer / SynergisticMixer).
+    syn_config = cmd.get("syn_config")
     rng_seed = cmd.get("rng_seed", 0)
     opp_pool = cmd["opp_pool"]
     # Phase 4.3a: orchestrator broadcasts pool_slot_map (opp_path -> slot_idx).
@@ -1873,6 +1876,7 @@ def _do_collect_iter_cis(state, worker_id, cmd, result_pipe, heartbeat_fn):
         heartbeat_fn=heartbeat_fn,
         liveness_state=_liveness_state,
         pool_slot_map=pool_slot_map,
+        syn_config=syn_config,
     )
     elapsed_s = time.time() - t0
     _liveness_state["alive"] = False
@@ -2585,6 +2589,7 @@ def mp_centralized_collect_sync(
     max_pool_size: int = 16,
     worker_device: Optional[str] = None,
     pfsp_max_share: float = 0.20,
+    syn_config: Optional[dict] = None,
 ) -> Tuple[List, int, int, int, Dict, float, dict]:
     """Synchronous one-iter CIS-routed collect.
 
@@ -2766,6 +2771,7 @@ def mp_centralized_collect_sync(
                 "turn_cap": turn_cap,
                 "battle_format": battle_format,
                 "procedural_teams_path": procedural_teams_path,
+                "syn_config": syn_config,
                 "device": worker_device if worker_device else str(device),
                 "opponent_device": opponent_device,
                 "rng_seed": rng_seed,
@@ -3116,6 +3122,7 @@ class CISBgCollector:
                 "turn_cap": ctx["turn_cap"],
                 "battle_format": ctx["battle_format"],
                 "procedural_teams_path": ctx["procedural_teams_path"],
+                "syn_config": ctx.get("syn_config"),
                 "device": ctx.get("worker_device_str") or ctx["device_str"],
                 "opponent_device": ctx["opponent_device"],
                 "rng_seed": ctx["rng_seed"],
@@ -3174,6 +3181,7 @@ class CISBgCollector:
             "turn_cap": args_dict.get("turn_cap", 300),
             "battle_format": args_dict.get("battle_format", "gen9ou"),
             "procedural_teams_path": args_dict.get("teambuilder_path"),
+            "syn_config": args_dict.get("syn_config"),
             "device_str": str(device),
             "device_type": device.type,
             # S68 worker-cpu mode: if args_dict["worker_device_str"] is set,
