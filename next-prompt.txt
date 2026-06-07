@@ -1,4 +1,158 @@
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S68 TEAM-DATA ARC (2026-06-07, RUN #5 + RUN #6 IN FLIGHT — 2×2 ABLATION CLOSING)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE**: 2×2 ablation firing in parallel. Run #5 (prod, BC+AWR+syn) at iter 20+ of 200, ~33hr ETA. Run #6 (dev, BC+no-AWR+syn) at iter 0 of 200, ~36-40hr ETA. Both on `feat/hierarchical-teambuilders @ fb79af84`. 4 infra commits shipped + 2 docs/memory commits. Branch NOT merged to master — keep on feature branch until 2×2 lands and we decide.
+
+## Critical context — DO NOT TOUCH RUNNING WORK
+
+- **Run #5 (PID 3485320, prod)**: BC+AWR+syn, iter 20+ of 200, log `/tmp/run5_bc_awr_syn_v1.log`, output `data/models/rl_v10/phase3_bc_awr_syn_v1`. Eval every 10 iters vs metamon-competitive. ETA ~33hr.
+- **Run #6 (PID 2314732, dev)**: BC+no-AWR+syn, iter 0 in progress, log `/tmp/run6_bc_noawr_syn_v1.log`, output `data/models/rl_v10/phase3_bc_noawr_syn_v1`. Eval every 10 iters. ETA ~36-40hr (dev slower).
+- **DO NOT KILL EITHER**. Cross-pod 2×2 ablation in flight. Killing either nukes ~$30+ of pod time + the comparison.
+
+## 2×2 ablation lineup (will land in ~33-40hr)
+
+|              | Procedural-only        | + 30% syn               |
+|--------------|------------------------|-------------------------|
+| **No AWR**   | Run #3 done (pool=36, peak 74.25 @ iter 119)  | **Run #6 firing** (pool=36)  |
+| **AWR**      | Run #4 done (pool=140, peak 75.25 @ iter 49)  | **Run #5 firing** (pool=140) |
+
+Within-pod ablations are clean (same pool, same workers). Cross-pod has pool-size + worker-count confound — pre-existing condition (Run #3 vs Run #4 had it too). Next session: pull eval registries from both pods, compare smart_avg trajectories across all 4 runs.
+
+## What shipped this session (in order)
+
+### 1. Per-worker cache for StaticTeamPool + ProceduralTeambuilder (commits `8170ee41` + `95bf0497`)
+Tactical fix. Smoke v3 collect creeping +30-50%/iter from re-loading 180k team files per worker per iter. Per-worker dict cache fixed it. Procedural cache shipped symmetrically (~225ms × 90w × 200 iters saved). **SUPERSEDED by mmap for production**, kept for procedural (procedural REGENERATES via RNG each call).
+
+### 2. mmap-bundled team pool (commit `6997a2fa`, "the real solution")
+Replaces per-worker StaticTeamPool's Python list with a single mmap'd binary bundle. Kernel page cache shares ~256 MB across all workers. Bundle format: `[magic PTM1][n_teams u32][index][body]`. Deterministic via sorted-file + atomic tmp-rename. `train_rl.py` main() prebuilds before workers spawn (single-threaded, no race).
+
+**EMPIRICAL** (smaller than projected): per-worker RSS 900 MB → 625 MB (-30%, not 90%); system-wide rss 73 GiB → 66 GiB (-7 GiB). Other 70% of per-worker RSS is PyTorch/CUDA/buffers — structural, mmap can't help. **PROVISIONAL** architectural property: scales O(1) per worker for multi-gen, unlike per-worker cache which would multiply N×.
+
+### 3. MM watchdog — unified trigger+confirm (commit `c8adf696`)
+
+**First attempt (commit `0f43faec`) was REFUTED** — Layer A+B design. Layer B (always-on 180s stall timer) false-positive killed 5 MMs mid-iter in smoke v6 because `accept_challenges()` blocks for THREE indistinguishable reasons (idle / long battle / hang). Layer B was the inverse shortcut.
+
+**Replacement**: any CRITICAL → arm 30s confirmation timer → exit if no battle event in window, else recover. Empirically safe broad trigger: **71/71 CRITICAL events in MM-subprocess scope over 10 days are the same `Can't switch: pass to fainted` pattern.** Scope warning documented in code: trainer-process CIS workers log `CRITICAL - Listen interrupted by` every iter boundary — DIFFERENT process, our handler doesn't see them.
+
+**CONFIRMED live in Run #5**: 3 firings in iters 0-20, all clean trigger+confirm cycles. ~810s wall saved already (3 stalls × 270s saved each vs old 300s allocator timeout). Projected for full Run #5: ~135 min saved.
+
+### 4. R2 team_bundles/ namespace (commit `fb79af84`)
+Bundles uploaded to `s3://team-builder-data/team_bundles/{hl_05_26,gl_05_26}.teampack` (md5 verified matching prod + dev + R2). CLOUD_RUNBOOK.md bucket layout section added. Launch scripts updated Step 1 = R2 download (PREFERRED) instead of scp dance.
+
+Future pod setup is now ~3 min:
+```bash
+source /workspace/team_builder/pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
+aws s3 cp s3://team-builder-data/team_bundles/hl_05_26.teampack \
+  /workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack --endpoint-url $S3_ENDPOINT_URL
+aws s3 cp s3://team-builder-data/team_bundles/gl_05_26.teampack \
+  /workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack --endpoint-url $S3_ENDPOINT_URL
+```
+
+## What we investigated + closed
+
+### Mode B "challenge routing failure" — REFUTED (was Mode A)
+Smoke v5 iter 1 stalled. Initially diagnosed as new failure mode different from documented Mode A. User pushback "we dealt with this many sessions ago" → proper investigation: tailed MM logs but missed CRITICAL line; grep showed `CRITICAL ... Can't switch ...` at 13:27:20 followed by 33 min of frozen heartbeats. Mode A confirmed reproducible. Cost: ~1 hr of misdirection. Value: live reproducibility data point.
+
+### MM stall investigation — RESOLVED
+Per `[[s68-mm-stall-open-investigation]]` was open before. Now closed: root cause confirmed Mode A on a second occasion (different MM instance, different day), watchdog ships fix that catches it in 30s instead of 300s+. Memo can be marked RESOLVED.
+
+### Run #4.5 (resume Run #4 for collapse repro) — DROPPED
+User-rejected: `--init-from` resets Adam momentum which dwarfs any signal; `--resume` requires missing-snapshot cleanup in win_rates.json. Cost > value.
+
+### Layer D BS-side WebSocket silence — SKIPPED
+Per "no shortcuts but no speculative additions" principle. A+B (now unified into one layer) cover all observed failure modes. D would be defense against unobserved scenario in different codebase (JS).
+
+## Key files to read NEXT SESSION
+
+- [[s68-team-data-arc-2026-06-07]] — comprehensive session wrap with CONFIRMED/EMPIRICAL/PROVISIONAL labels
+- [[feedback-broad-trigger-narrow-confirm]] — watchdog design lesson
+- `pokemon-ai-starter/pokemon-ai/src/mm_watchdog.py` — 100-LoC pure-stdlib watchdog
+- `pokemon-ai-starter/pokemon-ai/src/team_generator.py` — StaticTeamPoolMmap class + build_team_bundle + bundle_path_for + _MMAP_POOL_CACHE
+- `pokemon-ai-starter/pokemon-ai/src/test_mm_watchdog.py` — 10 watchdog tests
+- `pokemon-ai-starter/pokemon-ai/src/test_hierarchical_mixers.py` — 22 tests including 5 bundle tests
+- `docs/CLOUD_RUNBOOK.md` — bucket layout + fast-fetch pattern
+
+## What to do NEXT SESSION when 2×2 lands
+
+1. Pull `data/eval/registry/evals.jsonl` from both pods (eval registry).
+2. Compare smart_avg trajectories Run #3 / Run #4 / Run #5 / Run #6 at every 10-iter eval point.
+3. Answer the 4 questions:
+   - Q1: syn-teams effect in no-AWR baseline (Run #6 vs Run #3)
+   - Q2: syn-teams effect in AWR variant (Run #5 vs Run #4)
+   - Q3: AWR effect under syn (Run #5 vs Run #6) — pool-confound caveat
+   - Q4: AWR effect under proc (Run #4 vs Run #3) — pool-confound caveat
+4. Decision tree depends on answers. Don't pre-plan.
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  S68 AWR PHASE 3 (2026-06-04, SMOKE VALIDATING + ITER99 ADD-TO + PHASE 3 v3 STAGED + DEFAULTS MERGED TO MASTER)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE**: AWR replay rehearsal Phase 3 sequence in motion. Smoke v3_packed validating canonical config on prod (iter 6 of 7 done clean). Phase 3 v3 launch script staged at prod `/tmp/launch_awr_phase3_v3.sh` — fires after smoke confirms. Iter99 add-to running on dev to recover one missing ladder placement. All three pods reconciled to `master @ 71dbf8f5` (feat/replay-rehearsal-awr merged FF; opt/combined-cleanup-allocator superseded).
+
+## Critical context — DO NOT RESTART, DO NOT RE-INVESTIGATE
+
+- **Smoke v3_packed (PID 2077397, prod)**: 7-iter validation, iter 6 of 7 done @ 19:33 UTC clean (WR 47-53%, KL 0.013-0.031, AWR loss ~0.5 → ~2.5% of total). Don't kill — let it finish. ETA iter 7 ~19:45 UTC.
+- **Iter99 add-to (PID 1428984, dev)**: 35 matchups × 500g = 17500 games to add fishbowl_v2r_iter99 to era4_chain_FINAL. ETA ~20:30 UTC. Don't relaunch. Output: `data/eval/era4_ladder/era4_chain_iter99_addto.json`.
+- **Phase 3 v3 STAGED, not yet fired**: After smoke confirms, run `bash /tmp/launch_awr_phase3_v3.sh` on prod. Init = snap_0139. 30 iters @ ~13 min/iter = ~6.5 hr.
+- **DELETED**: `/tmp/launch_era4_v3_resume.sh` on dev — the resume code path was buggy (0/25 matchups completed in 2hr). Not worth fixing. Use clean add-to instead.
+
+## What shipped this session
+
+### Canonical defaults migrated to code (commits `4f040641` + `71dbf8f5`, merged to master `71dbf8f5`)
+
+5 prod-canonical flags became argparse defaults. Override syntax still works.
+
+| Now default | Override |
+|---|---|
+| `--packed` True | `--no-packed` |
+| per-chunk-gc OFF | `--per-chunk-gc` |
+| `--max-concurrent 200` | `--max-concurrent <N>` |
+| `--eval-interval 10` | `--eval-interval 99` (off) |
+| `--eval-team-set metamon-competitive` | `--eval-team-set pool` |
+
+NOT promoted (per-run methodology): `--win-rate-mode ema`, `--early-stop`, `--reward-style`. See [[s68-canonical-defaults-migration]] for full rationale.
+
+### AWR Phase 2C v3 (--packed compat) — commit `fcf3db12`
+
+`bc_to_ppo_packed_format` + `compute_awr_loss(packed=True)` using `forward_ppo_sequence_packed`. Saves ~3x update wall per iter for all future AWR runs.
+
+### 3-layer packed-equivalence battery — commits `ac9ed4b0`, `f1615948`, plus the awr_packed test from `fcf3db12`
+
+- `test_packed_adapter_inputs.py` — 27/27 features bit-exact (input level)
+- `test_awr_packed_equivalence.py` — loss diff 1.01e-5 (loss level)
+- `test_forward_packed_equivalence.py` — documents 1.19e-2 model-attention divergence (NOT a packing bug — both AWR and PPO use the same path consistently)
+
+Combined: PROVEN no training pollution from --packed AWR.
+
+### Branch reconciliation — all pods on `master @ 71dbf8f5`
+
+- LOCAL: was on feat-awr, now master (FF merge)
+- PROD: was on feat-awr @ ac9ed4b (4 behind), now master @ 71dbf8f5
+- DEV: was on opt/combined-cleanup-allocator (43 commits behind master), now master @ 71dbf8f5
+
+Both pods had local mods to eval registry .jsonl files — stash + pop cleanly preserved them.
+
+### Memory updates
+
+- [[s68-canonical-90w-config]] — branch line updated to "master" + defaults table now lists all 8 baked-in defaults
+- [[awr-replay-rehearsal-design]] — Phase 3 status section updated to reflect v1/v2 killed, v3 staged
+- [[s68-canonical-defaults-migration]] — NEW memo for the defaults change with override syntax + rationale
+- MEMORY.md First-action line updated (was fishbowl LR=1e-4, now AWR Phase 3 sequence)
+
+## Ladder resume bug diagnosis (S68, 2026-06-04)
+
+The era4_chain_v3 resume run failed: 0/25 matchups completed in 2hr. ALL 25 missing matchups involved fishbowl_v2r_iter99 (last new player). Inferences WERE running on both sides (slot 36 fires=192, slots 0-24 firing too) but no battles ever finished. NOT a BS-corruption issue (slot firings disprove that). Likely a CIS-Elo v2 resume-logic bug in dispatch/result-collection. Not worth fixing — pivoted to clean ADD-TO (single new player, no resume). The other 7 v3 new players (fishbowl_v2_iter29/69/109/149 + v2r_iter19/49/79) are NOT integrated to a final ladder JSON — they were partially completed in v3_workers.jsonl but never finalized. Decision: accept iter99 standalone placement; re-integrate all 8 cleanly later if needed.
+
+## Open items for next session
+
+1. **Check Phase 3 v3 outcome** (after the 6.5 hr run): ≥2pp MM-tier WR gain vs LargeRL? If yes → AWR validated → consider longer run with bigger replay set (Task #132 + #133). If neutral/regression → switch to AWR mix calibration (Task #128 Q2 table).
+2. **Iter99 add-to result** — placement on era4_chain ladder.
+3. **Whether to delete `feat/replay-rehearsal-awr`** branch (local + remote) — fully merged, safe. User hasn't decided.
+4. **Re-integrate 7 other v3 new players to ladder?** Lower priority — they're useful but not blocking.
+5. **CIS-Elo v2 resume logic** — fix or document as not-supported. The script's add-to mode works fine.
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S68 (2026-06-01, FISHBOWL LR=1e-4 IN FLIGHT — dual-shard parallel runs)
 ═══════════════════════════════════════════════════════════════════════════════
 
