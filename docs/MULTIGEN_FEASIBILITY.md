@@ -115,6 +115,25 @@ Game state elements currently NOT encoded (or poorly encoded) that should be add
 
 ### A. Architectural changes (small, ~1 week)
 
+> 📋 **BEFORE starting Section A** — read `docs/ARCHITECTURE_REVIEW_2026_06_07.md`
+> (and its TODO memo at `memory/project_architecture_review_2026_06_07_todo.md`).
+> That review lists architectural items deliberately deferred to "before next
+> major phase" because they have low marginal cost while action-space / model
+> code is being touched anyway. Particularly:
+>
+> - **Priority 1 — switch-action representation ablation**: replace mean-pool
+>   bench-Pokemon representation with attention summary tokens. Action-space
+>   code is being modified for gen-aware switches here in A anyway — natural
+>   point to bundle the change.
+> - **Priority 2 — Poke-Mask info-flow validation**: clarity question about
+>   actor/critic separation via temporal_ctx leak path.
+>
+> ⚠️ **GRAIN OF SALT**: that review is a 2026-06-07 snapshot. Re-read the
+> actual current model code (`model_transformer.py`) and `git log` since
+> commit `f421b7c7` (the review commit) before acting. Architecture may
+> have already drifted; the review's recommendations may already be
+> superseded or invalidated.
+
 #### A1. Gen-id token in model input (~30-50 lines)
 Add a learned embedding table for gen IDs:
 ```python

@@ -1217,6 +1217,17 @@ activation magnitudes are now well-controlled at init.
 
 ### B2. Format extensibility (multi-format goal)
 
+> 📋 **BEFORE doing the doubles/VGC/triples rewrite** that lifts
+> `n_active != 1` — read `docs/ARCHITECTURE_REVIEW_2026_06_07.md`
+> + memo `memory/project_architecture_review_2026_06_07_todo.md`. That
+> review flagged the move-vs-switch action representation asymmetry
+> (Priority 1) as worth fixing during action-space rewrites for low
+> marginal cost. Doubles/VGC will reshape the action head dramatically
+> (4+5=9 actions → up to 4×2+5=13 actions for doubles with target selection);
+> bundling the switch-rep ablation here is the natural opportunity.
+> ⚠️ **GRAIN OF SALT** — re-verify against current code first; review is a
+> 2026-06-07 snapshot (commit `f421b7c7`).
+
 Even though V1 is gen-9 singles only, the project goal is "all formats,
 all gens 4+" (NEXT_SESSION.md). Cheap hooks added now to avoid retrofit
 later:

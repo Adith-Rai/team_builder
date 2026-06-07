@@ -2626,6 +2626,15 @@ Study these files (DO NOT modify our code to copy theirs — learn principles, a
 
 ### Multi-gen + gen-agnostic prep
 
+> 📋 **BEFORE starting multi-gen work** — read `docs/ARCHITECTURE_REVIEW_2026_06_07.md`
+> + its TODO memo `memory/project_architecture_review_2026_06_07_todo.md`.
+> The review documents architectural items deliberately deferred to "before next
+> major phase" with low marginal cost when model/action-space code is being
+> rewritten anyway (Priority 1: switch-action representation; Priority 2:
+> Poke-Mask info-flow validation). **GRAIN OF SALT** — review is a 2026-06-07
+> snapshot; re-read current `model_transformer.py` and `git log` since commit
+> `f421b7c7` before acting on its recommendations.
+
 **Why first:** User direction (Session 33, reconfirmed Session 36): multi-gen before
 BC scaling or capacity reallocation. Reasoning: if we change model size or retrain BC
 BEFORE multi-gen, we'd redo all that work when we add multi-gen later. Do it once.
