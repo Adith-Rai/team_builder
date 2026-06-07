@@ -1,0 +1,50 @@
+# Dev-pod-specific variant of external_adapters_phase3_full_v1.yaml.
+# Only difference: instances=2 (not 3) for all 4 MMs.
+#
+# Why: dev pod has pids.max=9728 cgroup cap (vs prod's 16896). At 90w + 12 MM
+# subprocesses (3 instances × 4 MMs), dev hits "can't start new thread" errors
+# at iter 0. Reducing to 8 MM subprocesses (2 instances × 4 MMs) saves ~180
+# threads and fits under the cap with ~200 thread headroom.
+#
+# Asymmetry vs Run #4 (which uses external_adapters_phase3_full_v1.yaml with
+# instances=3): MM games-per-iter per MM are split across 2 instances on dev
+# vs 3 on prod, so each MM instance plays ~50% more games per iter on dev.
+# Total games per MM is the same; just parallelization is reduced.
+# Documented as asymmetry in [[s68-bc-init-awr-design]].
+opponents:
+- name: mcts-fast
+  type: mcts
+  search_time_ms: 100
+  weight: 1.0
+- name: mcts-medium
+  type: mcts
+  search_time_ms: 300
+  weight: 1.0
+- name: mm-largerl
+  type: metamon
+  model: LargeRL
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 2
+- name: mm-mediumrl-aug
+  type: metamon
+  model: MediumRL_Aug
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 2
+- name: mm-syntheticrlv2
+  type: metamon
+  model: SyntheticRLV2
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 2
+- name: mm-minikazam
+  type: metamon
+  model: Minikazam
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 2
