@@ -225,12 +225,12 @@ def make_accept_env(
     return PSLadderAMAGOWrapper(menv)
 
 
-# MM watchdog (Layer A + Layer B) — see mm_watchdog.py for the full design
-# rationale. Installed in main() after argparse. accept_loop calls
-# mm_watchdog.mark_battle_event() at each print so Layer B's stall timer
-# resets on real progress.
+# MM watchdog — unified trigger+confirm design (see mm_watchdog.py).
+# Any CRITICAL log fires a 30s confirmation timer; exits only if no battle
+# event happens in the window. accept_loop calls mark_battle_event() at
+# each iteration boundary so confirmation sees real progress.
 from mm_watchdog import (
-    install as _install_watchdogs,
+    install as _install_watchdog,
     mark_battle_event as _mark_battle_event,
 )
 
@@ -312,13 +312,10 @@ def main():
     if "METAMON_CACHE_DIR" not in os.environ:
         raise SystemExit("METAMON_CACHE_DIR must be set (used for HF model downloads + teams)")
 
-    # Install MM watchdog (A: known-pattern log handler + B: stall thread).
-    # external_opponent_manager respawns on subprocess exit, so os._exit(1)
-    # from a watchdog cleanly cycles the instance. Pass the subprocess log
-    # path (matches external_opponent_manager's log_file convention) so
-    # Layer B can dump a tail when it catches an unknown hang.
-    _log_path_for_tail = f"/workspace/team_builder/logs/external/{args.username.lower()}.log"
-    _install_watchdogs(log_path_for_tail=_log_path_for_tail)
+    # Install MM watchdog. Any CRITICAL in this MM-subprocess process →
+    # 30s confirmation timer → os._exit(1) if no battle progress.
+    # external_opponent_manager respawns on subprocess exit.
+    _install_watchdog()
 
     print(f"[metamon] model={args.model} user={args.username} "
           f"port={args.server_port} format={args.format} temp={args.temperature}",
