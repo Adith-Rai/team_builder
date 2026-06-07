@@ -56,7 +56,12 @@ from ppo import (
 )
 from rewards import RewardShaper
 from teams_ou import random_pool_teambuilder
-from team_generator import ProceduralTeambuilder, procedural_teambuilder
+from team_generator import (
+    ProceduralTeambuilder,
+    procedural_teambuilder,
+    bundle_path_for,
+    build_team_bundle,
+)
 from rl_collection import _make_server, collect_v9, BackgroundCollector
 
 
@@ -1402,6 +1407,27 @@ def main():
               f"intra_async={args.syn_intra_asymmetric_rate}, "
               f"top_async={args.top_asymmetric_rate}, "
               f"sources=[{_src_str}])", flush=True)
+
+        # Pre-build .teampack bundles for each syn source. Runs once in main()
+        # before workers spawn — single-threaded, no race. Workers then mmap
+        # the bundle file (kernel page cache shares the bytes across all 90
+        # workers, replacing the per-worker ~1 GB Python list of strings with
+        # ~few MB of mmap'd shared memory).
+        import time as _time
+        for path, _ in syn_config["team_dirs"]:
+            bundle = bundle_path_for(path)
+            if os.path.exists(bundle):
+                # Could re-validate magic/size here, but trust prior build —
+                # mmap construction in workers will fail loudly if corrupt.
+                print(f"  Team bundle EXISTS: {bundle}", flush=True)
+                continue
+            t0 = _time.perf_counter()
+            print(f"  Building team bundle: {path} → {bundle} ...", flush=True)
+            _bp, _n = build_team_bundle(path, output_path=bundle)
+            dt = _time.perf_counter() - t0
+            sz_mb = os.path.getsize(_bp) / (1024 * 1024)
+            print(f"  Team bundle BUILT: {_bp} ({_n} teams, {sz_mb:.1f} MB, {dt:.1f}s)",
+                  flush=True)
 
     # Save config
     config = vars(args)

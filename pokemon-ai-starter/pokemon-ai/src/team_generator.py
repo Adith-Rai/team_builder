@@ -11,9 +11,12 @@
 
 from __future__ import annotations
 import json
+import mmap
 import os
 import random
 import re
+import struct
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -538,6 +541,155 @@ class StaticTeamPool(_Teambuilder):
         return self.join_team(mons)
 
 
+# ---------------------------------------------------------------------------
+# Bundled / mmap-backed team pool
+#
+# StaticTeamPool loads every team file into a Python list of strings — at
+# 90 workers × ~1 GB per source pair (hl + gl), that's ~85 GB of duplicated
+# heap memory across the box. Each Python string is per-process, so kernel
+# page cache for the team files doesn't help us.
+#
+# StaticTeamPoolMmap replaces the heap-resident list with a single mmap'd
+# bundle file. The bundle is concatenated team text + an index of
+# (offset, length) pairs. Workers mmap the same file → kernel shares pages
+# via the page cache → per-worker resident memory drops from ~1 GB to a few
+# MB. yield_team semantics are identical: random index into a uniform-
+# probability pool, decode, parse, return packed format.
+#
+# Bundle format (little-endian):
+#   [0:4]      magic "PTM1"
+#   [4:8]      n_teams (uint32)
+#   [8:8+8n]   index: for each team i, (offset_in_body uint32, length uint32)
+#   [8+8n:]    body: concatenated UTF-8 team text
+# ---------------------------------------------------------------------------
+
+_BUNDLE_MAGIC = b'PTM1'
+_BUNDLE_HEADER_SIZE = 8  # magic + n_teams
+_BUNDLE_INDEX_ENTRY_SIZE = 8  # offset + length, each uint32
+
+
+def bundle_path_for(team_dir: str) -> str:
+    """Return the conventional bundle file path for a team directory.
+
+    Sibling file: /path/to/hl_05_26/gen9ou/ → /path/to/hl_05_26/gen9ou.teampack
+    """
+    p = Path(team_dir).resolve()
+    return str(p.parent / (p.name + ".teampack"))
+
+
+def build_team_bundle(team_dir: str, output_path: str = None) -> Tuple[str, int]:
+    """Build a .teampack bundle from a directory of team text files.
+
+    Walks team_dir recursively (matching StaticTeamPool semantics), reads each
+    non-hidden regular file, sorts by path for determinism, and writes a
+    single mmap-friendly bundle file. Atomic via tmp-rename.
+
+    Args:
+        team_dir: directory of team text files (e.g. .gen9ou_team)
+        output_path: bundle path (default: bundle_path_for(team_dir))
+
+    Returns:
+        (bundle_path, n_teams)
+    """
+    if output_path is None:
+        output_path = bundle_path_for(team_dir)
+    src = Path(team_dir)
+    if not src.exists():
+        raise FileNotFoundError(f"Team dir does not exist: {team_dir}")
+
+    # Collect all team files, sorted for deterministic bundle order
+    files = sorted(
+        fp for fp in src.rglob('*')
+        if fp.is_file() and not fp.name.startswith('.')
+    )
+
+    teams: List[bytes] = []
+    for fp in files:
+        try:
+            with open(fp, encoding='utf-8') as f:
+                text = f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if text:
+            teams.append(text.encode('utf-8'))
+
+    if not teams:
+        raise ValueError(f"No team files found in {team_dir}")
+
+    n = len(teams)
+    tmp_path = output_path + ".tmp"
+
+    # Compute offsets into body
+    offsets: List[Tuple[int, int]] = []
+    cur = 0
+    for t in teams:
+        offsets.append((cur, len(t)))
+        cur += len(t)
+
+    with open(tmp_path, 'wb') as f:
+        f.write(_BUNDLE_MAGIC)
+        f.write(struct.pack('<I', n))
+        for off, length in offsets:
+            f.write(struct.pack('<II', off, length))
+        for t in teams:
+            f.write(t)
+
+    os.replace(tmp_path, output_path)
+    return output_path, n
+
+
+class StaticTeamPoolMmap(_Teambuilder):
+    """Mmap-backed read-only team pool. Drop-in replacement for StaticTeamPool
+    when a .teampack bundle exists.
+
+    Per-worker resident memory: ~few KB (instance state) + transient
+    decoded-team string per yield_team call. The bundle file's pages live in
+    the kernel page cache, shared across all workers that mmap the same file.
+
+    Args:
+        bundle_path: path to .teampack file (produced by build_team_bundle).
+    """
+
+    def __init__(self, bundle_path: str):
+        super().__init__()
+        self.bundle_path = bundle_path
+        # Keep an fd open for the lifetime of the mmap; closing the fd is OK
+        # on Linux (mmap stays valid), but Windows requires the fd to stay open.
+        self._fd = open(bundle_path, 'rb')
+        try:
+            self._mm = mmap.mmap(self._fd.fileno(), 0, prot=mmap.PROT_READ)
+        except AttributeError:
+            # Windows uses ACCESS_READ instead of PROT_READ
+            self._mm = mmap.mmap(self._fd.fileno(), 0, access=mmap.ACCESS_READ)
+
+        magic = bytes(self._mm[:4])
+        if magic != _BUNDLE_MAGIC:
+            raise ValueError(
+                f"Bad bundle magic at {bundle_path}: got {magic!r}, "
+                f"expected {_BUNDLE_MAGIC!r}. Rebuild with build_team_bundle()."
+            )
+        self.n_teams = struct.unpack_from('<I', self._mm, 4)[0]
+        self._index_offset = _BUNDLE_HEADER_SIZE
+        self._body_offset = _BUNDLE_HEADER_SIZE + self.n_teams * _BUNDLE_INDEX_ENTRY_SIZE
+        print(f"StaticTeamPoolMmap: {self.n_teams} teams from {bundle_path}")
+
+    def __len__(self):
+        return self.n_teams
+
+    def _read_team_bytes(self, i: int) -> bytes:
+        """Read the raw UTF-8 bytes for team index i."""
+        idx_pos = self._index_offset + i * _BUNDLE_INDEX_ENTRY_SIZE
+        off, length = struct.unpack_from('<II', self._mm, idx_pos)
+        start = self._body_offset + off
+        return bytes(self._mm[start:start + length])
+
+    def yield_team(self) -> str:
+        i = random.randrange(self.n_teams)
+        text = self._read_team_bytes(i).decode('utf-8')
+        mons = self.parse_showdown_team(text)
+        return self.join_team(mons)
+
+
 class MultiSourceTeambuilder(_Teambuilder):
     """Teambuilder that delegates each yield_team() call to a randomly chosen source.
 
@@ -973,18 +1125,21 @@ class PairedQueueProducer:
 # ---------------------------------------------------------------------------
 
 # Per-process caches. Each worker is its own process → its own caches.
-# Caches the slow disk-load step so subsequent iters within a worker reuse
-# the loaded data. Mixer wrappings (Synergistic, TopMixer) are rebuilt fresh
+# Caches the lightweight per-process state (open mmap fd, parsed bundle
+# header, ProceduralTeambuilder pool) so subsequent iters within a worker
+# reuse them. Mixer wrappings (Synergistic, TopMixer) are rebuilt fresh
 # per call so selection_stats() starts at zero each iter ([TEAM-DIST] log
 # is per-iter, not cumulative).
 #
-# StaticTeamPool: caches list of pre-built team strings (~1.2 GB combined
-#   hl+gl per worker). yield_team picks one uniformly from the list.
+# StaticTeamPoolMmap: caches the open mmap + parsed bundle header (~few KB
+#   per worker). The actual team bytes live in kernel page cache as a
+#   single shared copy across all workers — mmap'ing the same file from
+#   multiple processes shares the same physical pages.
 # ProceduralTeambuilder: caches 545 PokemonData usage stats (~2 MB per
 #   worker). yield_team RE-GENERATES a fresh team via RNG each call — the
 #   cache only avoids re-parsing usage .txt files, every battle still gets
 #   a unique procedural team.
-_STATIC_POOL_CACHE: Dict[str, '_Teambuilder'] = {}
+_MMAP_POOL_CACHE: Dict[str, 'StaticTeamPoolMmap'] = {}
 _PROCEDURAL_CACHE: Dict[str, 'ProceduralTeambuilder'] = {}
 
 
@@ -1029,11 +1184,21 @@ def build_train_teambuilder(procedural_teams_path: str = None,
         if name in sources:
             # Duplicate names — disambiguate with full path component
             name = f"{Path(path).parents[1].name}_{name}"
-        # Per-worker-process cache: first iter eats the load, subsequent
-        # iters reuse the StaticTeamPool instance. Read-only data, safe.
-        if path not in _STATIC_POOL_CACHE:
-            _STATIC_POOL_CACHE[path] = StaticTeamPool(path)
-        sources[name] = _STATIC_POOL_CACHE[path]
+        # Require a pre-built .teampack bundle. train_rl.py main() builds
+        # these once before workers spawn, so by the time we get here the
+        # file exists. Workers mmap the same bundle file → kernel page
+        # cache serves the bytes once, shared across all 90 workers.
+        bundle = bundle_path_for(path)
+        if not os.path.exists(bundle):
+            raise FileNotFoundError(
+                f"Team bundle not found: {bundle}\n"
+                f"  Source dir: {path}\n"
+                f"  Run build_team_bundle() in train_rl.py main() before "
+                f"spawning workers, or invoke it manually."
+            )
+        if bundle not in _MMAP_POOL_CACHE:
+            _MMAP_POOL_CACHE[bundle] = StaticTeamPoolMmap(bundle)
+        sources[name] = _MMAP_POOL_CACHE[bundle]
         weights[name] = float(w)
 
     syn_mixer = SynergisticMixer(

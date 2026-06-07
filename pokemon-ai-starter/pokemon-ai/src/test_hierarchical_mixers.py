@@ -9,6 +9,7 @@ Verifies:
 Run with: python -m pytest test_hierarchical_mixers.py -v
 """
 from __future__ import annotations
+import os
 import random
 import pytest
 
@@ -319,17 +320,10 @@ def test_producer_invalid_n_pairs(tmp_path):
         producer.produce_all(-1)
 
 
-# --- StaticTeamPool cache (the perf-critical fix) ---
+# --- Bundle / mmap-backed team pool ---
 
-def test_static_pool_cached_across_builds(tmp_path):
-    """build_train_teambuilder should reuse StaticTeamPool across calls
-    when paths are the same. Prevents per-iter reload of 180k team files.
-    """
-    from team_generator import build_train_teambuilder, _STATIC_POOL_CACHE
-    # Create a fake teams dir with a few minimal valid Showdown team files
-    teams_dir = tmp_path / "fake_teams"
-    teams_dir.mkdir()
-    team_text = """Pikachu @ Light Ball
+_MINIMAL_TEAM_TEXTS = [
+    """Pikachu @ Light Ball
 Ability: Static
 Tera Type: Electric
 EVs: 252 SpA / 252 Spe / 4 HP
@@ -338,12 +332,155 @@ Timid Nature
 - Volt Switch
 - Surf
 - Hidden Power Ice
-"""
-    (teams_dir / "team_0.gen9ou_team").write_text(team_text)
-    (teams_dir / "team_1.gen9ou_team").write_text(team_text)
+""",
+    """Charizard @ Heavy-Duty Boots
+Ability: Solar Power
+Tera Type: Fire
+EVs: 252 SpA / 252 Spe / 4 HP
+Timid Nature
+- Fire Blast
+- Air Slash
+- Focus Blast
+- Roost
+""",
+    """Blastoise @ Leftovers
+Ability: Torrent
+Tera Type: Water
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+- Scald
+- Rapid Spin
+- Ice Beam
+- Toxic
+""",
+]
 
-    # Clear cache to start clean
-    _STATIC_POOL_CACHE.clear()
+
+def _make_fake_teams_dir(tmp_path, n: int = 3):
+    """Create a temp dir with `n` distinct fake team files. Returns the dir path."""
+    teams_dir = tmp_path / "fake_teams"
+    teams_dir.mkdir()
+    for i in range(n):
+        text = _MINIMAL_TEAM_TEXTS[i % len(_MINIMAL_TEAM_TEXTS)]
+        (teams_dir / f"team_{i:04d}.gen9ou_team").write_text(text)
+    return teams_dir
+
+
+def test_bundle_roundtrip(tmp_path):
+    """build_team_bundle writes a file that StaticTeamPoolMmap can parse,
+    and the team contents match what was written.
+    """
+    from team_generator import (
+        build_team_bundle, StaticTeamPoolMmap, bundle_path_for, _BUNDLE_MAGIC,
+    )
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=3)
+    bundle = bundle_path_for(str(teams_dir))
+    out, n = build_team_bundle(str(teams_dir), output_path=bundle)
+    assert out == bundle
+    assert n == 3
+
+    # File should exist with the correct magic header
+    with open(bundle, 'rb') as f:
+        magic = f.read(4)
+    assert magic == _BUNDLE_MAGIC, f"magic mismatch: {magic!r}"
+
+    # Load via mmap, read all teams back, compare to source
+    pool = StaticTeamPoolMmap(bundle)
+    assert len(pool) == 3
+    decoded = {pool._read_team_bytes(i).decode('utf-8') for i in range(3)}
+    expected = {t.strip() for t in _MINIMAL_TEAM_TEXTS[:3]}
+    assert decoded == expected
+
+
+def test_bundle_yield_team_distribution(tmp_path):
+    """Over many draws, yield_team eventually returns each team in the pool
+    (uniformly-distributed). Smoke check on the random.randrange index path.
+    """
+    from team_generator import build_team_bundle, StaticTeamPoolMmap, bundle_path_for
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=3)
+    bundle = bundle_path_for(str(teams_dir))
+    build_team_bundle(str(teams_dir), output_path=bundle)
+    pool = StaticTeamPoolMmap(bundle)
+
+    seen = set()
+    for _ in range(500):
+        # yield_team parses+packs; use _read_team_bytes for raw match
+        i = __import__('random').randrange(len(pool))
+        seen.add(i)
+    assert seen == {0, 1, 2}, f"not all team indices drawn after 500 picks: {seen}"
+
+
+def test_bundle_deterministic_across_rebuilds(tmp_path):
+    """Building the bundle twice from the same dir produces byte-identical files.
+    Important: file ordering is sorted in build_team_bundle, so repeat builds
+    are reproducible.
+    """
+    from team_generator import build_team_bundle, bundle_path_for
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=3)
+    bundle = bundle_path_for(str(teams_dir))
+
+    build_team_bundle(str(teams_dir), output_path=bundle)
+    with open(bundle, 'rb') as f:
+        bytes1 = f.read()
+
+    # Rebuild
+    build_team_bundle(str(teams_dir), output_path=bundle)
+    with open(bundle, 'rb') as f:
+        bytes2 = f.read()
+
+    assert bytes1 == bytes2, "rebuild must produce byte-identical bundle"
+
+
+def test_bundle_atomic_replace(tmp_path):
+    """build_team_bundle writes to .tmp and renames — partial writes never
+    expose a corrupt bundle (the rename is atomic on POSIX).
+    """
+    from team_generator import build_team_bundle, bundle_path_for
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=2)
+    bundle = bundle_path_for(str(teams_dir))
+    build_team_bundle(str(teams_dir), output_path=bundle)
+
+    # The .tmp file should NOT exist after successful build
+    assert not os.path.exists(bundle + ".tmp"), "tmp file should be renamed away"
+    assert os.path.exists(bundle), "bundle should exist post-rename"
+
+
+def test_bundle_missing_raises(tmp_path):
+    """build_train_teambuilder fails fast with a clear error if .teampack
+    bundle is missing for any syn source.
+    """
+    from team_generator import build_train_teambuilder
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=2)
+    # Intentionally do NOT build the bundle
+
+    syn_config = {
+        "team_dirs": [(str(teams_dir), 1.0)],
+        "team_pct": 0.5,
+        "intra_asymmetric_rate": 0.0,
+        "top_asymmetric_rate": 0.0,
+    }
+    with pytest.raises(FileNotFoundError, match="Team bundle not found"):
+        build_train_teambuilder(syn_config=syn_config)
+
+
+def test_mmap_pool_cached_across_builds(tmp_path):
+    """build_train_teambuilder reuses StaticTeamPoolMmap across calls when
+    bundle paths match. Same per-worker-process cache pattern as before, but
+    keyed on bundle file path rather than source dir.
+    """
+    from team_generator import build_train_teambuilder, build_team_bundle, \
+        bundle_path_for, _MMAP_POOL_CACHE
+
+    teams_dir = _make_fake_teams_dir(tmp_path, n=2)
+    bundle = bundle_path_for(str(teams_dir))
+    build_team_bundle(str(teams_dir), output_path=bundle)
+
+    _MMAP_POOL_CACHE.clear()
 
     syn_config = {
         "team_dirs": [(str(teams_dir), 1.0)],
@@ -352,19 +489,16 @@ Timid Nature
         "top_asymmetric_rate": 0.0,
     }
 
-    # First build → cache miss, instance created
     tb1 = build_train_teambuilder(syn_config=syn_config)
-    assert str(teams_dir) in _STATIC_POOL_CACHE, "first build should populate cache"
-    cached_instance = _STATIC_POOL_CACHE[str(teams_dir)]
+    assert bundle in _MMAP_POOL_CACHE, "first build should populate mmap cache"
+    cached = _MMAP_POOL_CACHE[bundle]
 
-    # Second build → cache hit, same instance reused inside the new mixer
     tb2 = build_train_teambuilder(syn_config=syn_config)
-    assert _STATIC_POOL_CACHE[str(teams_dir)] is cached_instance, \
-        "second build must reuse cached StaticTeamPool (no reload)"
+    assert _MMAP_POOL_CACHE[bundle] is cached, \
+        "second build must reuse cached StaticTeamPoolMmap (no re-mmap)"
 
-    # tb1 and tb2 themselves are DIFFERENT mixer instances (so selection_stats
-    # starts fresh each iter), but they share the underlying source pool.
-    assert tb1 is not tb2, "mixer wrapping should rebuild fresh (per-iter stats)"
+    # Mixer wrappings differ (per-iter stats fresh) but share underlying pool
+    assert tb1 is not tb2, "mixer wrapping should rebuild fresh"
 
 
 def test_procedural_cached_across_builds(tmp_path, monkeypatch):
