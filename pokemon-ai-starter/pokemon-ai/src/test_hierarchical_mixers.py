@@ -216,6 +216,109 @@ def test_top_invalid_pct_raises():
         )
 
 
+# --- PairedQueueProducer ---
+
+def test_producer_enqueues_correct_count(tmp_path):
+    random.seed(42)
+    from team_generator import PairedQueueProducer
+    syn = SynergisticMixer(
+        sources={"hl": _MockSource("hl"), "gl": _MockSource("gl")},
+        weights={"hl": 0.6, "gl": 0.4},
+        intra_asymmetric_rate=0.3,
+    )
+    top = TopMixer(
+        procedural=_MockSource("procedural"),
+        synergistic=syn,
+        syn_pct=0.3,
+        top_asymmetric_rate=0.2,
+    )
+    q_p1 = tmp_path / "q_p1"
+    q_p2 = tmp_path / "q_p2"
+    producer = PairedQueueProducer(top, q_p1, q_p2)
+    n = 50
+    stats = producer.produce_all(n)
+    files_p1 = list(q_p1.glob("*.team"))
+    files_p2 = list(q_p2.glob("*.team"))
+    assert len(files_p1) == n, f"expected {n} p1 files, got {len(files_p1)}"
+    assert len(files_p2) == n, f"expected {n} p2 files, got {len(files_p2)}"
+    assert stats["n_pairs"] == n
+    assert stats["matched_this_batch"] + stats["asymmetric_this_batch"] == n
+
+
+def test_producer_pair_fifo_alignment(tmp_path):
+    """Verify pair K's two teams sit at the same FIFO position in both queues.
+
+    Critical for matched-pool guarantee: even if pop order differs across
+    workers, both queues are populated in lockstep so corresponding files
+    line up by FIFO timestamp.
+    """
+    random.seed(42)
+    from team_generator import PairedQueueProducer
+
+    class _IdSource:
+        def __init__(self, name, counter):
+            self.name = name
+            self.counter = counter
+
+        def yield_team(self) -> str:
+            v = self.counter[0]
+            self.counter[0] += 1
+            return f"{self.name}_team_{v}"
+
+    counter_hl = [0]
+    counter_gl = [0]
+    syn = SynergisticMixer(
+        sources={
+            "hl": _IdSource("hl", counter_hl),
+            "gl": _IdSource("gl", counter_gl),
+        },
+        intra_asymmetric_rate=0.0,  # always matched within syn
+    )
+    top = TopMixer(
+        procedural=_MockSource("proc"),
+        synergistic=syn,
+        syn_pct=1.0,  # always syn
+        top_asymmetric_rate=0.0,
+    )
+    q_p1 = tmp_path / "q_p1"
+    q_p2 = tmp_path / "q_p2"
+    producer = PairedQueueProducer(top, q_p1, q_p2)
+    producer.produce_all(20)
+    files_p1 = sorted(q_p1.glob("*.team"))
+    files_p2 = sorted(q_p2.glob("*.team"))
+    # Pair K → file K in each queue (sorted by timestamp). Within each pair,
+    # both teams come from the same source (intra=0, syn_pct=1, top=0).
+    for f1, f2 in zip(files_p1, files_p2):
+        t1 = f1.read_text().strip()
+        t2 = f2.read_text().strip()
+        # Both should start with same source prefix (hl_ or gl_)
+        src1 = t1.split("_")[0]
+        src2 = t2.split("_")[0]
+        assert src1 == src2, f"pair mismatch in fifo position: {t1} vs {t2}"
+
+
+def test_producer_zero_pairs(tmp_path):
+    from team_generator import PairedQueueProducer
+    top = TopMixer(
+        procedural=_MockSource("proc"),
+        synergistic=_MockSource("syn"),
+    )
+    producer = PairedQueueProducer(top, tmp_path / "q1", tmp_path / "q2")
+    stats = producer.produce_all(0)
+    assert stats["n_pairs"] == 0
+
+
+def test_producer_invalid_n_pairs(tmp_path):
+    from team_generator import PairedQueueProducer
+    top = TopMixer(
+        procedural=_MockSource("proc"),
+        synergistic=_MockSource("syn"),
+    )
+    producer = PairedQueueProducer(top, tmp_path / "q1", tmp_path / "q2")
+    with pytest.raises(ValueError):
+        producer.produce_all(-1)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

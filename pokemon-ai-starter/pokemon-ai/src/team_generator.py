@@ -900,6 +900,72 @@ class TopMixer(_Teambuilder):
 
 
 # ---------------------------------------------------------------------------
+# PairedQueueProducer — pre-fills two queue dirs with matched team pairs.
+# Used by SP and external dispatch paths to deliver paired teams to both
+# player and opponent via the existing QueueTeambuilder pop-FIFO mechanism.
+# ---------------------------------------------------------------------------
+
+class PairedQueueProducer:
+    """Generate N pairs from a mixer with yield_pair() and enqueue to two dirs.
+
+    Usage pattern (synchronous, before battle_against):
+        producer = PairedQueueProducer(top_mixer, queue_p1_dir, queue_p2_dir)
+        stats = producer.produce_all(n_battles)  # blocking pre-fill
+        # ... then run battle_against; QueueTeambuilders pop FIFO
+
+    Both queue dirs are populated in lockstep — pair K's team1 → queue_p1,
+    team2 → queue_p2. FIFO-per-queue guarantees that each battle pops a
+    matched pair (the pair-index identity is preserved across queue pop order
+    because pair K's two teams sit at the same FIFO position in both queues).
+
+    Args:
+        mixer: object with .yield_pair() -> (team_p1, team_p2, src_p1, src_p2)
+        queue_p1_dir: directory for P1 teams (created if missing)
+        queue_p2_dir: directory for P2 teams (created if missing; can equal
+                      an existing external opp queue dir)
+
+    Returns from produce_all():
+        dict with keys: 'n_pairs', 'matched', 'asymmetric' (counts), and
+        'sources' (per-source selection counts if mixer tracks them).
+    """
+
+    def __init__(self, mixer, queue_p1_dir, queue_p2_dir):
+        self.mixer = mixer
+        self.queue_p1 = Path(queue_p1_dir)
+        self.queue_p2 = Path(queue_p2_dir)
+        self.queue_p1.mkdir(parents=True, exist_ok=True)
+        self.queue_p2.mkdir(parents=True, exist_ok=True)
+
+    def produce_all(self, n_pairs: int) -> dict:
+        """Generate n_pairs and enqueue to both queues. Returns stat summary."""
+        if n_pairs < 0:
+            raise ValueError(f"n_pairs must be >= 0, got {n_pairs}")
+        matched = 0
+        asymmetric = 0
+        # Snapshot stats before, diff after — handles either SynergisticMixer
+        # or TopMixer without tightly coupling to mixer internals.
+        stats_before = self.mixer.selection_stats() if hasattr(self.mixer, 'selection_stats') else None
+        for _ in range(n_pairs):
+            team_p1, team_p2, src_p1, src_p2 = self.mixer.yield_pair()
+            enqueue_team(self.queue_p1, team_p1)
+            enqueue_team(self.queue_p2, team_p2)
+            if src_p1 == src_p2:
+                matched += 1
+            else:
+                asymmetric += 1
+        stats_after = self.mixer.selection_stats() if hasattr(self.mixer, 'selection_stats') else None
+        result = {
+            "n_pairs": n_pairs,
+            "matched_this_batch": matched,
+            "asymmetric_this_batch": asymmetric,
+        }
+        if stats_before is not None and stats_after is not None:
+            # Only include the most useful summary; full stats remain on mixer.
+            result["mixer_total_pairs"] = stats_after.get("pairs", {})
+        return result
+
+
+# ---------------------------------------------------------------------------
 # CLI test
 # ---------------------------------------------------------------------------
 
