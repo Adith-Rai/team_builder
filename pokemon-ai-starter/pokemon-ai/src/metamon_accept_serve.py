@@ -178,10 +178,13 @@ class AcceptChallengesOnLocal(QueueOnLocalLadder):
             if n_battles and n_battles > 0:
                 for i in range(n_battles):
                     print(f"[metamon-accept] iter {i+1}/{n_battles} — awaiting challenge", flush=True)
+                    _mark_battle_event()  # watchdog B: reset stall timer
                     await self.agent.accept_challenges(self._accept_opponent_filter, 1)
                     print(f"[metamon-accept] iter {i+1}/{n_battles} — battle ended", flush=True)
+                    _mark_battle_event()  # watchdog B: reset stall timer
             else:
                 while self._keep_challenging:
+                    _mark_battle_event()  # watchdog B: reset stall timer
                     await self.agent.accept_challenges(self._accept_opponent_filter, 1)
         except Exception as e:
             print(f"[metamon-accept] FATAL in accept_loop: {e}", flush=True)
@@ -220,6 +223,16 @@ def make_accept_env(
     # it just adds an illegal-action mask to the obs and handles a quirk
     # with parallel-actor auto-resets. Nothing ladder-specific in it for our purposes.
     return PSLadderAMAGOWrapper(menv)
+
+
+# MM watchdog (Layer A + Layer B) — see mm_watchdog.py for the full design
+# rationale. Installed in main() after argparse. accept_loop calls
+# mm_watchdog.mark_battle_event() at each print so Layer B's stall timer
+# resets on real progress.
+from mm_watchdog import (
+    install as _install_watchdogs,
+    mark_battle_event as _mark_battle_event,
+)
 
 
 def _start_heartbeat_thread():
@@ -298,6 +311,14 @@ def main():
 
     if "METAMON_CACHE_DIR" not in os.environ:
         raise SystemExit("METAMON_CACHE_DIR must be set (used for HF model downloads + teams)")
+
+    # Install MM watchdog (A: known-pattern log handler + B: stall thread).
+    # external_opponent_manager respawns on subprocess exit, so os._exit(1)
+    # from a watchdog cleanly cycles the instance. Pass the subprocess log
+    # path (matches external_opponent_manager's log_file convention) so
+    # Layer B can dump a tail when it catches an unknown hang.
+    _log_path_for_tail = f"/workspace/team_builder/logs/external/{args.username.lower()}.log"
+    _install_watchdogs(log_path_for_tail=_log_path_for_tail)
 
     print(f"[metamon] model={args.model} user={args.username} "
           f"port={args.server_port} format={args.format} temp={args.temperature}",
