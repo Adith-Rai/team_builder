@@ -2351,6 +2351,44 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
     finally:
         loop.close()
 
+    # S68 (2026-06-07): per-worker team distribution log. Only fires in
+    # paired-pool mode (TopMixer/SynergisticMixer w/ selection_stats()).
+    # Validates that --syn-team-pct / --top-asymmetric-rate / --syn-intra-
+    # asymmetric-rate parameters are honored at runtime. One line per
+    # worker per iter; grep '[TEAM-DIST]' to filter.
+    if train_tb is not None and hasattr(train_tb, 'selection_stats'):
+        try:
+            stats = train_tb.selection_stats()
+            tops = stats.get("tops", {})
+            pairs = stats.get("pairs", {})
+            syn_inner = stats.get("synergistic_internal", {})
+            syn_sources = syn_inner.get("sources", {})
+            syn_pairs = syn_inner.get("pairs", {})
+            n_total_pairs = sum(pairs.values()) if pairs else 0
+            n_total_yields = sum(tops.values()) if tops else 0
+            n_syn_pairs = syn_pairs.get("matched", 0) + syn_pairs.get("asymmetric", 0)
+            # Actual rates (compare against args' targets in train_rl.py banner)
+            top_async_actual = (pairs.get("asymmetric", 0) / n_total_pairs
+                                if n_total_pairs else 0.0)
+            intra_async_actual = (syn_pairs.get("asymmetric", 0) / n_syn_pairs
+                                  if n_syn_pairs else 0.0)
+            proc_yields = tops.get("procedural", 0)
+            syn_yields = tops.get("synergistic", 0)
+            proc_pct = proc_yields / n_total_yields if n_total_yields else 0.0
+            print(
+                f"[cis-w{worker_id} TEAM-DIST iter={iter_n}] "
+                f"pairs={n_total_pairs} "
+                f"yields=(proc:{proc_yields} syn:{syn_yields}={proc_pct*100:.1f}%/{(1-proc_pct)*100:.1f}%) "
+                f"top_pairs=(both_proc:{pairs.get('both_proc',0)} "
+                f"both_syn:{pairs.get('both_syn',0)} "
+                f"async:{pairs.get('asymmetric',0)}={top_async_actual*100:.1f}%) "
+                f"syn_sources=({' '.join(f'{k}:{v}' for k,v in syn_sources.items())}) "
+                f"intra_async={intra_async_actual*100:.1f}%",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[cis-w{worker_id}] TEAM-DIST log failed: {e}", flush=True)
+
     summary = {"worker_id": worker_id, "iter_n": iter_n}
     return (all_trajs, total_w_count, total_l, total_ties, summary,
             wr_per_opp, total_fft_w, total_fft_l)
