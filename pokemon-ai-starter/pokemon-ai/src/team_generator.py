@@ -702,6 +702,204 @@ def enqueue_team(queue_dir, packed_team: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Hierarchical mixers — synergistic (hl/gl) + top-level (procedural/synergistic).
+# Per-pair asymmetric_rate controls how often P1 and P2 use different sources.
+# ---------------------------------------------------------------------------
+
+class SynergisticMixer(_Teambuilder):
+    """Mixer over synergistic team sources (e.g. hl_05_26 + gl_05_26).
+
+    Composes N source teambuilders with weights. Exposes both:
+      - yield_team(): independent weighted sample (one team).
+      - yield_pair(): paired (P1, P2) sample with intra_asymmetric_rate
+        controlling how often the two teams come from different sources.
+
+    Args:
+        sources: dict {name: teambuilder}; each teambuilder must have
+                 .yield_team() -> str (packed format).
+        weights: optional {name: float}; non-normalized OK. Default uniform.
+        intra_asymmetric_rate: probability that yield_pair() returns teams
+                 from two DIFFERENT sources (e.g. one hl, one gl). 0.0 = always
+                 matched, 1.0 = always cross-source.
+    """
+
+    def __init__(self, sources, weights=None, intra_asymmetric_rate: float = 0.30):
+        super().__init__()
+        if not sources:
+            raise ValueError("sources must be non-empty")
+        if not (0.0 <= intra_asymmetric_rate <= 1.0):
+            raise ValueError(f"intra_asymmetric_rate must be in [0,1], got {intra_asymmetric_rate}")
+        self.sources = dict(sources)
+        names = list(self.sources.keys())
+        if weights:
+            raw = [float(weights.get(k, 1.0)) for k in names]
+        else:
+            raw = [1.0] * len(names)
+        total = sum(raw)
+        if total <= 0:
+            raise ValueError(f"sum of weights must be positive, got {total}")
+        self._names = names
+        self._weights = [w / total for w in raw]
+        self.intra_asymmetric_rate = intra_asymmetric_rate
+        self.last_source = None
+        self._selection_counts = {n: 0 for n in names}
+        self._pair_counts = {"matched": 0, "asymmetric": 0}
+        weight_str = ", ".join(f"{n}={w:.2f}" for n, w in zip(self._names, self._weights))
+        print(f"SynergisticMixer: {len(self._names)} sources [{weight_str}], "
+              f"intra_asymmetric_rate={self.intra_asymmetric_rate:.2f}")
+
+    def _pick_source(self) -> str:
+        return random.choices(self._names, weights=self._weights, k=1)[0]
+
+    def yield_team(self) -> str:
+        """Independent weighted sample. Used when caller has no need for matched pairs."""
+        name = self._pick_source()
+        self.last_source = name
+        self._selection_counts[name] += 1
+        return self.sources[name].yield_team()
+
+    def yield_pair(self) -> tuple[str, str, str, str]:
+        """Paired (P1, P2) sample respecting intra_asymmetric_rate.
+
+        Returns: (team_p1, team_p2, source_p1, source_p2).
+        With probability intra_asymmetric_rate, sources differ; otherwise same source.
+        Even when sources match, the two teams are independent draws from that source.
+        """
+        if len(self._names) >= 2 and random.random() < self.intra_asymmetric_rate:
+            # Asymmetric: pick two distinct sources weighted by their probs
+            src_p1 = self._pick_source()
+            src_p2 = self._pick_source()
+            attempts = 0
+            while src_p2 == src_p1 and attempts < 8:
+                src_p2 = self._pick_source()
+                attempts += 1
+            if src_p2 == src_p1:
+                # Fallback: deterministically pick the other source
+                other = [n for n in self._names if n != src_p1]
+                if other:
+                    src_p2 = random.choice(other)
+            self._pair_counts["asymmetric"] += 1
+        else:
+            src_p1 = src_p2 = self._pick_source()
+            self._pair_counts["matched"] += 1
+        self._selection_counts[src_p1] += 1
+        self._selection_counts[src_p2] += 1
+        team_p1 = self.sources[src_p1].yield_team()
+        team_p2 = self.sources[src_p2].yield_team()
+        return (team_p1, team_p2, src_p1, src_p2)
+
+    def selection_stats(self) -> dict:
+        return {
+            "sources": dict(self._selection_counts),
+            "pairs": dict(self._pair_counts),
+        }
+
+
+class TopMixer(_Teambuilder):
+    """Top-level mixer over procedural + synergistic teambuilders.
+
+    Args:
+        procedural: teambuilder for procedural (random Smogon) teams.
+        synergistic: SynergisticMixer (or any teambuilder with yield_pair()).
+        syn_pct: fraction of teams that should be synergistic. Default 0.3.
+        top_asymmetric_rate: probability that yield_pair() returns one
+                             procedural + one synergistic team (cross-quality).
+                             Default 0.2.
+
+    yield_team(): independent weighted sample.
+    yield_pair(): paired sample respecting top_asymmetric_rate (and propagating
+                  to SynergisticMixer's intra_asymmetric_rate when both sides syn).
+    """
+
+    def __init__(self, procedural, synergistic, syn_pct: float = 0.3,
+                 top_asymmetric_rate: float = 0.2):
+        super().__init__()
+        if not (0.0 <= syn_pct <= 1.0):
+            raise ValueError(f"syn_pct must be in [0,1], got {syn_pct}")
+        if not (0.0 <= top_asymmetric_rate <= 1.0):
+            raise ValueError(f"top_asymmetric_rate must be in [0,1], got {top_asymmetric_rate}")
+        self.procedural = procedural
+        self.synergistic = synergistic
+        self.syn_pct = syn_pct
+        self.top_asymmetric_rate = top_asymmetric_rate
+        self._selection_counts = {"procedural": 0, "synergistic": 0}
+        self._pair_counts = {"both_proc": 0, "both_syn": 0, "asymmetric": 0}
+        print(f"TopMixer: syn_pct={syn_pct:.2f}, top_asymmetric_rate={top_asymmetric_rate:.2f}")
+
+    def _pick_top(self) -> str:
+        return "synergistic" if random.random() < self.syn_pct else "procedural"
+
+    def _yield_from(self, top_choice: str) -> tuple[str, str]:
+        """Returns (team, source_label) for a single side."""
+        if top_choice == "synergistic":
+            # If synergistic has yield_team(), use it. Otherwise fall back.
+            team = self.synergistic.yield_team()
+            label = getattr(self.synergistic, "last_source", "syn")
+            return (team, f"syn:{label}")
+        else:
+            team = self.procedural.yield_team()
+            return (team, "procedural")
+
+    def yield_team(self) -> str:
+        """Independent weighted sample."""
+        choice = self._pick_top()
+        self._selection_counts[choice] += 1
+        team, _ = self._yield_from(choice)
+        return team
+
+    def yield_pair(self) -> tuple[str, str, str, str]:
+        """Paired (P1, P2) sample respecting top_asymmetric_rate.
+
+        Returns: (team_p1, team_p2, source_p1, source_p2).
+
+        Branching:
+          - With probability top_asymmetric_rate: one side procedural, other synergistic
+          - Otherwise: both procedural OR both synergistic, picked by syn_pct
+            - If both synergistic, delegate to SynergisticMixer.yield_pair()
+              which respects ITS intra_asymmetric_rate.
+        """
+        if random.random() < self.top_asymmetric_rate:
+            # Asymmetric: one proc, one syn (50/50 which side is which)
+            if random.random() < 0.5:
+                p1_top, p2_top = "procedural", "synergistic"
+            else:
+                p1_top, p2_top = "synergistic", "procedural"
+            team_p1, src_p1 = self._yield_from(p1_top)
+            team_p2, src_p2 = self._yield_from(p2_top)
+            self._selection_counts[p1_top] += 1
+            self._selection_counts[p2_top] += 1
+            self._pair_counts["asymmetric"] += 1
+            return (team_p1, team_p2, src_p1, src_p2)
+
+        # Top-level matched: both proc or both syn
+        choice = self._pick_top()
+        self._selection_counts[choice] += 2  # both sides count toward this bucket
+        if choice == "synergistic" and hasattr(self.synergistic, "yield_pair"):
+            # Delegate to syn's yield_pair for intra-syn asymmetric handling.
+            # Prefix syn's raw source labels with "syn:" for unified labeling.
+            self._pair_counts["both_syn"] += 1
+            team_p1, team_p2, src_p1, src_p2 = self.synergistic.yield_pair()
+            return (team_p1, team_p2, f"syn:{src_p1}", f"syn:{src_p2}")
+        # Both procedural (or syn without yield_pair — fall back to two independent draws)
+        team_p1, src_p1 = self._yield_from(choice)
+        team_p2, src_p2 = self._yield_from(choice)
+        if choice == "procedural":
+            self._pair_counts["both_proc"] += 1
+        else:
+            self._pair_counts["both_syn"] += 1
+        return (team_p1, team_p2, src_p1, src_p2)
+
+    def selection_stats(self) -> dict:
+        out = {
+            "tops": dict(self._selection_counts),
+            "pairs": dict(self._pair_counts),
+        }
+        if hasattr(self.synergistic, "selection_stats"):
+            out["synergistic_internal"] = self.synergistic.selection_stats()
+        return out
+
+
+# ---------------------------------------------------------------------------
 # CLI test
 # ---------------------------------------------------------------------------
 
