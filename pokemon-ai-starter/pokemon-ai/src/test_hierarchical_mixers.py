@@ -367,6 +367,50 @@ Timid Nature
     assert tb1 is not tb2, "mixer wrapping should rebuild fresh (per-iter stats)"
 
 
+def test_procedural_cached_across_builds(tmp_path, monkeypatch):
+    """build_train_teambuilder should reuse ProceduralTeambuilder across calls
+    when stats_dir is the same. Prevents per-iter re-parse of usage stat files.
+    """
+    from team_generator import build_train_teambuilder, _PROCEDURAL_CACHE
+    import team_generator as tg
+
+    # Stub procedural_teambuilder factory with a counter so we can assert it
+    # was only invoked once across two build calls.
+    call_count = {"n": 0}
+
+    class _FakeProc:
+        def __init__(self, path):
+            self.path = path
+        def yield_team(self):
+            return "fake_team"
+
+    def fake_factory(stats_dir, random_pct=0.05, gen=9):
+        call_count["n"] += 1
+        return _FakeProc(stats_dir)
+
+    monkeypatch.setattr(tg, "procedural_teambuilder", fake_factory)
+
+    # Clear cache to start clean
+    _PROCEDURAL_CACHE.clear()
+
+    stats_path = "/fake/stats/dir"
+
+    # First build → cache miss
+    tb1 = build_train_teambuilder(procedural_teams_path=stats_path)
+    assert call_count["n"] == 1, "first build should invoke factory once"
+    assert stats_path in _PROCEDURAL_CACHE, "first build should populate cache"
+    cached_instance = _PROCEDURAL_CACHE[stats_path]
+
+    # Second build → cache hit, factory NOT called again
+    tb2 = build_train_teambuilder(procedural_teams_path=stats_path)
+    assert call_count["n"] == 1, "second build must NOT re-invoke factory (cache hit)"
+    assert _PROCEDURAL_CACHE[stats_path] is cached_instance
+
+    # When no syn_config is passed, build returns the cached Procedural instance
+    # directly (no mixer wrapping in pure-procedural mode), so tb1 IS tb2.
+    assert tb1 is tb2, "pure-procedural mode returns the cached instance directly"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

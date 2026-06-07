@@ -972,13 +972,20 @@ class PairedQueueProducer:
 # synergistic teams are configured.
 # ---------------------------------------------------------------------------
 
-# Per-process cache of StaticTeamPool instances. Each worker is its own
-# process → its own cache. Caches the slow part (reading 180k+ team files
-# from hl_05_26/gl_05_26 on first build) so subsequent iters reuse the
-# loaded teams. Mixer wrapping is rebuilt fresh per call so selection_stats
-# starts at zero each iter (the [TEAM-DIST] log measures per-iter, not
-# cumulative).
+# Per-process caches. Each worker is its own process → its own caches.
+# Caches the slow disk-load step so subsequent iters within a worker reuse
+# the loaded data. Mixer wrappings (Synergistic, TopMixer) are rebuilt fresh
+# per call so selection_stats() starts at zero each iter ([TEAM-DIST] log
+# is per-iter, not cumulative).
+#
+# StaticTeamPool: caches list of pre-built team strings (~1.2 GB combined
+#   hl+gl per worker). yield_team picks one uniformly from the list.
+# ProceduralTeambuilder: caches 545 PokemonData usage stats (~2 MB per
+#   worker). yield_team RE-GENERATES a fresh team via RNG each call — the
+#   cache only avoids re-parsing usage .txt files, every battle still gets
+#   a unique procedural team.
 _STATIC_POOL_CACHE: Dict[str, '_Teambuilder'] = {}
+_PROCEDURAL_CACHE: Dict[str, 'ProceduralTeambuilder'] = {}
 
 
 def build_train_teambuilder(procedural_teams_path: str = None,
@@ -1003,7 +1010,9 @@ def build_train_teambuilder(procedural_teams_path: str = None,
     """
     proc_tb = None
     if procedural_teams_path:
-        proc_tb = procedural_teambuilder(procedural_teams_path)
+        if procedural_teams_path not in _PROCEDURAL_CACHE:
+            _PROCEDURAL_CACHE[procedural_teams_path] = procedural_teambuilder(procedural_teams_path)
+        proc_tb = _PROCEDURAL_CACHE[procedural_teams_path]
 
     if not syn_config or not syn_config.get("team_dirs"):
         return proc_tb
