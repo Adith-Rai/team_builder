@@ -319,6 +319,54 @@ def test_producer_invalid_n_pairs(tmp_path):
         producer.produce_all(-1)
 
 
+# --- StaticTeamPool cache (the perf-critical fix) ---
+
+def test_static_pool_cached_across_builds(tmp_path):
+    """build_train_teambuilder should reuse StaticTeamPool across calls
+    when paths are the same. Prevents per-iter reload of 180k team files.
+    """
+    from team_generator import build_train_teambuilder, _STATIC_POOL_CACHE
+    # Create a fake teams dir with a few minimal valid Showdown team files
+    teams_dir = tmp_path / "fake_teams"
+    teams_dir.mkdir()
+    team_text = """Pikachu @ Light Ball
+Ability: Static
+Tera Type: Electric
+EVs: 252 SpA / 252 Spe / 4 HP
+Timid Nature
+- Thunderbolt
+- Volt Switch
+- Surf
+- Hidden Power Ice
+"""
+    (teams_dir / "team_0.gen9ou_team").write_text(team_text)
+    (teams_dir / "team_1.gen9ou_team").write_text(team_text)
+
+    # Clear cache to start clean
+    _STATIC_POOL_CACHE.clear()
+
+    syn_config = {
+        "team_dirs": [(str(teams_dir), 1.0)],
+        "team_pct": 0.5,
+        "intra_asymmetric_rate": 0.0,
+        "top_asymmetric_rate": 0.0,
+    }
+
+    # First build → cache miss, instance created
+    tb1 = build_train_teambuilder(syn_config=syn_config)
+    assert str(teams_dir) in _STATIC_POOL_CACHE, "first build should populate cache"
+    cached_instance = _STATIC_POOL_CACHE[str(teams_dir)]
+
+    # Second build → cache hit, same instance reused inside the new mixer
+    tb2 = build_train_teambuilder(syn_config=syn_config)
+    assert _STATIC_POOL_CACHE[str(teams_dir)] is cached_instance, \
+        "second build must reuse cached StaticTeamPool (no reload)"
+
+    # tb1 and tb2 themselves are DIFFERENT mixer instances (so selection_stats
+    # starts fresh each iter), but they share the underlying source pool.
+    assert tb1 is not tb2, "mixer wrapping should rebuild fresh (per-iter stats)"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

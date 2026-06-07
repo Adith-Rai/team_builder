@@ -972,6 +972,15 @@ class PairedQueueProducer:
 # synergistic teams are configured.
 # ---------------------------------------------------------------------------
 
+# Per-process cache of StaticTeamPool instances. Each worker is its own
+# process → its own cache. Caches the slow part (reading 180k+ team files
+# from hl_05_26/gl_05_26 on first build) so subsequent iters reuse the
+# loaded teams. Mixer wrapping is rebuilt fresh per call so selection_stats
+# starts at zero each iter (the [TEAM-DIST] log measures per-iter, not
+# cumulative).
+_STATIC_POOL_CACHE: Dict[str, '_Teambuilder'] = {}
+
+
 def build_train_teambuilder(procedural_teams_path: str = None,
                             syn_config: dict = None):
     """Construct a training teambuilder from configuration.
@@ -999,7 +1008,7 @@ def build_train_teambuilder(procedural_teams_path: str = None,
     if not syn_config or not syn_config.get("team_dirs"):
         return proc_tb
 
-    # Build synergistic sources
+    # Build synergistic sources, caching the slow StaticTeamPool loads.
     team_dirs = syn_config["team_dirs"]
     if not team_dirs:
         return proc_tb
@@ -1011,7 +1020,11 @@ def build_train_teambuilder(procedural_teams_path: str = None,
         if name in sources:
             # Duplicate names — disambiguate with full path component
             name = f"{Path(path).parents[1].name}_{name}"
-        sources[name] = StaticTeamPool(path)
+        # Per-worker-process cache: first iter eats the load, subsequent
+        # iters reuse the StaticTeamPool instance. Read-only data, safe.
+        if path not in _STATIC_POOL_CACHE:
+            _STATIC_POOL_CACHE[path] = StaticTeamPool(path)
+        sources[name] = _STATIC_POOL_CACHE[path]
         weights[name] = float(w)
 
     syn_mixer = SynergisticMixer(
