@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import gc
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -1413,7 +1414,6 @@ def main():
         # the bundle file (kernel page cache shares the bytes across all 90
         # workers, replacing the per-worker ~1 GB Python list of strings with
         # ~few MB of mmap'd shared memory).
-        import time as _time
         for path, _ in syn_config["team_dirs"]:
             bundle = bundle_path_for(path)
             if os.path.exists(bundle):
@@ -1421,10 +1421,10 @@ def main():
                 # mmap construction in workers will fail loudly if corrupt.
                 print(f"  Team bundle EXISTS: {bundle}", flush=True)
                 continue
-            t0 = _time.perf_counter()
+            t0 = time.perf_counter()
             print(f"  Building team bundle: {path} → {bundle} ...", flush=True)
             _bp, _n = build_team_bundle(path, output_path=bundle)
-            dt = _time.perf_counter() - t0
+            dt = time.perf_counter() - t0
             sz_mb = os.path.getsize(_bp) / (1024 * 1024)
             print(f"  Team bundle BUILT: {_bp} ({_n} teams, {sz_mb:.1f} MB, {dt:.1f}s)",
                   flush=True)
