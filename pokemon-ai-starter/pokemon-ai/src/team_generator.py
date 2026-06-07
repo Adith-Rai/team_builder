@@ -966,6 +966,74 @@ class PairedQueueProducer:
 
 
 # ---------------------------------------------------------------------------
+# Factory: build train_tb from config dict.
+# Used by mp_centralized_collect.py worker setup to construct either
+# ProceduralTeambuilder (legacy) or TopMixer (hierarchical) based on whether
+# synergistic teams are configured.
+# ---------------------------------------------------------------------------
+
+def build_train_teambuilder(procedural_teams_path: str = None,
+                            syn_config: dict = None):
+    """Construct a training teambuilder from configuration.
+
+    Args:
+        procedural_teams_path: path to usage stats directory for ProceduralTeambuilder.
+                               If None and syn_config is None, returns None.
+        syn_config: optional dict with keys:
+            - "team_dirs": list of (path, weight) tuples for synergistic sources
+                          (e.g. [("hl_05_26/gen9ou/", 0.6), ("gl_05_26/gen9ou/", 0.4)])
+                          Each dir loaded via StaticTeamPool.
+            - "team_pct": float in [0,1], fraction of teams that should be synergistic (TopMixer.syn_pct)
+            - "intra_asymmetric_rate": float in [0,1] for SynergisticMixer (default 0.30)
+            - "top_asymmetric_rate": float in [0,1] for TopMixer (default 0.20)
+
+    Returns:
+        - ProceduralTeambuilder if only procedural_teams_path set
+        - TopMixer (procedural + synergistic) if both set
+        - None if neither set
+    """
+    proc_tb = None
+    if procedural_teams_path:
+        proc_tb = procedural_teambuilder(procedural_teams_path)
+
+    if not syn_config or not syn_config.get("team_dirs"):
+        return proc_tb
+
+    # Build synergistic sources
+    team_dirs = syn_config["team_dirs"]
+    if not team_dirs:
+        return proc_tb
+    sources = {}
+    weights = {}
+    for path, w in team_dirs:
+        # Use directory basename as source name (e.g. "hl_05_26", "gl_05_26")
+        name = Path(path).parent.name if Path(path).name == "gen9ou" else Path(path).name
+        if name in sources:
+            # Duplicate names — disambiguate with full path component
+            name = f"{Path(path).parents[1].name}_{name}"
+        sources[name] = StaticTeamPool(path)
+        weights[name] = float(w)
+
+    syn_mixer = SynergisticMixer(
+        sources=sources,
+        weights=weights,
+        intra_asymmetric_rate=float(syn_config.get("intra_asymmetric_rate", 0.30)),
+    )
+
+    if proc_tb is None:
+        # No procedural — return syn mixer directly. yield_pair() works;
+        # yield_team() falls back to weighted independent sampling within syn.
+        return syn_mixer
+
+    return TopMixer(
+        procedural=proc_tb,
+        synergistic=syn_mixer,
+        syn_pct=float(syn_config.get("team_pct", 0.30)),
+        top_asymmetric_rate=float(syn_config.get("top_asymmetric_rate", 0.20)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI test
 # ---------------------------------------------------------------------------
 
