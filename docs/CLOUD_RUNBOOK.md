@@ -126,6 +126,29 @@ aws s3 ls s3://team-builder-data/ --profile r2 --endpoint-url $S3_ENDPOINT_URL
 
 Should list bucket contents (empty initially — that's fine). If it errors with "Bad credentials," check the access key/secret were copied right.
 
+### Bucket layout (as of 2026-06-07)
+
+```
+s3://team-builder-data/
+├── datasets/          # human_v8_100k memmap (~104 GB) — BC training data
+├── models/            # model checkpoints (BC + RL snapshots)
+├── raw_data/          # raw inputs (pokemon_usage stats, etc.)
+└── team_bundles/      # .teampack mmap-backed pool bundles (hl_05_26, gl_05_26)
+                       # added S68 — see team_generator.bundle_path_for + train_rl prebuild
+```
+
+Fast-fetch pattern for a fresh pod (replaces scp dance between pods):
+```bash
+source pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
+mkdir -p /workspace/metamon_cache/teams/hl_05_26 /workspace/metamon_cache/teams/gl_05_26
+aws s3 cp s3://team-builder-data/team_bundles/hl_05_26.teampack \
+    /workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack \
+    --endpoint-url $S3_ENDPOINT_URL
+aws s3 cp s3://team-builder-data/team_bundles/gl_05_26.teampack \
+    /workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack \
+    --endpoint-url $S3_ENDPOINT_URL
+```
+
 ### H. Upload 104 GB memmap to R2 (one-time, runs in background)
 
 This is **the slow step** — 24 hr at typical 10 Mbps residential, but our user's connection completed it in ~75 min on faster fiber.

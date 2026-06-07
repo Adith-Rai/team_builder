@@ -24,12 +24,23 @@
 # → Per-side type freq: 66% procedural, 19% hl, 15% gl
 #
 # Pre-launch checklist:
-#   [ ] hl_05_26 + gl_05_26 downloaded to metamon_cache (see Step 1 below)
+#   [ ] hl_05_26.teampack + gl_05_26.teampack downloaded from R2 (see Step 1)
 #   [ ] git checkout feat/hierarchical-teambuilders + verify on prod
 #   [ ] battle servers healthy (16 BS on prod)
 #   [ ] GPU clean (no zombie from prior runs)
 #
-# Step 1: Download team sets (one-time, ~30 min, ~750 MB extracted):
+# Step 1 (PREFERRED): Download bundles from R2 (~3 min, 256 MB total):
+#   source /workspace/team_builder/pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
+#   mkdir -p /workspace/metamon_cache/teams/hl_05_26 /workspace/metamon_cache/teams/gl_05_26
+#   aws s3 cp s3://team-builder-data/team_bundles/hl_05_26.teampack \
+#       /workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack \
+#       --endpoint-url $S3_ENDPOINT_URL
+#   aws s3 cp s3://team-builder-data/team_bundles/gl_05_26.teampack \
+#       /workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack \
+#       --endpoint-url $S3_ENDPOINT_URL
+#
+# Step 1 (FALLBACK): Rebuild bundles from raw HuggingFace download
+# (~30 min, ~750 MB extracted). Only needed if R2 unavailable:
 #   cd /workspace
 #   METAMON_CACHE_DIR=/workspace/metamon_cache \
 #     metamon_venv/bin/python -c "
@@ -37,8 +48,8 @@
 # download_teams('gen9ou', 'hl_05_26')
 # download_teams('gen9ou', 'gl_05_26')
 # "
-#   ls /workspace/metamon_cache/teams/hl_05_26/gen9ou | wc -l  # expect ~43000
-#   ls /workspace/metamon_cache/teams/gl_05_26/gen9ou | wc -l  # expect ~139000
+#   # train_rl.py main() auto-runs build_team_bundle on missing .teampack
+#   # if the raw dir exists alongside.
 
 set -u
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src

@@ -17,25 +17,26 @@
 #   [ ] Run #3 (phase3_bc_noawr_v1) completed
 #   [ ] git checkout feat/hierarchical-teambuilders + pull
 #   [ ] hl_05_26.teampack + gl_05_26.teampack present in /workspace/metamon_cache
-#       (transferred from prod via scp — see Step 1 below)
+#       (download from R2 — see Step 1 below)
 #   [ ] battle servers healthy (16 BS on dev)
 #   [ ] GPU clean
 #
-# Step 1: Transfer .teampack bundles from prod (run from local machine):
-#   scp -P 47913 -i ~/.ssh/id_ed25519 \
-#     root@195.26.233.30:/workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack \
-#     /tmp/hl_05_26.teampack
-#   scp -P 47913 -i ~/.ssh/id_ed25519 \
-#     root@195.26.233.30:/workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack \
-#     /tmp/gl_05_26.teampack
-#   scp -P 34576 -i ~/.ssh/id_ed25519 /tmp/hl_05_26.teampack \
-#     root@213.173.105.9:/workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack
-#   scp -P 34576 -i ~/.ssh/id_ed25519 /tmp/gl_05_26.teampack \
-#     root@213.173.105.9:/workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack
-#   # OR: just copy as gen9ou.teampack sibling — bundle_path_for computes
-#   # /workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack from the dir
-#   # /workspace/metamon_cache/teams/hl_05_26/gen9ou — so the .teampack lives
-#   # in the parent dir.
+# Step 1 (PREFERRED): Download bundles from R2 — fast, deterministic, no
+# inter-pod scp dance. Bundles uploaded 2026-06-07 from prod after build.
+#
+#   source /workspace/team_builder/pokemon-ai-starter/pokemon-ai/scripts/r2_env.local.sh
+#   mkdir -p /workspace/metamon_cache/teams/hl_05_26 /workspace/metamon_cache/teams/gl_05_26
+#   aws s3 cp s3://team-builder-data/team_bundles/hl_05_26.teampack \
+#       /workspace/metamon_cache/teams/hl_05_26/gen9ou.teampack \
+#       --endpoint-url $S3_ENDPOINT_URL
+#   aws s3 cp s3://team-builder-data/team_bundles/gl_05_26.teampack \
+#       /workspace/metamon_cache/teams/gl_05_26/gen9ou.teampack \
+#       --endpoint-url $S3_ENDPOINT_URL
+#
+# Step 1 (FALLBACK): if R2 access broken or bundle missing, rebuild from raw
+# team dirs (requires hl_05_26/ and gl_05_26/ downloaded from HuggingFace —
+# see metamon.data.download). train_rl.py main() auto-runs build_team_bundle
+# if the .teampack is missing AND the raw dir exists alongside.
 
 set -u
 cd /workspace/team_builder/pokemon-ai-starter/pokemon-ai/src
