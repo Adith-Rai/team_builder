@@ -301,6 +301,25 @@ def parse_args():
                    help="Path to Smogon usage stats dir for procedural team generation")
     p.add_argument("--random-team-pct", type=float, default=0.05,
                    help="Fraction of procedural teams with uniform weights")
+    # S68 hierarchical teambuilders (2026-06-06): synergistic team mix.
+    # When --syn-team-dirs is set, training switches to paired-pool mode
+    # via TopMixer + PairedQueueProducer. Each battle gets matched-source
+    # teams on both sides (with configurable asymmetric rates).
+    p.add_argument("--syn-team-dirs", default=None,
+                   help="Comma-separated synergistic team dirs with weights, e.g. "
+                        "'/workspace/metamon_cache/teams/hl_05_26/gen9ou:0.6,"
+                        "/workspace/metamon_cache/teams/gl_05_26/gen9ou:0.4'. "
+                        "Each dir holds Showdown .gen9ou_team files. When unset, "
+                        "training uses legacy ProceduralTeambuilder shared between sides.")
+    p.add_argument("--syn-team-pct", type=float, default=0.30,
+                   help="Fraction of teams from synergistic pools when --syn-team-dirs "
+                        "is set (TopMixer.syn_pct). Default 0.30 (30%% syn, 70%% procedural).")
+    p.add_argument("--syn-intra-asymmetric-rate", type=float, default=0.30,
+                   help="Probability that within-synergistic pairs use different syn sources "
+                        "(SynergisticMixer.intra_asymmetric_rate). Default 0.30.")
+    p.add_argument("--top-asymmetric-rate", type=float, default=0.20,
+                   help="Probability that top-level pairs cross procedural/synergistic "
+                        "(TopMixer.top_asymmetric_rate). Default 0.20.")
     p.add_argument("--lr-restart", action="store_true",
                    help="Reset optimizer on resume (use when dims/hyperparams changed)")
     p.add_argument("--mp", action="store_true",
@@ -797,6 +816,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             cis_timeout_ms=args.cis_timeout_ms,
             worker_device=("cpu" if getattr(args, 'worker_cpu', True) else str(device)),
             pfsp_max_share=getattr(args, 'pfsp_max_share', 0.20),
+            syn_config=syn_config,
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1336,6 +1356,37 @@ def main():
     train_teambuilder = procedural_teambuilder(proc_path, random_pct=args.random_team_pct)
     print(f"  Train teambuilder: ProceduralTeambuilder({proc_path}, random_pct={args.random_team_pct})", flush=True)
 
+    # S68 (2026-06-06): parse --syn-team-dirs into syn_config dict for the
+    # CIS workers. Workers build TopMixer + use PairedQueueProducer per battle.
+    # NB: train_rl.py's own train_teambuilder above stays procedural — only
+    # workers see paired-pool teams; the local SYNC/MP-disk paths use the
+    # procedural shared TB unchanged.
+    syn_config = None
+    if getattr(args, 'syn_team_dirs', None):
+        team_dirs = []
+        for spec in args.syn_team_dirs.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            if ":" not in spec:
+                raise SystemExit(
+                    f"ERROR: --syn-team-dirs entry must be 'path:weight', got '{spec}'"
+                )
+            path, w = spec.rsplit(":", 1)
+            team_dirs.append((path.strip(), float(w)))
+        if team_dirs:
+            syn_config = {
+                "team_dirs": team_dirs,
+                "team_pct": float(args.syn_team_pct),
+                "intra_asymmetric_rate": float(args.syn_intra_asymmetric_rate),
+                "top_asymmetric_rate": float(args.top_asymmetric_rate),
+            }
+            _src_str = ", ".join(f"{Path(p).name}@{w}" for p, w in team_dirs)
+            print(f"  Train teambuilder: PAIRED-POOL mode (syn_pct={args.syn_team_pct}, "
+                  f"intra_async={args.syn_intra_asymmetric_rate}, "
+                  f"top_async={args.top_asymmetric_rate}, "
+                  f"sources=[{_src_str}])", flush=True)
+
     # Save config
     config = vars(args)
     config["run_dir"] = str(run_dir)
@@ -1681,6 +1732,10 @@ def main():
         # S68 Path B-hybrid: per-opp max share cap (default 0.20 = max 20%
         # of per-iter games per opp). Read by CISBgCollector.start.
         "pfsp_max_share": getattr(args, 'pfsp_max_share', 0.20),
+        # S68 hierarchical teambuilders (2026-06-06): paired-pool config.
+        # When None, workers use legacy ProceduralTeambuilder. When set,
+        # workers build TopMixer + per-battle paired QueueTeambuilders.
+        "syn_config": syn_config,
     }
     pending_collection = None
     # Background collector for --mp/--cis + --pipeline. Mirrors the
