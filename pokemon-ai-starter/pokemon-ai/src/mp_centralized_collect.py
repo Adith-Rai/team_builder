@@ -1904,7 +1904,8 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                                temp_range, opp_temp_range, fp16, rs_cfg,
                                turn_cap, battle_format, procedural_teams_path,
                                heartbeat_fn, liveness_state=None,
-                               pool_slot_map: Optional[Dict[str, int]] = None):
+                               pool_slot_map: Optional[Dict[str, int]] = None,
+                               syn_config: Optional[dict] = None):
     """CIS-routed self-play collect inside one worker.
 
     Differences from mp_disk's _run_collect_in_worker:
@@ -1926,7 +1927,7 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
     from rl_player import V9RLPlayer, make_self_play_opponent
     from rl_collection import _make_server
     from teams_ou import random_pool_teambuilder
-    from team_generator import procedural_teambuilder
+    from team_generator import procedural_teambuilder, build_train_teambuilder
     from ppo import _cancel_listener
     import asyncio
     import gc
@@ -1942,10 +1943,18 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
     if diff != 0:
         n_per_opp[0] += diff
 
-    if procedural_teams_path:
-        train_tb = procedural_teambuilder(procedural_teams_path)
-    else:
-        train_tb = None
+    # S68 hierarchical teambuilders (2026-06-06): build_train_teambuilder
+    # returns either a ProceduralTeambuilder (legacy, no syn_config) or a
+    # TopMixer (paired-pool design with syn teams). When syn_config is set,
+    # the returned TB exposes yield_pair() — _play_vs_opp uses paired queues
+    # to deliver matched-pool teams to both sides per battle.
+    train_tb = build_train_teambuilder(
+        procedural_teams_path=procedural_teams_path,
+        syn_config=syn_config,
+    )
+    if train_tb is not None and hasattr(train_tb, 'yield_pair'):
+        print(f"[cis-w{worker_id}] paired-pool teambuilder active "
+              f"(syn_config={syn_config})", flush=True)
 
     # Phase 4.3a: build per-slot batchers. Player always slot 0; each opp
     # path gets the slot from pool_slot_map (orchestrator-assigned). If the
@@ -1986,6 +1995,42 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         opp_key = opp_entry.get("key") or opp_entry.get("path") or "unknown"
         batch_id = (worker_id * 100000) + (iter_n * 1000) + (hash(opp_key) % 1000)
 
+        # S68 paired-pool setup (2026-06-06): if train_tb supports yield_pair()
+        # (i.e. TopMixer or SynergisticMixer is configured), pre-fill per-side
+        # team queues so both sides draw matched-source teams per battle.
+        # Otherwise fall back to legacy shared-teambuilder behavior.
+        _use_paired = train_tb is not None and hasattr(train_tb, 'yield_pair')
+        _paired_queue_dirs = []  # collected for cleanup at end
+        if _use_paired:
+            import tempfile as _tempfile
+            from team_generator import PairedQueueProducer, QueueTeambuilder
+            _q_p1_dir = _tempfile.mkdtemp(
+                prefix=f"sp_p1_w{worker_id}_i{iter_n}_b{batch_id}_"
+            )
+            _paired_queue_dirs.append(_q_p1_dir)
+            if kind == "external_subprocess":
+                _opp_team_queue = opp_entry.get("team_queue_dir")
+                if _opp_team_queue:
+                    PairedQueueProducer(train_tb, _q_p1_dir, _opp_team_queue).produce_all(n_for_opp)
+                    p1_tb = QueueTeambuilder(_q_p1_dir)
+                    p2_tb = None  # subprocess opp has no in-proc TB
+                else:
+                    # No opp queue available — can't pair. Fall back to legacy.
+                    _use_paired = False
+                    p1_tb = train_tb or random_pool_teambuilder()
+                    p2_tb = train_tb or random_pool_teambuilder()
+            else:
+                _q_p2_dir = _tempfile.mkdtemp(
+                    prefix=f"sp_p2_w{worker_id}_i{iter_n}_b{batch_id}_"
+                )
+                _paired_queue_dirs.append(_q_p2_dir)
+                PairedQueueProducer(train_tb, _q_p1_dir, _q_p2_dir).produce_all(n_for_opp)
+                p1_tb = QueueTeambuilder(_q_p1_dir)
+                p2_tb = QueueTeambuilder(_q_p2_dir)
+        else:
+            p1_tb = train_tb or random_pool_teambuilder()
+            p2_tb = train_tb or random_pool_teambuilder()
+
         # Training player ALWAYS uses CIS player batcher (we still need NN inference)
         player = V9RLPlayer(
             batcher=player_batcher, device=device,
@@ -1993,7 +2038,7 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             temperature=1.0,
             turn_cap=turn_cap,
             battle_format=battle_format,
-            team=train_tb or random_pool_teambuilder(),
+            team=p1_tb,
             max_concurrent_battles=min(max_concurrent, n_for_opp),
             account_configuration=AccountConfiguration(
                 f"CISw{worker_id}r{batch_id}", None),
@@ -2002,10 +2047,11 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
         if kind == "local":
             opp_path = opp_entry["path"]
-            opp_tb = train_tb or random_pool_teambuilder()
             # Phase 4.3a: opp goes through its assigned slot. If pool_slot_map
             # didn't list this opp, we fall back to the player batcher (preserves
             # Phase 4.1 self-play-vs-self behavior).
+            # S68: opp's teambuilder is p2_tb — either a QueueTeambuilder
+            # (paired mode) or shared train_tb (legacy mode).
             opp_batcher = opp_batchers.get(opp_path, player_batcher)
             opponent = V9RLPlayer(
                 batcher=opp_batcher, device=device,
@@ -2013,7 +2059,7 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                 temperature=1.0,
                 turn_cap=turn_cap,
                 battle_format=battle_format,
-                team=opp_tb,
+                team=p2_tb,
                 max_concurrent_battles=min(max_concurrent, n_for_opp),
                 account_configuration=AccountConfiguration(
                     f"CISo{worker_id}r{batch_id}", None),
@@ -2036,14 +2082,14 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
             # opponent just isn't NN-based (it uses its own internal MCTS).
             factory_type = opp_entry.get("factory_type", "pokeengine")
             f_kwargs = opp_entry.get("factory_kwargs", {})
-            opp_tb_local = train_tb or random_pool_teambuilder()
+            # S68: in-process opp's teambuilder is p2_tb — paired or legacy
             try:
                 if factory_type == "pokeengine":
                     from pokeengine_player import PokeEnginePlayer
                     opponent = PokeEnginePlayer(
                         search_time_ms=int(f_kwargs.get("search_time_ms", 200)),
                         battle_format=battle_format,
-                        team=opp_tb_local,
+                        team=p2_tb,
                         max_concurrent_battles=min(max_concurrent, n_for_opp),
                         account_configuration=AccountConfiguration(
                             f"CISei{worker_id}r{batch_id}", None),
@@ -2095,8 +2141,11 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
 
             # Layer 1: team_queue enqueue (if subprocess uses QueueTeambuilder).
             # Pre-enqueue n_for_opp teams so subprocess plays matched-source.
-            # Uses worker's teambuilder (train_tb if set, else random_pool fallback).
-            if team_queue_dir:
+            # S68: In paired mode, the producer above already pushed P2 teams
+            # to team_queue_dir as part of the paired-pool setup — skip the
+            # legacy independent enqueue. In legacy mode, enqueue independently
+            # from train_tb (or fallback).
+            if team_queue_dir and not _use_paired:
                 _enq_tb = train_tb or random_pool_teambuilder()
                 try:
                     from team_generator import enqueue_team
@@ -2212,6 +2261,16 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
         del player
         if 'opponent' in locals():
             del opponent
+
+        # S68: clean up paired-mode temp queue dirs (only the ones we created
+        # for this opp call; external opp's persistent team_queue_dir stays).
+        if _paired_queue_dirs:
+            import shutil as _shutil
+            for _d in _paired_queue_dirs:
+                try:
+                    _shutil.rmtree(_d, ignore_errors=True)
+                except Exception:
+                    pass
 
         # POKE_LOOP threading rule (cookbook §3j): yield wall-clock time
         # so POKE_LOOP can drain cancellations + close websockets. Skip
