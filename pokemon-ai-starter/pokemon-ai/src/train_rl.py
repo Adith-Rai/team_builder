@@ -643,6 +643,35 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
 # Per-iter step helpers
 # =============================
 
+def _build_syn_config(args):
+    """Parse --syn-* flags into a syn_config dict (or None).
+
+    Shared between main() (for collect_args / CISBgCollector path) and
+    _collect_data() (for the direct mp_centralized_collect_sync call).
+    """
+    if not getattr(args, 'syn_team_dirs', None):
+        return None
+    team_dirs = []
+    for spec in args.syn_team_dirs.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        if ":" not in spec:
+            raise SystemExit(
+                f"ERROR: --syn-team-dirs entry must be 'path:weight', got '{spec}'"
+            )
+        path, w = spec.rsplit(":", 1)
+        team_dirs.append((path.strip(), float(w)))
+    if not team_dirs:
+        return None
+    return {
+        "team_dirs": team_dirs,
+        "team_pct": float(args.syn_team_pct),
+        "intra_asymmetric_rate": float(args.syn_intra_asymmetric_rate),
+        "top_asymmetric_rate": float(args.top_asymmetric_rate),
+    }
+
+
 def _collect_data(args, model, device, server_pool, snapshot_pool,
                   rs_cfg, train_teambuilder, battle_format,
                   loop, pending_collection, _flow, win_rates=None,
@@ -816,7 +845,7 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
             cis_timeout_ms=args.cis_timeout_ms,
             worker_device=("cpu" if getattr(args, 'worker_cpu', True) else str(device)),
             pfsp_max_share=getattr(args, 'pfsp_max_share', 0.20),
-            syn_config=syn_config,
+            syn_config=_build_syn_config(args),
         )
         _flow(f"cis collect done: {cis_result[6]:.0f}s, "
               f"{len(cis_result[0])} trajs")
@@ -1361,31 +1390,18 @@ def main():
     # NB: train_rl.py's own train_teambuilder above stays procedural — only
     # workers see paired-pool teams; the local SYNC/MP-disk paths use the
     # procedural shared TB unchanged.
-    syn_config = None
-    if getattr(args, 'syn_team_dirs', None):
-        team_dirs = []
-        for spec in args.syn_team_dirs.split(","):
-            spec = spec.strip()
-            if not spec:
-                continue
-            if ":" not in spec:
-                raise SystemExit(
-                    f"ERROR: --syn-team-dirs entry must be 'path:weight', got '{spec}'"
-                )
-            path, w = spec.rsplit(":", 1)
-            team_dirs.append((path.strip(), float(w)))
-        if team_dirs:
-            syn_config = {
-                "team_dirs": team_dirs,
-                "team_pct": float(args.syn_team_pct),
-                "intra_asymmetric_rate": float(args.syn_intra_asymmetric_rate),
-                "top_asymmetric_rate": float(args.top_asymmetric_rate),
-            }
-            _src_str = ", ".join(f"{Path(p).name}@{w}" for p, w in team_dirs)
-            print(f"  Train teambuilder: PAIRED-POOL mode (syn_pct={args.syn_team_pct}, "
-                  f"intra_async={args.syn_intra_asymmetric_rate}, "
-                  f"top_async={args.top_asymmetric_rate}, "
-                  f"sources=[{_src_str}])", flush=True)
+    syn_config = _build_syn_config(args)
+    if syn_config:
+        # Use parent-dir name for display when the leaf is "gen9ou" — that's
+        # where the real set name lives (e.g., hl_05_26/gen9ou → "hl_05_26").
+        def _src_label(p):
+            pp = Path(p)
+            return pp.parent.name if pp.name == "gen9ou" else pp.name
+        _src_str = ", ".join(f"{_src_label(p)}@{w}" for p, w in syn_config["team_dirs"])
+        print(f"  Train teambuilder: PAIRED-POOL mode (syn_pct={args.syn_team_pct}, "
+              f"intra_async={args.syn_intra_asymmetric_rate}, "
+              f"top_async={args.top_asymmetric_rate}, "
+              f"sources=[{_src_str}])", flush=True)
 
     # Save config
     config = vars(args)
