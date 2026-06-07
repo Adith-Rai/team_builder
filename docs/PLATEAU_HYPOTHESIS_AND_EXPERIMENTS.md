@@ -273,3 +273,115 @@ metamon team_construction setup proves too painful, but try the better tool firs
   IS the goal; mixture (procedural + metamon-gen elite) addresses both halves.
 - "mm x mm matrix is probably the least informative" — agreed; Minikazam likely
   wins those too. Deprioritized.
+
+## S68 update (2026-06-05): refined hypothesis + active experiment
+
+After Phase 3 v3 launch from snap_0139 (the 1178.4 Elo record holder), user
+sharpened the AWR mechanism framing and pivoted the next experiment.
+
+### Refined hypothesis chain (CONJECTURE markers throughout)
+
+1. BC v10 trained on 1500+ Elo human gen9ou ✓ CONFIRMED (memmap pre-filtered)
+2. BC = imitation → action distribution encodes elite patterns WITHOUT causal
+   understanding ✓ true in principle (no policy gradient = no reasoning about
+   why actions are good)
+3. PPO + procedural-team training (random comps from 545-Pokemon usage pool)
+   means model rarely sees synergistic-team contexts → never gets to execute
+   elite plays for reward signal ✓ CONFIRMED training setup
+4. Result: model becomes a "decent generalist" (the 70-74% smart_avg ceiling)
+   but never refines elite-team execution. PARTIAL EVIDENCE — era4 ladder
+   shows snap_0139 (1178) > BC (1135) on synergistic teams, so PPO doesn't
+   actively REGRESS elite play. Better framing: PPO doesn't REFINE elite-team
+   execution past BC's baseline. CONJECTURE
+5. AWR provides steady stream of elite human-play state-action pairs during
+   PPO → policy retains/amplifies these plays in sampled action distribution
+   → when self-play (or eval) presents a synergistic team, model executes
+   elite plays → PPO sees them succeed → reinforces with PPO's OWN refinement.
+   The loop: AWR seeds → SP execution → PPO rewards → refines. CONJECTURE +
+   MECHANISTICALLY GROUNDED
+
+### Subtle correction
+
+User initially framed (4) as "PPO forgets elite plays." Data doesn't fully
+support active forgetting (snap_0139 > BC on synergistic-team ladder).
+Refined framing: "PPO doesn't REFINE elite-team execution past BC's baseline"
+— the model stays stuck at BC's untrained-elite-plays level rather than
+improving them. AWR helps either way (retention if forgetting, amplification
+if stagnation), so the experiment is still right.
+
+### Phase 3 v3 = snap_0139 init data point (in flight, finishes ~04:30 UTC)
+
+Tests "does AWR break the snap_0139 ceiling?" — strong V_θ gives clean
+advantage discrimination but drifted policy means execution loop is weaker.
+Will yield a useful data point regardless of outcome.
+
+### BC-init AWR experiment (Run #3 + Run #4) — the real test
+
+**Design**: two legs, identical except AWR. Difference = AWR's clean
+contribution at BC + externals condition.
+
+| Leg | Init | LR | Reward | Pool | Externals | AWR | iters |
+|---|---|---|---|---|---|---|---|
+| #3 (ablation) | BC v10 | 8e-5 | terminal | 151-entry prod | full (with minikazam) | NO | 200 |
+| #4 (proposal) | BC v10 | 8e-5 | terminal | 151-entry prod | full (with minikazam) | mix=TBD (smoke), batch=16, binary | 200 |
+
+**Adds minikazam** at temperature=0.01, weight=1.0, instances=3 — the
+strongest MM (we lose ~91% vs it in prior data). Provides the strongest
+external pressure for the refinement loop. NOT a "cheating" addition — it's
+a legitimate strong opponent.
+
+**Pre-launch smoke**: 5 iters at mix=0.10 AND mix=0.15 on prod (after Phase 3
+v3 finishes) to calibrate AWR/total ratio at BC init. AWR loss magnitude may
+differ from snap_0139 baseline (smoke 2.05% at mix=0.05). Pick mix landing
+in 8-12% sweet spot.
+
+**Cost**: ~$60 total, ~3 days wall.
+
+**Operational sequence** (locked):
+1. Now → ~04:30 UTC: Phase 3 v3 finishes on prod
+2. ~05:00 UTC: smoke + Run #4 launch on prod
+3. ~14:00 UTC: fishbowl_terminal finishes on dev → MM setup → Run #3 launch
+4. ~+25hr: both complete, run eval_elo_ladder_cis_v2.py vs era4_chain_FINAL
+
+**Decision tree**:
+- Run #4 - Run #3 ≥ +10 Elo → AWR adds clean lift → promote to Phase 2 candidate
+- Within ±5 Elo → AWR neutral → revisit hypothesis
+- Run #4 < Run #3 by ≥10 → AWR actively hurts → diagnostic mode
+
+**Full launch artifacts + checklists**: `memory/project_s68_bc_init_awr_design.md`
+
+## S68 update (2026-06-07): Run #3 + #4 done; Run #5 + #6 firing to close 2×2
+
+### Run #3 + Run #4 results (CONFIRMED, from evals.jsonl)
+
+Both completed 200 iters. Eval registry data:
+
+| Run | Pool | Peak smart_avg | At iter | End (iter 199) |
+|---|---|---|---|---|
+| Run #3 (BC + no AWR + proc-only) | 36 (dev) | **74.25** | iter 119 | 72.0 |
+| Run #4 (BC + AWR + proc-only)    | 140 (prod) | **75.25** | iter 49 | (collapse → recover to 71.4 by iter 69) |
+
+**Observation (PROVISIONAL)**: Run #3 sustained ~70-74 plateau throughout. Run #4 had higher PEAK (+1pp) but unstable — 75.25 → 68.8 in 10 iters then partial recovery. **AWR alone gave a small peak boost but introduced instability.** Direct comparison limited by pool-size + worker-count confound (Run #3 dev vs Run #4 prod) but the within-run trajectory shape is informative regardless.
+
+### Refined hypothesis → next test (Run #5 + Run #6)
+
+**The tug-of-war framing**: AWR pulls policy toward elite plays. PPO un-reinforces on procedural teams (Pokémon picks that don't synergize → elite plays don't pay off → PPO weights down). Net: AWR's pull is counter-productive without team contexts that support elite plays.
+
+**Solution**: add synergistic (real ladder) teams to ~30% of training games. The PPO un-reinforce becomes PPO reward when elite plays land. AWR + syn teams = loop closes.
+
+### 2×2 ablation (Run #5 + Run #6 firing 2026-06-07)
+
+|              | Procedural-only        | + 30% syn               |
+|--------------|------------------------|-------------------------|
+| **No AWR**   | Run #3 done (pool=36)  | **Run #6 firing** (pool=36)  |
+| **AWR**      | Run #4 done (pool=140) | **Run #5 firing** (pool=140) |
+
+Same 60% hl_05_26 / 40% gl_05_26 syn mix for both, 200 iters each. Within-pod ablations (Run #5 vs #4, Run #6 vs #3) are clean apples-to-apples. Cross-pod (Run #5 vs Run #6) carries the same confound Run #3 vs Run #4 already had.
+
+**Decision tree (when 2×2 lands)**:
+- Run #6 - Run #3 ≥ +3pp smart_avg → syn teams help on their own → useful even without AWR
+- Run #5 - Run #4 ≥ +3pp → syn teams + AWR closes the tug-of-war loop → confirms hypothesis
+- Run #5 vs Run #6 (with pool-size caveat) → AWR's marginal contribution under syn condition
+- All ~flat → either tug-of-war hypothesis is wrong, or 30% syn ratio is too low → revisit
+
+**Infra shipped to support this** (commit `6997a2fa` mmap + `c8adf696` watchdog + `fb79af84` R2 bundles): see `memory/project_s68_team_data_arc_2026_06_07.md` for the architectural story. mmap-bundle scales O(1) per worker for multi-gen via kernel page cache; MM watchdog catches poke-env hangs in 30s instead of 300s (live-validated 3× in Run #5).
