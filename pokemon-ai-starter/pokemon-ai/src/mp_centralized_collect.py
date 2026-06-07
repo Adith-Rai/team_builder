@@ -2016,7 +2016,10 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                 _opp_team_queue = opp_entry.get("team_queue_dir")
                 if _opp_team_queue:
                     PairedQueueProducer(train_tb, _q_p1_dir, _opp_team_queue).produce_all(n_for_opp)
-                    p1_tb = QueueTeambuilder(_q_p1_dir)
+                    # clean_on_init=False: our producer just pre-filled this
+                    # queue. QueueTeambuilder default clean_on_init=True would
+                    # DELETE the pairs we just pushed.
+                    p1_tb = QueueTeambuilder(_q_p1_dir, clean_on_init=False)
                     p2_tb = None  # subprocess opp has no in-proc TB
                 else:
                     # No opp queue available — can't pair. Fall back to legacy.
@@ -2029,8 +2032,9 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                 )
                 _paired_queue_dirs.append(_q_p2_dir)
                 PairedQueueProducer(train_tb, _q_p1_dir, _q_p2_dir).produce_all(n_for_opp)
-                p1_tb = QueueTeambuilder(_q_p1_dir)
-                p2_tb = QueueTeambuilder(_q_p2_dir)
+                # clean_on_init=False: see comment above.
+                p1_tb = QueueTeambuilder(_q_p1_dir, clean_on_init=False)
+                p2_tb = QueueTeambuilder(_q_p2_dir, clean_on_init=False)
         else:
             p1_tb = train_tb or random_pool_teambuilder()
             p2_tb = train_tb or random_pool_teambuilder()
