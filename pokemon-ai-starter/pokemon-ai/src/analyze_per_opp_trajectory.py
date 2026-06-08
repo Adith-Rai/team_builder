@@ -298,7 +298,14 @@ def main():
     p.add_argument("--compare",
                    help="Path to a SECOND log; show side-by-side slope "
                         "comparison instead of single-run summary. Filters "
-                        "(--externals-only / --opp / --window) apply to both.")
+                        "(--externals-only / --opp / --window / --max-iter) "
+                        "apply to both.")
+    p.add_argument("--max-iter", type=int, default=None,
+                   help="Drop records with iter > max-iter. Use with --compare "
+                        "to slice both logs to the same iter range for "
+                        "apples-to-apples slope comparison (e.g., compare a "
+                        "completed 200-iter run vs an in-flight 50-iter run by "
+                        "slicing the 200-iter one to iter<=49).")
     args = p.parse_args()
 
     if not args.log and not args.snap_dir:
@@ -306,7 +313,18 @@ def main():
     if args.window < 1:
         p.error("--window must be >= 1")
 
+    def _slice_max_iter(recs):
+        if args.max_iter is None:
+            return recs
+        out = defaultdict(list)
+        for opp, entries in recs.items():
+            for it, wr, g, kind in entries:
+                if it <= args.max_iter:
+                    out[opp].append((it, wr, g, kind))
+        return out
+
     records = load_records(args.log, args.snap_dir)
+    records = _slice_max_iter(records)
 
     if not records:
         print("No data found.", file=sys.stderr)
@@ -325,8 +343,9 @@ def main():
         label_a = f"(window={args.window})"
 
     if args.compare:
-        # Second log
+        # Second log — same filters apply (max-iter, externals, opp, window)
         records_b = load_records(args.compare, None)
+        records_b = _slice_max_iter(records_b)
         if args.window > 1:
             records_b = bucket_records(records_b, args.window)
         opps_b = filter_opps(records_b, args.externals_only,
