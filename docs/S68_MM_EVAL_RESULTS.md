@@ -9,6 +9,63 @@ val set. Procedural = our training-time team distribution.
 
 ---
 
+## ⚠️ GRAIN OF SALT — context for interpretation
+
+This doc records EMPIRICAL measurements against the MMs we have integrated into
+our training pool (mm-largerl, mm-mediumrl-aug, mm-syntheticrlv2, mm-minikazam).
+The conclusions below are **not gospel** — they're contingent on several
+limitations worth keeping in mind before treating any percentage as a definitive
+statement about elite Pokémon AI capability:
+
+1. **These MMs are weak-to-low-mid-tier opponents in the actual gen9ou ladder
+   landscape.** Even Minikazam (the strongest in our set at 92% smart_avg)
+   is not state-of-the-art. LargeRL/MediumRL/SyntheticRLV2 sit in the
+   66-71% smart_avg band — same as us — which is suggestive of "modest
+   tier" rather than "elite tier" relative to top ladder play. Matching
+   or beating these models is necessary but not sufficient for actual
+   elite capability.
+
+2. **Different MMs were trained with different strategies.** TODO: investigate
+   their respective training methodologies (architecture, data, loss, opponent
+   pool composition) — not to copy, but to understand the landscape we're
+   measuring against. A "+5pp on LargeRL" is more or less meaningful
+   depending on whether LargeRL was trained on a similar opponent
+   distribution to ours, or on something fundamentally different. Reference:
+   `metamon_ref/` (shallow clone) + the Metamon papers/repo docs.
+
+3. **Training-time WR underestimates true H2H capability by ~30+ pp.** Snap_0139
+   trained at ~13-17% vs MediumRL during PFSP collection but H2H'd at **51%**
+   against the same model on the same procedural teams. This gap is likely
+   driven by action sampling (training samples from π with ent ~1.0; eval H2H
+   uses greedy argmax). The 7-25% training-time WRs visible in Run #5/Run #6
+   per-opp logs are NOT a direct measure of elite capability — they're
+   policy quality MULTIPLIED BY exploration cost. Use H2H eval for capability
+   claims, not training-time WR.
+
+4. **Smart_avg ceiling (~70-74%) is the modest-tier band**, not a structural
+   limit. Minikazam reaches 92% — proving the metric has headroom. But it
+   takes a categorically stronger model to escape the ~74% band. Plateauing
+   at 70-74% means we're "as good as LargeRL", which is not the same as
+   "elite."
+
+5. **MC vs procedural team distribution gap is SMALL, not large** (~0-9pp
+   mean), despite my earlier framing in this doc that implied a big gap.
+   The 30+pp gap that LOOKS like "team distribution mismatch" between training
+   and eval is mostly the training-method-vs-eval-method gap (sampling vs
+   greedy), NOT the team-distribution gap. See §5 for the corrected reading.
+
+6. **All n=500/pair evals carry ~±4.5pp 95% CI noise.** Single-data-point
+   deltas under that threshold are not statistically meaningful — only
+   monotonic patterns across multiple snaps (e.g., Minikazam ↑ across
+   139/249/289) are reliable signal.
+
+**Bottom line**: Use these results to track DIRECTION of change between runs
+and to spot OBVIOUS anomalies. Don't treat any single number as proof of
+"reached MM-tier" or "broke through" — too many confounds, too much noise,
+and the MMs themselves are limited reference points.
+
+---
+
 ## 1. MMs vs smart-bots (calibration — where MMs sit vs our anchor scale)
 
 Each cell = MM win rate vs that smart bot. Mean = simple average across 4 bots.
