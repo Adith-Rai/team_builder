@@ -188,6 +188,38 @@ Source: `fishbowl_prod_lr1e-4_v1_smart_avg_digest.txt` (digest of
 
 ---
 
+## 4b. Run #5 + Run #6 best-snaps H2H vs MMs — on metamon-competitive (2026-06-09)
+
+4 snaps × 4 MMs × 500 games each. Best-snap selection: peak smart_avg + final iter.
+
+| MM (baseline snap_0139) | run5_iter189 | run5_iter199 | run6_iter159 | run6_iter199 |
+|---|---|---|---|---|
+| LargeRL (51.0%) | 49.2% (-1.8) | 52.4% (+1.4) | 53.4% (+2.4) | **54.0% (+3.0)** |
+| MediumRL_Aug (56.2%) | 53.4% (-2.8) | 54.2% (-2.0) | 52.6% (-3.6) | 54.0% (-2.2) |
+| SyntheticRLV2 (48.6%) | 48.4% (-0.2) | 49.0% (+0.4) | 48.8% (+0.2) | 46.8% (-1.8) |
+| Minikazam (16.2%) | 18.0% (+1.8) | **19.6% (+3.4)** | 19.8% (+3.6) | 19.2% (+3.0) |
+| **Mean** | **42.3** | **43.8** | **43.7** | **43.5** |
+
+**Observations** (n=500/cell, SE ~±2.2pp):
+
+- **3 of 4 snaps beat baseline aggregate** (+0.5 to +0.8pp). Net peer-level with snap_0139.
+- **All snaps beat baseline on Minikazam** (+1.8 to +3.6pp) — consistent gain on hardest opp.
+- **Run #6 dominates LargeRL** (+2.4 / +3.0pp). Best single-cell improvement.
+- **All snaps regress on MediumRL_Aug** (-2 to -3.6pp uniformly). Likely some style/coverage gap.
+- **Run #5 vs Run #6 essentially tied in H2H** (within 1pp on most matchups, except LargeRL where Run #6 leads). Run #6's SP-pool dominance does NOT transfer to MM-tier H2H.
+
+**Smart_avg vs H2H decoupling** (additional evidence for §3 pattern):
+- Run #5 iter 189 had higher smart_avg (72.75) but LOWER H2H (42.3%) than iter 199 (70.0 / 43.8%).
+- Snap selection by smart_avg peak is unreliable — might be picking ~1-2pp suboptimal snaps.
+
+**No clear breakthrough above the 1178 Elo MM-tier ceiling.** Modest +0.5-0.8pp aggregate gain is within noise on individual MMs but the directional pattern across runs is consistent.
+
+Sources:
+- `mm_vs_smartbots_20260609_174121.json` (full 16-cell matrix)
+- Local copy: `data/h2h_runs5_6_results.json`
+
+---
+
 ## 5. Comparison: smart_avg metric vs MM-tier WR
 
 | Run | smart_avg band | snap vs LargeRL (MC) | gain on MMs? |
