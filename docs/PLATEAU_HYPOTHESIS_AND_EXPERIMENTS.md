@@ -471,6 +471,46 @@ The H2H result is the actual "is AWR worth it" answer — training-time WR under
 4. **Per-opp slopes are still climbing** — runs haven't plateaued in external WR, only in smart_avg (which saturates at bot ceiling).
 5. **H2H eval is the missing data point** — training-time WR systematically underestimates capability; the H2H result on MC teams may reveal AWR's true contribution.
 
+## S68 update (2026-06-09 late): H2H results + Run #8 firing + Run #9 in backlog
+
+### H2H eval on metamon-competitive teams (n=500/cell)
+
+4 snaps × 4 MMs = 16 matchups. Best snap: **run5_iter199 at 43.8% aggregate (+0.8 vs snap_0139 baseline)**. Modest net gain across runs; 3 of 4 snaps beat baseline aggregate. See `docs/S68_MM_EVAL_RESULTS.md` §4b for full matrix.
+
+Headline patterns:
+- All 4 RL snaps beat baseline on **Minikazam** (+1.8 to +3.6pp)
+- Run #6 dominates LargeRL (+2.4 / +3.0pp)
+- All snaps regress on MediumRL_Aug (-2 to -3.6pp)
+- Run #5 vs Run #6 essentially tied in H2H despite Run #6 SP-pool dominance
+
+### Run #8 (firing 2026-06-09 evening on dev pod)
+
+**Setup**: Run #5 + `--syn-team-pct 0.50` (was 0.30). One-variable test of the syn lever. Everything else identical: BC anchor coef 0.1, AWR binary mix 0.15, lr 8e-5, full pool, 4 MMs × 3 instances.
+
+Closes the syn% axis of the ablation matrix:
+- Run #5 → Run #7 = pure anchor effect (currently firing)
+- Run #5 → Run #8 = pure syn% effect
+
+If Run #8 lands at smart_avg 70-75 plateau too → syn% NOT the lever; rules out "more elite contexts breaks the ceiling" framing. If significantly higher → syn IS a lever.
+
+### Run #9 — opponent diversity (backlog, conditional on Run #7 result)
+
+**Setup**: Run #7 + add 5/iter heuristic opponents (RandomPlayer + MaxBP + SimpleHeuristics) to PFSP pool. BC init + AWR + 30% syn + **no anchor** + heuristic-opp variety.
+
+**Motivation (PROVISIONAL)**: Run #7's early per-opp data (iters 0-30) shows the model improving vs stochastic neural opps (SP-pool +5-14pp/10it, BC init +5.1pp/10it, mm-largerl +0.4pp/10it) but losing ground vs deterministic heuristics (smart_avg 65→60). One hypothesis: anchor was pulling toward "principled / heuristic-style play" which transferred to bots. Without anchor, model develops SP-specific tactics (baiting, prediction) that don't apply to deterministic opps.
+
+User's framing: this is about **diversity in opponent distribution**, NOT smart_avg fix. Heuristics provide deterministic-style training signal that pure SP doesn't, regardless of the symptomatic smart_avg drop. The principled question: does opponent variety alone (no anchor) preserve robustness while keeping no-anchor's SP gains?
+
+**REJECTED alternative**: anchor coef 0.05 (half-strength). User pushback: "we already found a pseudo-ceiling with it" — anchor at any coef > 0 just gives a different magnitude of the same lid. Either escape the lid or don't; half-doses just delay the answer.
+
+**Cost**: ~$20, ~33 hr on dev pod. Cheap because heuristic bots run in-process (no MM server overhead).
+
+**Conditional on**:
+- Run #7 finishing as "specialization not collapse" — i.e., per-opp climbing while smart_avg drops
+- Decision that ladder robustness matters enough to test (heuristic bots ARE proxies for "predictable opponents you should be able to dispatch")
+
+**Will NOT pursue if**: Run #7 collapses (different problem, anchor was load-bearing) OR Run #7 lifts smart_avg back up on its own (no need for diversity intervention).
+
 ### Cross-references (for newer findings)
 
 - `memory/project_s68_run5_run6_results_2026_06_09.md` — full results memo with evidence labels
