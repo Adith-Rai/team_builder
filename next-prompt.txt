@@ -1,4 +1,96 @@
 ═══════════════════════════════════════════════════════════════════════════════
+⚠️  S68 RUN #5 + #6 LANDED, RUN #7 FIRING (2026-06-09)
+═══════════════════════════════════════════════════════════════════════════════
+
+**SESSION END STATE**: 2×2 ablation closed. Run #5 (BC+AWR+syn, peak 72.75) + Run #6 (BC+no-AWR+syn, peak 75.125) both 200 iters done. Both inside the 70-75 plateau. **Run #7 NOW FIRING on prod (PID 184100, launched 16:11 UTC)**: same as Run #5 but `--bc-anchor-ckpt` + `--bc-anchor-coef` REMOVED (BCAnchor: OFF). Tests whether BC anchor is the lid. H2H eval QUEUED on dev — 4 best snaps × 4 MMs × 500g on metamon-competitive teams, will auto-fire when slow snap upload completes.
+
+## Critical context
+
+- **Run #7 PID 184100 on prod** (port 47913). Log `/tmp/run7_no_anchor_awr_syn_v1.log`. Out `data/models/rl_v10/phase3_no_anchor_awr_syn_v1`. Iter 5+ post-warmup. **bc_kl is NOT in log lines** because anchor off → metric not computed by trainer. To track divergence externally, compute KL(π_run7 || π_BC) post-hoc.
+- **H2H eval auto-launcher armed** (background task `bi7wumwzb`) — waits for both Run #5 snaps to fully upload to dev, then fires `eval_mm_vs_smartbots.py` with 4 snaps + 4 MMs + 500g/pair.
+- **Manual monitoring of Run #7** per user "no hard kill rules":
+  - WR vs snap_0139 / lr8e5_v1_flash snaps dropping below 30% = degrading
+  - MM WR (mm-largerl) dropping below 5% = collapse forming
+  - smart_avg dropping below 65 = collapse forming
+  - bc_kl (compute externally) > 0.4 = warning
+
+## 2×2 results (CONFIRMED)
+
+| Run | Setup | Peak smart_avg | At iter | Final i199 |
+|---|---|---|---|---|
+| Run #3 | proc, no AWR | 74.25 | 119 | 72.0 |
+| Run #4 | proc, AWR | **75.25** | 49 | volatile (peak-then-collapse) |
+| Run #5 | syn, AWR | 72.75 | 189 | 70.0 |
+| Run #6 | syn, no AWR | **75.125** | 159 | 71.625 |
+
+**All 4 runs landed in 70-75 plateau.** Neither syn variant broke through Run #4's peak (75.25). Run #6 nearly matched it.
+
+**Run #6 dominates Run #5 on SP-pool WR** by 5-20pp on older BC-style snapshots. Both runs nearly tied on externals (Run #6 wins 5 of 6 end-of-run) and smart_avg.
+
+**Per-opp WR slopes (200 iters)**: both runs STILL CLIMBING on externals at iter 199 — not plateaued in that signal. Smart_avg saturates at bot ceiling (70-74); per-opp is the better progress metric.
+
+**bc_kl trajectories**:
+- Run #5: ~0.145 stable (AWR pulls toward BC plays → restrains)
+- Run #6: drifted 0.146 → 0.169-0.178 (anchor still binds without AWR's pull, but stretches)
+
+## Tug-of-war hypothesis REFRAMED (PROVISIONAL)
+
+Original framing: "AWR + syn closes the loop." Data refuted: Run #5 (AWR+syn) underperforms Run #6 (no AWR + syn).
+
+Reframed: **AWR and BC anchor are functionally two anchors** — both pull toward BC. Together they over-constrain divergence. Removing AWR (Run #6) explored more productively than keeping both. Run #7 tests removing the other anchor (BC anchor) instead.
+
+## Possible interpretations of plateau (PROVISIONAL)
+
+1. **BC v10 intrinsic ceiling** — model capacity / BC's learned representations cap at ~74. All RL methodology variations land in same band. Need BC v11 with quality filtering OR distillation from a stronger teacher.
+2. **BC anchor lid** — anchor at 0.1 holds bc_kl ~0.15 even when policy wants to drift further. Removing it lets policy break through. Run #7 tests this.
+3. **Combination of both** — anchor is current binding, but BC capability is the deeper ceiling.
+
+Run #7 result will distinguish #1 from #2.
+
+## What shipped this session arc (2026-06-07 → 2026-06-09)
+
+- **mmap-bundled team pool** (commit `6997a2fa`) — replaces per-worker StaticTeamPool. 75GB → ~1GB per-worker via kernel page cache sharing.
+- **MM watchdog unified trigger+confirm** (commit `c8adf696`) — 36 firings × ~270s saved each = ~3hr saved per 200-iter run.
+- **R2 team_bundles namespace** (commit `fb79af84`) — 3-min pod setup vs 20-min scp dance.
+- **Architecture review** (commit `f421b7c7`) — TransformerBattlePolicy critique, Priority 1 = switch-action representation, bundle with multi-gen rewrite.
+- **MM training strategies doc** (commit `3446211e`) — paper-era 2024 baselines + Minikazam; NOT current Metamon SOTA.
+- **S68 MM eval grain-of-salt** (commit `e0a8f98d`) — 6-point caveat header on the eval doc.
+- **analyze_per_opp_trajectory** (`--window N` + `--compare LOG2` + `--max-iter`) — per-10-iter aggregated trends with slope/pattern.
+- **Run #7 launch script** (commit `cfb95ab1`) — no-anchor variant.
+
+## Disk on prod cleaned (2026-06-09)
+
+83% → 76% used. ~11 GB freed:
+- s62_artifacts (5.6 GB) — old chrome traces
+- s64_artifacts (2.0 GB) — old chrome traces
+- v2_dense_combined_resume_iter129 (2.4 GB) — old superseded experiment
+- smoke_bc_awr_syn_v1 (916 MB) — smoke test outputs
+- v2_dense_terminal_iter129_eval_peak (230 MB) — old experiment
+- awr_phase3_v1/v2_packed (small) — empty dirs
+- Old /tmp logs (~200 MB)
+
+All pool anchors verified — none of the deleted dirs were referenced. 18 anchors still missing but all from `phase2_lr3e5_v1` which was deleted in a PRIOR cleanup (refuted experiment).
+
+## What to do NEXT SESSION
+
+1. **Check Run #7 trajectory** — has bc_kl drifted? smart_avg trend? WR vs strong SP pool members holding?
+2. **Pull H2H eval results** if completed — `/tmp/h2h_run5_6_eval.log` + JSON output. Compare 4 snaps vs MMs on MC teams.
+3. **Decide based on data**:
+   - Run #7 breaks plateau → BC anchor was the lid → consider Run #8 (no anchor + no AWR) to confirm
+   - Run #7 plateaus same → BC v10 intrinsic ceiling → BC v11 becomes priority (with bundled arch review items per `docs/ARCHITECTURE_REVIEW_2026_06_07.md`)
+   - Run #7 collapses → AWR + syn + MMs are insufficient grounding; revisit
+4. **H2H eval result** is the critical missing data — training-time WR underestimates H2H by ~30pp; AWR's true contribution may show here even if invisible in training signals
+
+## Files to READ next session
+
+- `memory/project_s68_run5_run6_results_2026_06_09.md` — full results + interpretations
+- `memory/project_s68_team_data_arc_2026_06_07.md` — design + infra context
+- `docs/PLATEAU_HYPOTHESIS_AND_EXPERIMENTS.md` — strategic framework + 2×2 update
+- `docs/MM_TRAINING_STRATEGIES.md` — context on what MMs actually are
+- `docs/S68_MM_EVAL_RESULTS.md` (grain-of-salt section) — H2H baseline data
+- `data/cloud_runs/awr_phase3_v3/launch_run7_no_anchor_awr_syn_v1.sh` — Run #7 spec
+
+═══════════════════════════════════════════════════════════════════════════════
 ⚠️  S68 TEAM-DATA ARC (2026-06-07, RUN #5 + RUN #6 IN FLIGHT — 2×2 ABLATION CLOSING)
 ═══════════════════════════════════════════════════════════════════════════════
 

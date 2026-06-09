@@ -385,3 +385,95 @@ Same 60% hl_05_26 / 40% gl_05_26 syn mix for both, 200 iters each. Within-pod ab
 - All ~flat → either tug-of-war hypothesis is wrong, or 30% syn ratio is too low → revisit
 
 **Infra shipped to support this** (commit `6997a2fa` mmap + `c8adf696` watchdog + `fb79af84` R2 bundles): see `memory/project_s68_team_data_arc_2026_06_07.md` for the architectural story. mmap-bundle scales O(1) per worker for multi-gen via kernel page cache; MM watchdog catches poke-env hangs in 30s instead of 300s (live-validated 3× in Run #5).
+
+## S68 update (2026-06-09): Run #5 + #6 results → tug-of-war hypothesis REFRAMED, Run #7 firing
+
+### Final smart_avg (200 iters)
+
+| Run | Setup | Peak | At iter | Final iter 199 |
+|---|---|---|---|---|
+| Run #3 (done) | proc, no AWR | 74.25 | 119 | 72.0 |
+| Run #4 (done) | proc, AWR | **75.25** | 49 | volatile (peak-then-collapse) |
+| **Run #5 (done)** | syn, AWR | 72.75 | 189 | 70.0 |
+| **Run #6 (done)** | syn, no AWR | **75.125** | 159 | 71.625 |
+
+**All 4 runs landed in the 70-75 plateau.** Neither syn-team variant broke through. Run #6 nearly matched Run #4's all-time peak (75.125 vs 75.25) but then drifted back into the band.
+
+### Per-opp WR slope over full 200 iters (externals)
+
+```
+Opp                  | Run #5 final WR / slope | Run #6 final WR / slope
+mcts-fast            | 26.2% / +0.39           | 28.7% / +0.48
+mcts-medium          | 30.0% / +0.49           | 30.4% / +0.54
+mm-largerl           | 15.8% / +0.37           | 17.2% / +0.37
+mm-mediumrl-aug      | 17.0% / +0.31           | 18.7% / +0.38
+mm-minikazam         | 11.7% / +0.21           | 11.0% / +0.20
+mm-syntheticrlv2     | 16.0% / +0.34           | 16.9% / +0.34
+```
+
+**Run #6 wins 5 of 6 externals end-of-run.** Run #5 only edges on mm-minikazam (the hardest opp). Both still climbing on external WR at iter 199 — neither plateaued in this signal yet.
+
+### SP-pool WR — Run #6 dominates
+
+Per-snap WR vs prior pool members (BC v10 + 150 historical anchors):
+
+| SP Opponent | Run #5 final | Run #6 final | Lead |
+|---|---|---|---|
+| v10_padded (BC) | 62.7 | ~65.1 | Run #6 +2.4 |
+| prod_1600g_snap_0009 | 56.7 | 64.5 | Run #6 +7.8 |
+| snapshot_0049 (older) | 40.8 | 60.4 | **Run #6 +19.6** ⭐⭐ |
+
+On older / BC-stylistic snaps, Run #6 wins decisively (+5-20pp). Closer on more recent snaps that themselves diverged from BC.
+
+### bc_kl trajectories
+
+Both runs used `--bc-anchor-coef 0.1`.
+- **Run #5**: bc_kl stable at ~0.145 (AWR pulls toward BC plays → restrains divergence)
+- **Run #6**: drifted upward 0.146 → 0.169-0.178 (without AWR's pull, anchor still bounds but lets it stretch)
+
+Both stayed within anchor-allowed envelope. Neither collapsed. Run #6's drift CONFIRMS the anchor is the binding constraint.
+
+### Tug-of-war hypothesis REFRAMED (PROVISIONAL)
+
+**Original hypothesis (refuted as framed):** "AWR + syn closes the loop — AWR pulls toward elite plays, syn-team context lets PPO reward them."
+
+**Data shows:** AWR + syn (Run #5) consistently UNDERPERFORMS no-AWR + syn (Run #6) across SP-pool, externals end-state, and smart_avg peak. AWR appears to be REDUNDANT with BC anchor — both pull toward BC.
+
+**Reframed hypothesis (PROVISIONAL):** AWR and BC anchor are functionally two anchors. Together they over-constrain divergence. Removing either (Run #6 = no AWR; Run #7 = no anchor — see below) lets the policy explore more productively.
+
+### Run #7 — testing the BC anchor hypothesis (firing 2026-06-09)
+
+Launched 2026-06-09 16:11 UTC on prod. Same as Run #5 with `--bc-anchor-ckpt` and `--bc-anchor-coef` REMOVED entirely (`BCAnchor: OFF` verified). AWR still present (binary mix 0.15), syn 30%, full pool, MMs.
+
+**Tests:** is the BC anchor the lid? If Run #7 escapes 70-75 plateau → anchor was the lid. If Run #7 also plateaus → BC v10 intrinsic ceiling, need BC v11.
+
+**Safety**: AWR + syn teams + strong SP pool (snap_0139 etc) + MMs provide multiple grounding signals that Phase 1 v3 didn't have. Manual eyeball monitoring (no hard kill rules) for WR vs strong snaps + MM WR + smart_avg.
+
+200 iters projected ~33hr. Currently at iter 6 (post-warmup, kl=0.018 — slightly elevated vs Run #5's ~0.010 due to no anchor restraint; not alarming).
+
+### H2H eval queued
+
+When snap upload completes, 4 snaps × 4 MMs × 500g tournament on metamon-competitive teams. Best snaps:
+- Run #5 iter 189 (peak 72.75)
+- Run #5 iter 199 (final 70.0)
+- Run #6 iter 159 (peak 75.125)
+- Run #6 iter 199 (final 71.625)
+
+Compare to snap_0139 baseline (51% / 56% / 49% / 16% vs LargeRL/MedRL/SynRL/Mini).
+
+The H2H result is the actual "is AWR worth it" answer — training-time WR underestimates H2H by ~30pp due to action sampling vs greedy argmax. AWR's contribution may show up here even if invisible in training-time signals.
+
+### Bottom line so far (PROVISIONAL)
+
+1. **Adding syn teams didn't break the plateau** — both Run #5 and Run #6 landed in the same 70-75 band as Run #3 + Run #4.
+2. **AWR + BC anchor together appear redundant** — Run #6 (anchor only) explored more productively than Run #5 (anchor + AWR).
+3. **The lid is either BC v10 (intrinsic ceiling) or BC anchor (configurable)** — Run #7 will distinguish.
+4. **Per-opp slopes are still climbing** — runs haven't plateaued in external WR, only in smart_avg (which saturates at bot ceiling).
+5. **H2H eval is the missing data point** — training-time WR systematically underestimates capability; the H2H result on MC teams may reveal AWR's true contribution.
+
+### Cross-references (for newer findings)
+
+- `memory/project_s68_run5_run6_results_2026_06_09.md` — full results memo with evidence labels
+- `memory/project_s68_team_data_arc_2026_06_07.md` — design + infra context
+- `docs/MM_TRAINING_STRATEGIES.md` — what each MM we benchmark actually is
+- `docs/S68_MM_EVAL_RESULTS.md` (with grain-of-salt section) — H2H baseline data
