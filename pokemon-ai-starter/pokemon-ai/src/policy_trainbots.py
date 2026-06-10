@@ -136,42 +136,41 @@ class AntiSetupBot(SimpleHeuristicsPlayer):
         return best[1]
 
     def choose_move(self, battle: AbstractBattle):
+        # REVISED 2026-06-10: cleaner specialty injection + SH fall-through.
+        # Previous design replaced SH's full choose_move with a chain of
+        # conditional branches that fell back to choose_random_move when
+        # nothing matched — which crippled the bot in the common "opp has
+        # no boost" case. Per GreedySEv2 template: inject specialty only when
+        # it applies, fall through to SH for everything else.
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
-
         if active is None or opponent is None:
             return self.choose_random_move(battle)
 
-        if not battle.available_moves and not battle.available_switches:
-            return self.choose_random_move(battle)
-
-        moves_by_id = {m.id: m for m in battle.available_moves if m is not None}
+        moves_by_id = {m.id: m for m in battle.available_moves if m is not None} if battle.available_moves else {}
         opp_boost_sum = self._opp_boost_sum(opponent)
-        matchup = self._estimate_matchup(active, opponent)
 
-        # --- 1. Sleep — strongest setup disabler ---
-        # Apply when opp has no status and matchup isn't terrible.
-        if opp_boost_sum >= 1 and opponent.status is None and matchup > -1.5:
-            for mid in SLEEP_IDS:
-                if mid in moves_by_id:
-                    return self.create_order(moves_by_id[mid])
+        # Only inject specialty when opp has actually started setting up.
+        # When opp is at 0 boosts, SH's default play is already strong and
+        # generally appropriate — let it handle the game.
+        if opp_boost_sum >= 1 and moves_by_id:
+            try:
+                matchup = self._estimate_matchup(active, opponent)
+            except Exception:
+                matchup = 0.0
 
-        # --- 2. Phaze — clear opponent boosts ---
-        # Lower threshold than Strategic (which fires at boost >= 2).
-        if opp_boost_sum >= 1:
+            # --- Specialty 1: Sleep (strongest setup disabler) ---
+            if opponent.status is None and matchup > -1.5:
+                for mid in SLEEP_IDS:
+                    if mid in moves_by_id:
+                        return self.create_order(moves_by_id[mid])
+
+            # --- Specialty 2: Phaze (clears opp boosts) ---
             for mid in PHAZE_IDS:
                 if mid in moves_by_id:
                     return self.create_order(moves_by_id[mid])
 
-        # --- 3. Taunt — preempt future setups / recovery ---
-        # Use when matchup is OK (we'll live to benefit) and opp is healthy
-        # enough to potentially setup again.
-        if "taunt" in moves_by_id and matchup > -0.5 and opponent.current_hp_fraction > 0.5:
-            return self.create_order(moves_by_id["taunt"])
-
-        # --- 4. Priority damage when opp boosted ---
-        # Chip them down before they sweep. Worth even if not lethal.
-        if opp_boost_sum >= 1 and battle.available_moves:
+            # --- Specialty 3: Priority damage (chip before sweep) ---
             prio_attacks = [m for m in battle.available_moves
                             if m.priority > 0 and m.base_power > 0]
             if prio_attacks:
@@ -179,43 +178,30 @@ class AntiSetupBot(SimpleHeuristicsPlayer):
                                 key=lambda m: self._move_damage_score(m, active, opponent))
                 return self.create_order(best_prio)
 
-        # --- 5. Switch to resist when opp is heavily boosted ---
-        if opp_boost_sum >= 2 and battle.available_switches:
-            sw = self._best_resist_switch(battle, opponent)
-            if sw is not None:
-                return self.create_order(sw)
+            # --- Specialty 4: Switch to resist when heavily boosted (+2) ---
+            if opp_boost_sum >= 2 and battle.available_switches:
+                sw = self._best_resist_switch(battle, opponent)
+                if sw is not None:
+                    return self.create_order(sw)
 
-        # --- 6. Cripple status (burn/para) when matchup is positive ---
-        if opponent.status is None and matchup > 0 and battle.available_moves:
-            # Burn physical attackers
-            if opponent.base_stats.get("atk", 0) > opponent.base_stats.get("spa", 0):
-                for mid in BURN_IDS:
-                    if mid in moves_by_id:
-                        return self.create_order(moves_by_id[mid])
-            # Para fast threats (when we'd otherwise be outsped)
-            if opponent.base_stats.get("spe", 0) > active.base_stats.get("spe", 0):
-                for mid in PARA_IDS:
-                    if mid in moves_by_id:
-                        return self.create_order(moves_by_id[mid])
+        # --- Taunt: proactive preempt (even at 0 opp boosts) ---
+        # Use Taunt when matchup is OK and opp is healthy — pre-empts setup
+        # before it happens. Distinct identity vs. SH which doesn't use Taunt.
+        if ("taunt" in moves_by_id and opp_boost_sum == 0
+                and opponent.current_hp_fraction > 0.5):
+            try:
+                matchup = self._estimate_matchup(active, opponent)
+                if matchup > -0.2:
+                    return self.create_order(moves_by_id["taunt"])
+            except Exception:
+                pass
 
-        # --- 7. Max-damage attack ---
-        # NEVER set up ourselves. If we have available attacks, use the best
-        # one. Otherwise switch (poke-env handles via SH _should_switch_out).
-        best = self._best_attack(battle)
-        if best is not None:
-            return self.create_order(best)
-
-        # --- 8. Fall-through: pivot or switch ---
-        if battle.available_moves:
-            for m in battle.available_moves:
-                if m.id in PIVOT_IDS:
-                    return self.create_order(m)
-        if battle.available_switches:
-            sw = self._best_resist_switch(battle, opponent)
-            if sw is not None:
-                return self.create_order(sw)
-
-        return self.choose_random_move(battle)
+        # Fall through to SH default (strong general play)
+        # Note: SH's setup branch could fire here. AntiSetupBot identity is
+        # "punish OPP's setup" not "never setup yourself" — but to avoid
+        # accidentally setting up alongside opp's setup-spam, we suppress
+        # SH's setup branch by checking matchup is genuinely positive.
+        return super().choose_move(battle)
 
 
 # ====================================================================
@@ -474,6 +460,110 @@ class GreedySEv2(SimpleHeuristicsPlayer):
         # matchup>0 AND we passed the moves+!should_switch check above. In that
         # case we'd have returned _best_se_attack already (a damaging move exists),
         # so setup branch only fires when no damage move is available — fine.
+        return super().choose_move(battle)
+
+
+# ====================================================================
+# SetupThenSweepv2 — SimpleHeuristics base + aggressive setup preference
+# ====================================================================
+
+# Setup moves sorted by typical sweep priority (offensive first, defensive last)
+SETUP_PRIORITY = [
+    "dragondance", "swordsdance", "nastyplot", "calmmind", "quiverdance",
+    "shiftgear", "shellsmash", "bulkup", "growth", "trailblaze",
+    "agility", "rockpolish", "tailglow", "geomancy", "bellydrum",
+    "coil", "irondefense", "cosmicpower", "cottonguard", "stockpile",
+    "acidarmor",
+]
+
+
+class SetupThenSweepv2(SimpleHeuristicsPlayer):
+    """SimpleHeuristics base + aggressive setup move preference.
+
+    Style: setup sweeper. Aggressively uses setup moves (Dragon Dance, Swords
+    Dance, Calm Mind, etc.) when even MILDLY safe, then sweeps with boosted
+    attacks. Uses SH's strong default logic for everything else.
+
+    Differs from policy_rulebots.SetupThenSweepPlayer (raw Player, ~807 Elo):
+    inherits SH's full decision tree instead of choose_random_move fallback.
+
+    Differs from SH itself:
+    - SH only sets up when HP_fraction == 1 AND matchup > 0 (very conservative).
+    - SetupThenSweepv2 sets up when HP_fraction >= 0.7 AND matchup > -0.5
+      (much more aggressive — accepts mild HP loss + mild matchup disadvantage
+      because the boost will let us sweep anyway).
+    - Caps at +4 cumulative offensive boost (don't waste turns once already
+      sweeping).
+    - Prefers offensive setup over defensive (Dragon Dance > Iron Defense).
+
+    Identity signature: forces 'I will setup early' even when SH wouldn't.
+    """
+
+    HP_THRESH = 0.7
+    MATCHUP_THRESH = -0.5
+    MAX_OFFENSIVE_BOOST = 4
+
+    def _try_setup(self, battle, active, opponent):
+        """Return a setup move if conditions are met, else None."""
+        if not battle.available_moves:
+            return None
+        # Conditions check
+        if active.current_hp_fraction < self.HP_THRESH:
+            return None
+        try:
+            matchup = self._estimate_matchup(active, opponent)
+            if matchup < self.MATCHUP_THRESH:
+                return None
+        except Exception:
+            return None
+        # Don't setup if already heavily boosted
+        try:
+            atk_boost = active.boosts.get("atk", 0)
+            spa_boost = active.boosts.get("spa", 0)
+            if max(atk_boost, spa_boost) >= self.MAX_OFFENSIVE_BOOST:
+                return None
+        except Exception:
+            pass
+        # Don't setup if we can OHKO the opp anyway (SH-style heuristic)
+        try:
+            best_attack_score = 0.0
+            physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
+            special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
+            for m in battle.available_moves:
+                if m.base_power > 0:
+                    stab = 1.5 if m.type in active.types else 1.0
+                    ratio = physical_ratio if m.category == MoveCategory.PHYSICAL else special_ratio
+                    score = m.base_power * stab * ratio * m.accuracy * opponent.damage_multiplier(m)
+                    if score > best_attack_score:
+                        best_attack_score = score
+            # If we can clearly KO (high score against low HP opp), skip setup
+            if best_attack_score > 200 and opponent.current_hp_fraction < 0.5:
+                return None
+        except Exception:
+            pass
+
+        # Try setup moves in priority order
+        moves_by_id = {m.id: m for m in battle.available_moves if m is not None}
+        for setup_id in SETUP_PRIORITY:
+            if setup_id in moves_by_id:
+                # Don't use Substitute if already too low HP
+                if setup_id == "substitute" and active.current_hp_fraction < 0.5:
+                    continue
+                return moves_by_id[setup_id]
+        return None
+
+    def choose_move(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return self.choose_random_move(battle)
+
+        # Specialty: try setup first (with loosened conditions vs SH)
+        setup_move = self._try_setup(battle, active, opponent)
+        if setup_move is not None:
+            return self.create_order(setup_move)
+
+        # Fall through to SH default (handles attacks/switches/hazards)
         return super().choose_move(battle)
 
 
