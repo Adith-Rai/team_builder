@@ -48,10 +48,12 @@ def move_new_replays(before, dest_dir):
     return n
 
 
-async def run_matchup(snap_path, snap_cached, bot_name, n_games, server_cfg, teambuilder, concurrency):
+async def run_matchup(snap_path, snap_cached, bot_name, n_games, server_cfg, teambuilder, concurrency, match_idx=0):
     """Play snap vs one bot for n_games, save replays."""
-    snap_account = AccountConfiguration(f"Sm{os.getpid() % 999}", None)
-    bot_account = AccountConfiguration(f"B{bot_name[:6]}{os.getpid() % 99}", None)
+    # Unique account names per matchup to avoid showdown username collision
+    suffix = f"{os.getpid() % 999}m{match_idx}"
+    snap_account = AccountConfiguration(f"Sm{suffix}", None)
+    bot_account = AccountConfiguration(f"B{bot_name[:5]}{suffix}", None)
 
     common = dict(
         battle_format="gen9ou",
@@ -109,9 +111,9 @@ async def main_async(snap_path, bots, n_games, server_url, concurrency):
     teambuilder = random_pool_teambuilder()
 
     results = []
-    for bot_name in bots:
+    for idx, bot_name in enumerate(bots):
         print(f"\n=== {bot_name} ===", flush=True)
-        r = await run_matchup(snap_path, snap_cached, bot_name, n_games, server_cfg, teambuilder, concurrency)
+        r = await run_matchup(snap_path, snap_cached, bot_name, n_games, server_cfg, teambuilder, concurrency, match_idx=idx)
         results.append(r)
         print(f"  snap {r['snap_wins']}-{r['bot_wins']} ({r['snap_wr']*100:.0f}% snap WR, {r['elapsed_s']}s, {r['n_replays']} replays @ {r['replay_dir']})", flush=True)
 
