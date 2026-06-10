@@ -2103,6 +2103,24 @@ def _run_collect_in_worker_cis(*, cis_handle, device, worker_id, iter_n,
                             f"CISei{worker_id}r{batch_id}", None),
                         server_configuration=srv,
                     )
+                elif factory_type == "heuristic":
+                    # S68 (2026-06-10) heuristic-bot adapter — in-process
+                    # Player from policy_trainbots / policy_rulebots / poke_env.
+                    from external_adapters import _resolve_heuristic_class
+                    bot_class_name = f_kwargs.get("bot_class")
+                    if not bot_class_name:
+                        print(f"[cis-w{worker_id}] heuristic missing bot_class "
+                              f"for {opp_key}; skipping", flush=True)
+                        return
+                    bot_cls = _resolve_heuristic_class(bot_class_name)
+                    opponent = bot_cls(
+                        battle_format=battle_format,
+                        team=p2_tb,
+                        max_concurrent_battles=min(max_concurrent, n_for_opp),
+                        account_configuration=AccountConfiguration(
+                            f"CISeh{worker_id}r{batch_id}", None),
+                        server_configuration=srv,
+                    )
                 else:
                     print(f"[cis-w{worker_id}] unknown external_inprocess "
                           f"factory_type={factory_type} for {opp_key}; skipping",
@@ -3400,9 +3418,14 @@ def _estimate_per_game_seconds(opp_msg: dict) -> float:
     per opp by wall-time cost rather than game count."""
     kind = opp_msg.get("kind", "local")
     if kind == "external_inprocess":
+        f_kwargs = opp_msg.get("factory_kwargs", {})
+        factory_type = f_kwargs.get("factory_type", "pokeengine")
+        if factory_type == "heuristic":
+            # In-process Python heuristic bot — fast (~3s/game like
+            # local self-play, no MCTS search budget).
+            return 3.0
         # MCTS via poke-engine: ~25 turns × search_time_ms + ~5s overhead
         # (state-build, network, choose_move serialization).
-        f_kwargs = opp_msg.get("factory_kwargs", {})
         st_ms = int(f_kwargs.get("search_time_ms", 200))
         return st_ms * 0.025 + 5.0
     if kind == "external_subprocess":

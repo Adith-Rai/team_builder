@@ -88,6 +88,81 @@ def _factory_pokeengine(spec: dict, _ctx: dict) -> Tuple[PoolEntry, Optional[Ext
     return entry, None  # no subprocess to manage
 
 
+def _factory_heuristic(spec: dict, ctx: dict) -> Tuple[PoolEntry, List]:
+    """In-process heuristic-bot adapter (S68 2026-06-10).
+
+    YAML spec:
+      - name: heur-greedysev2
+        type: heuristic
+        bot_class: GreedySEv2
+        weight: 1.0
+
+    Supported bot_class values (mapped to imports lazily in worker):
+      From policy_trainbots.py (v2 set, SH-base, ~950-1043 Elo):
+        GreedySEv2, SetupThenSweepv2, SwitchAwareEscapev3,
+        HazardSensev2, AntiSetupBot, StrategicV2, SwitchAwareEscapeV2
+      From policy_rulebots.py (raw Player base, ~730-830 Elo):
+        GreedySEPlayer, HazardSensePlayer, SwitchAwareEscapePlayer, SetupThenSweepPlayer
+      From poke_env.player.baselines:
+        RandomPlayer, MaxBasePowerPlayer
+        (SimpleHeuristicsPlayer is excluded — it's the eval SH bot.)
+
+    Returns (PoolEntry, []) — no subprocess (in-process Player instance).
+    """
+    name = spec["__name__"]
+    weight = spec["__weight__"]
+    bot_class_name = spec.get("bot_class")
+    if not bot_class_name:
+        raise ValueError(f"heuristic adapter {name!r} missing required 'bot_class' field")
+
+    def _build(server_configuration, account_configuration, team,
+               battle_format, max_concurrent_battles, **kw):
+        # Lazy import so training works when the bot modules aren't on path
+        bot_cls = _resolve_heuristic_class(bot_class_name)
+        return bot_cls(
+            battle_format=battle_format,
+            team=team,
+            max_concurrent_battles=max_concurrent_battles,
+            account_configuration=account_configuration,
+            server_configuration=server_configuration,
+        )
+
+    entry = PoolEntry(
+        kind="external", key=name, factory=_build, weight=weight,
+        factory_kwargs={"factory_type": "heuristic", "bot_class": bot_class_name},
+    )
+    return entry, []  # no subprocess to manage
+
+
+def _resolve_heuristic_class(name: str):
+    """Map bot_class name string to the actual Python class (lazy import)."""
+    # Try policy_trainbots first (v2 set is the primary target)
+    try:
+        import policy_trainbots as _train
+        if hasattr(_train, name):
+            return getattr(_train, name)
+    except ImportError:
+        pass
+    # Fall back to policy_rulebots (raw originals)
+    try:
+        import policy_rulebots as _rule
+        if hasattr(_rule, name):
+            return getattr(_rule, name)
+    except ImportError:
+        pass
+    # Final fallback: poke-env baselines (Random, MaxBP)
+    try:
+        from poke_env.player import baselines as _baseline
+        if hasattr(_baseline, name):
+            return getattr(_baseline, name)
+    except ImportError:
+        pass
+    raise ValueError(
+        f"heuristic bot_class {name!r} not found in policy_trainbots, "
+        f"policy_rulebots, or poke_env.player.baselines"
+    )
+
+
 def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpponent]]:
     """Subprocess adapter — spawns metamon_accept_serve.py in metamon_venv.
 
@@ -323,6 +398,13 @@ _FACTORY_REGISTRY = {
     # Real Foul Play (full strategy: prepare_battles + multi-MCTS averaging).
     "foulplay": _factory_foulplay,
     "metamon": _factory_metamon,
+    # S68 (2026-06-10) heuristic-bot training adapter — in-process Player
+    # instances from policy_smartbots / policy_rulebots / policy_trainbots.
+    # Designed for Run #9 heuristic-opp diversity: provides categorically-
+    # different decision processes (not BC-derived neural opps) as training
+    # guardrails. See memory/project_s68_bot_elo_findings_2026_06_10.md +
+    # the user's "guardrails" framing.
+    "heuristic": _factory_heuristic,
 }
 
 

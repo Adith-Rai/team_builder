@@ -1,0 +1,88 @@
+# Phase 3 / Run #9 external adapter pool: 3 MCTS + 4 MM + 5 heuristic v2 bots.
+#
+# Extends external_adapters_phase3_full_v1.yaml (Run #7 setup) by adding the
+# 5 v2 heuristic bots designed in S68 (2026-06-10). All v2 bots inherit
+# SimpleHeuristicsPlayer for strong baseline play and add a distinct decision
+# specialty. Elo measured at 949-1043 (vs SH=1000 anchor) on dev pod.
+#
+# Heuristic bots are IN-PROCESS — no subprocess overhead, ~3s/game cost
+# (similar to local self-play, much cheaper than MCTS 100+ms search budget).
+#
+# Per-iter slot allocation (when used with --n-ext-per-iter 9):
+#   - MCTS-fast, MCTS-medium: 2 search-based opps
+#   - 4 MMs (LargeRL, MediumRL_Aug, SyntheticRLV2, Minikazam): 4 RL-trained
+#     opps with neural decision processes
+#   - 5 heuristic v2 bots: GreedySEv2, SetupThenSweepv2, SwitchAwareEscapev3,
+#     HazardSensev2, AntiSetupBot — rule-based decisions, categorically
+#     different from BC-derived neural opps. PFSP-weighted within ext slots.
+
+opponents:
+
+# --- MCTS opponents (search-based, 2) ---
+- name: mcts-fast
+  type: mcts
+  search_time_ms: 100
+  weight: 1.0
+- name: mcts-medium
+  type: mcts
+  search_time_ms: 300
+  weight: 1.0
+
+# --- Metamon RL opponents (4 MMs, 3 instances each = 12 subprocesses) ---
+- name: mm-largerl
+  type: metamon
+  model: LargeRL
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 3
+- name: mm-mediumrl-aug
+  type: metamon
+  model: MediumRL_Aug
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 3
+- name: mm-syntheticrlv2
+  type: metamon
+  model: SyntheticRLV2
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 3
+- name: mm-minikazam
+  type: metamon
+  model: Minikazam
+  temperature: 0.01
+  server_port: 9000
+  weight: 1.0
+  instances: 3
+
+# --- Heuristic v2 bots (5, in-process, ~3s/game cost) ---
+# S68 2026-06-10. Each provides categorically-different decision process.
+# Elo measured on dev pod ladder (30g/matchup, SH=1000 anchor):
+#   GreedySEv2          1043   greedy super-effective attacker
+#   SetupThenSweepv2    1031   forced setup at HP>=70% then sweep
+#   SwitchAwareEscapev3 1012   offensive-pivot specialist
+#   AntiSetupBot         968   anti-setup punisher (phaze/taunt/priority)
+#   HazardSensev2        949   hazards-first utility
+- name: heur-greedysev2
+  type: heuristic
+  bot_class: GreedySEv2
+  weight: 1.0
+- name: heur-setupthen
+  type: heuristic
+  bot_class: SetupThenSweepv2
+  weight: 1.0
+- name: heur-switchaware
+  type: heuristic
+  bot_class: SwitchAwareEscapev3
+  weight: 1.0
+- name: heur-antisetup
+  type: heuristic
+  bot_class: AntiSetupBot
+  weight: 1.0
+- name: heur-hazardsense
+  type: heuristic
+  bot_class: HazardSensev2
+  weight: 1.0
