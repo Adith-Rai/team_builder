@@ -397,6 +397,87 @@ class StrategicV2(SimpleHeuristicsPlayer):
 
 
 # ====================================================================
+# GreedySEv2 — SimpleHeuristics base + greedy super-effective preference
+# ====================================================================
+
+class GreedySEv2(SimpleHeuristicsPlayer):
+    """SimpleHeuristics base + 'always prefer super-effective' move preference.
+
+    Style: greedy attacker. Picks the most super-effective attacking move
+    available, breaking ties by effective power. Uses SH's strong default
+    logic for switching, hazards, and fallback decisions.
+
+    Differs from policy_rulebots.GreedySEPlayer (raw Player base, ~790 Elo):
+    inherits SH's full decision tree instead of falling back to choose_random_move
+    when no attacks fit the greedy-SE template. Preserves the "always SE first"
+    identity in the move scorer.
+
+    Differs from SH itself in move selection: SH picks max(bp * stab * ratio *
+    accuracy * type_mult) — a smooth damage maximizer. GreedySEv2 sorts
+    lexicographically by (type_mult, effective_power) — strictly prefers a 4x
+    move over a 1x move even if BP is lower. This preserves the distinctive
+    "greedy SE" identity.
+
+    Does NOT setup itself (greedy attackers don't setup) — overrides SH's
+    setup branch by checking matchup first and trying to attack.
+    """
+
+    def _best_se_attack(self, battle, active, opponent):
+        """Greedy super-effective move selection.
+
+        Sorts attacking moves by (type_effectiveness, effective_power) lexicographic,
+        matching policy_rulebots.GreedySEPlayer's "always pick SE first" semantic.
+        """
+        legal = [m for m in battle.available_moves if m is not None and m.base_power > 0]
+        if not legal:
+            return None
+        try:
+            physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
+            special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
+        except Exception:
+            physical_ratio = special_ratio = 1.0
+
+        scored = []
+        for m in legal:
+            try:
+                type_mult = opponent.damage_multiplier(m)
+            except Exception:
+                type_mult = 1.0
+            stab = 1.5 if m.type in active.types else 1.0
+            cat_ratio = physical_ratio if m.category == MoveCategory.PHYSICAL else special_ratio
+            effective_power = m.base_power * stab * cat_ratio * m.accuracy
+            scored.append((type_mult, effective_power, m))
+
+        # Sort by (type_mult, effective_power) descending — original GreedySE semantic
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return scored[0][2]
+
+    def choose_move(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+
+        if active is None or opponent is None:
+            return self.choose_random_move(battle)
+
+        # Check: should we switch out per SH logic?
+        # Same gate SH uses: if we have moves AND (not should_switch OR no switches available)
+        if battle.available_moves and (
+            not self._should_switch_out(battle) or not battle.available_switches
+        ):
+            # Try greedy-SE attack first (overrides SH's smooth damage maximizer)
+            best = self._best_se_attack(battle, active, opponent)
+            if best is not None:
+                return self.create_order(best)
+
+        # Fall through to SH (handles switch-out, hazards, etc.)
+        # Note: SH's setup branch could fire here, but only if active HP=100% AND
+        # matchup>0 AND we passed the moves+!should_switch check above. In that
+        # case we'd have returned _best_se_attack already (a damaging move exists),
+        # so setup branch only fires when no damage move is available — fine.
+        return super().choose_move(battle)
+
+
+# ====================================================================
 # SwitchAwareEscapeV2 — original pivot trigger + stat-disadvantage trigger
 # ====================================================================
 

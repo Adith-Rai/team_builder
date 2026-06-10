@@ -125,7 +125,7 @@ from poke_env.player.baselines import (
 
 from battle_agent import BattleAgent
 from policy_smartbots import SmartDamagePlayer, TacticalPlayer, StrategicPlayer
-from policy_trainbots import AntiSetupBot, StrategicV2, SwitchAwareEscapeV2
+from policy_trainbots import AntiSetupBot, StrategicV2, SwitchAwareEscapeV2, GreedySEv2
 from policy_rulebots import (
     GreedySEPlayer, HazardSensePlayer, SwitchAwareEscapePlayer, SetupThenSweepPlayer,
 )
@@ -171,6 +171,7 @@ TRAIN_BOTS = {
     "AntiSetupBot":      AntiSetupBot,
     "StrategicV2":       StrategicV2,
     "SwitchAwareEscapeV2": SwitchAwareEscapeV2,
+    "GreedySEv2":        GreedySEv2,
 }
 
 # All 10 + 3 bots — full anchor set. Per Session 23 round-robin (50 games × 45 matchups):
