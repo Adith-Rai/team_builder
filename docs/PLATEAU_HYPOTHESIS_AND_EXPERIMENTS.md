@@ -471,6 +471,52 @@ The H2H result is the actual "is AWR worth it" answer — training-time WR under
 4. **Per-opp slopes are still climbing** — runs haven't plateaued in external WR, only in smart_avg (which saturates at bot ceiling).
 5. **H2H eval is the missing data point** — training-time WR systematically underestimates capability; the H2H result on MC teams may reveal AWR's true contribution.
 
+## S68 update (2026-06-10 early UTC): Run #7 transition CONFIRMED + Elo ladder findings
+
+After the Run #5/#6 H2H eval landed yesterday + a deep dive into Run #7 today, the picture has shifted meaningfully:
+
+### Bot Elo ladder findings (CONFIRMED, n=30 g/matchup)
+
+3-snap × 13-bot Bradley-Terry tournament: Run #5 peak iter189 (1184 Elo) + Run #6 peak iter159 (1160) + Run #7 snap_0039 (970). **Run #7 is ~200 Elo BELOW the anchored peaks** — real capability loss, not measurement artifact.
+
+Best non-eval setup-spam punishers (15-30pp differential between policies):
+- StrategicV2 (+30pp), SetupThenSweep (+24pp), HazardSense (+22pp), AntiSetupBot (+18pp), GreedySE (+18pp)
+
+Original Strategic still beats my new StrategicV2 (991 vs 884) — loosening conditions made it worse.
+
+Full results: `memory/project_s68_bot_elo_findings_2026_06_10.md` + `data/elo_ladder_*.json`.
+
+### Run #7 transition CONFIRMED via iter 49 replay analysis
+
+The "model is in flux, abandoning setup-spam" hypothesis (user's framing) is CONFIRMED by decision-pattern data:
+
+- Early-setup (t1-5) in wins: **0.44 → 0.28** (-36% iter 39 → 49)
+- Early-setup (t1-5) in losses: **0.55 → 0.31** (-44%)
+- Setup % in wins: 14.48% → 12.29%
+- Status targeting stable 60-61% (wasn't part of failure)
+- Bot WR: 53% → 44% (exploration cost)
+
+Replay-level evidence (eyeballed):
+- iter 39 losses: setup-spam + type-blind + desperate Healing Wish
+- iter 49 losses: principled pivots + direct damage + ZERO setup
+- iter 49 wins: still Iron Moth sweep but with new glitches (SR spam when already up)
+
+**Model is in "exploration valley"** — abandoning bad strategy, hasn't sharpened new one yet. Self-correcting via pool[-1] forcing + adaptive entropy + stronger pool members (snapshot_0149/0209) now BEATING current model.
+
+### Updated Run #9 framing
+
+Run #9 reframes from "fix the failure" to "accelerate in-progress shift":
+- Heuristic-opp diversity provides direct gradient (15-30pp differential bots)
+- Best pool candidates: StrategicV2, SetupThenSweep, HazardSense, AntiSetupBot
+- Less urgent than I initially thought (natural mechanism is working)
+- Decision tree: if iter 99 eval recovers toward 1100+ Elo, natural shift succeeded; if stays at 970, Run #9 needed; if drops <950, deeper problem
+
+### Run #8 KILLED
+
+Run #8 v2 (BC + no AWR + syn 50% on dev) was killed at ~iter 7 after the Elo data + iter 49 findings showed Run #7's evolution is more interesting than syn% ablation. Dev pod freed for measurement + future Run #9.
+
+---
+
 ## S68 update (2026-06-09 late): H2H results + Run #8 firing + Run #9 in backlog
 
 ### H2H eval on metamon-competitive teams (n=500/cell)
