@@ -1332,8 +1332,20 @@ def main():
         print("optimizer: AdamW fused kernel enabled", flush=True)
 
     # Run directory + TensorBoard
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.out_dir) / f"selfplay_v9_{run_id}"
+    # On --resume, reuse the existing run_dir (parent of the resume checkpoint)
+    # instead of creating a new timestamp-based dir. This preserves snapshot path
+    # identity for PFSP win-rate tracking (path-keyed) and keeps tb/eval registry
+    # appending to the same run. S68 (2026-06-10) fix: previously the fork to a
+    # new run_dir on resume caused PFSP to treat new-dir snapshots as zero-history
+    # opponents, observable as per-opp WR collapse during the resumed iters of
+    # Run #7. See memory/project_s68_resume_mechanism_issues.md.
+    if args.resume:
+        resume_parent = Path(args.resume).parent
+        run_dir = resume_parent
+        print(f"  [RESUME] Reusing existing run_dir: {run_dir}", flush=True)
+    else:
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.out_dir) / f"selfplay_v9_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
 
