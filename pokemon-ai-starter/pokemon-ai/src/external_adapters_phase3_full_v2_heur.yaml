@@ -1,20 +1,18 @@
-# Phase 3 / Run #9 external adapter pool: 3 MCTS + 4 MM + 5 heuristic v2 bots.
+# Phase 3 / Run #9 external adapter pool: 2 MCTS + 4 MMs + ALL non-eval heuristic bots.
 #
-# Extends external_adapters_phase3_full_v1.yaml (Run #7 setup) by adding the
-# 5 v2 heuristic bots designed in S68 (2026-06-10). All v2 bots inherit
-# SimpleHeuristicsPlayer for strong baseline play and add a distinct decision
-# specialty. Elo measured at 949-1043 (vs SH=1000 anchor) on dev pod.
+# Extends external_adapters_phase3_full_v1.yaml (Run #7 setup) by adding
+# all available heuristic bots EXCEPT the 4 used for eval (SH, SmartDmg,
+# Tactical, Strategic — eval data leakage). The heuristic bots get their
+# OWN PFSP sub-pool via --n-heur-per-iter (S68 2026-06-10).
 #
-# Heuristic bots are IN-PROCESS — no subprocess overhead, ~3s/game cost
-# (similar to local self-play, much cheaper than MCTS 100+ms search budget).
-#
-# Per-iter slot allocation (when used with --n-ext-per-iter 9):
-#   - MCTS-fast, MCTS-medium: 2 search-based opps
-#   - 4 MMs (LargeRL, MediumRL_Aug, SyntheticRLV2, Minikazam): 4 RL-trained
-#     opps with neural decision processes
-#   - 5 heuristic v2 bots: GreedySEv2, SetupThenSweepv2, SwitchAwareEscapev3,
-#     HazardSensev2, AntiSetupBot — rule-based decisions, categorically
-#     different from BC-derived neural opps. PFSP-weighted within ext slots.
+# Heuristic-pool rationale (S68 2026-06-10):
+# Including the weak originals (~720-830 Elo) alongside strong v2s
+# (~950-1043 Elo) lets PFSP naturally downsample the weak bots (model
+# wins ~95% vs RandomPlayer → very low (1-WR)² weight → rarely picked).
+# The "1 random heur" slot ensures even weak bots SOMETIMES appear for
+# variety. PFSP within heur pool prevents single-pool starving where
+# MMs' very low WR would dominate selection (see project_s68_bot_elo_findings
+# memo for the differential-WR rationale).
 
 opponents:
 
@@ -58,23 +56,18 @@ opponents:
   weight: 1.0
   instances: 3
 
-# --- Heuristic v2 bots (5, in-process, ~3s/game cost) ---
-# S68 2026-06-10. Each provides categorically-different decision process.
-# Elo measured on dev pod ladder (30g/matchup, SH=1000 anchor):
-#   GreedySEv2          1043   greedy super-effective attacker
-#   SetupThenSweepv2    1031   forced setup at HP>=70% then sweep
-#   SwitchAwareEscapev3 1012   offensive-pivot specialist
-#   AntiSetupBot         968   anti-setup punisher (phaze/taunt/priority)
-#   HazardSensev2        949   hazards-first utility
+# --- Heuristic bots — strong v2 set (5, ~950-1043 Elo, eval-bot tier) ---
+# Built S68 2026-06-10 with SimpleHeuristicsPlayer base + specialty override.
+# All inherit SH's strong defaults, each adds one distinct decision specialty.
 - name: heur-greedysev2
   type: heuristic
   bot_class: GreedySEv2
   weight: 1.0
-- name: heur-setupthen
+- name: heur-setupthenv2
   type: heuristic
   bot_class: SetupThenSweepv2
   weight: 1.0
-- name: heur-switchaware
+- name: heur-switchawarev3
   type: heuristic
   bot_class: SwitchAwareEscapev3
   weight: 1.0
@@ -82,7 +75,57 @@ opponents:
   type: heuristic
   bot_class: AntiSetupBot
   weight: 1.0
-- name: heur-hazardsense
+- name: heur-hazardsensev2
   type: heuristic
   bot_class: HazardSensev2
   weight: 1.0
+
+# --- Heuristic bots — weaker training-only set (2, ~720-880 Elo) ---
+# Kept for stylistic variance. PFSP will downsample if too easy.
+- name: heur-strategicv2
+  type: heuristic
+  bot_class: StrategicV2
+  weight: 1.0
+- name: heur-switchawareV2
+  type: heuristic
+  bot_class: SwitchAwareEscapeV2
+  weight: 1.0
+
+# --- Heuristic bots — raw originals (4, ~730-830 Elo) ---
+# Original rule-bots from policy_rulebots.py. Hand-coded styles different
+# from v2 SH-base. Variety even at lower strength.
+- name: heur-greedyse-orig
+  type: heuristic
+  bot_class: GreedySEPlayer
+  weight: 1.0
+- name: heur-hazardsense-orig
+  type: heuristic
+  bot_class: HazardSensePlayer
+  weight: 1.0
+- name: heur-switchaware-orig
+  type: heuristic
+  bot_class: SwitchAwareEscapePlayer
+  weight: 1.0
+- name: heur-setupthensweep-orig
+  type: heuristic
+  bot_class: SetupThenSweepPlayer
+  weight: 1.0
+
+# --- Heuristic bots — poke-env baselines (2, very low Elo) ---
+# RandomPlayer is essentially noise (~400 Elo). MaxBP is a pure damage
+# maximizer (~720 Elo). Included per user direction ("even the shitty
+# ones") — PFSP downsamples; "1 random heur" slot lets them appear
+# occasionally for variety / RNG noise.
+- name: heur-random
+  type: heuristic
+  bot_class: RandomPlayer
+  weight: 1.0
+- name: heur-maxbp
+  type: heuristic
+  bot_class: MaxBasePowerPlayer
+  weight: 1.0
+
+# Total: 2 MCTS + 4 MMs + 13 heuristics = 19 distinct opponents.
+# When used with --n-ext-per-iter 5 --n-heur-per-iter 4:
+#   - 5 ext slots filled from {mcts-fast, mcts-medium, 4 MMs} (6 candidates)
+#   - 4 heur slots filled from 13 heuristic candidates

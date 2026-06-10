@@ -409,6 +409,15 @@ def parse_args():
                         "sub-pool). Requires pool to contain external opps (via "
                         "--external-adapters). Default 0 = non-stratified single-PFSP. "
                         "Phase 2-ext design: --n-ext-per-iter 5 → 5 self + 5 ext per iter.")
+    p.add_argument("--n-heur-per-iter", type=int, default=0,
+                   help="S68 (2026-06-10): if >0, splits external pool into MM/MCTS and "
+                        "heuristic sub-pools with INDEPENDENT PFSP weighting. Adds this "
+                        "many heuristic opp slots per iter (1 random + rest PFSP within "
+                        "heuristic sub-pool only). Prevents MMs (~15% model WR) from "
+                        "dominating single-pool PFSP and starving heuristics (~30-50% "
+                        "WR, closer to PFSP target). Requires --n-ext-per-iter > 0 + "
+                        "heuristic entries in --external-adapters yaml (type: heuristic). "
+                        "Run #9 design: --n-heur-per-iter 4 → 5 self + 5 ext + 4 heur.")
     p.add_argument("--pool-max-current-run", type=int, default=-1,
                    help="Cap on number of self-play snapshots from the CURRENT run "
                         "kept in the pool. When N>=0 and the current run has produced "
@@ -725,19 +734,29 @@ def _collect_data(args, model, device, server_pool, snapshot_pool,
         force_anchors_str = getattr(args, 'force_anchors', '') or ''
         force_anchors_list = [p.strip().replace("\\", "/") for p in force_anchors_str.split(",") if p.strip()] or None
         n_ext_per_iter = getattr(args, 'n_ext_per_iter', 0)
+        n_heur_per_iter = getattr(args, 'n_heur_per_iter', 0)
         effective_pool = snapshot_pool
         if max_opps > 0 and len(snapshot_pool) > max_opps:
-            from rl_collection import select_opponents_phase2_stage1, _is_external_entry
+            from rl_collection import (select_opponents_phase2_stage1,
+                                       _is_external_entry, _is_heuristic_entry,
+                                       _is_mm_or_mcts_entry)
             effective_pool = select_opponents_phase2_stage1(
                 snapshot_pool, win_rates, max_n=max_opps,
                 force_anchors=force_anchors_list,
                 n_ext_target=n_ext_per_iter,
+                n_heur_target=n_heur_per_iter,
             )
             n_force = len(force_anchors_list) if force_anchors_list else 0
             # Log composition (different shape for stratified vs non-stratified)
-            n_ext_actual = sum(1 for s in effective_pool if _is_external_entry(s))
-            n_self_actual = len(effective_pool) - n_ext_actual
-            if n_ext_per_iter > 0:
+            n_ext_actual = sum(1 for s in effective_pool if _is_mm_or_mcts_entry(s))
+            n_heur_actual = sum(1 for s in effective_pool if _is_heuristic_entry(s))
+            n_self_actual = len(effective_pool) - n_ext_actual - n_heur_actual - n_force
+            if n_heur_per_iter > 0:
+                force_desc = (f"{n_force} force + 3-stratified: "
+                              f"{n_self_actual} self (1 pool[-1] + 1 rand + rest PFSP) + "
+                              f"{n_ext_actual} ext (1 rand + rest PFSP) + "
+                              f"{n_heur_actual} heur (1 rand + rest PFSP)")
+            elif n_ext_per_iter > 0:
                 force_desc = (f"{n_force} force + stratified: "
                               f"{n_self_actual} self (1 pool[-1] + 1 rand + rest PFSP) + "
                               f"{n_ext_actual} ext (1 rand + rest PFSP)")

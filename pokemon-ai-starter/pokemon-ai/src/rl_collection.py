@@ -105,10 +105,34 @@ def _entry_key(item) -> str:
 
 
 def _is_external_entry(item) -> bool:
-    """True if item is an external opp (Metamon subprocess, MCTS, etc.)."""
+    """True if item is an external opp (Metamon subprocess, MCTS, heuristic, etc.).
+
+    Note: this returns True for ALL non-local entries — both MM/MCTS and
+    heuristics. Use _is_heuristic_entry / _is_mm_mcts_entry to distinguish.
+    """
     if isinstance(item, str):
         return False
     return getattr(item, "kind", "local") != "local"
+
+
+def _is_heuristic_entry(item) -> bool:
+    """True if item is a heuristic-bot external opp (S68 2026-06-10).
+
+    Distinguishes heuristic in-process bots (factory_type='heuristic') from
+    MM/MCTS externals. Used by 3-pool stratified composition to allocate
+    separate slots for heuristics independent of MM/MCTS PFSP.
+    """
+    if isinstance(item, str):
+        return False
+    if getattr(item, "kind", "local") == "local":
+        return False
+    factory_kwargs = getattr(item, "factory_kwargs", None) or {}
+    return factory_kwargs.get("factory_type") == "heuristic"
+
+
+def _is_mm_or_mcts_entry(item) -> bool:
+    """True if item is MM/MCTS external (not heuristic, not local)."""
+    return _is_external_entry(item) and not _is_heuristic_entry(item)
 
 
 def _make_server(ws_url: str) -> ServerConfiguration:
@@ -129,6 +153,7 @@ def select_opponents_phase2_stage1(
     max_n: int = 10,
     force_anchors: Optional[List[str]] = None,
     n_ext_target: int = 0,
+    n_heur_target: int = 0,
 ) -> List[Union[str, PoolEntry]]:
     """Phase 2 Stage 1 composition (S67 locked design, 2026-05-22).
 
@@ -243,15 +268,18 @@ def select_opponents_phase2_stage1(
     if pool_size <= max_n:
         return list(snapshot_pool)
 
-    # ── Mode (B): stratified self/ext composition (S67-ext, 2026-05-27) ──
-    # Active when n_ext_target > 0 AND pool actually contains externals.
-    # Allocates self and external slots independently with per-category PFSP.
-    if n_ext_target > 0:
+    # ── Mode (B): stratified self/ext/(heur) composition (S67-ext + S68) ──
+    # Active when n_ext_target > 0 OR n_heur_target > 0 AND pool actually
+    # contains externals. Allocates self, MM/MCTS, and heuristic slots
+    # independently with per-category PFSP — prevents PFSP confound between
+    # different opp categories (MMs naturally have very low WR for the model
+    # and would dominate single-pool PFSP, starving heuristics).
+    if n_ext_target > 0 or n_heur_target > 0:
         ext_in_pool = [s for s in snapshot_pool if _is_external_entry(s)]
         if ext_in_pool:
             return _select_stratified(
                 snapshot_pool, win_rates, max_n,
-                force_anchor_entries, force_anchor_keys, n_ext_target,
+                force_anchor_entries, force_anchor_keys, n_ext_target, n_heur_target,
             )
         # else: no externals in pool → fall through to non-stratified path
 
@@ -313,32 +341,49 @@ def _select_stratified(
     force_anchor_entries: List[Union[str, PoolEntry]],
     force_anchor_keys: set,
     n_ext_target: int,
+    n_heur_target: int = 0,
 ) -> List[Union[str, PoolEntry]]:
-    """Stratified self/ext composition (S67-ext, AlphaStar-style category allocation).
+    """Stratified self/ext/heur composition (S67-ext + S68 2026-06-10).
 
-    Composition per Phase 2-ext design:
+    Composition per Phase 2-ext + S68 heuristic-pool design:
       - K force-anchors (passed in, already validated)
-      - n_ext_eff = min(n_ext_target - K_ext, available_ext, max_n - K - 2) external slots:
-          * 1 random_ext (uniform within ext sub-pool)
-          * rest PFSP_ext ((1-WR)^2 within ext sub-pool only)
-      - n_self_eff = max_n - K - n_ext_eff self slots:
+      - n_ext_eff = min(n_ext_target - K_ext, available_mm_mcts, ...) ext slots:
+          * 1 random_ext (uniform within MM/MCTS sub-pool)
+          * rest PFSP_ext ((1-WR)^2 within MM/MCTS sub-pool only)
+      - n_heur_eff = min(n_heur_target, available_heur, ...) heur slots:
+          * 1 random_heur (uniform within heuristic sub-pool — even shitty bots
+            get sampled sometimes for variety)
+          * rest PFSP_heur ((1-WR)^2 within heuristic sub-pool only — naturally
+            downsamples weak bots the model wins ~100% against)
+      - n_self_eff = max_n - K - n_ext_eff - n_heur_eff self slots:
           * 1 forced self (snapshot_pool[-1], walking back if dup with force)
           * 1 random_self (uniform within self sub-pool)
           * rest PFSP_self ((1-WR)^2 within self sub-pool only)
+
+    Three independent PFSP weighting pools prevents the failure mode where
+    e.g. MMs (~15% model WR) dominate single-pool PFSP and starve heuristics
+    (~30-50% WR, closer to PFSP 50% target so less weight).
     """
     # Count externals already in force-anchors (subtract from target)
-    n_force_ext = sum(1 for f in force_anchor_entries if _is_external_entry(f))
+    # Note: force-anchors are MM/MCTS-only by convention; heuristics aren't
+    # specified via --force-anchors. If that assumption changes, adjust here.
+    n_force_ext = sum(1 for f in force_anchor_entries if _is_mm_or_mcts_entry(f))
     n_force = len(force_anchor_entries)
 
-    # Split non-forced pool into self vs external
+    # Split non-forced pool into self vs MM/MCTS vs heuristic (three sub-pools)
     non_forced = [s for s in snapshot_pool if _entry_key(s) not in force_anchor_keys]
     self_pool = [s for s in non_forced if not _is_external_entry(s)]
-    ext_pool = [s for s in non_forced if _is_external_entry(s)]
+    ext_pool = [s for s in non_forced if _is_mm_or_mcts_entry(s)]
+    heur_pool = [s for s in non_forced if _is_heuristic_entry(s)]
 
-    # Resolve target slot counts
+    # Resolve target slot counts (in priority: forced → ext → heur → self)
     n_ext_remaining = max(0, n_ext_target - n_force_ext)
-    n_ext = min(n_ext_remaining, len(ext_pool), max(0, max_n - n_force - 2))
-    n_self = max_n - n_force - n_ext
+    # Reserve at least 2 self slots; max_n - n_force - 2 is the upper bound
+    # we can distribute between ext and heur.
+    n_ext_heur_budget = max(0, max_n - n_force - 2)
+    n_ext = min(n_ext_remaining, len(ext_pool), n_ext_heur_budget)
+    n_heur = min(n_heur_target, len(heur_pool), n_ext_heur_budget - n_ext)
+    n_self = max_n - n_force - n_ext - n_heur
 
     # === Self sub-composition: 1 forced (pool[-1]) + 1 random + (n_self - 2) PFSP ===
     forced_self_picks = []
@@ -384,9 +429,29 @@ def _select_stratified(
     else:
         ext_pfsp = []
 
+    # === Heur sub-composition: 1 random + (n_heur - 1) PFSP ===
+    # S68 2026-06-10: separate PFSP from MM/MCTS so heuristics get reliable
+    # exposure. PFSP within heur pool naturally downsamples weak bots the
+    # model wins ~95-100% against, and the 1 random slot ensures variety.
+    n_heur_random = min(1, n_heur, len(heur_pool))
+    heur_random = random.sample(heur_pool, n_heur_random) if n_heur_random > 0 else []
+
+    heur_random_keys = {_entry_key(r) for r in heur_random}
+    heur_for_pfsp = [h for h in heur_pool if _entry_key(h) not in heur_random_keys]
+    n_heur_pfsp = n_heur - n_heur_random
+    if n_heur_pfsp > 0 and heur_for_pfsp:
+        if win_rates is not None:
+            heur_pfsp = pfsp_sample(heur_for_pfsp, win_rates, n_heur_pfsp,
+                                    uniform_frac=0.0, latest_snapshot=None)
+        else:
+            heur_pfsp = random.sample(heur_for_pfsp, min(n_heur_pfsp, len(heur_for_pfsp)))
+    else:
+        heur_pfsp = []
+
     return (force_anchor_entries
             + forced_self_picks + self_random + self_pfsp
-            + ext_random + ext_pfsp)
+            + ext_random + ext_pfsp
+            + heur_random + heur_pfsp)
 
 
 def pfsp_sample(

@@ -18,13 +18,20 @@
 #   AntiSetupBot         (968 Elo) — anti-setup punisher
 #   HazardSensev2        (949 Elo) — hazards-first utility
 #
-# Design (per user "guardrails" framing 2026-06-10):
+# Design (per user "guardrails" framing 2026-06-10, REVISED for 3-pool):
 #   - ADDITIVE — don't reduce existing signal (SP + MM + MCTS slots all stay)
-#   - +4 heuristic slots (3 PFSP-weighted + 1 random) on top of current 5 ext
+#   - SEPARATE heuristic sub-pool with own PFSP (S68 code change). Prevents
+#     MMs (~15% model WR) from dominating single-pool PFSP and starving
+#     heuristics (~30-50% WR, closer to PFSP target).
+#   - +4 heuristic slots (3 PFSP-weighted + 1 random) via --n-heur-per-iter 4
 #   - +640 games/iter (160 per new slot × 4) so per-slot games stay at 160
-#   - --n-ext-per-iter 9 (was 5): 2 MCTS + 4 MMs + 3-4 heuristics rotated
-#   - --max-opponents-per-iter 14 (was 10)
+#   - --n-ext-per-iter 5 (UNCHANGED): MMs/MCTS slot allocation preserved
+#   - --n-heur-per-iter 4: NEW dedicated heuristic slots
+#   - --max-opponents-per-iter 15 (was 10): 1 force + 5 self + 5 ext + 4 heur
 #   - --games-per-iter 2240 (was 1600)
+# Yaml includes ALL 13 non-eval heuristic bots (5 v2 strong + 2 v2 weaker
+# + 4 raw originals + 2 poke-env baselines). PFSP within heur pool
+# naturally downsamples weak bots; random slot ensures variety.
 #
 # Cost projection vs Run #7:
 #   Per-iter: 40% more games, but heuristics are ~3s/game vs MM ~5s/game
@@ -83,8 +90,9 @@ setsid nohup python -u train_rl.py \
   --awr-replay-memmap data/datasets/human_v8_5k \
   --awr-mix-weight 0.15 --awr-batch-size 16 --awr-binary \
   --pool-anchors "${POOL_ANCHORS}" --force-anchors ${INIT_CKPT} \
-  --max-opponents-per-iter 14 \
-  --external-adapters external_adapters_phase3_full_v2_heur.yaml --n-ext-per-iter 9 \
+  --max-opponents-per-iter 15 \
+  --external-adapters external_adapters_phase3_full_v2_heur.yaml \
+  --n-ext-per-iter 5 --n-heur-per-iter 4 \
   --cis --tier3 --tier3-minibatch-size 64 --bf16 \
   --mp-workers 90 \
   --cis-min-batch 32 --cis-timeout-ms 50 \
@@ -103,14 +111,20 @@ echo "Log: /tmp/run9_heur_diversity_v1.log"
 echo "Out: ${OUT_DIR}"
 echo ""
 echo "Diff from Run #7:"
-echo "  --n-ext-per-iter 9   (was 5: now 2 MCTS + 4 MMs + 3 heuristic rotated)"
-echo "  --max-opponents-per-iter 14   (was 10)"
+echo "  --n-ext-per-iter 5   (UNCHANGED — MMs/MCTS slot allocation preserved)"
+echo "  --n-heur-per-iter 4   (NEW — dedicated heuristic pool with own PFSP)"
+echo "  --max-opponents-per-iter 15   (was 10: 1 force + 5 self + 5 ext + 4 heur)"
 echo "  --games-per-iter 2240   (was 1600: keeps per-slot games at 160)"
-echo "  --external-adapters full_v2_heur.yaml   (was full_v1, adds 5 v2 bots)"
+echo "  --external-adapters full_v2_heur.yaml   (was full_v1, adds 13 heur bots)"
 echo ""
-echo "5 heuristic v2 bots: GreedySEv2, SetupThenSweepv2, SwitchAwareEscapev3,"
-echo "                     AntiSetupBot, HazardSensev2"
-echo "Each provides categorically-different decision process (not BC-derived)."
+echo "13 heuristic bots (all non-eval):"
+echo "  v2 strong (5, ~950-1043 Elo): GreedySEv2, SetupThenSweepv2,"
+echo "      SwitchAwareEscapev3, AntiSetupBot, HazardSensev2"
+echo "  v2 weaker (2, ~720-880 Elo): StrategicV2, SwitchAwareEscapeV2"
+echo "  Raw originals (4, ~730-830 Elo): GreedySE, HazardSense,"
+echo "      SwitchAwareEscape, SetupThenSweep"
+echo "  poke-env baselines (2, ~400-720 Elo): RandomPlayer, MaxBasePower"
+echo "PFSP within heur pool downsamples weak bots; 1 random slot adds variety."
 echo ""
 echo "200 iters @ projected ~13-14 min/iter = ~45 hr wall"
 echo ""
