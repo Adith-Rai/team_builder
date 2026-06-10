@@ -91,7 +91,13 @@ async def run_one_bot(snap_path, snap_cached, bot_name, n_games, concurrency, se
         checkpoint_path=snap_path, _cached_ckpt=snap_cached, device="cuda",
         save_replays=False, account_configuration=snap_account, **common,
     )
-    bot_cls = ALL_BOTS[bot_name]
+    # Resolve bot class: try ALL_BOTS first (ladder names), fall back to
+    # heuristic class resolver (handles raw Player class names like
+    # GreedySEPlayer, MaxBasePowerPlayer, etc.)
+    if bot_name in ALL_BOTS:
+        bot_cls = ALL_BOTS[bot_name]
+    else:
+        bot_cls = _resolve_heuristic_class(bot_name)
     bot = bot_cls(save_replays=False, account_configuration=bot_account, **common)
     _instrument_bot(bot, bot_name)
 
