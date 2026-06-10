@@ -91,9 +91,12 @@ opponents:
   bot_class: SwitchAwareEscapeV2
   weight: 1.0
 
-# --- Heuristic bots — raw originals (4, ~730-830 Elo) ---
+# --- Heuristic bots — raw originals (3, ~730-790 Elo) ---
 # Original rule-bots from policy_rulebots.py. Hand-coded styles different
 # from v2 SH-base. Variety even at lower strength.
+# NOTE 2026-06-10: SetupThenSweepPlayer (raw original) caused worker hangs
+# in CIS iter 0 — investigation TODO. Dropped from training pool for now;
+# the v2 SetupThenSweepv2 (SH-base, 1031 Elo) covers the same style stronger.
 - name: heur-greedyse-orig
   type: heuristic
   bot_class: GreedySEPlayer
@@ -106,26 +109,19 @@ opponents:
   type: heuristic
   bot_class: SwitchAwareEscapePlayer
   weight: 1.0
-- name: heur-setupthensweep-orig
-  type: heuristic
-  bot_class: SetupThenSweepPlayer
-  weight: 1.0
 
-# --- Heuristic bots — poke-env baselines (2, very low Elo) ---
-# RandomPlayer is essentially noise (~400 Elo). MaxBP is a pure damage
-# maximizer (~720 Elo). Included per user direction ("even the shitty
-# ones") — PFSP downsamples; "1 random heur" slot lets them appear
-# occasionally for variety / RNG noise.
+# --- Heuristic bots — poke-env baselines (1, ~400 Elo) ---
+# RandomPlayer (~400 Elo) is essentially noise. Per user direction
+# ("even the shitty ones") for variety / RNG. PFSP downsamples; "1 random
+# heur" slot lets it appear occasionally.
+# NOTE 2026-06-10: MaxBasePowerPlayer dropped — caused worker hangs in
+# CIS iter 0 (investigation TODO). v2 GreedySEv2 covers max-damage style.
 - name: heur-random
   type: heuristic
   bot_class: RandomPlayer
   weight: 1.0
-- name: heur-maxbp
-  type: heuristic
-  bot_class: MaxBasePowerPlayer
-  weight: 1.0
 
-# Total: 2 MCTS + 4 MMs + 13 heuristics = 19 distinct opponents.
+# Total: 2 MCTS + 4 MMs + 11 heuristics = 17 distinct opponents.
 # When used with --n-ext-per-iter 5 --n-heur-per-iter 4:
 #   - 5 ext slots filled from {mcts-fast, mcts-medium, 4 MMs} (6 candidates)
-#   - 4 heur slots filled from 13 heuristic candidates
+#   - 4 heur slots filled from 11 heuristic candidates
