@@ -14,10 +14,19 @@
 from __future__ import annotations
 from typing import Optional
 
+from poke_env.player import Player
 from poke_env.player.baselines import SimpleHeuristicsPlayer
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.move_category import MoveCategory
 from poke_env.battle.side_condition import SideCondition
+
+from policy_rulebots import (
+    _best_attacking_move,
+    _best_pivot_move,
+    _best_switch_candidate,
+    _type_multiplier,
+    _effective_power,
+)
 
 
 # Move-id sets reused from policy_smartbots.py — keep separate here so
@@ -383,5 +392,101 @@ class StrategicV2(SimpleHeuristicsPlayer):
                         best_sw = (worst, mon)
                 if best_sw is not None:
                     return self.create_order(best_sw[1])
+
+        return self.choose_random_move(battle)
+
+
+# ====================================================================
+# SwitchAwareEscapeV2 — original pivot trigger + stat-disadvantage trigger
+# ====================================================================
+
+def _is_stat_disadvantage(active, opponent, attacking_move):
+    """Return True if we're outsped AND opp's likely strongest offensive stat
+    exceeds our matching defensive stat by a meaningful margin.
+
+    Heuristic threshold: opp_offense - our_defense > 20 base points.
+    """
+    if active is None or opponent is None:
+        return False
+    try:
+        active_spe = active.base_stats.get("spe", 0) or 0
+        opp_spe = opponent.base_stats.get("spe", 0) or 0
+        outsped = opp_spe > active_spe
+        if not outsped:
+            return False
+        # Opp's best offensive stat (whichever is higher)
+        opp_atk = opponent.base_stats.get("atk", 0) or 0
+        opp_spa = opponent.base_stats.get("spa", 0) or 0
+        opp_offense = max(opp_atk, opp_spa)
+        # Our defensive stat — match to attacker side if known,
+        # otherwise take the lower of the two (worst case).
+        our_def = active.base_stats.get("def", 0) or 0
+        our_spd = active.base_stats.get("spd", 0) or 0
+        # If opp clearly leans physical or special, match that
+        if opp_atk > opp_spa + 20:
+            our_defense = our_def
+        elif opp_spa > opp_atk + 20:
+            our_defense = our_spd
+        else:
+            our_defense = min(our_def, our_spd)
+        return (opp_offense - our_defense) > 20
+    except Exception:
+        return False
+
+
+class SwitchAwareEscapeV2(Player):
+    """Enhanced SwitchAwareEscape — pivots on type-eff < 1.0 OR stat disadvantage.
+
+    Differs from policy_rulebots.SwitchAwareEscapePlayer only in the pivot
+    trigger condition. Still uses offensive pivot moves (U-turn / Volt Switch
+    etc.) as its signature mechanic — the broader trigger just catches more
+    bad-matchup scenarios.
+
+    Original SwitchAwareEscapePlayer is intentionally left untouched so both
+    flavors live in the training pool with different "voice".
+    """
+
+    def choose_move(self, battle):
+        legal_moves = [m for m in battle.available_moves if m is not None]
+        legal_switches = [p for p in battle.available_switches if p is not None]
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+
+        # === Pivot trigger: type OR stat disadvantage ===
+        pivot = _best_pivot_move(battle)
+        if pivot is not None:
+            best = _best_attacking_move(battle)
+            should_pivot = False
+            if best is None:
+                should_pivot = True
+            else:
+                # Trigger 1 (original): type-resisted by opponent
+                eff = _type_multiplier(best, (opponent.types if opponent else []))
+                if eff < 1.0:
+                    should_pivot = True
+                # Trigger 2 (new): outsped + outclassed offensively
+                elif _is_stat_disadvantage(active, opponent, best):
+                    should_pivot = True
+            if should_pivot:
+                return self.create_order(pivot)
+
+        # === If "locked" into one weak move, try to switch ===
+        if len(legal_moves) == 1 and legal_switches:
+            the_move = legal_moves[0]
+            eff = _type_multiplier(the_move, (opponent.types if opponent else []))
+            if _effective_power(the_move, active) <= 0 or eff < 1.0:
+                sw = _best_switch_candidate(battle)
+                if sw is not None:
+                    return self.create_order(sw)
+
+        # === Attack normally ===
+        best = _best_attacking_move(battle)
+        if best is not None:
+            return self.create_order(best)
+
+        # === If walled, switch to a resist ===
+        sw = _best_switch_candidate(battle)
+        if sw is not None:
+            return self.create_order(sw)
 
         return self.choose_random_move(battle)
