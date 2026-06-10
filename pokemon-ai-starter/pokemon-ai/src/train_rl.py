@@ -625,7 +625,15 @@ def _resume_from_checkpoint(args, model, optimizer, snapshot_pool, device):
     existing = set(pool)
     new_snaps = [s for s in all_disk if s not in existing]
     if new_snaps:
-        pool = new_snaps + pool
+        # S68 (2026-06-10) fix: APPEND, not prepend. Previously this prepended
+        # new_snaps to pool, which made pool[-1] point at the LAST static anchor
+        # (e.g. phase2_vf05_v1/snapshot_0219.pt) instead of the model's own
+        # most-recent snapshot. The "1 pool[-1]" forced PFSP slot is supposed
+        # to be "fight my own latest self" — prepending broke this convention.
+        # all_disk is sorted alphabetically = iter-order, so appending preserves
+        # the same chronological pool[-1] = latest-snap semantics as continuous
+        # training (which appends each new snapshot at iter boundaries).
+        pool = pool + new_snaps
 
     # Deduplicate (same file, different path variants)
     seen = set()
