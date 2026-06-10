@@ -125,6 +125,7 @@ from poke_env.player.baselines import (
 
 from battle_agent import BattleAgent
 from policy_smartbots import SmartDamagePlayer, TacticalPlayer, StrategicPlayer
+from policy_trainbots import AntiSetupBot, StrategicV2, SwitchAwareEscapeV2
 from policy_rulebots import (
     GreedySEPlayer, HazardSensePlayer, SwitchAwareEscapePlayer, SetupThenSweepPlayer,
 )
@@ -162,12 +163,25 @@ FLOOR_BOTS = {
     "MaxBasePower": MaxBasePowerPlayer,
 }
 
-# All 10 bots — full anchor set. Per Session 23 round-robin (50 games × 45 matchups):
+# Training-only bots (S68, 2026-06-09) — designed for training pool, NOT eval.
+# Included in ALL_BOTS so they can be measured/ranked in Elo round-robins,
+# but should NOT appear in the production eval pipeline (smart_avg, MM eval).
+# See policy_trainbots.py docstrings + project_s68_run7_decision_pattern_findings_2026_06_09.md.
+TRAIN_BOTS = {
+    "AntiSetupBot":      AntiSetupBot,
+    "StrategicV2":       StrategicV2,
+    "SwitchAwareEscapeV2": SwitchAwareEscapeV2,
+}
+
+# All 10 + 3 bots — full anchor set. Per Session 23 round-robin (50 games × 45 matchups):
 #   Tactical 81.8% > Strategic 81.3% > SmartDmg 78.0% > SH 67.8% > SetupThenSweep 44.7%
 #   > GreedySE 38.4% > HazardSense 36.7% > MaxBP 33.3% > SwitchAwareEscape 32.7% > Random 5.3%
 # This gives a ~75% win-rate spread across the bot anchors → ~400 Elo of dynamic range,
 # which is wide enough to interpolate snapshot Elos meaningfully.
-ALL_BOTS = {**FLOOR_BOTS, **RULE_BOTS, **SMART_BOTS}
+# Training-only bots (AntiSetupBot, StrategicV2, SwitchAwareEscapeV2) added S68
+# 2026-06-09 to enable round-robin ranking; their training-only status is enforced
+# at training pipeline level (which bots get challenge-served), not here.
+ALL_BOTS = {**FLOOR_BOTS, **RULE_BOTS, **SMART_BOTS, **TRAIN_BOTS}
 
 
 # =============================
