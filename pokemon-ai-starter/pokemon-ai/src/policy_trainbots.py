@@ -478,6 +478,149 @@ class GreedySEv2(SimpleHeuristicsPlayer):
 
 
 # ====================================================================
+# HazardSensev2 — SimpleHeuristics base + aggressive hazard prioritization
+# ====================================================================
+
+HAZARD_LAY_IDS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
+HAZARD_REMOVAL_IDS = {"rapidspin", "defog", "courtchange", "tidyup", "mortalspin"}
+
+
+class HazardSensev2(SimpleHeuristicsPlayer):
+    """SimpleHeuristics base + aggressive hazard play.
+
+    Style: hazard-first specialist. Prioritizes hazard placement and removal
+    over damage when reasonable. Uses SH's strong default logic for everything
+    else.
+
+    Differs from policy_rulebots.HazardSensePlayer (raw Player base, ~735 Elo):
+    inherits SH's full decision tree instead of choose_random_move fallback.
+
+    Differs from SH itself:
+    - SH lays SR only if n_opp_remaining >= 3. HazardSensev2 lays at >= 2
+      (more aggressive — accepts marginal value when 1 KO already happened).
+    - HazardSensev2 ALSO lays Spikes/Toxic Spikes/Sticky Web if available AND
+      target hazard isn't already up (SH only handles SR).
+    - HazardSensev2 always uses Rapid Spin / Defog if hazards on our side
+      and we have >= 2 mons (more aggressive than SH's similar check).
+
+    Does NOT setup itself.
+    """
+
+    def choose_move(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return self.choose_random_move(battle)
+
+        if not battle.available_moves:
+            return super().choose_move(battle)
+
+        # Count remaining mons
+        try:
+            n_remaining = sum(1 for m in battle.team.values() if not m.fainted)
+            n_opp_remaining = 6 - sum(1 for m in battle.opponent_team.values() if m.fainted)
+        except Exception:
+            n_remaining = n_opp_remaining = 6
+
+        moves_by_id = {m.id: m for m in battle.available_moves if m is not None}
+        own_side = battle.side_conditions
+        opp_side = battle.opponent_side_conditions
+
+        # === Priority 1: Lay Stealth Rock (more aggressive than SH's n_opp >= 3) ===
+        if n_opp_remaining >= 2 and "stealthrock" in moves_by_id:
+            if SideCondition.STEALTH_ROCK not in opp_side:
+                return self.create_order(moves_by_id["stealthrock"])
+
+        # === Priority 2: Lay Spikes / Toxic Spikes / Sticky Web ===
+        if n_opp_remaining >= 2:
+            if "spikes" in moves_by_id and SideCondition.SPIKES not in opp_side:
+                return self.create_order(moves_by_id["spikes"])
+            if "toxicspikes" in moves_by_id and SideCondition.TOXIC_SPIKES not in opp_side:
+                return self.create_order(moves_by_id["toxicspikes"])
+            if "stickyweb" in moves_by_id and SideCondition.STICKY_WEB not in opp_side:
+                return self.create_order(moves_by_id["stickyweb"])
+
+        # === Priority 3: Remove hazards on our side (Rapid Spin / Defog) ===
+        any_own_hazards = any(c in own_side for c in (
+            SideCondition.STEALTH_ROCK, SideCondition.SPIKES,
+            SideCondition.TOXIC_SPIKES, SideCondition.STICKY_WEB))
+        if any_own_hazards and n_remaining >= 2:
+            for mid in HAZARD_REMOVAL_IDS:
+                if mid in moves_by_id:
+                    return self.create_order(moves_by_id[mid])
+
+        # === Fall through to SH default (handles attack/switch/setup) ===
+        return super().choose_move(battle)
+
+
+# ====================================================================
+# SwitchAwareEscapev3 — SimpleHeuristics base + offensive pivot preference
+# ====================================================================
+
+class SwitchAwareEscapev3(SimpleHeuristicsPlayer):
+    """SimpleHeuristics base + 'use pivot moves to escape bad matchups'.
+
+    Style: pivot specialist. When matchup is unfavorable, uses an offensive
+    pivot move (U-turn, Volt Switch, Flip Turn, Parting Shot, Teleport) to
+    deal damage while switching out, instead of a raw switch.
+
+    Differs from policy_rulebots.SwitchAwareEscapePlayer (raw Player, ~735 Elo)
+    and SwitchAwareEscapeV2 (raw Player, ~776 Elo): inherits SH's full decision
+    tree instead of choose_random_move fallback.
+
+    Differs from SH itself:
+    - SH's _should_switch_out triggers a normal switch via choose_switch.
+    - SwitchAwareEscapev3 PREFERS to switch via a pivot MOVE instead (deals
+      damage as it switches), if one is available.
+    - Lowers the switch trigger from SH's matchup < -2 to matchup < -0.5
+      (more aggressive escape — uses the pivot's damage to make it worth).
+
+    Does NOT setup itself.
+    """
+
+    PIVOT_MATCHUP_THRESH = -0.5
+
+    def choose_move(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        if active is None or opponent is None:
+            return self.choose_random_move(battle)
+
+        # Find available pivot move (if any)
+        pivot_move = None
+        if battle.available_moves:
+            for m in battle.available_moves:
+                if m is not None and m.id in PIVOT_IDS:
+                    pivot_move = m
+                    break
+
+        if pivot_move is not None and battle.available_switches:
+            # Aggressive pivot: use pivot when matchup is bad (looser than SH's switch threshold)
+            try:
+                matchup = self._estimate_matchup(active, opponent)
+            except Exception:
+                matchup = 0.0
+
+            # Trigger 1: SH would switch out
+            should_pivot = False
+            try:
+                if self._should_switch_out(battle):
+                    should_pivot = True
+            except Exception:
+                pass
+
+            # Trigger 2: mild matchup disadvantage (use pivot's damage)
+            if not should_pivot and matchup < self.PIVOT_MATCHUP_THRESH:
+                should_pivot = True
+
+            if should_pivot:
+                return self.create_order(pivot_move)
+
+        # Fall through to SH default (handles attack/switch/setup/hazards)
+        return super().choose_move(battle)
+
+
+# ====================================================================
 # SwitchAwareEscapeV2 — original pivot trigger + stat-disadvantage trigger
 # ====================================================================
 
