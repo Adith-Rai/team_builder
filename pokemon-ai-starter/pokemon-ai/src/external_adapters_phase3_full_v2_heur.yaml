@@ -1,30 +1,39 @@
-# Phase 3 / Run #9 external adapter pool: 2 MCTS + 4 MMs + ALL non-eval heuristic bots.
-#
-# Extends external_adapters_phase3_full_v1.yaml (Run #7 setup) by adding
-# all available heuristic bots EXCEPT the 4 used for eval (SH, SmartDmg,
-# Tactical, Strategic — eval data leakage). The heuristic bots get their
-# OWN PFSP sub-pool via --n-heur-per-iter (S68 2026-06-10).
+# Phase 3 / Run #9 external adapter pool: 4 MMs + ALL non-eval heuristic bots.
 #
 # Heuristic-pool rationale (S68 2026-06-10):
-# Including the weak originals (~720-830 Elo) alongside strong v2s
-# (~950-1043 Elo) lets PFSP naturally downsample the weak bots (model
-# wins ~95% vs RandomPlayer → very low (1-WR)² weight → rarely picked).
-# The "1 random heur" slot ensures even weak bots SOMETIMES appear for
-# variety. PFSP within heur pool prevents single-pool starving where
-# MMs' very low WR would dominate selection (see project_s68_bot_elo_findings
-# memo for the differential-WR rationale).
+# Including weak originals (~720-830 Elo) alongside strong v2s (~950-1043 Elo)
+# lets PFSP naturally downsample weak bots (model wins ~95% vs RandomPlayer
+# → very low (1-WR)² weight → rarely picked). The "1 random heur" slot
+# ensures even weak bots SOMETIMES appear for variety. PFSP within the heur
+# pool prevents single-pool starving where MMs' very low WR would dominate
+# selection (see project_s68_bot_elo_findings memo for the differential-WR
+# rationale). Heur pool requires --n-heur-per-iter flag (S68 2026-06-10).
+#
+# ⚠️ MCTS DEFERRED 2026-06-10 — see TODO_MCTS_RUN9.md
+# Stress test on dev pod (70 workers, 2240g, 15 opps) revealed MCTS-paired
+# workers became severely slow due to compound effect: (1) MCTS executor is
+# single-threaded per worker (ThreadPoolExecutor max_workers=1); (2) Run #9
+# load profile has ~30 concurrent battles per worker per opp (vs Run #7's
+# ~18), so MCTS queue depth is 70% deeper; (3) new "InvalidWeight" panic
+# type appears in Run #9 (vs Run #7's "Encore" panic) — recovery overhead
+# compounds across queue. Smart-fallback works (TacticalPlayer) but doesn't
+# eliminate per-battle latency increase.
+#
+# Run #7 prod with MCTS works fine — 5,963 MCTS panics observed, no
+# throughput impact. Run #9 dev with MCTS shows slow workers.
+#
+# Removed for THIS run as experimental decision (not a "fix").
+# Three concrete investigation hooks before re-adding to Run #10+:
+#  1. Patch _battle_to_pe_state to filter battle states triggering
+#     InvalidWeight panic upstream (look at mcts.rs:111 source for
+#     what makes weight invalid — possibly NaN/zero in move scoring).
+#  2. Bump MCTS executor max_workers from 1 to 2-4 (less serialization,
+#     more CPU usage per worker but better throughput).
+#  3. Scale --mp-workers to match opps count (Run #7 has 9 workers/opp,
+#     Run #9 had 5 workers/opp; equal/proximal scaling avoids queue depth
+#     amplification).
 
 opponents:
-
-# --- MCTS opponents (search-based, 2) ---
-- name: mcts-fast
-  type: mcts
-  search_time_ms: 100
-  weight: 1.0
-- name: mcts-medium
-  type: mcts
-  search_time_ms: 300
-  weight: 1.0
 
 # --- Metamon RL opponents (4 MMs, 3 instances each = 12 subprocesses) ---
 - name: mm-largerl
@@ -58,7 +67,6 @@ opponents:
 
 # --- Heuristic bots — strong v2 set (5, ~950-1043 Elo, eval-bot tier) ---
 # Built S68 2026-06-10 with SimpleHeuristicsPlayer base + specialty override.
-# All inherit SH's strong defaults, each adds one distinct decision specialty.
 - name: heur-greedysev2
   type: heuristic
   bot_class: GreedySEv2
@@ -91,12 +99,13 @@ opponents:
   bot_class: SwitchAwareEscapeV2
   weight: 1.0
 
-# --- Heuristic bots — raw originals (3, ~730-790 Elo) ---
+# --- Heuristic bots — raw originals (4, ~730-830 Elo) ---
 # Original rule-bots from policy_rulebots.py. Hand-coded styles different
 # from v2 SH-base. Variety even at lower strength.
-# NOTE 2026-06-10: SetupThenSweepPlayer (raw original) caused worker hangs
-# in CIS iter 0 — investigation TODO. Dropped from training pool for now;
-# the v2 SetupThenSweepv2 (SH-base, 1031 Elo) covers the same style stronger.
+# NOTE 2026-06-10: previously dropped SetupThenSweepPlayer and MaxBP based
+# on false root-cause attribution (we thought they caused CIS hangs). Stress
+# tests proved them fine — actual issue was MCTS serialization slowdown.
+# Re-included for full diversity.
 - name: heur-greedyse-orig
   type: heuristic
   bot_class: GreedySEPlayer
@@ -109,19 +118,25 @@ opponents:
   type: heuristic
   bot_class: SwitchAwareEscapePlayer
   weight: 1.0
+- name: heur-setupthensweep-orig
+  type: heuristic
+  bot_class: SetupThenSweepPlayer
+  weight: 1.0
 
-# --- Heuristic bots — poke-env baselines (1, ~400 Elo) ---
-# RandomPlayer (~400 Elo) is essentially noise. Per user direction
-# ("even the shitty ones") for variety / RNG. PFSP downsamples; "1 random
-# heur" slot lets it appear occasionally.
-# NOTE 2026-06-10: MaxBasePowerPlayer dropped — caused worker hangs in
-# CIS iter 0 (investigation TODO). v2 GreedySEv2 covers max-damage style.
+# --- Heuristic bots — poke-env baselines (2, very low Elo) ---
+# RandomPlayer (~400 Elo) is essentially noise. MaxBP (~720 Elo) is pure
+# damage maximizer. Per user direction ("even the shitty ones") for variety
+# / RNG. PFSP downsamples; "1 random heur" slot lets them appear occasionally.
 - name: heur-random
   type: heuristic
   bot_class: RandomPlayer
   weight: 1.0
+- name: heur-maxbp
+  type: heuristic
+  bot_class: MaxBasePowerPlayer
+  weight: 1.0
 
-# Total: 2 MCTS + 4 MMs + 11 heuristics = 17 distinct opponents.
-# When used with --n-ext-per-iter 5 --n-heur-per-iter 4:
-#   - 5 ext slots filled from {mcts-fast, mcts-medium, 4 MMs} (6 candidates)
-#   - 4 heur slots filled from 11 heuristic candidates
+# Total: 4 MMs + 13 heuristics = 17 distinct opponents.
+# Designed for --n-ext-per-iter 4 --n-heur-per-iter 4:
+#   - 4 ext slots filled from 4 MMs (full coverage)
+#   - 4 heur slots filled from 13 heuristic candidates
