@@ -486,20 +486,28 @@ class PokeEnginePlayer(Player):
 
         # poke-engine raises pyo3 PanicException (a BaseException subclass,
         # NOT a regular Exception) on niche edge cases like
-        # `'Encore should not be active when last used move is not a move'`.
-        # Plain `except Exception` doesn't catch BaseException, so the panic
-        # propagates up through poke-env's _handle_battle_request and crashes
-        # the listener task — battle hangs, send_challenges times out (~600s),
-        # iter loses one game. Catching BaseException with explicit re-raise
-        # for KeyboardInterrupt / SystemExit lets us fall back to random move
+        # `'Encore should not be active when last used move is not a move'`
+        # (Run #7 pattern) or `'InvalidWeight'` from mcts.rs:112 when all
+        # generate_instructions_from_move_pair percentages are 0 (Run #9
+        # pattern — see docs/TODO_MCTS_RUN9.md). Plain `except Exception`
+        # doesn't catch BaseException, so the panic propagates up through
+        # poke-env's _handle_battle_request and crashes the listener task —
+        # battle hangs, send_challenges times out (~600s), iter loses one
+        # game. Catching BaseException with explicit re-raise for
+        # KeyboardInterrupt / SystemExit lets us fall back to random move
         # cleanly while preserving Ctrl-C semantics.
+        # S68 2026-06-10: exc_info=False on panic warnings — formatting the
+        # full Rust→Python traceback per turn was a significant chunk of
+        # per-panic recovery cost. The single-line warning (battle_tag +
+        # exc type + str(e)) is sufficient for diagnosis; full tracebacks
+        # add no info since the panic origin is always inside poke-engine.
         try:
             state = _battle_to_pe_state(battle)
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as e:
             logger.warning("PokeEngine state build failed for %s: %s (%s)",
-                           battle.battle_tag, e, type(e).__name__, exc_info=True)
+                           battle.battle_tag, e, type(e).__name__)
             return self._smart_fallback(battle)
 
         loop = asyncio.get_event_loop()
@@ -514,7 +522,7 @@ class PokeEnginePlayer(Player):
             raise
         except BaseException as e:
             logger.warning("PokeEngine MCTS failed for %s: %s (%s)",
-                           battle.battle_tag, e, type(e).__name__, exc_info=True)
+                           battle.battle_tag, e, type(e).__name__)
             return self._smart_fallback(battle)
 
         try:
@@ -524,7 +532,7 @@ class PokeEnginePlayer(Player):
             raise
         except BaseException as e:
             logger.warning("PokeEngine choice translation failed for %s: %s (%s)",
-                           battle.battle_tag, e, type(e).__name__, exc_info=True)
+                           battle.battle_tag, e, type(e).__name__)
             return self._smart_fallback(battle)
 
     def _battle_finished_callback(self, battle):

@@ -1,6 +1,55 @@
 # MCTS deferred from Run #9 — investigation TODO
 
-**Status**: deferred, not fixed. S68 2026-06-10.
+**Status**: partially mitigated (panic recovery cost reduced); MCTS still
+deferred from Run #9 pending validation. S68 2026-06-10.
+
+## 2026-06-10 update — root cause CONFIRMED + mitigation shipped
+
+Looked at the poke-engine 0.0.46 source on GitHub. `mcts.rs:112` is:
+
+```rust
+unsafe fn sample_node(&self, move_vector: *mut Box<[Node]>) -> *mut Node {
+    let mut rng = rng();
+    let weights: Vec<f64> = (*move_vector)
+        .iter()
+        .map(|x| x.instructions.percentage as f64)
+        .collect();
+    let dist = WeightedIndex::new(weights).unwrap();  // PANICS HERE
+    ...
+}
+```
+
+The panic is `WeightedIndex::new()` failing when all input weights are
+0 / negative / NaN / empty. In context, `instructions.percentage` for each
+node in `move_vector` (output of `generate_instructions_from_move_pair`)
+sums to zero or contains invalid float values.
+
+This is a code path the Rust crate doesn't gracefully handle (no fallback,
+just `.unwrap()`). Fix in Rust would be a `match WeightedIndex::new(...)`
+with `Err` → uniform sampling fallback. We can't easily patch the binary
+crate; would need rebuilding from source.
+
+**Mitigation shipped 2026-06-10 in `pokeengine_player.py`**:
+- Drop `exc_info=True` from the 3 panic-catch `logger.warning` calls.
+  Skipping Rust→Python traceback formatting reduces per-panic cost
+  substantially (traceback formatting was a noticeable share of the
+  recovery overhead per the docstring-level reasoning; not measured
+  in isolation but cheap and obvious).
+
+This is the only behaviour-preserving change we can safely make
+Python-side without rebuilding the Rust crate. The panic itself still
+fires once per panicking turn, and existing smart-fallback
+(TacticalPlayer) handles that turn. We do NOT skip MCTS for the rest
+of the battle — battle state changes turn-to-turn (HP, switches,
+boosts, opp moves resolved), so an InvalidWeight panic on turn N
+doesn't necessarily reoccur on turn N+1. Skipping all subsequent
+turns would silently degrade MCTS coverage without evidence the
+condition persists.
+
+If we later observe panics REPEAT on the same battle across many
+turns in a row (collect a battle_tag histogram from logs), THEN add a
+per-battle skip-after-K-panics gate with the threshold tuned to that
+data. Don't add it speculatively.
 
 ## What happened
 

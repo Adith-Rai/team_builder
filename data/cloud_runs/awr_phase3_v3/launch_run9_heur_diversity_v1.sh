@@ -24,16 +24,19 @@
 #     MMs (~15% model WR) from dominating single-pool PFSP and starving
 #     heuristics (~30-50% WR, closer to PFSP target).
 #   - +4 heuristic slots (3 PFSP-weighted + 1 random) via --n-heur-per-iter 4
-#   - --n-ext-per-iter 4 (was 5: MCTS deferred — see docs/TODO_MCTS_RUN9.md)
+#   - --n-ext-per-iter 5: matches Run #7 (4 MMs + 2 MCTS = 6 candidates,
+#     PFSP samples 5/6 per iter)
 #   - --n-heur-per-iter 4: NEW dedicated heuristic slots
-#   - --max-opponents-per-iter 14: 1 force + 5 self + 4 ext + 4 heur
-#   - --games-per-iter 2240: 160 games per opp (matching Run #7 per-opp density)
-# Yaml has 4 MMs + 13 non-eval heuristic bots. PFSP within heur pool
-# naturally downsamples weak bots; random slot ensures variety.
+#   - --max-opponents-per-iter 15: 1 force + 5 self + 5 ext + 4 heur
+#   - --games-per-iter 2400: 160 games per opp (matching Run #7 per-opp density)
+# Yaml has 4 MMs + 2 MCTS + 13 non-eval heuristic bots.
+# PFSP within heur pool naturally downsamples weak bots; random slot ensures variety.
 #
-# ⚠️ MCTS DEFERRED 2026-06-10. See docs/TODO_MCTS_RUN9.md for the diagnosis
-# (per-worker MCTS executor serialization + new InvalidWeight panic) +
-# concrete investigation hooks before re-adding to Run #10+.
+# MCTS re-enabled 2026-06-11: dropped exc_info=True from pokeengine_player.py
+# panic-catch warnings (was source of per-panic overhead). Run #7 prod
+# absorbed 5,963 panics with no throughput impact even before this mitigation;
+# Run #9 should also tolerate them. Smart-fallback (TacticalPlayer) handles
+# the panicking turn, subsequent turns retry MCTS as normal.
 #
 # Cost projection vs Run #7:
 #   Per-iter: 40% more games, but heuristics are ~3s/game vs MM ~5s/game
@@ -81,7 +84,7 @@ setsid nohup python -u train_rl.py \
   --init-from ${INIT_CKPT} \
   --out-dir ${OUT_DIR} \
   --n-iters 200 --warmup-iters 5 \
-  --games-per-iter 2240 --turn-cap 300 --lr 8e-5 \
+  --games-per-iter 2400 --turn-cap 300 --lr 8e-5 \
   --lam 0.95 \
   --reward-style terminal \
   --procedural-teams /workspace/raw_data/pokemon_usage/2024-04 \
@@ -92,9 +95,9 @@ setsid nohup python -u train_rl.py \
   --awr-replay-memmap data/datasets/human_v8_5k \
   --awr-mix-weight 0.15 --awr-batch-size 16 --awr-binary \
   --pool-anchors "${POOL_ANCHORS}" --force-anchors ${INIT_CKPT} \
-  --max-opponents-per-iter 14 \
+  --max-opponents-per-iter 15 \
   --external-adapters external_adapters_phase3_full_v2_heur.yaml \
-  --n-ext-per-iter 4 --n-heur-per-iter 4 \
+  --n-ext-per-iter 5 --n-heur-per-iter 4 \
   --cis --tier3 --tier3-minibatch-size 64 --bf16 \
   --mp-workers 90 \
   --cis-min-batch 32 --cis-timeout-ms 50 \
@@ -116,7 +119,7 @@ echo "Diff from Run #7:"
 echo "  --n-ext-per-iter 5   (UNCHANGED — MMs/MCTS slot allocation preserved)"
 echo "  --n-heur-per-iter 4   (NEW — dedicated heuristic pool with own PFSP)"
 echo "  --max-opponents-per-iter 15   (was 10: 1 force + 5 self + 5 ext + 4 heur)"
-echo "  --games-per-iter 2240   (was 1600: keeps per-slot games at 160)"
+echo "  --games-per-iter 2400   (was 1600: keeps per-slot games at 160)"
 echo "  --external-adapters full_v2_heur.yaml   (was full_v1, adds 13 heur bots)"
 echo ""
 echo "13 heuristic bots (all non-eval):"

@@ -1,4 +1,4 @@
-# Phase 3 / Run #9 external adapter pool: 4 MMs + ALL non-eval heuristic bots.
+# Phase 3 / Run #9 external adapter pool: 4 MMs + 2 MCTS + ALL non-eval heuristic bots.
 #
 # Heuristic-pool rationale (S68 2026-06-10):
 # Including weak originals (~720-830 Elo) alongside strong v2s (~950-1043 Elo)
@@ -9,31 +9,27 @@
 # selection (see project_s68_bot_elo_findings memo for the differential-WR
 # rationale). Heur pool requires --n-heur-per-iter flag (S68 2026-06-10).
 #
-# ⚠️ MCTS DEFERRED 2026-06-10 — see TODO_MCTS_RUN9.md
-# Stress test on dev pod (70 workers, 2240g, 15 opps) revealed MCTS-paired
-# workers became severely slow due to compound effect: (1) MCTS executor is
-# single-threaded per worker (ThreadPoolExecutor max_workers=1); (2) Run #9
-# load profile has ~30 concurrent battles per worker per opp (vs Run #7's
-# ~18), so MCTS queue depth is 70% deeper; (3) new "InvalidWeight" panic
-# type appears in Run #9 (vs Run #7's "Encore" panic) — recovery overhead
-# compounds across queue. Smart-fallback works (TacticalPlayer) but doesn't
-# eliminate per-battle latency increase.
-#
-# Run #7 prod with MCTS works fine — 5,963 MCTS panics observed, no
-# throughput impact. Run #9 dev with MCTS shows slow workers.
-#
-# Removed for THIS run as experimental decision (not a "fix").
-# Three concrete investigation hooks before re-adding to Run #10+:
-#  1. Patch _battle_to_pe_state to filter battle states triggering
-#     InvalidWeight panic upstream (look at mcts.rs:111 source for
-#     what makes weight invalid — possibly NaN/zero in move scoring).
-#  2. Bump MCTS executor max_workers from 1 to 2-4 (less serialization,
-#     more CPU usage per worker but better throughput).
-#  3. Scale --mp-workers to match opps count (Run #7 has 9 workers/opp,
-#     Run #9 had 5 workers/opp; equal/proximal scaling avoids queue depth
-#     amplification).
+# MCTS re-enabled 2026-06-11 after pokeengine_player.py mitigation:
+# dropped exc_info=True on panic-catch warnings → no more per-panic
+# Rust→Python traceback formatting. Run #7 prod absorbed 5,963 panics
+# with no throughput impact even before the mitigation; this should let
+# Run #9's load profile tolerate them too. Per-turn smart-fallback
+# (TacticalPlayer) handles the panicking turn; subsequent turns retry
+# MCTS as normal. Root cause documented in docs/TODO_MCTS_RUN9.md
+# (mcts.rs:112 WeightedIndex::new panics when all outcome percentages
+# are 0/NaN — a Rust-side bug requiring crate rebuild to fix fully).
 
 opponents:
+
+# --- MCTS opponents (2 search-budget tiers) ---
+- name: mcts-fast
+  type: mcts
+  search_time_ms: 100
+  weight: 1.0
+- name: mcts-medium
+  type: mcts
+  search_time_ms: 300
+  weight: 1.0
 
 # --- Metamon RL opponents (4 MMs, 3 instances each = 12 subprocesses) ---
 - name: mm-largerl
