@@ -135,32 +135,107 @@ def _factory_heuristic(spec: dict, ctx: dict) -> Tuple[PoolEntry, List]:
 
 
 def _resolve_heuristic_class(name: str):
-    """Map bot_class name string to the actual Python class (lazy import)."""
+    """Map bot_class name string to the actual Python class (lazy import).
+
+    Returned class is wrapped with `_wrap_with_sh_fallback` (see below) —
+    a try/except around choose_move that catches any exception from the
+    bot's custom logic and falls through to SimpleHeuristicsPlayer's
+    choose_move. Required because poke-env's `_handle_battle_request`
+    (player.py:416) calls `choose_move` with no try/except: if a custom
+    bot's helper raises on an edge-case battle state, the exception
+    propagates up and crashes the asyncio task driving the bot's
+    WebSocket listener. All in-flight battles on that account become
+    zombies, our worker waits in poll() for next-move requests Showdown
+    will never send, and the 30-min asyncio batch timeout eventually
+    fires as "timeout vs in-process <opp>". See S68 Run #9 diagnosis
+    (2026-06-12): 16/16 worker timeouts on bots that own custom
+    choose_move + helpers; 0 on bots that fall through to SH.
+    """
+    cls = None
     # Try policy_trainbots first (v2 set is the primary target)
     try:
         import policy_trainbots as _train
         if hasattr(_train, name):
-            return getattr(_train, name)
+            cls = getattr(_train, name)
     except ImportError:
         pass
     # Fall back to policy_rulebots (raw originals)
-    try:
-        import policy_rulebots as _rule
-        if hasattr(_rule, name):
-            return getattr(_rule, name)
-    except ImportError:
-        pass
+    if cls is None:
+        try:
+            import policy_rulebots as _rule
+            if hasattr(_rule, name):
+                cls = getattr(_rule, name)
+        except ImportError:
+            pass
     # Final fallback: poke-env baselines (Random, MaxBP)
-    try:
-        from poke_env.player import baselines as _baseline
-        if hasattr(_baseline, name):
-            return getattr(_baseline, name)
-    except ImportError:
-        pass
-    raise ValueError(
-        f"heuristic bot_class {name!r} not found in policy_trainbots, "
-        f"policy_rulebots, or poke_env.player.baselines"
-    )
+    if cls is None:
+        try:
+            from poke_env.player import baselines as _baseline
+            if hasattr(_baseline, name):
+                cls = getattr(_baseline, name)
+        except ImportError:
+            pass
+    if cls is None:
+        raise ValueError(
+            f"heuristic bot_class {name!r} not found in policy_trainbots, "
+            f"policy_rulebots, or poke_env.player.baselines"
+        )
+    return _wrap_with_sh_fallback(cls)
+
+
+def _wrap_with_sh_fallback(cls):
+    """Return a subclass of `cls` whose choose_move catches any exception
+    and falls through to SimpleHeuristicsPlayer.choose_move.
+
+    Identity-preserving: when the bot's own choose_move runs without
+    raising (the 99% path), behaviour is unchanged. The wrapper only
+    fires on the rare exception that would otherwise crash poke-env's
+    WebSocket listener task.
+
+    Logs each caught exception at WARNING (one line — no traceback, to
+    avoid the Rust-style formatting cost we hit in pokeengine_player.py
+    panic recovery). Gives concrete confirmation of which bots raise on
+    which battle states, so the underlying helper bugs can be fixed
+    upstream later — but the hang is contained at this boundary now,
+    so it isn't urgent.
+
+    If the resolved class already inherits SimpleHeuristicsPlayer with
+    a `super().choose_move(battle)` fallback (the v2-strong set), the
+    wrapper still applies — they never raise in production, so the
+    wrapper is a no-op for them. We don't try to detect that and skip
+    wrapping: cheaper to wrap uniformly than to maintain a class-set
+    allowlist.
+    """
+    from poke_env.player import SimpleHeuristicsPlayer
+
+    class _SafeHeuristic(cls):
+        def choose_move(self, battle):
+            try:
+                return super().choose_move(battle)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as e:
+                logger.warning(
+                    "[heur-safe] %s raised %s on battle %s: %s — falling to SH",
+                    cls.__name__, type(e).__name__,
+                    getattr(battle, "battle_tag", "?"), e,
+                )
+                try:
+                    return SimpleHeuristicsPlayer.choose_move(self, battle)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as e2:
+                    logger.warning(
+                        "[heur-safe] %s SH-fallback also raised %s: %s — using random",
+                        cls.__name__, type(e2).__name__, e2,
+                    )
+                    return self.choose_random_move(battle)
+
+    # Preserve the original class name for any reflection/logging downstream
+    _SafeHeuristic.__name__ = cls.__name__
+    _SafeHeuristic.__qualname__ = cls.__qualname__
+    _SafeHeuristic.__module__ = cls.__module__
+    return _SafeHeuristic
 
 
 def _factory_metamon(spec: dict, ctx: dict) -> Tuple[PoolEntry, List[ExternalOpponent]]:
