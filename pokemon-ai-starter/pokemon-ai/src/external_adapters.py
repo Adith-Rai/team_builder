@@ -207,8 +207,43 @@ def _wrap_with_sh_fallback(cls):
     allowlist.
     """
     from poke_env.player import SimpleHeuristicsPlayer
+    from poke_env import AccountConfiguration
 
     class _SafeHeuristic(cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Lazy-init SH fallback. We need a REAL SimpleHeuristicsPlayer
+            # instance (not just SH.choose_move called with self) because
+            # SH.choose_move uses `self._stat_estimation`, `self._estimate_matchup`,
+            # `self._should_dynamax`, etc. — instance methods that only exist
+            # on SH-inheriting classes. Calling SH.choose_move with a Player-base
+            # `self` raises AttributeError immediately. Cache one per wrapper
+            # instance; built with start_listening=False so no Showdown connection.
+            self._sh_fallback = None
+
+        def _get_sh_fallback(self):
+            if self._sh_fallback is False:
+                return None  # prior init failed; don't retry every turn
+            if self._sh_fallback is None:
+                try:
+                    self._sh_fallback = SimpleHeuristicsPlayer(
+                        account_configuration=AccountConfiguration(
+                            f"shfb-{id(self):x}"[:18], None
+                        ),
+                        start_listening=False,
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as e:
+                    logger.warning(
+                        "[heur-safe] %s SH-fallback init failed (%s: %s) — "
+                        "will use choose_random_move for this instance",
+                        cls.__name__, type(e).__name__, e,
+                    )
+                    self._sh_fallback = False
+                    return None
+            return self._sh_fallback
+
         def choose_move(self, battle):
             try:
                 return super().choose_move(battle)
@@ -220,16 +255,18 @@ def _wrap_with_sh_fallback(cls):
                     cls.__name__, type(e).__name__,
                     getattr(battle, "battle_tag", "?"), e,
                 )
-                try:
-                    return SimpleHeuristicsPlayer.choose_move(self, battle)
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException as e2:
-                    logger.warning(
-                        "[heur-safe] %s SH-fallback also raised %s: %s — using random",
-                        cls.__name__, type(e2).__name__, e2,
-                    )
-                    return self.choose_random_move(battle)
+                sh = self._get_sh_fallback()
+                if sh is not None:
+                    try:
+                        return sh.choose_move(battle)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as e2:
+                        logger.warning(
+                            "[heur-safe] %s SH-fallback also raised %s: %s — using random",
+                            cls.__name__, type(e2).__name__, e2,
+                        )
+                return self.choose_random_move(battle)
 
     # Preserve the original class name for any reflection/logging downstream
     _SafeHeuristic.__name__ = cls.__name__
