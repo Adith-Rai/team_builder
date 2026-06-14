@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import gc
 import json
 import os
@@ -28,6 +29,38 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+# S68 2026-06-13: enable faulthandler with periodic all-thread stack dumps.
+# Triggered by a Run #9 v4 silent hang where main process was stuck in
+# wait4() inside the cis-orch reset path; without ptrace/gdb access in
+# docker we couldn't identify the blocking code line. faulthandler running
+# in-process bypasses ptrace restrictions and writes thread stacks to a
+# dedicated file every FAULTHANDLER_DUMP_INTERVAL_S seconds (5 min default).
+# This means any future hang of >5 min will have the exact stack of every
+# thread captured in the dump file — eliminating "we don't know what hung".
+# Dump file is /tmp/train_rl_faulthandler_<pid>.log; kept in /tmp because
+# the training logs already live there. Wraps in try/except because some
+# embedded environments (jupyter, certain test frameworks) don't allow it.
+_FAULTHANDLER_DUMP_INTERVAL_S = int(os.environ.get("FAULTHANDLER_DUMP_INTERVAL_S", "300"))
+try:
+    _fh_log_path = f"/tmp/train_rl_faulthandler_{os.getpid()}.log"
+    _fh_file = open(_fh_log_path, "a")
+    faulthandler.enable(file=_fh_file, all_threads=True)
+    if _FAULTHANDLER_DUMP_INTERVAL_S > 0:
+        # repeat=True → re-arms after each fire, so we get periodic dumps,
+        # not just one. exit=False → just dump, don't kill the process.
+        faulthandler.dump_traceback_later(
+            timeout=_FAULTHANDLER_DUMP_INTERVAL_S,
+            repeat=True,
+            file=_fh_file,
+            exit=False,
+        )
+        print(f"[faulthandler] enabled, dumping all-thread stacks every "
+              f"{_FAULTHANDLER_DUMP_INTERVAL_S}s to {_fh_log_path}",
+              flush=True)
+except Exception as _e:
+    print(f"[faulthandler] could not enable ({type(_e).__name__}: {_e}); "
+          f"continuing without periodic stack dumps", flush=True)
 import torch._dynamo  # imported at module top so any later reference inside main() doesn't shadow `torch` as a local
 
 # Linux/Ampere optimizations (parity with train_bc.py — Session 50 audit found
