@@ -35,10 +35,31 @@ from poke_env.battle.effect import Effect
 
 from format_config import FormatConfig, FORMAT_SINGLES
 
+# Format-dependent sizes. These module-level names are the SINGLES values and
+# exist for backward compatibility with importers (dataset.py, replay_to_memmap,
+# model_transformer, tests). Encoder functions take an explicit `cfg` parameter
+# instead of reading these, so a non-singles format can be encoded without
+# mutating module state — see _resolve_fmt().
+#
+# n_types/n_moves/n_stats are invariant across every gen and every format we
+# target; only the team layout (n_active/n_bench) changes, and only for
+# doubles/triples. Verified 2026-09-21 across gen4ou/gen4uu/gen9ou.
 N_TYPES = FORMAT_SINGLES.n_types
 MAX_BENCH = FORMAT_SINGLES.n_bench
 MAX_MOVES = FORMAT_SINGLES.n_moves
-N_STATS = FORMAT_SINGLES.n_stats
+
+
+def _resolve_fmt(cfg: Optional[FormatConfig]) -> FormatConfig:
+    """Resolve the format config for one encode call.
+
+    Passing `cfg` explicitly is the forward-looking path: doubles/triples need
+    a different team layout and action-space size. `None` falls back to
+    singles, which is what every current caller wants and keeps behaviour
+    bit-identical to the pre-threading code.
+    """
+    return cfg if cfg is not None else FORMAT_SINGLES
+
+
 _STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]
 _BOOST_KEYS = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
 
@@ -144,9 +165,9 @@ def _hp_pct_int(poke) -> int:
         return 0
 
 
-def _types_multihot(types) -> List[float]:
+def _types_multihot(types, cfg: Optional[FormatConfig] = None) -> List[float]:
     """19-dim multi-hot type encoding."""
-    v = [0.0] * N_TYPES
+    v = [0.0] * _resolve_fmt(cfg).n_types
     for t in (types or []):
         name = t.name if hasattr(t, "name") else str(t).upper()
         idx = _TYPE_TO_IDX.get(name)
@@ -221,9 +242,9 @@ def _paradox_encoding(poke) -> List[float]:
     return vec
 
 
-def _tera_encoding(poke) -> List[float]:
+def _tera_encoding(poke, cfg: Optional[FormatConfig] = None) -> List[float]:
     """20-dim: [is_terastallized] + tera_type one-hot (19)."""
-    vec = [0.0] * (1 + N_TYPES)
+    vec = [0.0] * (1 + _resolve_fmt(cfg).n_types)
     if poke is None:
         return vec
     try:
@@ -280,7 +301,8 @@ def _future_sight_bit(poke) -> float:
 # Per-Pokemon feature extraction
 # =============================
 
-def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
+def _encode_pokemon(poke, is_active: bool, is_opponent: bool,
+                    cfg: Optional[FormatConfig] = None) -> dict:
     """Extract structured features for one Pokemon token.
 
     Returns dict with:
@@ -288,6 +310,7 @@ def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
       banks: dict of int values for NumericalBanks
       continuous: list of float features (concatenated in model)
     """
+    _fmt = _resolve_fmt(cfg)
     v = _get_vocab()
 
     if poke is None:
@@ -312,10 +335,10 @@ def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
     ability_known = poke.ability is not None
     ability_id = v.ability(ability_raw) if ability_known or not is_opponent else 0
 
-    # Move IDs (up to 4)
+    # Move IDs (one per move slot for this format)
     moves_list = list((poke.moves or {}).keys())
     move_ids = [v.move(moves_list[i]) if i < len(moves_list) else 0
-                for i in range(MAX_MOVES)]
+                for i in range(_fmt.n_moves)]
 
     # --- NumericalBank values (clamped ints) ---
     hp_pct = _hp_pct_int(poke)
@@ -341,7 +364,7 @@ def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
     cont = []
 
     # Types (19 multi-hot)
-    cont.extend(_types_multihot(poke.types))
+    cont.extend(_types_multihot(poke.types, cfg))
 
     # Status (7 one-hot)
     cont.extend(_status_onehot(poke.status))
@@ -357,7 +380,7 @@ def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
     if is_active:
         cont.extend(_volatile_bits(poke))       # 38
         cont.extend(_paradox_encoding(poke))     # 7
-        cont.extend(_tera_encoding(poke))        # 20
+        cont.extend(_tera_encoding(poke, cfg))   # 20
         cont.extend(_combat_state(poke))         # 5
         cont.append(_toxic_fraction(poke))       # 1
         cont.append(_future_sight_bit(poke))     # 1
@@ -375,17 +398,16 @@ def _encode_pokemon(poke, is_active: bool, is_opponent: bool) -> dict:
     # Move compact encodings (4 x 23 = 92 dims)
     # type_onehot(19) + bp_norm(1) + category(2) + priority_norm(1)
     moves_vals = list((poke.moves or {}).values())
-    for i in range(MAX_MOVES):
+    for i in range(_fmt.n_moves):
         if i < len(moves_vals):
-            cont.extend(_encode_move_compact(moves_vals[i]))
+            cont.extend(_encode_move_compact(moves_vals[i], cfg))
         else:
             cont.extend([0.0] * 23)
 
     return {
         "ids": {
             "species": species_id, "item": item_id, "ability": ability_id,
-            "move0": move_ids[0], "move1": move_ids[1],
-            "move2": move_ids[2], "move3": move_ids[3],
+            **{f"move{i}": move_ids[i] for i in range(_fmt.n_moves)},
         },
         "banks": {
             "hp_pct": hp_pct, "level": level,
@@ -428,13 +450,13 @@ def extract_move_cont(pokemon_cont):
             for i in range(N_MOVE_SLOTS)]
 
 
-def _encode_move_compact(move) -> List[float]:
+def _encode_move_compact(move, cfg: Optional[FormatConfig] = None) -> List[float]:
     """23-dim compact move encoding: type_onehot(19) + bp(1) + category(2) + priority(1)."""
     if move is None:
         return [0.0] * 23
     try:
         # Type one-hot
-        type_oh = [0.0] * N_TYPES
+        type_oh = [0.0] * _resolve_fmt(cfg).n_types
         mt = getattr(move, "type", None)
         if mt:
             name = mt.name if hasattr(mt, "name") else str(mt).upper()
@@ -474,25 +496,44 @@ def _get_sorted_bench(team) -> list:
         return []
 
 
-def _encode_team(battle, is_opponent: bool) -> List[dict]:
-    """Encode a full team as 6 Pokemon dicts. Active first, then bench (sorted)."""
+def _encode_team(battle, is_opponent: bool,
+                 cfg: Optional[FormatConfig] = None) -> List[dict]:
+    """Encode a full team as `cfg.team_size` Pokemon dicts.
+
+    Layout: active first, then bench sorted by species name.
+
+    Only single-active formats are implemented. Doubles/triples need
+    `n_active` active slots and a per-active action space; encoding a
+    multi-active format here would silently produce a short team, so it
+    raises instead. Mirrors the doubles rejection in model_transformer.
+    """
+    _fmt = _resolve_fmt(cfg)
+    if _fmt.n_active != 1:
+        raise NotImplementedError(
+            f"_encode_team supports single-active formats only "
+            f"(got n_active={_fmt.n_active} for {_fmt.battle_format!r}). "
+            f"Multi-active team layout is a doubles/triples prerequisite - see "
+            f"docs/CURRENT_STATE.md section 2."
+        )
+
     team = battle.opponent_team if is_opponent else battle.team
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
 
     result = []
 
     # Active Pokemon (slot 0)
-    result.append(_encode_pokemon(active, is_active=True, is_opponent=is_opponent))
+    result.append(_encode_pokemon(active, is_active=True, is_opponent=is_opponent, cfg=cfg))
 
-    # Bench Pokemon (slots 1-5)
+    # Bench Pokemon (slots 1..n_bench)
     bench = _get_sorted_bench(team)
-    for i in range(MAX_BENCH):
+    for i in range(_fmt.n_bench):
         if i < len(bench):
-            result.append(_encode_pokemon(bench[i], is_active=False, is_opponent=is_opponent))
+            result.append(_encode_pokemon(bench[i], is_active=False, is_opponent=is_opponent, cfg=cfg))
         else:
-            result.append(_encode_pokemon(None, is_active=False, is_opponent=is_opponent))
+            result.append(_encode_pokemon(None, is_active=False, is_opponent=is_opponent, cfg=cfg))
 
-    assert len(result) == 6, f"Team should have 6 slots, got {len(result)}"
+    assert len(result) == _fmt.team_size, \
+        f"Team should have {_fmt.team_size} slots, got {len(result)}"
     return result
 
 
@@ -500,8 +541,9 @@ def _encode_team(battle, is_opponent: bool) -> List[dict]:
 # Field token
 # =============================
 
-def _encode_field(battle) -> dict:
+def _encode_field(battle, cfg: Optional[FormatConfig] = None) -> dict:
     """Extract field state features."""
+    _fmt = _resolve_fmt(cfg)
     our_sc = battle.side_conditions or {}
     opp_sc = battle.opponent_side_conditions or {}
     weather = battle.weather or {}
@@ -601,12 +643,12 @@ def _encode_field(battle) -> dict:
     # Opponent revealed fraction
     opp_revealed = sum(1 for p in battle.opponent_team.values()
                        if getattr(p, "revealed", True))
-    opp_revealed_frac = _clamp_float(opp_revealed / 6.0)
+    opp_revealed_frac = _clamp_float(opp_revealed / _fmt.team_size)
 
     # Alive counts
     our_alive = sum(1 for p in battle.team.values() if not p.fainted)
     opp_fainted = sum(1 for p in battle.opponent_team.values() if p.fainted)
-    opp_alive = 6 - opp_fainted
+    opp_alive = _fmt.team_size - opp_fainted
 
     return {
         "banks": {
@@ -645,7 +687,7 @@ def _encode_field(battle) -> dict:
             dmax_turns_us, dmax_turns_opp,
             trapped, force_switch, opp_revealed_frac,
             # Alive
-            our_alive / 6.0, opp_alive / 6.0,
+            our_alive / _fmt.team_size, opp_alive / _fmt.team_size,
         ],
     }
 
@@ -1002,7 +1044,7 @@ def _safe_getattr(obj, name, default=None):
         return default
 
 
-def _project_move_flags(m, poke_types=None) -> dict:
+def _project_move_flags(m, poke_types=None, cfg: Optional[FormatConfig] = None) -> dict:
     """Convert a poke-env Move object into a model-friendly dict.
     Uses poke-env Move attributes only — no hardcoded dex tables.
     Identical to v7 _project_move_flags (well-tested, 107-dim base output, +2 from action slots)."""
@@ -1179,7 +1221,7 @@ def _project_move_flags(m, poke_types=None) -> dict:
     ignore_immunity = bool(ignore_immunity_raw and ignore_immunity_raw is not False)
 
     # Type one-hot
-    type_oh = [0.0] * N_TYPES
+    type_oh = [0.0] * _resolve_fmt(cfg).n_types
     if _safe_getattr(m, "type", None):
         tn = m.type.name if hasattr(m.type, "name") else str(m.type).upper()
         tidx = _TYPE_TO_IDX.get(tn)
@@ -1343,9 +1385,13 @@ def _switch_offensive_effectiveness(switch_target, opp_active) -> float:
     return max_eff
 
 
-def _encode_action_slots(battle) -> Tuple[np.ndarray, List[dict], List[dict]]:
-    """Returns (legal_mask[9], active_move_dicts[4], switch_dicts[5])."""
-    mask = np.zeros(9, dtype=np.float32)
+def _encode_action_slots(battle, cfg: Optional[FormatConfig] = None) -> Tuple[np.ndarray, List[dict], List[dict]]:
+    """Returns (legal_mask, active_move_dicts, switch_dicts).
+
+    Lengths are format-derived: n_actions / n_moves / n_switches.
+    Singles: 9 / 4 / 5."""
+    _fmt = _resolve_fmt(cfg)
+    mask = np.zeros(_fmt.n_actions, dtype=np.float32)
     move_dicts = []
     switch_dicts = []
 
@@ -1354,10 +1400,10 @@ def _encode_action_slots(battle) -> Tuple[np.ndarray, List[dict], List[dict]]:
     active_types = battle.active_pokemon.types if battle.active_pokemon else None
     opp_active = battle.opponent_active_pokemon
     opp_threat = _max_opp_threat(battle)
-    for i in range(4):
+    for i in range(_fmt.n_moves):
         if i < len(moves):
             mask[i] = 1.0
-            md = _project_move_flags(moves[i], poke_types=active_types)
+            md = _project_move_flags(moves[i], poke_types=active_types, cfg=cfg)
             # Append type effectiveness vs opponent active + opponent threat to us
             md["continuous"].append(_compute_type_effectiveness(moves[i], opp_active))
             md["continuous"].append(opp_threat)
@@ -1368,14 +1414,14 @@ def _encode_action_slots(battle) -> Tuple[np.ndarray, List[dict], List[dict]]:
     # Switches
     switches = list(battle.available_switches or [])
     v = _get_vocab()
-    for j in range(5):
+    for j in range(_fmt.n_switches):
         if j < len(switches):
             p = switches[j]
-            mask[4 + j] = 1.0
+            mask[_fmt.n_moves + j] = 1.0
             switch_dicts.append({
                 "species_id": v.species(p.species),
                 "continuous": (
-                    _types_multihot(p.types) +  # 19
+                    _types_multihot(p.types, cfg) +  # 19
                     [_clamp_float(p.current_hp_fraction or 0)] +  # 1
                     _status_onehot(p.status) +  # 7
                     [_clamp_float(float(getattr(p, "weight", 0) or 0) / 1000.0)] +  # 1
@@ -1391,7 +1437,7 @@ def _encode_action_slots(battle) -> Tuple[np.ndarray, List[dict], List[dict]]:
         if len(moves) > 0:
             mask[0] = 1.0
         elif len(switches) > 0:
-            mask[4] = 1.0
+            mask[_fmt.n_moves] = 1.0
 
     return mask, move_dicts, switch_dicts
 
@@ -1403,7 +1449,7 @@ SWITCH_SLOT_CONT_DIM = 30  # 19 + 1 + 7 + 1 + 1 (defensive_eff) + 1 (offensive_e
 # Public API
 # =============================
 
-def make_features(battle) -> dict:
+def make_features(battle, cfg: Optional[FormatConfig] = None) -> dict:
     """Extract all v8 structured features from a poke-env Battle object.
 
     Returns dict with keys:
@@ -1416,11 +1462,11 @@ def make_features(battle) -> dict:
       switch_slots: list of 5 dicts (or None for empty slots)
       gen: int (battle.gen, used by D1 gen-id token in TransformerBattlePolicy)
     """
-    our_pokemon = _encode_team(battle, is_opponent=False)
-    opp_pokemon = _encode_team(battle, is_opponent=True)
-    field = _encode_field(battle)
+    our_pokemon = _encode_team(battle, is_opponent=False, cfg=cfg)
+    opp_pokemon = _encode_team(battle, is_opponent=True, cfg=cfg)
+    field = _encode_field(battle, cfg=cfg)
     transition = _encode_transition(battle)
-    legal_mask, active_moves, switch_slots = _encode_action_slots(battle)
+    legal_mask, active_moves, switch_slots = _encode_action_slots(battle, cfg=cfg)
 
     # Session 51 D2: pass gen through to the model. poke-env Battle exposes
     # `.gen` as an int (1-9). Defensive: if attribute is missing or invalid,
