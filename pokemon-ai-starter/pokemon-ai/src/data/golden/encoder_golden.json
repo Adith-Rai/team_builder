@@ -1,0 +1,120 @@
+{
+  "all": "8ed3ec0f4f2a7a2e",
+  "dims": {
+    "field_banks": 4,
+    "field_cont": 52,
+    "legal_mask": 9,
+    "move_slot_banks": 4,
+    "move_slot_cont": 109,
+    "move_slot_ids": 1,
+    "n_paradox": 7,
+    "n_volatile": 38,
+    "pokemon_banks": 10,
+    "pokemon_cont": 285,
+    "pokemon_ids": 7,
+    "switch_slot_cont": 30,
+    "switch_slot_ids": 1,
+    "transition_cont": 51,
+    "transition_ids": 2
+  },
+  "n_turns": 771,
+  "per_field": {
+    "action": "b27b8f3ce54348c5",
+    "done": "7c5984e531a661f6",
+    "episode_id": "225d6712bccb5937",
+    "field_banks": "f1c5a0c448502b0a",
+    "field_cont": "a3ce15d9a3e0bf02",
+    "legal": "eda4176ee89610a6",
+    "move_banks": "a1227cc52ca3d1a9",
+    "move_cont": "c503d002e84c6b06",
+    "move_ids": "aeb4153951fdbdaa",
+    "opp_poke_banks": "d43b6fdd9f9df546",
+    "opp_poke_cont": "1d126cdb896fa144",
+    "opp_poke_ids": "579a9bc18398f790",
+    "opp_poke_mcont": "4504baf81af5efc4",
+    "our_poke_banks": "903cc05c9e0a6b11",
+    "our_poke_cont": "fc7b279dd73566ad",
+    "our_poke_ids": "21f524143bdf305c",
+    "our_poke_mcont": "318f5ad99d11248d",
+    "result": "b5bc5bc408c591ab",
+    "switch_cont": "6d11ddc89555a1f0",
+    "switch_ids": "848931d4e9a28d62",
+    "t": "b608452890ce5c90",
+    "trans_cont": "43ed2d82b68f4084",
+    "trans_ids": "9232ecc3b80f1227"
+  },
+  "shapes": {
+    "action": "int",
+    "done": "bool",
+    "episode_id": "str",
+    "field_banks": [
+      4
+    ],
+    "field_cont": [
+      52
+    ],
+    "legal": [
+      9
+    ],
+    "move_banks": [
+      4,
+      4
+    ],
+    "move_cont": [
+      4,
+      109
+    ],
+    "move_ids": [
+      4
+    ],
+    "opp_poke_banks": [
+      6,
+      10
+    ],
+    "opp_poke_cont": [
+      6,
+      285
+    ],
+    "opp_poke_ids": [
+      6,
+      7
+    ],
+    "opp_poke_mcont": [
+      6,
+      4,
+      23
+    ],
+    "our_poke_banks": [
+      6,
+      10
+    ],
+    "our_poke_cont": [
+      6,
+      285
+    ],
+    "our_poke_ids": [
+      6,
+      7
+    ],
+    "our_poke_mcont": [
+      6,
+      4,
+      23
+    ],
+    "result": "float",
+    "switch_cont": [
+      5,
+      30
+    ],
+    "switch_ids": [
+      5
+    ],
+    "t": "int",
+    "trans_cont": [
+      51
+    ],
+    "trans_ids": [
+      2
+    ]
+  }
+}
