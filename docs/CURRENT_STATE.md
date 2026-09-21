@@ -60,17 +60,44 @@ for compute. Nothing is left half-finished; the arc has a clean stopping point.
   evidence say representation is not the cap (section 5). Do not read the
   result as evidence either way about the ceiling.
 
+### Multi-gen encoding is NOT blocked *(CONFIRMED 2026-09-21)*
+
+Measured, contradicting the earlier framing in this plan:
+
+- **All `FormatConfig` dims are identical** for `gen4ou` / `gen4uu` / `gen9ou`
+  (team 6, active 1, bench 5, moves 4, stats 6, types 19, actions 9). They are
+  *format* properties, not *gen* properties. Only `gen` differs.
+- **Gen 4 encodes end to end today.** 4 real gen4ou replays from Showdown ->
+  `Battle(gen=4)` -> `make_features()` = 125 records, zero exceptions.
+- **Gen semantics are correct, not merely non-crashing.** Steel resists Dark
+  and Ghost at gen 4 (0.5x) and does not at gen 9 (1.0x), via
+  `Pokemon.damage_multiplier()` - the exact call `_compute_type_effectiveness`
+  makes.
+- **Showdown's replay API feeds the existing pipeline unmodified.**
+  `replay.pokemonshowdown.com/search.json?format=<fmt>` then `/<id>.log` yields
+  raw logs that `_split_log_lines` consumes directly. This is the gen 5-8
+  ingestion route: an adapter, not a rewrite. (Note: plain `urllib` gets 403;
+  use curl or set a User-Agent.)
+
+**Consequence**: getting gen 4 training data is a data-sourcing job, not an
+encoder job. `FormatConfig` threading is worth doing for doubles and hygiene,
+but it is not what stands between us and multi-gen.
+
 ### Steps, in order
 
 1. [ ] **Thread `FormatConfig`.** Replace import-time `FORMAT_SINGLES` binding
    with a per-battle/per-run config throughout `features.py`,
    `model_transformer.py`, `rewards.py`, `collate_seq`, `_encode_action_slots`.
    Wire `format_from_str()` (currently zero callers).
-   **Acceptance test: encoder output must be BIT-IDENTICAL for gen9ou before
-   and after.** The dynamic values equal today's hardcoded ones, so any
-   difference is a bug. Do this first precisely because it is verifiable, and
-   because it is the root cause behind the gen dimension, the hardcoded
-   constants, and the doubles team-layout prerequisite.
+   **Acceptance test: `python encoder_golden.py verify` must exit 0** — encoder
+   output bit-identical for gen9ou before and after. The dynamic values equal
+   today's hardcoded ones, so any difference is a bug.
+   **Why first**: this is the ONLY step provable by bit-identity. Once step 3
+   changes dims the golden re-baselines and that proof is gone permanently.
+   Do the provable refactor while it is still provable.
+   ⚠️ **Scope corrected 2026-09-21**: this is a **doubles/triples**
+   prerequisite, NOT a multi-gen unblocker. See "multi-gen is not blocked"
+   below.
 2. [ ] **Retire the legacy arch** — `model.py`, `arch_compat.py`, legacy
    `BattleAgent` dispatch paths. Make `TransformerBattlePolicy` the only arch
    so the schema work is done once, not twice.
