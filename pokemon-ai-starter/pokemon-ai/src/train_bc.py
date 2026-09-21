@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# train_bc.py — Behavioral Cloning training for PokeTransformer (v8)
+# train_bc.py — Behavioral Cloning training for TransformerBattlePolicy.
 #
 # Usage:
 #   python -u bc_train_v8.py --memmap-dir data/datasets/memmap_v8 \
@@ -32,7 +32,9 @@ torch.backends.cudnn.benchmark = True
 import asyncio
 
 from dataset import MemmapDataset, collate_seq, unpack_turn_batch
-from model import PokeTransformer, PokeTransformerConfig, add_model_args, config_from_args
+from model_transformer import (
+    TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup, add_model_args,
+)
 
 
 def _state_dict_is_transformer(state: dict) -> bool:
@@ -78,7 +80,7 @@ def compute_accuracy(logits: torch.Tensor, actions: torch.Tensor,
     return (preds == actions).float().mean().item()
 
 
-def train_one_epoch(model: PokeTransformer, loader: DataLoader,
+def train_one_epoch(model: TransformerBattlePolicy, loader: DataLoader,
                     optimizer: torch.optim.Optimizer, device: torch.device,
                     epoch: int, tb: Optional[SummaryWriter], global_step: int,
                     grad_clip: float = 1.0, label_smoothing: float = 0.0,
@@ -214,7 +216,7 @@ def train_one_epoch(model: PokeTransformer, loader: DataLoader,
 
 
 @torch.no_grad()
-def validate(model: PokeTransformer, loader: DataLoader, device: torch.device) -> tuple:
+def validate(model: TransformerBattlePolicy, loader: DataLoader, device: torch.device) -> tuple:
     """Validate using batched forward. Returns (avg_loss, avg_acc, avg_vloss)."""
     model.eval()
     total_loss = 0.0
@@ -360,7 +362,7 @@ def eval_vs_bots(checkpoint_path: str, device: str = "cuda", n_battles: int = 20
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BC training for PokeTransformer v8")
+    parser = argparse.ArgumentParser(description="BC training for TransformerBattlePolicy")
     parser.add_argument("--memmap-dir", required=True, help="Path to memmap directory")
     parser.add_argument("--format", default="gen9ou", help="Battle format (gen9ou, gen8ou, etc.)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -392,14 +394,6 @@ def main():
                         help="Enable mixed precision training (AMP) for ~2x speedup on CUDA")
     parser.add_argument("--server", type=str, default="ws://127.0.0.1:9000/showdown/websocket",
                         help="Battle server URL for bot eval")
-    parser.add_argument("--use-transformer", action="store_true",
-                        help="Use the new TransformerBattlePolicy (model_transformer.py) "
-                             "instead of the legacy MLP-arch PokeTransformer. "
-                             "REWRITE_DESIGN.md §7 Week 3. Forces eval-games=0 (no live "
-                             "BattleAgent for the new arch yet — defer to Week 5). "
-                             "The --gradient-checkpoint flag from add_model_args also "
-                             "applies (saves ~50% peak activation memory; needed on "
-                             "6 GB VRAM at B>=4 to survive worst-case T_max=200 draws).")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap spatial + temporal transformers in torch.compile() "
                              "for 10-25%% speedup on Linux/A100. Adds ~30-60s warmup at "
@@ -434,46 +428,36 @@ def main():
                             persistent_workers=(nw > 0),
                             prefetch_factor=(2 if nw > 0 else None))
 
-    # Model
-    arch = "transformer" if args.use_transformer else "mlp"
-    if args.use_transformer:
-        from model_transformer import (
-            TransformerBattlePolicy, TransformerConfig, load_move_flag_lookup,
-        )
-        cfg = TransformerConfig.with_vocab_sizes_from_disk()
-        if args.gradient_checkpoint:
-            cfg.gradient_checkpoint = True
-        lookup = load_move_flag_lookup(
-            Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
-        )
-        model = TransformerBattlePolicy(cfg, move_flag_lookup=lookup).to(device)
-        print(f"Model: {model.count_parameters():,} params (transformer arch)")
-        print(f"Config: d_model={cfg.d_model}, d_temporal={cfg.d_temporal}, "
-              f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
-              f"heads={cfg.n_heads}, K={cfg.n_summary_tokens}, dropout={cfg.dropout}, "
-              f"gradient_checkpoint={cfg.gradient_checkpoint}")
-        if args.compile:
-            # Granular compile: only the heavy attention stacks (static shapes,
-            # no Python control flow). forward_sequence's outer (b, t) loop stays
-            # in eager mode — Inductor can't trace through arbitrary Python loops.
-            # Mirrors Metamon's @torch.compile pattern in metamon_to_amago.py:521,579.
-            print("  [compile] wrapping spatial + temporal transformers in torch.compile()")
-            model.spatial = torch.compile(model.spatial)
-            model.temporal = torch.compile(model.temporal)
-        if args.eval_games > 0:
-            print(f"  [INFO] Forcing --eval-games 0: BattleAgentTransformer not built "
-                  f"yet (Week 5). Run eval_metamon_competitive.py manually post-epoch "
-                  f"if needed.", flush=True)
-            args.eval_games = 0
-    else:
-        cfg = config_from_args(args)
-        model = PokeTransformer(cfg).to(device)
-        print(f"Model: {model.count_parameters():,} params (legacy MLP arch)")
-        # Print effective (resolved) dims so reshape runs are obvious in logs.
-        print(f"Config: d_spatial={model.d_spatial}, d_temporal={model.d_temporal}, "
-              f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
-              f"heads={cfg.n_heads}, n_summary_tokens={cfg.n_summary_tokens}, "
-              f"dropout={cfg.dropout}")
+    # Model. Only TransformerBattlePolicy remains — the legacy MLP arch
+    # (PokeTransformer) was retired in S69.
+    arch = "transformer"
+    cfg = TransformerConfig.with_vocab_sizes_from_disk()
+    if args.gradient_checkpoint:
+        cfg.gradient_checkpoint = True
+    lookup = load_move_flag_lookup(
+        Path("data/lookup/move_flags_v1.pt"), expected_n_moves=cfg.n_moves,
+    )
+    model = TransformerBattlePolicy(cfg, move_flag_lookup=lookup).to(device)
+    print(f"Model: {model.count_parameters():,} params (transformer arch)")
+    print(f"Config: d_model={cfg.d_model}, d_temporal={cfg.d_temporal}, "
+          f"spatial={cfg.n_spatial_layers}L, temporal={cfg.n_temporal_layers}L, "
+          f"heads={cfg.n_heads}, K={cfg.n_summary_tokens}, dropout={cfg.dropout}, "
+          f"gradient_checkpoint={cfg.gradient_checkpoint}")
+    if args.compile:
+        # Granular compile: only the heavy attention stacks (static shapes,
+        # no Python control flow). forward_sequence's outer (b, t) loop stays
+        # in eager mode — Inductor can't trace through arbitrary Python loops.
+        print("  [compile] wrapping spatial + temporal transformers in torch.compile()")
+        model.spatial = torch.compile(model.spatial)
+        model.temporal = torch.compile(model.temporal)
+    if args.eval_games > 0:
+        # NOTE (S69): this restriction is stale — BattleAgentTransformer exists
+        # and eval_vs_bots() already dispatches to it. Left as-is because
+        # changing eval behaviour is outside the scope of the arch retirement.
+        print(f"  [INFO] Forcing --eval-games 0: in-loop eval not wired for this "
+              f"arch. Run eval_metamon_competitive.py manually post-epoch.", flush=True)
+        args.eval_games = 0
+
     # Echo training hyperparams to log — prevents silent-config debugging pain.
     print(f"Train: lr={args.lr}, wd={args.weight_decay}, grad_clip={args.grad_clip}, "
           f"label_smoothing={args.label_smoothing}, batch_size={args.batch_size}, "
@@ -521,9 +505,10 @@ def main():
             ckpt_arch = "transformer" if _state_dict_is_transformer(ckpt["model_state_dict"]) else "mlp"
         if ckpt_arch != arch:
             raise SystemExit(
-                f"Resume arch mismatch: checkpoint is '{ckpt_arch}' but training run "
-                f"is '{arch}'. Either rerun with --use-transformer={'on' if ckpt_arch=='transformer' else 'off'} "
-                f"or pick a matching checkpoint."
+                f"Resume arch mismatch: checkpoint is '{ckpt_arch}' but this run is "
+                f"'{arch}'. The legacy MLP arch was retired in S69, so pre-v10 "
+                f"checkpoints can no longer be resumed. Pick a transformer-arch "
+                f"checkpoint (BC v10 onward)."
             )
         # torch.compile wraps modules with `_orig_mod.` prefix in state_dict;
         # strip on load so we can resume between compiled/uncompiled runs.

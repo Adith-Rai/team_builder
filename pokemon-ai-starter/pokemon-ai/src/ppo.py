@@ -38,7 +38,7 @@ from arch_compat import (
     call_value_logits,
     get_v_support,
 )
-from model import PokeTransformer, PokeTransformerConfig
+from model_transformer import TransformerBattlePolicy, TransformerConfig
 from precision_config import autocast_ctx, get_amp_dtype
 
 
@@ -888,8 +888,8 @@ def ppo_loss_batched(collated: dict, forward_out: dict, model, cfg,
 # PPO Update (batched spatial, sequential temporal)
 # =============================
 
-def ppo_update(model: PokeTransformer, optimizer, episodes: List[dict],
-                  device: torch.device, cfg: PokeTransformerConfig,
+def ppo_update(model: TransformerBattlePolicy, optimizer, episodes: List[dict],
+                  device: torch.device, cfg: TransformerConfig,
                   epochs: int = 3, clip_eps: float = 0.2, ent_coef: float = 0.02,
                   vf_coef: float = 0.5, max_grad_norm: float = 0.5,
                   target_kl: float = 0.02, grad_accum: int = 1,
@@ -2176,35 +2176,27 @@ def load_checkpoint(path: str, device: torch.device):
         model.load_state_dict(state, strict=True)
         return model, cfg, ckpt
 
-    # Legacy MLP arch.
-    cfg = PokeTransformerConfig.from_dict(ckpt.get("model_config", {}))
-    model = PokeTransformer(cfg).to(device)
-
-    # Handle dim expansion for type effectiveness features (zero-init new columns)
-    # move_net.mlp.0.weight: 187 -> 189 (+2: type_eff, opp_threat)
-    # switch_mlp.0.weight: 60 -> 62 (+2: defensive/offensive effectiveness)
-    _expand_targets = ["move_net.mlp.0.weight", "switch_mlp.0.weight"]
-    for key in list(state.keys()):
-        if any(key.endswith(t) for t in _expand_targets):
-            old_w = state[key]
-            parts = key.split(".")
-            mod = model
-            for p in parts[:-1]:
-                mod = getattr(mod, p) if not p.isdigit() else mod[int(p)]
-            expected_in = mod.in_features
-            if old_w.shape[1] < expected_in:
-                pad = expected_in - old_w.shape[1]
-                state[key] = torch.cat([old_w, torch.zeros(old_w.shape[0], pad, device=old_w.device)], dim=1)
-                print(f"  [INFO] Expanding {key}: {old_w.shape[1]} -> {expected_in} (+{pad} dims, zero-init)")
-
-    model.load_state_dict(state, strict=True)
-    return model, cfg, ckpt
+    # Legacy MLP arch (PokeTransformer) was retired in S69. Its checkpoints
+    # all predate BC v10 and are strictly weaker; the loader, including the
+    # dim-expansion shim for the Session-30 type-effectiveness columns, went
+    # with it. Fail clearly rather than half-loading.
+    raise RuntimeError(
+        f"Checkpoint {path!r} is a legacy MLP-arch checkpoint (arch={arch!r}). "
+        f"That architecture was retired in S69 - every checkpoint from BC v10 "
+        f"onward is TransformerBattlePolicy. To inspect a pre-v10 checkpoint, "
+        f"check out a commit before the retirement: "
+        f"`git checkout <sha> -- pokemon-ai-starter/pokemon-ai/src/model.py`."
+    )
 
 
 def save_checkpoint(path, model, cfg, optimizer, iteration, metrics=None):
-    # Architecture tag — read by load_checkpoint to dispatch to the right class.
-    # Detect from cfg type so callers don't have to pass an extra argument.
-    arch = "transformer" if type(cfg).__name__ == "TransformerConfig" else "mlp"
+    # Architecture tag — read back by load_checkpoint. Only one arch exists
+    # since the S69 legacy retirement; the tag is kept so older checkpoints
+    # remain distinguishable and so load_checkpoint can refuse them clearly.
+    assert type(cfg).__name__ == "TransformerConfig", (
+        f"save_checkpoint expects a TransformerConfig, got {type(cfg).__name__}"
+    )
+    arch = "transformer"
     ckpt = {
         "arch": arch,
         "model_state_dict": model.state_dict(),

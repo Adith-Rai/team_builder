@@ -385,8 +385,9 @@ def _do_collect_iter(state, worker_id, cmd, result_pipe, heartbeat_fn):
         model, cfg, _ = load_checkpoint(weights_path, device)
         if not _is_transformer_arch(model):
             raise RuntimeError(
-                "--mp requires transformer architecture; got legacy ckpt at "
-                f"{weights_path}. Use --pipeline (without --mp) for legacy."
+                "Expected a transformer-arch checkpoint; got a legacy one at "
+                f"{weights_path}. The legacy MLP arch was retired in S69 - use a "
+                f"checkpoint from BC v10 onward."
             )
         model.eval()
         state["model"] = model

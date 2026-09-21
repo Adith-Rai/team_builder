@@ -105,8 +105,17 @@ but it is not what stands between us and multi-gen.
      `add_model_args` to `model_transformer` (15 of its 16 flags were dead -
      parsed and silently discarded on the transformer path, and no launch
      script passed any of them).
-   - [ ] 2b: remove the legacy model architecture from the training path -
-     `train_bc` legacy branch, `ppo.py` legacy checkpoint load, `arch_compat`.
+   - [x] 2b: DONE 2026-09-21. `train_bc` collapsed to a single arch and
+     `--use-transformer` removed (no launch script passed it). `ppo.py`
+     `load_checkpoint` now refuses legacy checkpoints with a clear error
+     instead of loading them, and the dim-expansion shim for the Session-30
+     type-effectiveness columns went with it. `arch_compat` keeps its four
+     helpers but the dispatch and every legacy branch are gone — it is now
+     documented as an adapter between the batched call pattern and the model
+     API, not an arch dispatcher. Stale guard messages in `train_bc` and
+     `mp_disk_collect` updated.
+     Still importing `model.py`: `battle_agent.py` (2c), the two dead
+     `mp_collect_v2/v3`, and three legacy test files.
    - [ ] **2c (DEFERRED, hygiene not prerequisite)**: retire `BattleAgent` /
      `SelfPlayOpponent` and the arch dispatch in ~12 eval scripts.
      **Why deferred**: the duplication that justified this step lives in the
