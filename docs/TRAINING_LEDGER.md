@@ -18,7 +18,7 @@ against the KL gate" (it was redundant with the BC anchor).
 > ⚠️ **Elo figures below are not comparable across rows.** Bradley-Terry Elo
 > re-centres when the pool changes; frozen bots drift ~±50 Elo between
 > ladders. Each number is meaningful only against its own ladder. See
-> `CURRENT_STATE.md` §4.
+> `CURRENT_STATE.md` §5.
 
 Last review: **2026-09-20**
 
@@ -43,7 +43,7 @@ all. That is a climbing-out-of-incompetence gain, not a reaching-elite gain.
 
 There is no evidence feature engineering pays anything like that near the
 current ceiling, and direct evidence against: Minikazam has **no** precomputed
-type effectiveness and beats us 84-16 (`CURRENT_STATE.md` §4).
+type effectiveness and beats us 84-16 (`CURRENT_STATE.md` §5).
 
 **Do not use the +222 to justify expecting a ceiling break from more feature
 work.** The encoding/tokenization arc is justified by multi-gen readiness and

@@ -35,7 +35,62 @@ gate, the `--resume` fix, Phase 2 launch.
 
 ---
 
-## 2. Infrastructure and data
+## 2. Active work plan — encoding/tokenization arc
+
+Decided 2026-09-21. Maintained in place; tick items off as they land.
+
+### Scope boundary (Option A)
+
+This arc ends at **schema complete, validated on a subset, re-encode script
+ready**. **BC v11 retrain is explicitly OUT OF SCOPE** — BC v10 was trained on
+an A100 80GB at batch 48, and the local box is a 6 GB 3060. The retrain waits
+for compute. Nothing is left half-finished; the arc has a clean stopping point.
+
+### Decisions
+
+- **Legacy arch: RETIRE.** *(CONFIRMED safe 2026-09-21)* BC v10 and everything
+  forward is `TransformerBattlePolicy`; legacy only loads pre-v10 checkpoints,
+  which are archived and strictly weaker. Recovery if ever needed:
+  `git checkout <sha> -- src/model.py`.
+- **Validation corpus: `s3://team-builder-data/datasets/human_v8_5k/`**, NOT the
+  103 GB set. Fresh subsets can also be regenerated with
+  `replay_to_memmap.py --max-replays N` straight from HuggingFace.
+- **Expectation: this is NOT a plateau fix.** Justified by multi-gen readiness,
+  completeness, and the future team builder. Three independent lines of
+  evidence say representation is not the cap (section 5). Do not read the
+  result as evidence either way about the ceiling.
+
+### Steps, in order
+
+1. [ ] **Thread `FormatConfig`.** Replace import-time `FORMAT_SINGLES` binding
+   with a per-battle/per-run config throughout `features.py`,
+   `model_transformer.py`, `rewards.py`, `collate_seq`, `_encode_action_slots`.
+   Wire `format_from_str()` (currently zero callers).
+   **Acceptance test: encoder output must be BIT-IDENTICAL for gen9ou before
+   and after.** The dynamic values equal today's hardcoded ones, so any
+   difference is a bug. Do this first precisely because it is verifiable, and
+   because it is the root cause behind the gen dimension, the hardcoded
+   constants, and the doubles team-layout prerequisite.
+2. [ ] **Retire the legacy arch** — `model.py`, `arch_compat.py`, legacy
+   `BattleAgent` dispatch paths. Make `TransformerBattlePolicy` the only arch
+   so the schema work is done once, not twice.
+3. [ ] **Add the encoding gaps** — May memo Tier 1/2 (nature, EVs, IVs,
+   substitute HP, tera-as-own-token, duration counters, choice-lock move, exact
+   HP) plus the S69 addendum (team-preview persistence, opponent
+   `possible_abilities`, `base_species`, `preparing_move`, `previous_move`,
+   `gender`).
+4. [ ] **Bump `LOOKUP_SCHEMA_VERSION` 4 → 5**, write the re-encode script,
+   validate end-to-end on the 5k subset.
+5. [ ] **Profile the BC pipeline, THEN optimize.** Candidates only:
+   `--workers 0`, batch 16, fp16-vs-bf16, deprecated `GradScaler`,
+   `collate_seq` fill pattern. Land the schema first and freeze it as the
+   baseline so breakage stays attributable.
+6. [ ] **Fix the 19 hardcoded `/workspace/` paths** — independent of the above,
+   can land any time, unblocks local eval tooling.
+
+---
+
+## 3. Infrastructure and data
 
 ### Compute
 - **Local only**: RTX 3060 Laptop 6 GB / 16 GB RAM / Win10 / Python 3.11 /
@@ -98,7 +153,7 @@ training is limited to gen 4 and gen 9.
 
 ---
 
-## 3. Gen scope (decided 2026-09-20)
+## 4. Gen scope (decided 2026-09-20)
 
 | Gens | Decision | Reason |
 |---|---|---|
@@ -117,7 +172,7 @@ availability. Gen 6+ would yield gen 9 alone.
 
 ---
 
-## 4. Capability — what we actually know
+## 5. Capability — what we actually know
 
 See `memory/project_s69_ceiling_evidence.md` for full detail.
 
@@ -234,7 +289,7 @@ recommendation. **The S33 memo is stale on this point**; S66's "temporal-heavy,
 
 ---
 
-## 5. Codebase audit (2026-09-20)
+## 6. Codebase audit (2026-09-20)
 
 Full sweep of the encoding/data layer. All findings verified against live code.
 
@@ -382,20 +437,20 @@ remains trustworthy even though it can't be reproduced.
 
 ---
 
-## 6. Open — genuinely unresolved
+## 7. Open — genuinely unresolved
 
 | Question | Status |
 |---|---|
-| ~~Run #7 (BC anchor removed): exploration valley or real degradation?~~ | **CLOSED AS UNRECOVERABLE 2026-09-20.** The iter-99 gate never ran, the resume failed mechanically, and **every checkpoint past iter 39 is gone** (§5). Only re-running the experiment answers it — that is cloud work |
+| ~~Run #7 (BC anchor removed): exploration valley or real degradation?~~ | **CLOSED AS UNRECOVERABLE 2026-09-20.** The iter-99 gate never ran, the resume failed mechanically, and **every checkpoint past iter 39 is gone** (§6). Only re-running the experiment answers it — that is cloud work |
 | Run #9 (heuristic-opp diversity) | **Never ran.** Designed, coded, launch script written; hung on dev because heuristic bots raised exceptions inside CIS. Root-caused and fixed 2026-06-12/13. **Untested, not refuted** |
 | `--resume` mechanism | Two of three issues appear fixed (`d1c15295`, `05a04d54`). The third — PFSP win_rates being path-keyed so forked dirs start blind — is **unverified against current code** |
-| ~~Is representation the cap?~~ | **ANSWERED 2026-09-20 — NO.** See §4. Metamon's obs is strictly poorer and Minikazam still beats us 84-16 |
+| ~~Is representation the cap?~~ | **ANSWERED 2026-09-20 — NO.** See §5. Metamon's obs is strictly poorer and Minikazam still beats us 84-16 |
 | Why does Minikazam win, then? | Open. Candidates, in rough order of support: distillation from a strong teacher (Alakazam), ~10x more self-play volume, offline RL on human replays vs our online PPO, opponent-pool composition. None tested |
 | Did the type chart / tokenizer produce the historical jumps? | Unverified. Predates all reviewed material |
 
 ---
 
-## 7. Settled — do not reopen
+## 8. Settled — do not reopen
 
 - AWR and the BC anchor are **functionally redundant** — both pull toward BC.
   Run #6 (no AWR) beat Run #5 (AWR). AWR measured ~24 Elo of micro-improvement,
@@ -408,7 +463,7 @@ remains trustworthy even though it can't be reproduced.
 
 ---
 
-## 8. Known traps
+## 9. Known traps
 
 - **Two `data/` directories.** The real corpus is under
   `pokemon-ai-starter/pokemon-ai/src/data/`, *not* `pokemon-ai/data/`. Easy to
@@ -421,14 +476,14 @@ remains trustworthy even though it can't be reproduced.
 
 ---
 
-## 9. Live docs (everything else is in `history/`)
+## 10. Live docs (everything else is in `history/`)
 
 | File | Purpose |
 |---|---|
 | `CURRENT_STATE.md` | **this file** — the only doc that claims to be true *now* |
 | `ARCHITECTURE.md`, `CURRENT_ARCH_PATHWAY.md` | architecture + canonical data flow |
 | `ARCHITECTURE_REVIEW_2026_06_07.md` | open TODO: switch-action representation ablation |
-| `MULTIGEN_FEASIBILITY.md` | multi-gen scoping — **its "gen 6+" recommendation is refuted, see §3** |
+| `MULTIGEN_FEASIBILITY.md` | multi-gen scoping — **its "gen 6+" recommendation is refuted, see §4** |
 | `REFUTED_LOG.md` | maintained don't-retry list — **infrastructure** side |
 | `TRAINING_LEDGER.md` | maintained tried/outcome ledger — **training** side |
 | `PLATEAU_HYPOTHESIS_AND_EXPERIMENTS.md` | plateau framework + experiment queue |
