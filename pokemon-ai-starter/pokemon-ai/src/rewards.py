@@ -53,7 +53,11 @@ class RewardShaper:
         ko_bonus: float = 0.0,
         faint_penalty: float = 0.0,
         dense_events: bool = True,
+        fmt=None,
     ):
+        from format_config import FORMAT_SINGLES
+        # Format drives team_size, used to impute HP for unrevealed mons.
+        self.fmt = fmt if fmt is not None else FORMAT_SINGLES
         self.ko_coef = ko_coef
         self.hp_coef = hp_coef
         self.terminal_coef = terminal_coef
@@ -65,16 +69,14 @@ class RewardShaper:
         self._prev_hp_adv = None
         self._acc = 0.0
 
-    @staticmethod
-    def _team_hp_frac(team_dict: Dict[str, Any]) -> float:
+    def _team_hp_frac(self, team_dict: Dict[str, Any]) -> float:
         vals = []
         for p in (team_dict or {}).values():
             hp = getattr(p, "current_hp_fraction", None)
             if hp is not None:
                 vals.append(max(0.0, min(1.0, float(hp))))
         # Assume unseen mons (not in team_dict) are at 100% HP
-        from format_config import FORMAT_SINGLES
-        ts = FORMAT_SINGLES.team_size
+        ts = self.fmt.team_size
         return (sum(vals) + max(0, ts - len(team_dict or {}))) / float(ts)
 
     @staticmethod

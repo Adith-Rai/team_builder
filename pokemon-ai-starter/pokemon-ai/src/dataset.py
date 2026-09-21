@@ -174,39 +174,51 @@ def collate_seq(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     B = len(episodes)
     T = max(len(ep) for ep in episodes)
 
-    # Get shapes from first sample
+    # Derive EVERY dimension from the data. The memmap is the source of truth
+    # for what was actually encoded — team size, move slots and action-space
+    # width are format-dependent, so hardcoding them here would silently
+    # mis-shape any non-singles corpus.
     s0 = episodes[0][0]
+    n_poke, n_poke_id = s0["our_pokemon_ids"].shape          # (team_size, 7)
+    n_poke_bank = s0["our_pokemon_banks"].shape[1]
     poke_cont_dim = s0["our_pokemon_cont"].shape[1]
+    _, n_move_slots, move_slot_cont = s0["our_pokemon_mcont"].shape
+    field_bank_dim = s0["field_banks"].shape[0]
     field_cont_dim = s0["field_cont"].shape[0]
+    trans_id_dim = s0["trans_ids"].shape[0]
     trans_cont_dim = s0["trans_cont"].shape[0]
+    n_active_moves = s0["move_ids"].shape[0]
+    move_bank_dim = s0["move_banks"].shape[1]
     move_cont_dim = s0["move_cont"].shape[1]
+    n_switch = s0["switch_ids"].shape[0]
     switch_cont_dim = s0["switch_cont"].shape[1]
+    n_actions = s0["legal"].shape[0]
 
     # Pre-allocate tensors
-    our_poke_ids = torch.zeros(B, T, 6, 7, dtype=torch.long)
-    our_poke_banks = torch.zeros(B, T, 6, 10, dtype=torch.long)
-    our_poke_cont = torch.zeros(B, T, 6, poke_cont_dim, dtype=torch.float32)
-    our_poke_mcont = torch.zeros(B, T, 6, 4, 23, dtype=torch.float32)
+    our_poke_ids = torch.zeros(B, T, n_poke, n_poke_id, dtype=torch.long)
+    our_poke_banks = torch.zeros(B, T, n_poke, n_poke_bank, dtype=torch.long)
+    our_poke_cont = torch.zeros(B, T, n_poke, poke_cont_dim, dtype=torch.float32)
+    our_poke_mcont = torch.zeros(B, T, n_poke, n_move_slots, move_slot_cont, dtype=torch.float32)
 
-    opp_poke_ids = torch.zeros(B, T, 6, 7, dtype=torch.long)
-    opp_poke_banks = torch.zeros(B, T, 6, 10, dtype=torch.long)
-    opp_poke_cont = torch.zeros(B, T, 6, poke_cont_dim, dtype=torch.float32)
-    opp_poke_mcont = torch.zeros(B, T, 6, 4, 23, dtype=torch.float32)
+    opp_poke_ids = torch.zeros(B, T, n_poke, n_poke_id, dtype=torch.long)
+    opp_poke_banks = torch.zeros(B, T, n_poke, n_poke_bank, dtype=torch.long)
+    opp_poke_cont = torch.zeros(B, T, n_poke, poke_cont_dim, dtype=torch.float32)
+    opp_poke_mcont = torch.zeros(B, T, n_poke, n_move_slots, move_slot_cont, dtype=torch.float32)
 
-    field_banks_t = torch.zeros(B, T, 4, dtype=torch.long)
+    field_banks_t = torch.zeros(B, T, field_bank_dim, dtype=torch.long)
     field_cont_t = torch.zeros(B, T, field_cont_dim, dtype=torch.float32)
 
-    trans_ids_t = torch.zeros(B, T, 2, dtype=torch.long)
+    trans_ids_t = torch.zeros(B, T, trans_id_dim, dtype=torch.long)
     trans_cont_t = torch.zeros(B, T, trans_cont_dim, dtype=torch.float32)
 
-    active_move_ids = torch.zeros(B, T, 4, dtype=torch.long)
-    active_move_banks = torch.zeros(B, T, 4, 4, dtype=torch.long)
-    active_move_cont = torch.zeros(B, T, 4, move_cont_dim, dtype=torch.float32)
+    active_move_ids = torch.zeros(B, T, n_active_moves, dtype=torch.long)
+    active_move_banks = torch.zeros(B, T, n_active_moves, move_bank_dim, dtype=torch.long)
+    active_move_cont = torch.zeros(B, T, n_active_moves, move_cont_dim, dtype=torch.float32)
 
-    switch_ids_t = torch.zeros(B, T, 5, dtype=torch.long)
-    switch_cont_t = torch.zeros(B, T, 5, switch_cont_dim, dtype=torch.float32)
+    switch_ids_t = torch.zeros(B, T, n_switch, dtype=torch.long)
+    switch_cont_t = torch.zeros(B, T, n_switch, switch_cont_dim, dtype=torch.float32)
 
-    legal_t = torch.zeros(B, T, 9, dtype=torch.float32)
+    legal_t = torch.zeros(B, T, n_actions, dtype=torch.float32)
     action_t = torch.full((B, T), -1, dtype=torch.long)
     result_t = torch.full((B, T), -1.0, dtype=torch.float32)
     mask_t = torch.zeros(B, T, dtype=torch.float32)

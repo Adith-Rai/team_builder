@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from features import make_features, POKEMON_CONT_DIM, FIELD_CONT_DIM, TRANSITION_CONT_DIM
+from format_config import FormatConfig, format_from_str
 from features import MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM
 
 # Import replay parsing helpers from existing replay_parser
@@ -52,6 +53,7 @@ def _parse_perspective_v8(
     players: Dict[str, str], winner_role: Optional[str], is_tie: bool,
     fmt: str, rating: Optional[int], moves_map: Dict[str, List[str]],
     turn_bounds: List[Tuple[int, int]], gen: int,
+    cfg: Optional[FormatConfig] = None,
 ) -> List[Dict[str, Any]]:
     """Parse one perspective of a replay into v8 feature records.
 
@@ -59,6 +61,9 @@ def _parse_perspective_v8(
     """
     username = players[perspective]
     episode_id = f"{replay_id}::{perspective}"
+    # Derive the format config from the format string unless one was passed.
+    # This is what makes non-gen9 / non-singles encoding work end to end.
+    cfg = cfg if cfg is not None else format_from_str(fmt)
 
     battle = Battle(
         battle_tag=replay_id,
@@ -112,7 +117,7 @@ def _parse_perspective_v8(
 
         # Extract V8 features
         try:
-            feat = make_features(battle)
+            feat = make_features(battle, cfg=cfg)
         except Exception:
             for i in range(turn_line_idx + 1, next_turn_line_idx):
                 _safe_parse(battle, lines[i])

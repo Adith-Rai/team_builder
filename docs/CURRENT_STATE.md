@@ -85,7 +85,7 @@ but it is not what stands between us and multi-gen.
 
 ### Steps, in order
 
-1. [ ] **Thread `FormatConfig`.** Replace import-time `FORMAT_SINGLES` binding
+1. [x] **Thread `FormatConfig`.** DONE 2026-09-21 (`54daa50d`, `1c7f...`). Replace import-time `FORMAT_SINGLES` binding
    with a per-battle/per-run config throughout `features.py`,
    `model_transformer.py`, `rewards.py`, `collate_seq`, `_encode_action_slots`.
    Wire `format_from_str()` (currently zero callers).
