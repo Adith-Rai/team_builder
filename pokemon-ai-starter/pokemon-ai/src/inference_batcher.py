@@ -20,7 +20,7 @@ from arch_compat import (
     call_value_logits,
     get_v_support,
 )
-from model import PokeTransformer
+from model_transformer import TransformerBattlePolicy
 from precision_config import autocast_ctx
 
 
@@ -32,7 +32,7 @@ class InferenceBatcher:
     model.forward() processes them all.
     """
 
-    def __init__(self, model: PokeTransformer, device: torch.device,
+    def __init__(self, model: TransformerBattlePolicy, device: torch.device,
                  fp16: bool = False, min_batch: int = 8, timeout_ms: int = 20):
         self.model = model
         self.device = device

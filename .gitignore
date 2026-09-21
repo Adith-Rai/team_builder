@@ -120,3 +120,10 @@ logs/
 
 # Pokemon AI data directory (separate from src/data/ above)
 pokemon-ai-starter/pokemon-ai/data/
+
+# S69: model output dirs. src/data/ is un-ignored above (line ~107) so the ELO
+# registry can be tracked, but that negation also re-exposes model output dirs.
+# .pt/.npy are covered globally; this catches the config.json / log files that
+# training runs drop alongside them.
+pokemon-ai-starter/pokemon-ai/src/data/models/
+pokemon-ai-starter/pokemon-ai/src/data/datasets/

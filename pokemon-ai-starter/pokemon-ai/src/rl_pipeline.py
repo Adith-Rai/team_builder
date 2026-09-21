@@ -27,7 +27,7 @@ from poke_env.ps_client.server_configuration import ServerConfiguration
 from precision_config import autocast_ctx
 
 from features import make_features, MOVE_SLOT_CONT_DIM, SWITCH_SLOT_CONT_DIM
-from model import PokeTransformer
+from model_transformer import TransformerBattlePolicy
 from ppo import Trajectory, _cancel_listener
 from rewards import RewardShaper
 from teams_ou import random_pool_teambuilder
@@ -61,7 +61,7 @@ class InferenceServer:
     returns results to per-worker result queues. Manages temporal history.
     """
 
-    def __init__(self, model: PokeTransformer, device: torch.device,
+    def __init__(self, model: TransformerBattlePolicy, device: torch.device,
                  request_queue: MPQueue, result_queues: Dict[int, MPQueue],
                  fp16: bool = False, batch_timeout_ms: float = 20,
                  min_batch: int = 4):
@@ -281,7 +281,7 @@ class MPRLPlayer(Player):
         return self._trajectories[btag]
 
     def _build_turn_batch_cpu(self, feat: dict) -> dict:
-        """Convert make_features() output to PokeTransformer batch dict on CPU."""
+        """Convert make_features() output to a model batch dict on CPU."""
         from features import build_turn_batch
         return build_turn_batch(feat, device=None)  # None = CPU tensors
 
@@ -472,7 +472,7 @@ def _mp_worker(
 
 
 def mp_collect_v9(
-    model: PokeTransformer, device: torch.device,
+    model: TransformerBattlePolicy, device: torch.device,
     server_pool: List[ServerConfiguration],
     n_games: int = 200, max_concurrent: int = 10,
     snapshot_pool: List[str] = None, fp16: bool = True,

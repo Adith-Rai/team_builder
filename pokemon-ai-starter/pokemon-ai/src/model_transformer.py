@@ -305,6 +305,25 @@ class NumericalBank(nn.Module):
 # Config
 # =============================
 
+def add_model_args(parser):
+    """Add transformer model CLI arguments.
+
+    Replaces the legacy model.py:add_model_args, which defined 16 flags of
+    which exactly one (--gradient-checkpoint) was ever read outside model.py
+    itself. The other 15 were parsed and silently discarded on the transformer
+    path, and no launch script passed any of them (verified 2026-09-21). They
+    are removed rather than accepted-and-ignored so that passing one now fails
+    loudly instead of quietly doing nothing.
+
+    Architecture dimensions come from TransformerConfig, which is persisted in
+    the checkpoint, rather than from the command line.
+    """
+    g = parser.add_argument_group("Model Architecture")
+    g.add_argument("--gradient-checkpoint", action="store_true",
+                   help="Trade compute for memory in the spatial/temporal stacks.")
+    return parser
+
+
 def _default_format() -> FormatConfig:
     return FORMAT_SINGLES
 

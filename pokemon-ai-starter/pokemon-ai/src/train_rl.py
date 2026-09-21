@@ -82,7 +82,7 @@ except Exception:
 
 from torch.utils.tensorboard import SummaryWriter
 
-from model import PokeTransformer, PokeTransformerConfig, add_model_args
+from model_transformer import add_model_args
 from ppo import (
     Trajectory, compute_gae, build_ppo_episodes, ppo_update,
     ppo_update_batched, make_compiled_train_step,

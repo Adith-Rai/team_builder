@@ -24,7 +24,7 @@ from poke_env.player import Player
 from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.ps_client.server_configuration import ServerConfiguration
 
-from model import PokeTransformer
+from model_transformer import TransformerBattlePolicy
 from ppo import Trajectory, _cancel_listener
 # teams_ou.random_pool_teambuilder (the 70 hand-curated eval teams) is intentionally
 # NOT imported here — it's eval-only. Training callers must pass a procedural
@@ -532,7 +532,7 @@ def pfsp_sample(
 
 
 async def collect_v9(
-    model: PokeTransformer, device: torch.device,
+    model: TransformerBattlePolicy, device: torch.device,
     server_pool: List[ServerConfiguration],
     n_games: int = 200, max_concurrent: int = 20,
     snapshot_pool: List[Union[str, PoolEntry]] = None, fp16: bool = True,

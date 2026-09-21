@@ -98,9 +98,26 @@ but it is not what stands between us and multi-gen.
    ⚠️ **Scope corrected 2026-09-21**: this is a **doubles/triples**
    prerequisite, NOT a multi-gen unblocker. See "multi-gen is not blocked"
    below.
-2. [ ] **Retire the legacy arch** — `model.py`, `arch_compat.py`, legacy
-   `BattleAgent` dispatch paths. Make `TransformerBattlePolicy` the only arch
-   so the schema work is done once, not twice.
+2. [~] **Retire the legacy arch.** SCOPE NARROWED 2026-09-21 after measuring
+   the real dependency surface.
+   - [x] 2a: migrate type-hint-only importers (`inference_batcher`,
+     `rl_collection`, `rl_pipeline`) and `train_rl` off `model.py`; move
+     `add_model_args` to `model_transformer` (15 of its 16 flags were dead -
+     parsed and silently discarded on the transformer path, and no launch
+     script passed any of them).
+   - [ ] 2b: remove the legacy model architecture from the training path -
+     `train_bc` legacy branch, `ppo.py` legacy checkpoint load, `arch_compat`.
+   - [ ] **2c (DEFERRED, hygiene not prerequisite)**: retire `BattleAgent` /
+     `SelfPlayOpponent` and the arch dispatch in ~12 eval scripts.
+     **Why deferred**: the duplication that justified this step lives in the
+     *architecture*, not the thin agent wrappers. And once the schema bumps to
+     v5, every legacy checkpoint becomes unloadable anyway (v4-shaped
+     embeddings), so `BattleAgent` stops being a burden on its own. Doing a
+     ~25-file change now would also mean doing it under much weaker validation
+     than step 1 had - eval scripts need a Showdown server and cannot be
+     end-to-end tested locally.
+     Note `rl_player.py:334` is `class SelfPlayOpponent(BattleAgent)`, so this
+     is a dependency chain, not a find-and-replace.
 3. [ ] **Add the encoding gaps** — May memo Tier 1/2 (nature, EVs, IVs,
    substitute HP, tera-as-own-token, duration counters, choice-lock move, exact
    HP) plus the S69 addendum (team-preview persistence, opponent
